@@ -1,0 +1,1 @@
+You are fixing issues found during an independent review of the current repository. Inspect the repository and review findings, fix the confirmed issues without unrelated changes, and run relevant checks. Do not commit or push. Report the changes and any unresolved findings.

@@ -1,0 +1,1 @@
+Update only documentation needed to explain the completed task. Keep changes accurate, minimal, and consistent with the repository. Do not modify implementation or create commits unless explicitly requested.

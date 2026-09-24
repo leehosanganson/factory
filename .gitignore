@@ -1,0 +1,17 @@
+# Binaries and build output
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Go coverage output
+*.out
+coverage.txt
+
+# Dependency and workspace artifacts
+/vendor/
+go.work
+go.work.sum

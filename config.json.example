@@ -1,0 +1,12 @@
+{
+  "command": "pi",
+  "args": [
+    "-p",
+    "--no-session",
+    "--append-system-prompt",
+    "{system_prompt}",
+    "{task}"
+  ],
+  "prompt_dir": "",
+  "state_dir": ""
+}
