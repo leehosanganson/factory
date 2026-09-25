@@ -1099,17 +1099,13 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	evalTask := evaluatorTask(task, string(output), worktree, changed)
 	evalLog := filepath.Join(dir, "evaluation.log")
 	evalCtx, cancelEval := context.WithTimeout(ctx, agentTimeout)
-	evalErr := (Runner{Config: cfg}).RunContext(evalCtx, "evaluate", evalPrompt, evalTask, worktree, evalLog)
+	evalOutput, evalErr := (Runner{Config: cfg}).RunWithOutputContext(evalCtx, "evaluate", evalPrompt, evalTask, worktree, evalLog)
 	cancelEval()
 	if evalErr != nil {
 		appendBabysitLog(dir, "Evaluator failed; no commit or push: "+evalErr.Error())
 		return evalErr
 	}
-	evalOutput, err := os.ReadFile(evalLog)
-	if err != nil {
-		return err
-	}
-	decision, files := parseEvaluation(string(evalOutput))
+	decision, files := parseEvaluation(evalOutput)
 	if decision != "PASS" {
 		if decision == "APPROVAL_REQUIRED" {
 			_, proposal = agentProtocol(string(evalOutput))
@@ -1227,7 +1223,7 @@ func changedPaths(worktree string) ([]string, error) {
 
 func evaluatorTask(task, agentOutput, worktree string, paths []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Independently evaluate the agent's proposed routine change. The agent's FIXED verdict is not evidence. Inspect the worktree, tests, and diff. Return PASS only if the fix is correct, scoped, tested, and safe for automatic commit/push. If ambiguous/high-impact, return APPROVAL_REQUIRED first and a FACTORY_PROPOSAL= line. Otherwise return FAIL. If PASS, also emit exactly one FACTORY_FILES=<JSON array> line listing every changed path you independently authorize; the list must match the complete diff exactly.\n\nTask and snapshot:\n%s\nAgent output:\n%s\nWorktree: %s\nChanged paths: %s\n", task, agentOutput, worktree, mustJSON(paths))
+	fmt.Fprintf(&b, "Independently evaluate the agent's proposed routine change. The agent's FIXED verdict is not evidence. Inspect the worktree, tests, and diff. Put PASS as the first non-empty stdout line only if the fix is correct, scoped, tested, and safe for automatic commit/push. If ambiguous/high-impact, put APPROVAL_REQUIRED first and emit a FACTORY_PROPOSAL= line. Otherwise put FAIL first. If PASS, also emit exactly one FACTORY_FILES=<JSON array> line on stdout listing every changed path you independently authorize; the list must match the complete diff exactly.\n\nTask and snapshot:\n%s\nAgent output:\n%s\nWorktree: %s\nChanged paths: %s\n", task, agentOutput, worktree, mustJSON(paths))
 	return b.String()
 }
 
@@ -1237,7 +1233,7 @@ func parseEvaluation(output string) (string, []string) {
 	decision := ""
 	files := []string{}
 	for _, line := range strings.Split(output, "\n") {
-		if decision == "" && line != "" {
+		if decision == "" && strings.TrimSpace(line) != "" {
 			decision = strings.TrimSuffix(line, "\r")
 		}
 		if strings.HasPrefix(line, "FACTORY_FILES=") {

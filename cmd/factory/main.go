@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/leehosanganson/factory/internal/factory"
 )
@@ -42,7 +45,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if err != nil {
 				return err
 			}
-			return runPipeline(task, gate, in, out)
+			ctx, stop := foregroundContext()
+			defer stop()
+			return runPipelineContext(ctx, task, gate, in, out)
 		case "clean":
 			gate, task, err := parseGate(args[1:])
 			if err != nil {
@@ -51,19 +56,29 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if len(task) != 0 {
 				return fmt.Errorf("factory clean accepts only --gate")
 			}
-			return runClean(gate, in, out, errOut)
+			ctx, stop := foregroundContext()
+			defer stop()
+			return runCleanContext(ctx, gate, in, out, errOut)
 		default:
 			if args[0] == "--gate" {
 				gate, task, err := parseGate(args)
 				if err != nil {
 					return err
 				}
-				return runPipeline(task, gate, in, out)
+				ctx, stop := foregroundContext()
+				defer stop()
+				return runPipelineContext(ctx, task, gate, in, out)
 			}
 			return fmt.Errorf("unknown command %q (try factory help)", args[0])
 		}
 	}
-	return runPipeline(nil, false, in, out)
+	ctx, stop := foregroundContext()
+	defer stop()
+	return runPipelineContext(ctx, nil, false, in, out)
+}
+
+func foregroundContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 }
 
 func parseGate(args []string) (bool, []string, error) {
@@ -83,6 +98,15 @@ func parseGate(args []string) (bool, []string, error) {
 }
 
 func runPipeline(args []string, gate bool, in io.Reader, out io.Writer) error {
+	ctx, stop := foregroundContext()
+	defer stop()
+	return runPipelineContext(ctx, args, gate, in, out)
+}
+
+func runPipelineContext(ctx context.Context, args []string, gate bool, in io.Reader, out io.Writer) error {
+	if file, ok := in.(*os.File); ok {
+		in = &contextStdin{file: file, ctx: ctx}
+	}
 	return runPipelineTask(args, in, out, func(task string, workflowIn io.Reader) error {
 		cfg, err := factory.LoadConfig("")
 		if err != nil {
@@ -93,14 +117,23 @@ func runPipeline(args []string, gate bool, in io.Reader, out io.Writer) error {
 			return fmt.Errorf("get target repository directory: %w", err)
 		}
 		stdout, outputIsFile := out.(*os.File)
-		stdin, inputIsFile := in.(*os.File)
+		stdin, inputIsFile := inputFile(in)
 		terminal := inputIsFile && outputIsFile && isTerminal(stdin) && isTerminal(stdout)
 		workflow := factory.Workflow{Agent: factory.Runner{Config: cfg}, Config: cfg, In: workflowIn, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: gate}
-		return workflow.Run(task)
+		return workflow.RunContext(ctx, task)
 	})
 }
 
 func runClean(gate bool, in io.Reader, out, errOut io.Writer) error {
+	ctx, stop := foregroundContext()
+	defer stop()
+	return runCleanContext(ctx, gate, in, out, errOut)
+}
+
+func runCleanContext(ctx context.Context, gate bool, in io.Reader, out, errOut io.Writer) error {
+	if file, ok := in.(*os.File); ok {
+		in = &contextStdin{file: file, ctx: ctx}
+	}
 	cfg, err := factory.LoadConfig("")
 	if err != nil {
 		return err
@@ -110,12 +143,40 @@ func runClean(gate bool, in io.Reader, out, errOut io.Writer) error {
 		return fmt.Errorf("get target repository directory: %w", err)
 	}
 	stdout, outputIsFile := out.(*os.File)
-	stdin, inputIsFile := in.(*os.File)
+	stdin, inputIsFile := inputFile(in)
 	terminal := inputIsFile && outputIsFile && isTerminal(stdin) && isTerminal(stdout)
 	if gate && !terminal {
 		return fmt.Errorf("factory clean --gate requires an interactive terminal for approvals")
 	}
-	return (factory.CleanWorkflow{Agent: factory.Runner{Config: cfg}, Config: cfg, In: in, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: gate}).Run("")
+	return (factory.CleanWorkflow{Agent: foregroundAgent{ctx: ctx, agent: factory.Runner{Config: cfg}}, Config: cfg, In: in, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: gate}).RunContext(ctx, "")
+}
+
+type foregroundAgent struct {
+	ctx   context.Context
+	agent factory.Agent
+}
+
+func (a foregroundAgent) Run(stage, prompt, task, workdir, logPath string) error {
+	return a.RunWithContext(a.ctx, stage, prompt, task, workdir, logPath)
+}
+
+func (a foregroundAgent) RunWithContext(_ context.Context, stage, prompt, task, workdir, logPath string) error {
+	ctx := a.ctx
+	if contextual, ok := a.agent.(interface {
+		RunWithContext(context.Context, string, string, string, string, string) error
+	}); ok {
+		return contextual.RunWithContext(ctx, stage, prompt, task, workdir, logPath)
+	}
+	return fmt.Errorf("agent does not support context-aware execution")
+}
+
+func (a foregroundAgent) RunWithOutputContext(ctx context.Context, stage, prompt, task, workdir, logPath string) (string, error) {
+	if contextual, ok := a.agent.(interface {
+		RunWithOutputContext(context.Context, string, string, string, string, string) (string, error)
+	}); ok {
+		return contextual.RunWithOutputContext(ctx, stage, prompt, task, workdir, logPath)
+	}
+	return "", fmt.Errorf("evaluator agent does not provide stdout protocol output")
 }
 
 func runPipelineTask(args []string, in io.Reader, out io.Writer, run func(string, io.Reader) error) error {
@@ -124,24 +185,64 @@ func runPipelineTask(args []string, in io.Reader, out io.Writer, run func(string
 	if len(args) > 0 {
 		task = strings.Join(args, " ")
 	} else {
-		stdin, inputIsFile := in.(*os.File)
+		stdin, inputIsFile := inputFile(in)
 		stdout, outputIsFile := out.(*os.File)
 		if !inputIsFile || !outputIsFile || !isTerminal(stdin) || !isTerminal(stdout) {
 			return fmt.Errorf("an interactive terminal is required; run factory pipeline from a terminal")
 		}
 		fmt.Fprintln(out, "Factory task (enter one line per paragraph; a line containing only . ends input):")
-		reader := bufio.NewReader(in)
-		var err error
-		task, err = readTask(reader, out)
-		if err != nil {
-			return err
+		if stdin, ok := in.(*contextStdin); ok {
+			var err error
+			task, err = readTaskContext(stdin, out)
+			if err != nil {
+				return err
+			}
+			workflowIn = stdin
+		} else {
+			reader := bufio.NewReader(in)
+			var err error
+			task, err = readTask(reader, out)
+			if err != nil {
+				return err
+			}
+			workflowIn = reader
 		}
-		workflowIn = reader
 	}
 	if strings.TrimSpace(task) == "" {
 		return fmt.Errorf("task must not be empty")
 	}
 	return run(task, workflowIn)
+}
+
+func inputFile(in io.Reader) (*os.File, bool) {
+	if file, ok := in.(*os.File); ok {
+		return file, true
+	}
+	if stdin, ok := in.(*contextStdin); ok {
+		return stdin.file, true
+	}
+	return nil, false
+}
+
+func readTaskContext(reader *contextStdin, out io.Writer) (string, error) {
+	fmt.Fprintln(out, "Tip: describe the outcome you want and how it should be verified.")
+	var lines []string
+	for {
+		line, err := reader.ReadLineContext(reader.ctx)
+		trimmed := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if trimmed == "." {
+			return strings.Join(lines, "\n"), nil
+		}
+		if line != "" {
+			lines = append(lines, trimmed)
+		}
+		if err != nil {
+			if err == io.EOF {
+				return strings.Join(lines, "\n"), nil
+			}
+			return "", err
+		}
+	}
 }
 
 func readTask(reader *bufio.Reader, out io.Writer) (string, error) {
@@ -170,7 +271,7 @@ func printHelp(out io.Writer) {
 
 Usage:
   factory pipeline [--gate] [description...]  Run the task workflow (approvals default off)
-  factory clean [--gate]                     Review, fix, document, verify, commit, and push
+  factory clean [--gate]                     Review/fix/document and verify; pristine runs publish, dirty runs do not
   factory [--gate] [description...]           Alias for factory pipeline
   factory babysit   Start or manage detached PR babysitting
   factory help      Show this help
@@ -186,11 +287,17 @@ Usage:
 Pipeline successful-stage approvals and retry prompts are skipped by default. Use --gate
 for human approval; evaluator PASS checks and four-attempt limits always apply. With no
 arguments, pipeline task entry still requires an interactive terminal.
-Clean requires a pristine worktree on a non-detached branch whose configured upstream
-is an ancestor of local HEAD; upstream-ahead and diverged branches are refused. After
-review and checks, it pushes existing local commits and any verified cleanup commit.
-A synced no-op creates no empty commit. It never changes upstream or force-pushes. This is
-separate from `+"`make clean`"+`, which removes local build artifacts.
+Clean requires a non-detached branch. Pristine mode applies to a clean worktree; it reviews, fixes,
+documents, verifies, then commits generated changes and pushes existing local commits
+and verified cleanup changes. It uses the configured upstream when available. Fallback
+destination: origin/<branch>, only if that remote branch does not already exist. Upstream-ahead
+and diverged branches are refused. A synced no-op creates no empty commit.
+
+With staged, unstaged, or untracked changes, clean warns that agents and formatters may
+affect them, then reviews, fixes, documents, and runs the same checks in dirty safe mode.
+It does not stage, commit, or push any files in dirty mode, and does not require an
+upstream or origin. Preserve or back up important local changes first. Neither mode is
+a sandbox. This is separate from `+"`make clean`"+`, which removes local build artifacts.
 
 Configuration: ${XDG_CONFIG_HOME:-~/.config}/factory/config.json
 Foreground run state: ${XDG_STATE_HOME:-~/.local/state}/factory/runs

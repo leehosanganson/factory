@@ -14,7 +14,7 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Command != "pi" || len(cfg.Args) == 0 {
+	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" {
 		t.Fatalf("unexpected default config: %#v", cfg)
 	}
 	if timeout, err := cfg.agentTimeout(); err != nil || timeout != 60*time.Minute {

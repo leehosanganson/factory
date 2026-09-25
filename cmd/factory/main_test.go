@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/leehosanganson/factory/internal/factory"
 )
@@ -17,12 +20,140 @@ func TestHelpAndBabysitUsage(t *testing.T) {
 	if err := run([]string{"-h"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "factory pipeline") || !strings.Contains(out.String(), "factory clean") || !strings.Contains(out.String(), "factory babysit") || !strings.Contains(out.String(), "Alias for factory pipeline") || !strings.Contains(out.String(), "babysit approve <id>") || !strings.Contains(out.String(), "make clean") {
+	if !strings.Contains(out.String(), "factory pipeline") || !strings.Contains(out.String(), "factory clean") || !strings.Contains(out.String(), "factory babysit") || !strings.Contains(out.String(), "Alias for factory pipeline") || !strings.Contains(out.String(), "babysit approve <id>") || !strings.Contains(out.String(), "make clean") || !strings.Contains(out.String(), "Fallback\ndestination: origin/<branch>") || !strings.Contains(out.String(), "only if that remote branch does not already exist") || !strings.Contains(out.String(), "Pristine mode") || !strings.Contains(out.String(), "dirty safe mode") || !strings.Contains(out.String(), "does not stage, commit, or push") || !strings.Contains(out.String(), "does not require an") {
 		t.Fatalf("help missing babysit commands: %s", out.String())
 	}
 	if err := run([]string{"babysit"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "usage: factory babysit") {
 		t.Fatalf("babysit should show usage: err=%v", err)
 	}
+}
+
+func TestWorkflowApprovalCancellationWithPipeLeavesInputOpen(t *testing.T) {
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readEnd.Close()
+	defer writeEnd.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stateDir := filepath.Join(t.TempDir(), "state")
+	prompted := make(chan struct{})
+	workflow := factory.Workflow{
+		Agent: passingTestAgent{}, Config: factory.Config{StateDir: stateDir},
+		In: &contextStdin{file: readEnd, ctx: ctx}, Out: promptSignalWriter{prompted: prompted},
+		Workdir: t.TempDir(), Gate: true, Stages: []string{"requirements"},
+	}
+	result := make(chan error, 1)
+	go func() { result <- workflow.RunContext(ctx, "task") }()
+	select {
+	case <-prompted:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("workflow did not reach approval prompt")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled workflow error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("workflow did not return promptly after approval cancellation")
+	}
+	entries, err := os.ReadDir(filepath.Join(stateDir, "runs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected persisted workflow state, entries=%v err=%v", entries, err)
+	}
+	state, err := os.ReadFile(filepath.Join(stateDir, "runs", entries[0].Name(), "state.json"))
+	if err != nil || !strings.Contains(string(state), `"status": "interrupted"`) {
+		t.Fatalf("canceled approval state = %s, %v; want interrupted", state, err)
+	}
+	if _, err := writeEnd.Write([]byte("yes\n")); err != nil {
+		t.Fatalf("canceled prompt closed stdin: %v", err)
+	}
+}
+
+type passingTestAgent struct{}
+
+func (passingTestAgent) Run(_, _, _, _, logPath string) error {
+	return os.WriteFile(logPath, []byte("PASS\n"), 0o600)
+}
+
+func (a passingTestAgent) RunWithContext(_ context.Context, stage, prompt, task, workdir, logPath string) error {
+	return a.Run(stage, prompt, task, workdir, logPath)
+}
+
+type promptSignalWriter struct {
+	prompted chan struct{}
+}
+
+func (w promptSignalWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "Type exactly yes") {
+		select {
+		case <-w.prompted:
+		default:
+			close(w.prompted)
+		}
+	}
+	return io.Discard.Write(p)
+}
+
+func TestForegroundContextStopsOnInterruptAndCanBeReleased(t *testing.T) {
+	ctx, stop := foregroundContext()
+	// Canceling the context releases signal.NotifyContext's signal resources.
+	stop()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("stopped foreground context error = %v, want canceled", ctx.Err())
+	}
+}
+
+func TestForegroundAgentUsesSignalContextForContextAwareRunner(t *testing.T) {
+	signalCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	agent := foregroundAgent{ctx: signalCtx, agent: cancelAwareTestAgent{}}
+	err := agent.RunWithContext(context.Background(), "review", "prompt", "task", ".", "log")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("foreground agent error = %v, want signal context cancellation", err)
+	}
+}
+
+func TestForegroundAgentFailsClosedWithoutStdoutAwareEvaluator(t *testing.T) {
+	legacy := &legacyForegroundAgent{}
+	wrapped := foregroundAgent{ctx: context.Background(), agent: legacy}
+	workflow := factory.Workflow{
+		Agent: wrapped, Config: factory.Config{StateDir: filepath.Join(t.TempDir(), "state")},
+		In: strings.NewReader(""), Out: io.Discard, Workdir: t.TempDir(), Stages: []string{"requirements"},
+	}
+	if err := workflow.Run("task"); err == nil || !strings.Contains(err.Error(), "does not provide stdout protocol output") {
+		t.Fatalf("workflow error = %v, want fail-closed stdout protocol error", err)
+	}
+	if legacy.calls != 4 {
+		t.Fatalf("legacy agent calls = %d, want four stage attempts and no evaluator invocation", legacy.calls)
+	}
+}
+
+type legacyForegroundAgent struct {
+	calls int
+}
+
+func (a *legacyForegroundAgent) Run(_, _, _, _, logPath string) error {
+	a.calls++
+	return os.WriteFile(logPath, []byte("PASS\nstderr-only protocol text\n"), 0o600)
+}
+
+func (a *legacyForegroundAgent) RunWithContext(_ context.Context, stage, prompt, task, workdir, logPath string) error {
+	return a.Run(stage, prompt, task, workdir, logPath)
+}
+
+type cancelAwareTestAgent struct{}
+
+func (cancelAwareTestAgent) Run(string, string, string, string, string) error {
+	return errors.New("non-context runner called")
+}
+
+func (cancelAwareTestAgent) RunWithContext(ctx context.Context, _, _, _, _, _ string) error {
+	return ctx.Err()
 }
 
 func TestNonInteractivePipelineAndBareAliasAreRejected(t *testing.T) {

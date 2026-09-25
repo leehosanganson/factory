@@ -1,24 +1,26 @@
 ---
 name: factory
 description: >-
-  Use Factory's human-gated pipeline for deliberate feature and engineering work,
-  or its detached babysitter for routine, low-risk fixes on an existing open PR.
-  Preserve explicit approvals, bounded retries, and user control; do not treat
-  Factory as an autonomous engineering or security-sandbox system.
+  Use Factory's pipeline for deliberate feature and engineering work, or its
+  detached babysitter for routine, low-risk fixes on an existing open PR.
+  Pipeline approval prompts are opt-in; use `--gate` when explicit approvals are
+  wanted. Preserve bounded retries and user control; do not treat Factory as an
+  autonomous engineering or security-sandbox system.
 ---
 
 # Factory operating guidance
 
 Choose the workflow that matches the work. Preserve the user's authority over
-scope and decisions; never skip an approval gate or present automation as a
-substitute for review.
+scope and decisions; honor any enabled approval gate and never present
+automation as a substitute for review.
 
 ## Choose the right workflow
 
 - Use **pipeline** for deliberate feature work, engineering tasks, or work that
   needs requirements clarified before implementation. It proceeds through
   requirements, implementation, review, and documentation, with independent
-  evaluation and explicit human approval between stages.
+  evaluation at each stage. Approval prompts are off by default; use `--gate`
+  for explicit human approval between stages and before retries.
 - Use **babysit** only for routine, low-risk fixes to an existing open pull
   request: failed checks, concrete review comments, or relevant PR/check snapshot
   changes. It monitors that PR in a detached, isolated worktree and may
@@ -27,7 +29,7 @@ substitute for review.
   high-impact decisions, to merge a PR, or as a security sandbox. Pause for
   human direction when the work exceeds a narrow, concrete routine fix.
 
-## Pipeline: deliberate, human-gated work
+## Pipeline: deliberate task workflow
 
 Run in the target repository:
 
@@ -39,7 +41,8 @@ factory                         # interactive alias for factory pipeline
 
 With no description arguments, `factory pipeline` and bare `factory` prompt for
 task text and require an interactive terminal. Supplying description arguments
-skips only that task-entry prompt; it does not skip later approval gates.
+skips only that task-entry prompt. Approval gates are off by default; add
+`--gate` to opt into them.
 
 Operate the stages in this order:
 
@@ -50,13 +53,32 @@ Operate the stages in this order:
    Factory's state directory outside the target repository; the requirements
    agent itself runs from the run-state directory with the target path as
    context.
-3. Require the fresh evaluator to succeed and emit exactly `PASS` as its first
-   non-empty output line. Only then ask for explicit user approval to continue.
-4. After approval, run implementation, evaluation, and a separate explicit
-   approval; then do the same for review and documentation, in order. Each stage
-   has its own fresh evaluator and approval gate.
-5. Stop if approval is withheld. Do not perform a later stage on the assumption
-   that earlier approval covers it.
+3. Run a fresh evaluator for each stage. It must exit successfully and emit
+   exactly `PASS` as its first non-empty stdout line. Both streams remain in the
+   evaluator log, but stderr does not count toward the protocol. Without `--gate`, a passing
+   stage proceeds automatically to the next stage. With `--gate`, require the
+   exact approval response `yes` after each passing evaluation, including the
+   final stage.
+4. Continue through implementation, review, and documentation in order, with a
+   fresh evaluator after each stage. With `--gate`, each passing evaluation has
+   its own approval; approval of one stage does not cover later stages.
+5. Each stage allows at most four attempts regardless of gate mode. Without
+   `--gate`, a failed stage or evaluation retries automatically; with `--gate`,
+   require the exact response `yes` before each retry. Any other gated response
+   stops the workflow.
+
+Foreground run records and logs persist outside the target repository. The run
+directory is printed at startup. On a TTY, an animated dashboard shows the
+stage, attempt, elapsed time, and recent log lines unless `TERM=dumb` or the
+detected terminal width is under 40 columns; those environments use a plain
+stage-start line followed by periodic heartbeats with the latest log activity.
+Non-TTY output uses the same plain progress format.
+Stage progress and completion output identify the log path; inspect that file
+to review full stage output. By default, foreground runs are under
+`${XDG_STATE_HOME:-~/.local/state}/factory/runs`; a configured `state_dir` uses
+its `runs` subdirectory. Progress is informational only: an evaluator must exit
+successfully and emit exactly `PASS` as its first non-empty stdout line; stderr
+output is retained in the log but does not count toward the protocol.
 
 The foreground pipeline does not create branches or commits; Factory itself does
 not commit pipeline work. Agents and their tools can still modify the target
@@ -65,14 +87,43 @@ inspect changes as appropriate.
 
 ### Failures and retries
 
-Never blindly retry a stalled, failed, or rejected stage. Inspect the persisted
-run state and the stage/evaluator logs first. Distinguish an agent, tool,
-process, or runtime failure from substantive evaluator findings; a successful
-process exit or warning-free tool output is not an evaluator `PASS`. Resolve
-ambiguity with the user when necessary, then retry only with concrete findings
-or corrective context. Retries are bounded (at most four attempts per stage)
-and require the exact approval response `yes`; do not use retries to bypass a
-failed evaluation or missing user decision.
+Inspect the persisted run state and stage/evaluator logs when a stage stalls,
+fails, or is rejected. Distinguish an agent, tool, process, or runtime failure
+from substantive evaluator findings; a successful process exit or warning-free
+tool output is not an evaluator `PASS`. Resolve ambiguity with the user when
+necessary, then retry only with concrete findings or corrective context. Retries
+are bounded to at most four attempts per stage in all modes. By default, retries
+proceed automatically; `--gate` requires the exact approval response `yes`
+before each retry. Do not use retries to bypass a failed evaluation or missing
+user decision.
+
+## Clean: pristine publishing and dirty safe mode
+
+Run `factory clean` for review, fixes, documentation, then `make fmt`, `make test`,
+and `make vet`. It has two distinct modes:
+
+- **Pristine mode** applies when the initial index, tracked worktree, and untracked
+  set are empty. On a non-detached branch, it uses the configured non-local
+  upstream when available, requiring that upstream to be an ancestor of local
+  HEAD. Without an upstream it uses `origin/<branch>` only if `origin` has one
+  push URL and that same-name remote branch does not exist. Both fallback push
+  paths use an empty expected-value lease for that ref, so a branch created by
+  another writer after validation cannot be replaced; this is create-only
+  protection, not a force-push. After successful stages and checks it can commit
+  run-generated changes and push, including existing local commits. Configured
+  upstreams retain their existing fast-forward-only push behavior.
+- **Dirty safe mode** applies when staged, unstaged, and/or untracked changes
+  exist at startup. It warns up front that agents and formatters may affect those
+  changes, then runs review/fix/document and all three checks. It does not stage,
+  commit, or push any files, and it does not require an upstream or `origin`.
+  The warning is not a guarantee that pre-existing changes remain untouched;
+  preserve or back up important work first.
+
+Both modes require evaluator `PASS` as the first non-empty stdout line and have
+at most four attempts per stage. Successful approval prompts are skipped by
+default; `factory clean --gate` restores explicit gates. Neither mode is a
+security sandbox. This workflow is distinct from `make clean`, which removes
+local build artifacts.
 
 ## Babysit: bounded routine PR maintenance
 
@@ -89,8 +140,8 @@ Changes are proposals until the independent evaluator passes and all commit/push
 guards succeed. Automatic commit and push require, at minimum:
 
 - an agent proposal with changes;
-- a successfully completed independent evaluator whose first non-empty output
-  line is exactly `PASS`;
+- a successfully completed independent evaluator whose first non-empty stdout
+  line is exactly `PASS` (stderr remains visible in the log but does not count);
 - evaluator authorization that exactly matches the complete set of changed
   paths; and
 - successful revalidation of the checkout, worktree, branch, baseline, safe

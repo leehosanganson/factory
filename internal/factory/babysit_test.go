@@ -475,7 +475,12 @@ func TestBabysitProtocolAndEvaluatorRequireExactFirstVerdict(t *testing.T) {
 	if got, _ := parseEvaluation("PASS\nFACTORY_FILES=[\"main.go\"]\n"); got != "PASS" {
 		t.Fatalf("exact verdict rejected: %s", got)
 	}
-	for _, out := range []string{" PASS\nFACTORY_FILES=[]\n", "prefix\nPASS\nFACTORY_FILES=[]\n", "PASS extra\nFACTORY_FILES=[]\n"} {
+	for _, out := range []string{" \t\n\t\nPASS\nFACTORY_FILES=[]\n", "\n  \r\nPASS\nFACTORY_FILES=[]\n"} {
+		if got, _ := parseEvaluation(out); got != "PASS" {
+			t.Errorf("verdict after whitespace-only lines rejected: %q => %q", out, got)
+		}
+	}
+	for _, out := range []string{" PASS\nFACTORY_FILES=[]\n", "prefix\nPASS\nFACTORY_FILES=[]\n", "PASS extra\nFACTORY_FILES=[]\n", " \t\nPASS \t\nFACTORY_FILES=[]\n"} {
 		if got, _ := parseEvaluation(out); got == "PASS" {
 			t.Errorf("non-exact verdict accepted: %q", out)
 		}
@@ -571,6 +576,7 @@ if [ "$stage" = "babysit" ]; then
   exit 0
 fi
 if [ "$stage" = "evaluate" ]; then
+  printf '%s\\n' '[pi-web-access] Dynamic tool activation requires Pi 0.86.1 or newer; web tools remain eagerly available.' >&2
   printf 'PASS\\nFACTORY_FILES=["README.md"]\\n'
   exit 0
 fi

@@ -2,6 +2,9 @@ package factory
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,20 +14,22 @@ import (
 	"strings"
 )
 
-// CleanWorkflow reviews and verifies changes from a pristine checkout, then pushes existing branch commits and commits/pushes any cleanup edits.
+// CleanWorkflow reviews and verifies a checkout, publishing only from pristine mode; dirty safe mode never stages, commits, or pushes.
 type CleanWorkflow struct {
-	Agent    Agent
-	Config   Config
-	In       io.Reader
-	Out      io.Writer
-	Workdir  string
-	Terminal bool
-	Gate     bool
-	Git      func(string, ...string) ([]byte, error)
-	Make     func(string, ...string) error
+	Agent      Agent
+	Config     Config
+	In         io.Reader
+	Out        io.Writer
+	Workdir    string
+	Terminal   bool
+	Gate       bool
+	Git        func(string, ...string) ([]byte, error)
+	GitContext func(context.Context, string, ...string) ([]byte, error)
+	Make       func(string, ...string) error
 }
 
 type cleanBaseline struct {
+	dirty        bool
 	branch       string
 	upstream     string
 	head         string
@@ -40,26 +45,51 @@ type cleanFileSnapshot struct {
 }
 
 func (w CleanWorkflow) Run(task string) error {
+	return w.RunContext(context.Background(), task)
+}
+
+func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr error) {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("clean interrupted: %w", err)
+	}
 	root, err := canonicalPath(w.Workdir)
 	if err != nil {
 		return fmt.Errorf("resolve target directory: %w", err)
 	}
-	git := w.Git
-	if git == nil {
-		git = func(name string, args ...string) ([]byte, error) {
-			cmd := exec.Command(name, args...)
-			cmd.Dir = root
-			return cmd.Output()
+	git := func(name string, args ...string) ([]byte, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
+		var output []byte
+		var gitErr error
+		switch {
+		case w.GitContext != nil:
+			output, gitErr = w.GitContext(ctx, name, args...)
+		case w.Git != nil:
+			output, gitErr = w.Git(name, args...)
+		default:
+			cmd := exec.CommandContext(ctx, name, args...)
+			configureProcessCancellation(cmd)
+			cmd.Dir = root
+			output, gitErr = cmd.Output()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return output, gitErr
 	}
 	baseline, err := inspectCleanBaseline(git)
 	if err != nil {
 		return err
 	}
+	if baseline.dirty {
+		fmt.Fprintln(w.Out, "Warning: the initial worktree/index is dirty. Existing changes may be affected by agents or formatters; Factory will not commit or push anything in this run.")
+	}
 	makeTarget := w.Make
 	if makeTarget == nil {
 		makeTarget = func(target string, _ ...string) error {
-			cmd := exec.Command("make", target)
+			cmd := exec.CommandContext(ctx, "make", target)
+			configureProcessCancellation(cmd)
 			cmd.Dir = root
 			cmd.Stdout, cmd.Stderr = w.Out, w.Out
 			return cmd.Run()
@@ -68,15 +98,54 @@ func (w CleanWorkflow) Run(task string) error {
 	if strings.TrimSpace(task) == "" {
 		task = "Review the current repository and work performed in this clean run. Fix every issue found, then document the changes. Preserve the user's intent and avoid unrelated changes."
 	}
-	workflow := Workflow{Agent: w.Agent, Config: w.Config, In: w.In, Out: w.Out, Workdir: root, Terminal: w.Terminal, Gate: w.Gate, RequireComplete: true, Stages: []string{"review", "fix", "document"}, FinalApproval: "commit and push clean changes"}
-	if err := workflow.Run(task); err != nil {
+	finalApproval := "commit and push clean changes"
+	if baseline.dirty {
+		finalApproval = "verify and complete without committing or pushing changes"
+	}
+	runOutput := &cleanRunOutput{out: w.Out}
+	workflow := Workflow{Agent: w.Agent, Config: w.Config, In: w.In, Out: runOutput, Workdir: root, Terminal: w.Terminal, Gate: w.Gate, RequireComplete: true, Stages: []string{"review", "fix", "document"}, FinalApproval: finalApproval}
+	if err := workflow.RunContext(ctx, task); err != nil {
 		return err
 	}
+	defer func() {
+		if runErr == nil || runOutput.runDir == "" {
+			return
+		}
+		data, readErr := os.ReadFile(filepath.Join(runOutput.runDir, "state.json"))
+		if readErr != nil {
+			return
+		}
+		var state State
+		if json.Unmarshal(data, &state) != nil || state.Status != "complete" {
+			return
+		}
+		state.Status = "failed"
+		if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+			state.Status = "interrupted"
+		}
+		_ = writeState(runOutput.runDir, &state)
+	}()
 	for _, target := range []string{"fmt", "test", "vet"} {
+		if err := cleanVerificationInterrupted(ctx, runOutput.runDir); err != nil {
+			return err
+		}
 		fmt.Fprintf(w.Out, "Running make %s\n", target)
 		if err := makeTarget(target); err != nil {
+			if interrupted := cleanVerificationInterrupted(ctx, runOutput.runDir); interrupted != nil {
+				return interrupted
+			}
 			return fmt.Errorf("make %s: %w", target, err)
 		}
+		if err := cleanVerificationInterrupted(ctx, runOutput.runDir); err != nil {
+			return err
+		}
+	}
+	if err := cleanVerificationInterrupted(ctx, runOutput.runDir); err != nil {
+		return err
+	}
+	if baseline.dirty {
+		fmt.Fprintln(w.Out, "Clean verification succeeded. Changes remain uncommitted and were not pushed.")
+		return nil
 	}
 	paths, err := cleanChangedPaths(git)
 	if err != nil {
@@ -86,36 +155,39 @@ func (w CleanWorkflow) Run(task string) error {
 		if err := revalidateClean(git, baseline, nil, nil); err != nil {
 			return err
 		}
-		if baseline.head == baseline.upstreamHead {
+		if baseline.upstream != "" && baseline.head == baseline.upstreamHead {
 			fmt.Fprintln(w.Out, "Clean completed with no changes; branch is already synced.")
 			return nil
 		}
 		if err := validateBeforePush(git, baseline, baseline.head); err != nil {
 			return err
 		}
-		if err := validateNoURLRewrite(git, baseline.pushURL); err != nil {
+		if err := cleanContextCheck(ctx); err != nil {
 			return err
 		}
-		if _, err := git("git", "push", "--no-follow-tags", baseline.pushURL, baseline.head+":"+baseline.remoteRef); err != nil {
+		if _, err := git("git", cleanPushArgs(baseline, baseline.head)...); err != nil {
 			return fmt.Errorf("push clean branch: %w", err)
 		}
 		fmt.Fprintf(w.Out, "Existing branch commits pushed (%s).\n", baseline.head)
 		return nil
 	}
-	snapshot, err := snapshotCleanPaths(root, paths)
+	snapshot, err := snapshotCleanPaths(git, root, paths)
 	if err != nil {
 		return fmt.Errorf("snapshot clean changes: %w", err)
 	}
 	if err := revalidateClean(git, baseline, paths, nil); err != nil {
 		return err
 	}
-	if err := verifyCleanSnapshot(root, paths, snapshot); err != nil {
+	if err := verifyCleanSnapshot(git, root, paths, snapshot); err != nil {
 		return fmt.Errorf("clean outputs changed before staging; refusing commit: %w", err)
+	}
+	if err := cleanContextCheck(ctx); err != nil {
+		return err
 	}
 	if _, err := git("git", append([]string{"add", "-A", "--"}, paths...)...); err != nil {
 		return fmt.Errorf("stage clean changes: %w", err)
 	}
-	if err := verifyCleanSnapshot(root, paths, snapshot); err != nil {
+	if err := verifyCleanSnapshot(git, root, paths, snapshot); err != nil {
 		return fmt.Errorf("clean outputs changed during staging; refusing commit: %w", err)
 	}
 	if err := revalidateClean(git, baseline, paths, paths); err != nil {
@@ -142,8 +214,11 @@ func (w CleanWorkflow) Run(task string) error {
 	if err != nil || len(unstaged) != 0 {
 		return fmt.Errorf("unstaged changes appeared before commit; refusing commit")
 	}
-	if err := verifyCleanSnapshot(root, paths, snapshot); err != nil {
+	if err := verifyCleanSnapshot(git, root, paths, snapshot); err != nil {
 		return fmt.Errorf("clean outputs changed before commit; refusing commit: %w", err)
+	}
+	if err := cleanContextCheck(ctx); err != nil {
+		return err
 	}
 	if _, err := git("git", "commit", "-m", "chore: clean and verify changes"); err != nil {
 		return fmt.Errorf("commit clean changes: %w", err)
@@ -173,13 +248,62 @@ func (w CleanWorkflow) Run(task string) error {
 	if err := validateBeforePush(git, baseline, strings.TrimSpace(string(committedHead))); err != nil {
 		return err
 	}
-	if err := validateNoURLRewrite(git, baseline.pushURL); err != nil {
+	if err := cleanContextCheck(ctx); err != nil {
 		return err
 	}
-	if _, err := git("git", "push", "--no-follow-tags", baseline.pushURL, strings.TrimSpace(string(committedHead))+":"+baseline.remoteRef); err != nil {
+	if _, err := git("git", cleanPushArgs(baseline, strings.TrimSpace(string(committedHead)))...); err != nil {
 		return fmt.Errorf("push clean commit: %w", err)
 	}
 	fmt.Fprintf(w.Out, "Clean changes committed (%s) and pushed.\n", strings.TrimSpace(string(committedHead)))
+	return nil
+}
+
+type cleanRunOutput struct {
+	out    io.Writer
+	runDir string
+	line   bytes.Buffer
+}
+
+func (w *cleanRunOutput) Write(data []byte) (int, error) {
+	written, err := w.out.Write(data)
+	if err != nil {
+		return written, err
+	}
+	for _, b := range data[:written] {
+		if b == '\n' {
+			line := w.line.String()
+			w.line.Reset()
+			if strings.HasPrefix(line, "Run: ") {
+				w.runDir = strings.TrimPrefix(line, "Run: ")
+			}
+		} else {
+			w.line.WriteByte(b)
+		}
+	}
+	return written, nil
+}
+
+func cleanVerificationInterrupted(ctx context.Context, runDir string) error {
+	if err := ctx.Err(); err != nil {
+		if runDir != "" {
+			data, readErr := os.ReadFile(filepath.Join(runDir, "state.json"))
+			if readErr == nil {
+				var state State
+				if json.Unmarshal(data, &state) == nil {
+					state.Status = "interrupted"
+					_ = writeState(runDir, &state)
+				}
+			}
+		}
+		return fmt.Errorf("clean verification interrupted: %w", err)
+	}
+	return nil
+}
+
+func cleanContextCheck(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("clean interrupted: %w", err)
+	}
 	return nil
 }
 
@@ -188,46 +312,121 @@ func inspectCleanBaseline(git func(string, ...string) ([]byte, error)) (cleanBas
 	if err != nil {
 		return cleanBaseline{}, fmt.Errorf("inspect initial git status: %w", err)
 	}
-	if len(status) != 0 {
-		return cleanBaseline{}, fmt.Errorf("factory clean requires a completely clean initial worktree (staged, unstaged, and untracked changes found)")
-	}
 	branch, err := git("git", "symbolic-ref", "--quiet", "--short", "HEAD")
 	if err != nil || strings.TrimSpace(string(branch)) == "" {
 		return cleanBaseline{}, fmt.Errorf("factory clean requires a current non-detached branch")
 	}
-	upstream, err := git("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-	if err != nil || strings.TrimSpace(string(upstream)) == "" {
-		return cleanBaseline{}, fmt.Errorf("factory clean requires a configured upstream")
-	}
-	remote, remoteRef, err := cleanUpstream(git, strings.TrimSpace(string(branch)))
-	if err != nil {
-		return cleanBaseline{}, err
-	}
-	if remote == "." || strings.TrimSpace(remote) == "" {
-		return cleanBaseline{}, fmt.Errorf("factory clean requires a non-local configured upstream remote")
-	}
-	pushURLs, err := git("git", "remote", "get-url", "--push", "--all", remote)
-	if err != nil {
-		return cleanBaseline{}, fmt.Errorf("inspect upstream push destination: %w", err)
-	}
-	urls := lineValues(pushURLs)
-	if len(urls) != 1 || strings.TrimSpace(urls[0]) == "" {
-		return cleanBaseline{}, fmt.Errorf("factory clean requires exactly one push URL for upstream remote %s", remote)
-	}
+	branchName := strings.TrimSpace(string(branch))
 	head, err := git("git", "rev-parse", "HEAD")
 	if err != nil {
 		return cleanBaseline{}, fmt.Errorf("inspect local HEAD: %w", err)
 	}
-	upstreamHead, err := git("git", "rev-parse", "@{upstream}")
+	headName := strings.TrimSpace(string(head))
+	if len(status) != 0 {
+		return cleanBaseline{dirty: true, branch: branchName, head: headName}, nil
+	}
+	remote, remoteRef, configuredUpstream, err := cleanUpstreamConfig(git, branchName)
 	if err != nil {
-		return cleanBaseline{}, fmt.Errorf("inspect upstream HEAD: %w", err)
+		return cleanBaseline{}, err
 	}
-	head = bytes.TrimSpace(head)
-	upstreamHead = bytes.TrimSpace(upstreamHead)
-	if _, err := git("git", "merge-base", "--is-ancestor", string(upstreamHead), string(head)); err != nil {
-		return cleanBaseline{}, fmt.Errorf("factory clean requires configured upstream to be an ancestor of local HEAD; upstream-ahead or diverged branches are refused")
+	upstream, upstreamErr := git("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	upstreamName := strings.TrimSpace(string(upstream))
+	if configuredUpstream {
+		if upstreamErr != nil || upstreamName == "" {
+			return cleanBaseline{}, fmt.Errorf("factory clean cannot resolve the configured upstream")
+		}
+		if remote == "." || strings.TrimSpace(remote) == "" {
+			return cleanBaseline{}, fmt.Errorf("factory clean requires a non-local configured upstream remote")
+		}
+	} else {
+		if upstreamErr == nil && upstreamName != "" {
+			return cleanBaseline{}, fmt.Errorf("factory clean found an upstream without branch upstream configuration")
+		}
+		remote = "origin"
+		remoteRef = "refs/heads/" + branchName
 	}
-	return cleanBaseline{branch: strings.TrimSpace(string(branch)), upstream: strings.TrimSpace(string(upstream)), head: string(head), upstreamHead: string(upstreamHead), remote: remote, remoteRef: remoteRef, pushURL: urls[0]}, nil
+	pushURL, explicitPushURL, err := cleanRawPushURL(git, remote)
+	if err != nil {
+		return cleanBaseline{}, err
+	}
+	if err := validateNoURLRewrite(git, pushURL, !explicitPushURL); err != nil {
+		return cleanBaseline{}, err
+	}
+	if !configuredUpstream {
+		if err := ensureCleanRemoteRefAbsent(git, pushURL, remoteRef); err != nil {
+			return cleanBaseline{}, err
+		}
+	}
+	var upstreamHead []byte
+	if configuredUpstream {
+		upstreamHead, err = git("git", "rev-parse", "@{upstream}")
+		if err != nil {
+			return cleanBaseline{}, fmt.Errorf("inspect upstream HEAD: %w", err)
+		}
+		head = bytes.TrimSpace(head)
+		upstreamHead = bytes.TrimSpace(upstreamHead)
+		if _, err := git("git", "merge-base", "--is-ancestor", string(upstreamHead), string(head)); err != nil {
+			return cleanBaseline{}, fmt.Errorf("factory clean requires configured upstream to be an ancestor of local HEAD; upstream-ahead or diverged branches are refused")
+		}
+	}
+	return cleanBaseline{branch: branchName, upstream: upstreamName, head: headName, upstreamHead: string(upstreamHead), remote: remote, remoteRef: remoteRef, pushURL: pushURL}, nil
+}
+
+func validateCleanDestination(git func(string, ...string) ([]byte, error), baseline cleanBaseline, context string) error {
+	remote, remoteRef, configuredUpstream, configErr := cleanUpstreamConfig(git, baseline.branch)
+	if configErr != nil {
+		return fmt.Errorf("upstream configuration changed %s: %w", context, configErr)
+	}
+	upstream, upstreamErr := git("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	upstreamName := strings.TrimSpace(string(upstream))
+	if baseline.upstream != "" {
+		if !configuredUpstream || upstreamErr != nil || upstreamName == "" || upstreamName != baseline.upstream {
+			return fmt.Errorf("upstream changed %s", context)
+		}
+		if remote != baseline.remote || remoteRef != baseline.remoteRef {
+			return fmt.Errorf("upstream remote or branch changed %s", context)
+		}
+	} else {
+		if configuredUpstream || (upstreamErr == nil && upstreamName != "") {
+			return fmt.Errorf("upstream appeared or cannot be verified %s", context)
+		}
+		if baseline.remote != "origin" || baseline.remoteRef != "refs/heads/"+baseline.branch {
+			return fmt.Errorf("fallback push destination changed %s", context)
+		}
+	}
+	pushURL, explicitPushURL, err := cleanRawPushURL(git, baseline.remote)
+	if err != nil || pushURL != baseline.pushURL {
+		return fmt.Errorf("push destination changed %s", context)
+	}
+	if err := validateNoURLRewrite(git, pushURL, !explicitPushURL); err != nil {
+		return err
+	}
+	if baseline.upstream == "" {
+		if err := ensureCleanRemoteRefAbsent(git, baseline.pushURL, baseline.remoteRef); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanPushArgs(baseline cleanBaseline, head string) []string {
+	args := []string{"push", "--no-follow-tags"}
+	if baseline.upstream == "" {
+		// An empty expected value permits creation only; it cannot replace an existing fallback ref.
+		args = append(args, "--force-with-lease="+baseline.remoteRef+":")
+	}
+	return append(args, baseline.pushURL, head+":"+baseline.remoteRef)
+}
+
+func ensureCleanRemoteRefAbsent(git func(string, ...string) ([]byte, error), pushURL, remoteRef string) error {
+	refs, err := git("git", "ls-remote", "--heads", pushURL, remoteRef)
+	if err != nil {
+		return fmt.Errorf("cannot verify fallback remote destination is absent; refusing push: %w", err)
+	}
+	if len(bytes.TrimSpace(refs)) != 0 {
+		return fmt.Errorf("fallback remote destination %s already exists; refusing push", remoteRef)
+	}
+	return nil
 }
 
 // revalidateClean checks the same branch and baseline before and after staging.
@@ -236,25 +435,18 @@ func revalidateClean(git func(string, ...string) ([]byte, error), baseline clean
 	if err != nil || strings.TrimSpace(string(branch)) != baseline.branch {
 		return fmt.Errorf("branch changed or became detached during clean")
 	}
-	upstream, err := git("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-	if err != nil || strings.TrimSpace(string(upstream)) != baseline.upstream {
-		return fmt.Errorf("upstream changed during clean")
-	}
-	remote, remoteRef, err := cleanUpstream(git, baseline.branch)
-	if err != nil || remote != baseline.remote || remoteRef != baseline.remoteRef {
-		return fmt.Errorf("upstream remote or branch changed during clean")
-	}
-	pushURLs, err := git("git", "remote", "get-url", "--push", "--all", baseline.remote)
-	if err != nil || !equalStrings(lineValues(pushURLs), []string{baseline.pushURL}) {
-		return fmt.Errorf("upstream push destination changed during clean")
+	if err := validateCleanDestination(git, baseline, "during clean"); err != nil {
+		return err
 	}
 	head, err := git("git", "rev-parse", "HEAD")
 	if err != nil || strings.TrimSpace(string(head)) != baseline.head {
 		return fmt.Errorf("local HEAD changed during clean")
 	}
-	upstreamHead, err := git("git", "rev-parse", "@{upstream}")
-	if err != nil || strings.TrimSpace(string(upstreamHead)) != baseline.upstreamHead {
-		return fmt.Errorf("upstream HEAD changed during clean")
+	if baseline.upstream != "" {
+		upstreamHead, err := git("git", "rev-parse", "@{upstream}")
+		if err != nil || strings.TrimSpace(string(upstreamHead)) != baseline.upstreamHead {
+			return fmt.Errorf("upstream HEAD changed during clean")
+		}
 	}
 	status, err := git("git", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all")
 	if err != nil {
@@ -278,21 +470,14 @@ func validateBeforePush(git func(string, ...string) ([]byte, error), baseline cl
 	if err != nil || strings.TrimSpace(string(branch)) != baseline.branch {
 		return fmt.Errorf("branch changed or became detached after commit; refusing push")
 	}
-	upstream, err := git("git", "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
-	if err != nil || strings.TrimSpace(string(upstream)) != baseline.upstream {
-		return fmt.Errorf("upstream changed after commit; refusing push")
+	if err := validateCleanDestination(git, baseline, "after commit; refusing push"); err != nil {
+		return err
 	}
-	remote, remoteRef, err := cleanUpstream(git, baseline.branch)
-	if err != nil || remote != baseline.remote || remoteRef != baseline.remoteRef {
-		return fmt.Errorf("upstream remote or branch changed after commit; refusing push")
-	}
-	pushURLs, err := git("git", "remote", "get-url", "--push", "--all", baseline.remote)
-	if err != nil || !equalStrings(lineValues(pushURLs), []string{baseline.pushURL}) {
-		return fmt.Errorf("upstream push destination changed after commit; refusing push")
-	}
-	upstreamHead, err := git("git", "rev-parse", "@{upstream}")
-	if err != nil || strings.TrimSpace(string(upstreamHead)) != baseline.upstreamHead {
-		return fmt.Errorf("upstream advanced after commit; refusing push")
+	if baseline.upstream != "" {
+		upstreamHead, err := git("git", "rev-parse", "@{upstream}")
+		if err != nil || strings.TrimSpace(string(upstreamHead)) != baseline.upstreamHead {
+			return fmt.Errorf("upstream advanced after commit; refusing push")
+		}
 	}
 	head, err := git("git", "rev-parse", "HEAD")
 	if err != nil || strings.TrimSpace(string(head)) != committedHead {
@@ -308,7 +493,7 @@ func validateBeforePush(git func(string, ...string) ([]byte, error), baseline cl
 	return nil
 }
 
-func validateNoURLRewrite(git func(string, ...string) ([]byte, error), pushURL string) error {
+func validateNoURLRewrite(git func(string, ...string) ([]byte, error), pushURL string, allowPushInsteadOf bool) error {
 	data, err := git("git", "config", "--null", "--list")
 	if err != nil {
 		return fmt.Errorf("cannot inspect Git URL rewrite configuration; refusing push")
@@ -319,27 +504,73 @@ func validateNoURLRewrite(git func(string, ...string) ([]byte, error), pushURL s
 			return fmt.Errorf("cannot inspect Git URL rewrite configuration; refusing push")
 		}
 		key = strings.ToLower(key)
-		if strings.HasPrefix(key, "url.") && strings.HasSuffix(key, ".insteadof") && strings.HasPrefix(pushURL, value) {
-			return fmt.Errorf("factory clean found a matching Git url.*.insteadOf rule for the captured push URL; refusing push to prevent URL redirection")
+		if !strings.HasPrefix(key, "url.") || !strings.HasPrefix(pushURL, value) {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(key, ".insteadof"):
+			return fmt.Errorf("factory clean found a matching Git url.*.insteadOf rule for the raw push URL; refusing push to prevent URL redirection")
+		case allowPushInsteadOf && strings.HasSuffix(key, ".pushinsteadof"):
+			return fmt.Errorf("factory clean found a matching Git url.*.pushInsteadOf rule for the raw remote URL; refusing push to prevent URL redirection")
 		}
 	}
 	return nil
 }
 
-func cleanUpstream(git func(string, ...string) ([]byte, error), branch string) (string, string, error) {
-	remote, err := git("git", "config", "--get", "branch."+branch+".remote")
+func cleanRawPushURL(git func(string, ...string) ([]byte, error), remote string) (string, bool, error) {
+	key := "remote." + remote + ".pushurl"
+	data, err := git("git", "config", "--null", "--get-all", key)
+	explicitPushURL := err == nil
 	if err != nil {
-		return "", "", fmt.Errorf("inspect configured upstream remote: %w", err)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return "", false, fmt.Errorf("inspect configured push URLs for remote %s: %w", remote, err)
+		}
+		key = "remote." + remote + ".url"
+		data, err = git("git", "config", "--null", "--get-all", key)
+		if err != nil {
+			return "", false, fmt.Errorf("inspect configured remote URLs for remote %s: %w", remote, err)
+		}
 	}
-	merge, err := git("git", "config", "--get", "branch."+branch+".merge")
+	urls := nulPaths(data)
+	if len(urls) != 1 || strings.TrimSpace(urls[0]) == "" {
+		return "", false, fmt.Errorf("factory clean requires exactly one raw push URL for remote %s", remote)
+	}
+	return urls[0], explicitPushURL, nil
+}
+
+func cleanUpstreamConfig(git func(string, ...string) ([]byte, error), branch string) (string, string, bool, error) {
+	remote, remoteMissing, err := cleanConfigValue(git, "branch."+branch+".remote")
 	if err != nil {
-		return "", "", fmt.Errorf("inspect configured upstream branch: %w", err)
+		return "", "", false, fmt.Errorf("inspect configured upstream remote: %w", err)
 	}
-	remoteName, ref := strings.TrimSpace(string(remote)), strings.TrimSpace(string(merge))
+	merge, mergeMissing, err := cleanConfigValue(git, "branch."+branch+".merge")
+	if err != nil {
+		return "", "", false, fmt.Errorf("inspect configured upstream branch: %w", err)
+	}
+	if remoteMissing && mergeMissing {
+		return "", "", false, nil
+	}
+	if remoteMissing || mergeMissing {
+		return "", "", true, fmt.Errorf("factory clean requires both configured upstream remote and branch")
+	}
+	remoteName, ref := strings.TrimSpace(remote), strings.TrimSpace(merge)
 	if remoteName == "" || ref == "" || !strings.HasPrefix(ref, "refs/heads/") {
-		return "", "", fmt.Errorf("factory clean requires a configured remote branch upstream")
+		return "", "", true, fmt.Errorf("factory clean requires a configured remote branch upstream")
 	}
-	return remoteName, ref, nil
+	return remoteName, ref, true, nil
+}
+
+func cleanConfigValue(git func(string, ...string) ([]byte, error), key string) (string, bool, error) {
+	value, err := git("git", "config", "--get", key)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return "", true, nil
+		}
+		return "", false, err
+	}
+	return string(value), false, nil
 }
 
 func lineValues(data []byte) []string {
@@ -350,7 +581,7 @@ func lineValues(data []byte) []string {
 	return strings.Split(trimmed, "\n")
 }
 
-func snapshotCleanPaths(root string, paths []string) (map[string]cleanFileSnapshot, error) {
+func snapshotCleanPaths(git func(string, ...string) ([]byte, error), root string, paths []string) (map[string]cleanFileSnapshot, error) {
 	snapshot := make(map[string]cleanFileSnapshot, len(paths))
 	for _, path := range paths {
 		fullPath := filepath.Join(root, filepath.FromSlash(path))
@@ -371,9 +602,8 @@ func snapshotCleanPaths(root string, paths []string) (map[string]cleanFileSnapsh
 			target, err = os.Readlink(fullPath)
 			entry.content = []byte(target)
 		case info.IsDir():
-			cmd := exec.Command("git", "-C", fullPath, "rev-parse", "HEAD")
 			var output []byte
-			output, err = cmd.Output()
+			output, err = git("git", "-C", fullPath, "rev-parse", "HEAD")
 			if err == nil {
 				entry.content = bytes.TrimSpace(output)
 			}
@@ -403,8 +633,8 @@ func snapshotMode(mode os.FileMode) string {
 	}
 }
 
-func verifyCleanSnapshot(root string, paths []string, expected map[string]cleanFileSnapshot) error {
-	actual, err := snapshotCleanPaths(root, paths)
+func verifyCleanSnapshot(git func(string, ...string) ([]byte, error), root string, paths []string, expected map[string]cleanFileSnapshot) error {
+	actual, err := snapshotCleanPaths(git, root, paths)
 	if err != nil {
 		return err
 	}
