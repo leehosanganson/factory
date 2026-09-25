@@ -42,7 +42,7 @@ With `--gate`, an exact `yes` approval is also required after each passing evalu
 
 The requirements agent's working directory is the run-state directory outside the target repository; it receives the target path as task context. Evaluators and later stage agents run with the target repository as their working directory. Evaluators must exit successfully and emit exactly `PASS` as their first non-empty output line. With `--gate`, a passing evaluator requires exact `yes` approval to continue; retries (up to four attempts) likewise require exact `yes`. Any other gated response stops the run.
 
-Foreground run records, task text, and logs are stored outside the target repository. Factory does not create a branch or commit for the pipeline. This is not a security sandbox: configured agents and their tools may still access or modify the repository. Evaluators run in the repository too. Factory does not copy its program source into the target.
+Foreground run records, task text, and logs are stored outside the target repository. Factory does not create a branch or commit for the pipeline. Agent and evaluator processes use the configured `agent_timeout` (default `60m`); this applies to pipeline, clean, and babysit invocations. This is not a security sandbox: configured agents and their tools may still access or modify the repository. Evaluators run in the repository too. Factory does not copy its program source into the target.
 
 ## Clean workflow
 
@@ -58,7 +58,7 @@ Start monitoring the open PR associated with the current checkout's branch:
 factory babysit <description>
 ```
 
-The babysit agent and its independent evaluator each have a five-minute timeout. A GitHub PR/check snapshot query has a separate two-minute timeout. Consecutive snapshot failures use bounded exponential backoff (starting at one second and capped at one minute); after eight failures the job enters `recoverable_failure` instead of retrying indefinitely.
+The babysit agent and its independent evaluator use the configured `agent_timeout` (default `60m`). A GitHub PR/check snapshot query has a separate two-minute timeout; `agent_timeout` does not change it. Consecutive snapshot failures use bounded exponential backoff (starting at one second and capped at one minute); after eight failures the job enters `recoverable_failure` instead of retrying indefinitely.
 
 The current directory must be a Git checkout with a clean working tree, a checked-out branch, and an `origin` that matches the PR head repository. The local branch head must equal the validated open PR head. The GitHub CLI must be able to identify and read the current PR. Factory rejects a second active babysitter for the same PR.
 
@@ -83,7 +83,7 @@ factory babysit reset <id>
 
 ## Configuration and state
 
-Configuration is read from `${XDG_CONFIG_HOME:-~/.config}/factory/config.json`. If no file exists, Factory uses the embedded defaults. See [`config.json.example`](config.json.example). A configuration has a non-empty `command`, an `args` array, and optional `prompt_dir` and absolute `state_dir` values. Command and arguments are passed directly to `os/exec`, without a shell. `{system_prompt}` and `{task}` must each occur exactly once across the command and arguments; `{workdir}` and `{stage}` are optional placeholders. The default adapter is:
+Configuration is read from `${XDG_CONFIG_HOME:-~/.config}/factory/config.json`. If no file exists, Factory uses the embedded defaults. See [`config.json.example`](config.json.example). A configuration has a non-empty `command`, an `args` array, and optional `prompt_dir`, absolute `state_dir`, and `agent_timeout` values. `agent_timeout` is a Go duration string controlling agent and evaluator process timeouts for pipeline, clean, and babysit; it defaults to `60m`. It does not affect the two-minute GitHub snapshot timeout or clean verification commands (`make fmt`, `make test`, and `make vet`). Command and arguments are passed directly to `os/exec`, without a shell. `{system_prompt}` and `{task}` must each occur exactly once across the command and arguments; `{workdir}` and `{stage}` are optional placeholders. The default adapter is:
 
 ```text
 pi -p --no-session --append-system-prompt {system_prompt} {task}

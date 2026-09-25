@@ -8,21 +8,24 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Config describes the agent process and prompt overrides used for each run.
 type Config struct {
-	Command   string   `json:"command"`
-	Args      []string `json:"args"`
-	PromptDir string   `json:"prompt_dir,omitempty"`
-	StateDir  string   `json:"state_dir,omitempty"`
+	Command      string   `json:"command"`
+	Args         []string `json:"args"`
+	PromptDir    string   `json:"prompt_dir,omitempty"`
+	StateDir     string   `json:"state_dir,omitempty"`
+	AgentTimeout string   `json:"agent_timeout,omitempty"`
 }
 
 // DefaultConfig returns a copy of the built-in pi command adapter.
 func DefaultConfig() Config {
 	return Config{
-		Command: "pi",
-		Args:    []string{"-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"},
+		Command:      "pi",
+		Args:         []string{"-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"},
+		AgentTimeout: "60m",
 	}
 }
 
@@ -76,6 +79,9 @@ func LoadConfig(path string) (Config, error) {
 
 // Validate checks config fields before they can influence a child process or file path.
 func (c Config) Validate() error {
+	if _, err := c.agentTimeout(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Command) == "" {
 		return fmt.Errorf("command must not be empty")
 	}
@@ -105,4 +111,18 @@ func (c Config) Validate() error {
 		return fmt.Errorf("state_dir must be absolute")
 	}
 	return nil
+}
+
+func (c Config) agentTimeout() (time.Duration, error) {
+	if c.AgentTimeout == "" {
+		return 60 * time.Minute, nil
+	}
+	duration, err := time.ParseDuration(c.AgentTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("agent_timeout must be a valid duration: %w", err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("agent_timeout must be positive")
+	}
+	return duration, nil
 }

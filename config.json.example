@@ -8,5 +8,6 @@
     "{task}"
   ],
   "prompt_dir": "",
-  "state_dir": ""
+  "state_dir": "",
+  "agent_timeout": "60m"
 }

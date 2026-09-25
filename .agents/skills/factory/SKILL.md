@@ -146,7 +146,11 @@ underlying cause of a failure.
   itself does not branch or commit.
 
 Configuration defaults to `${XDG_CONFIG_HOME:-~/.config}/factory/config.json`
-and can be reviewed alongside `config.json.example`. Foreground runs and
-babysit jobs/logs are persisted outside the target repository by default under
-`${XDG_STATE_HOME:-~/.local/state}/factory/`. Do not infer additional resume,
-rollback, or control commands beyond those provided by the CLI.
+and can be reviewed alongside `config.json.example`. The `agent_timeout`
+duration string sets the maximum runtime for agent and evaluator invocations in
+pipeline, clean, and babysit; it defaults to `60m`. It does not change the
+separate two-minute GitHub PR/check snapshot timeout or clean verification
+commands. Foreground runs and babysit jobs/logs are persisted outside the target
+repository by default under `${XDG_STATE_HOME:-~/.local/state}/factory/`. Do not
+infer additional resume, rollback, or control commands beyond those provided by
+the CLI.

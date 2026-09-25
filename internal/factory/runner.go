@@ -23,7 +23,13 @@ type Runner struct {
 
 // Run starts one independent agent process and records its output at logPath.
 func (r Runner) Run(stage, systemPrompt, task, workdir, logPath string) error {
-	return r.RunContext(context.Background(), stage, systemPrompt, task, workdir, logPath)
+	timeout, err := r.Config.agentTimeout()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return r.RunContext(ctx, stage, systemPrompt, task, workdir, logPath)
 }
 
 // RunContext starts one independent agent process and stops it when ctx is canceled.

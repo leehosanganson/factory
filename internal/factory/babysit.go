@@ -25,7 +25,6 @@ import (
 const (
 	babysitPollDefault        = 30 * time.Second
 	babysitSnapshotMaxRetries = 8
-	babysitStageTimeout       = 5 * time.Minute
 )
 
 var (
@@ -1049,7 +1048,11 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 		return err
 	}
 	logPath := filepath.Join(dir, "agent.log")
-	agentCtx, cancelAgent := context.WithTimeout(ctx, babysitStageTimeout)
+	agentTimeout, err := cfg.agentTimeout()
+	if err != nil {
+		return err
+	}
+	agentCtx, cancelAgent := context.WithTimeout(ctx, agentTimeout)
 	agentErr := (Runner{Config: cfg}).RunContext(agentCtx, "babysit", prompt, task, worktree, logPath)
 	cancelAgent()
 	if agentErr != nil {
@@ -1095,7 +1098,7 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	}
 	evalTask := evaluatorTask(task, string(output), worktree, changed)
 	evalLog := filepath.Join(dir, "evaluation.log")
-	evalCtx, cancelEval := context.WithTimeout(ctx, babysitStageTimeout)
+	evalCtx, cancelEval := context.WithTimeout(ctx, agentTimeout)
 	evalErr := (Runner{Config: cfg}).RunContext(evalCtx, "evaluate", evalPrompt, evalTask, worktree, evalLog)
 	cancelEval()
 	if evalErr != nil {

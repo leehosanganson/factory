@@ -196,7 +196,8 @@ Configuration: ${XDG_CONFIG_HOME:-~/.config}/factory/config.json
 Foreground run state: ${XDG_STATE_HOME:-~/.local/state}/factory/runs
 Babysit job state and logs: ${XDG_STATE_HOME:-~/.local/state}/factory/jobs
 Babysit polling interval: FACTORY_BABYSIT_POLL_INTERVAL (default 30s)
-Babysit agent/evaluator timeout: 5m; GitHub snapshot failure cap: 8 retries
+Agent/evaluator timeout: config agent_timeout (default 60m; pipeline, clean, babysit)
+GitHub snapshot timeout: 2m; clean verification commands are not covered; failure cap: 8 retries
 Agent argument placeholders: {system_prompt}, {task}, {workdir}, {stage}
 
 Default agent: pi -p --no-session --append-system-prompt {system_prompt} {task}`)

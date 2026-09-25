@@ -27,6 +27,36 @@ func TestRunnerRunContextStopsAgentWhenCanceled(t *testing.T) {
 	}
 }
 
+func TestRunnerRunUsesConfiguredTimeout(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "slow-agent.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}, AgentTimeout: "100ms"}}).Run("implement", "prompt", "task", dir, filepath.Join(dir, "agent.log"))
+	if err == nil {
+		t.Fatal("agent exceeded configured timeout without error")
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("timed-out agent took %s to return", elapsed)
+	}
+}
+
+func TestRunnerRunContextUsesOnlyCallerContext(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "short-agent.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.15\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}, AgentTimeout: "10ms"}}).RunContext(ctx, "implement", "prompt", "task", dir, filepath.Join(dir, "agent.log"))
+	if err != nil {
+		t.Fatalf("RunContext applied configured timeout instead of caller context: %v", err)
+	}
+}
+
 func TestRunnerExpandsPlaceholdersAsDistinctArguments(t *testing.T) {
 	dir := t.TempDir()
 	capture := filepath.Join(dir, "capture")

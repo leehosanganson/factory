@@ -73,6 +73,78 @@ func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) 
 	}
 }
 
+func TestBabysitAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		ctx        func() (context.Context, context.CancelFunc)
+		timeout    string
+		hangAt     string
+		maxElapsed time.Duration
+	}{
+		{name: "configured agent timeout", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "100ms", hangAt: "babysit", maxElapsed: 3 * time.Second},
+		{name: "configured evaluator timeout", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "100ms", hangAt: "evaluate", maxElapsed: 3 * time.Second},
+		{name: "parent cancellation", ctx: func() (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), 100*time.Millisecond)
+		}, timeout: "3s", hangAt: "babysit", maxElapsed: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := t.TempDir()
+			bare := filepath.Join(base, "remote.git")
+			repo := filepath.Join(base, "repo")
+			runTestCommand(t, base, "git", "init", "--bare", bare)
+			runTestCommand(t, base, "git", "clone", bare, repo)
+			runTestCommand(t, repo, "git", "checkout", "-b", "feature")
+			runTestCommand(t, repo, "git", "config", "user.name", "Factory Test")
+			runTestCommand(t, repo, "git", "config", "user.email", "factory@example.test")
+			if err := os.WriteFile(filepath.Join(repo, "tracked"), []byte("clean\\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			runTestCommand(t, repo, "git", "add", "tracked")
+			runTestCommand(t, repo, "git", "commit", "-m", "initial")
+			runTestCommand(t, repo, "git", "push", "-u", "origin", "feature")
+			head, err := runGit(context.Background(), repo, "rev-parse", "HEAD")
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(base, "job")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			script := filepath.Join(base, "agent")
+			scriptBody := `#!/bin/sh
+if [ "$1" = babysit ]; then
+  if [ "$HANG_AT" = babysit ]; then exec sleep 30; fi
+  printf changed > tracked
+  printf 'FACTORY_STATUS=FIXED\n'
+  exit 0
+fi
+exec sleep 30
+`
+			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			job := &babysitJob{ID: "20260518T120005-0123456789ab", Description: "monitor", RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", Attempts: 1, CreatedAt: time.Now().UTC()}
+			if err := saveBabysitJob(dir, job); err != nil {
+				t.Fatal(err)
+			}
+			worktree := filepath.Join(base, "worktree")
+			runTestCommand(t, repo, "git", "worktree", "add", "-b", "worker", worktree, head)
+			job.Worktree, job.WorkerBranch = worktree, "worker"
+			ctx, cancel := tc.ctx()
+			defer cancel()
+			t.Setenv("HANG_AT", tc.hangAt)
+			started := time.Now()
+			err = processBabysitEventContext(ctx, dir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}, AgentTimeout: tc.timeout}, &babysitSnapshot{HeadRefOID: head}, strings.Repeat("a", 64))
+			if err == nil {
+				t.Fatal("babysit agent unexpectedly completed")
+			}
+			if elapsed := time.Since(started); elapsed > tc.maxElapsed {
+				t.Fatalf("canceled babysit call took %s to return", elapsed)
+			}
+		})
+	}
+}
+
 func TestSnapshotRetryDelayIsCappedExponential(t *testing.T) {
 	if got := snapshotRetryDelay(1); got != time.Second {
 		t.Fatalf("first delay = %s, want 1s", got)

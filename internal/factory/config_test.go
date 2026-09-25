@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadConfigDefaultsAndValidation(t *testing.T) {
@@ -15,6 +16,9 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	}
 	if cfg.Command != "pi" || len(cfg.Args) == 0 {
 		t.Fatalf("unexpected default config: %#v", cfg)
+	}
+	if timeout, err := cfg.agentTimeout(); err != nil || timeout != 60*time.Minute {
+		t.Fatalf("default agent timeout = %s, %v; want 60m", timeout, err)
 	}
 
 	for _, content := range []string{
@@ -31,6 +35,44 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 			}
 			if _, err := LoadConfig(file); err == nil {
 				t.Fatal("expected invalid config to be rejected")
+			}
+		})
+	}
+}
+
+func TestLoadConfigAgentTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "omitted defaults", value: ``, want: 60 * time.Minute},
+		{name: "empty defaults", value: `,"agent_timeout":""`, want: 60 * time.Minute},
+		{name: "configured duration", value: `,"agent_timeout":"2m30s"`, want: 150 * time.Second},
+		{name: "invalid duration", value: `,"agent_timeout":"soon"`, wantErr: true},
+		{name: "zero duration", value: `,"agent_timeout":"0s"`, wantErr: true},
+		{name: "negative duration", value: `,"agent_timeout":"-1s"`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.json")
+			content := `{"command":"pi","args":["{task}","{system_prompt}"]` + tc.value + `}`
+			if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(file)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid agent_timeout was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := cfg.agentTimeout()
+			if err != nil || got != tc.want {
+				t.Fatalf("agent timeout = %s, %v; want %s", got, err, tc.want)
 			}
 		})
 	}
