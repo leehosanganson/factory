@@ -335,6 +335,13 @@ func inspectCleanBaseline(git func(string, ...string) ([]byte, error)) (cleanBas
 		if upstreamErr != nil || upstreamName == "" {
 			return cleanBaseline{}, fmt.Errorf("factory clean cannot resolve the configured upstream")
 		}
+		resolvedMerge, err := cleanResolvedUpstreamMerge(git, branchName)
+		if err != nil {
+			return cleanBaseline{}, err
+		}
+		if resolvedMerge != remoteRef {
+			return cleanBaseline{}, fmt.Errorf("factory clean configured merge ref %s does not match resolved upstream ref %s", remoteRef, resolvedMerge)
+		}
 		if remote == "." || strings.TrimSpace(remote) == "" {
 			return cleanBaseline{}, fmt.Errorf("factory clean requires a non-local configured upstream remote")
 		}
@@ -382,6 +389,10 @@ func validateCleanDestination(git func(string, ...string) ([]byte, error), basel
 	if baseline.upstream != "" {
 		if !configuredUpstream || upstreamErr != nil || upstreamName == "" || upstreamName != baseline.upstream {
 			return fmt.Errorf("upstream changed %s", context)
+		}
+		resolvedMerge, err := cleanResolvedUpstreamMerge(git, baseline.branch)
+		if err != nil || resolvedMerge != remoteRef {
+			return fmt.Errorf("upstream merge ref changed %s", context)
 		}
 		if remote != baseline.remote || remoteRef != baseline.remoteRef {
 			return fmt.Errorf("upstream remote or branch changed %s", context)
@@ -544,9 +555,16 @@ func cleanUpstreamConfig(git func(string, ...string) ([]byte, error), branch str
 	if err != nil {
 		return "", "", false, fmt.Errorf("inspect configured upstream remote: %w", err)
 	}
-	merge, mergeMissing, err := cleanConfigValue(git, "branch."+branch+".merge")
+	merges, mergeMissing, err := cleanConfigValues(git, "branch."+branch+".merge")
 	if err != nil {
 		return "", "", false, fmt.Errorf("inspect configured upstream branch: %w", err)
+	}
+	if len(merges) > 1 {
+		return "", "", true, fmt.Errorf("factory clean requires exactly one configured upstream branch")
+	}
+	merge := ""
+	if len(merges) == 1 {
+		merge = merges[0]
 	}
 	if remoteMissing && mergeMissing {
 		return "", "", false, nil
@@ -561,6 +579,18 @@ func cleanUpstreamConfig(git func(string, ...string) ([]byte, error), branch str
 	return remoteName, ref, true, nil
 }
 
+func cleanResolvedUpstreamMerge(git func(string, ...string) ([]byte, error), branch string) (string, error) {
+	merge, err := git("git", "for-each-ref", "--format=%(upstream:remoteref)", "refs/heads/"+branch)
+	if err != nil {
+		return "", fmt.Errorf("factory clean cannot inspect the resolved upstream branch: %w", err)
+	}
+	ref := strings.TrimSpace(string(merge))
+	if ref == "" {
+		return "", fmt.Errorf("factory clean cannot resolve the configured upstream branch")
+	}
+	return ref, nil
+}
+
 func cleanConfigValue(git func(string, ...string) ([]byte, error), key string) (string, bool, error) {
 	value, err := git("git", "config", "--get", key)
 	if err != nil {
@@ -571,6 +601,18 @@ func cleanConfigValue(git func(string, ...string) ([]byte, error), key string) (
 		return "", false, err
 	}
 	return string(value), false, nil
+}
+
+func cleanConfigValues(git func(string, ...string) ([]byte, error), key string) ([]string, bool, error) {
+	data, err := git("git", "config", "--null", "--get-all", key)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil, true, nil
+		}
+		return nil, false, err
+	}
+	return nulPaths(data), false, nil
 }
 
 func lineValues(data []byte) []string {

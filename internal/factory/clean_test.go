@@ -134,6 +134,36 @@ func TestCleanRefusesUnsafeInitialRepositoriesBeforeAgents(t *testing.T) {
 	}
 }
 
+func TestCleanRefusesMultipleConfiguredMergeRefsBeforeAgentsOrPublication(t *testing.T) {
+	repo := newCleanRepo(t)
+	initial := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main")))
+	gitClean(t, repo.work, "config", "--add", "branch.main.merge", "refs/heads/other")
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+	workflow := cleanTestWorkflow(repo.work, agent)
+	pushCalls := 0
+	workflow.Git = func(name string, args ...string) ([]byte, error) {
+		if name == "git" && len(args) > 0 && args[0] == "push" {
+			pushCalls++
+		}
+		cmd := exec.Command(name, args...)
+		cmd.Dir = repo.work
+		return cmd.Output()
+	}
+
+	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "exactly one configured upstream branch") {
+		t.Fatalf("multiple merge refs error = %v, want ambiguous upstream rejection", err)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("agent ran before ambiguous upstream refusal: %v", agent.calls)
+	}
+	if pushCalls != 0 {
+		t.Fatalf("ambiguous upstream invoked push %d times", pushCalls)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initial {
+		t.Fatalf("ambiguous upstream changed remote main: got %s want %s", got, initial)
+	}
+}
+
 func TestCleanRefusesConfiguredButUnresolvedUpstreamBeforeAgents(t *testing.T) {
 	for _, mode := range []string{"missing-ref", "missing-remote", "missing-merge", "invalid-merge"} {
 		t.Run(mode, func(t *testing.T) {
@@ -458,7 +488,7 @@ func TestCleanFailsClosedWhenRawRemoteURLsCannotBeInspected(t *testing.T) {
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 	workflow := cleanTestWorkflow(repo.work, agent)
 	workflow.Git = func(name string, args ...string) ([]byte, error) {
-		if name == "git" && len(args) == 4 && args[0] == "config" && args[1] == "--null" && args[2] == "--get-all" {
+		if name == "git" && len(args) == 4 && args[0] == "config" && args[1] == "--null" && args[2] == "--get-all" && strings.HasPrefix(args[3], "remote.origin.") {
 			return nil, fmt.Errorf("simulated config inspection failure")
 		}
 		cmd := exec.Command(name, args...)
@@ -836,7 +866,7 @@ func TestCleanTerminalProgressUsesSpinnerAndClearsLine(t *testing.T) {
 	if err := workflow.Run(""); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "⠋\033[0m review 1/4") || !strings.Contains(got, "\r\033[2K") {
+	if got := output.String(); !strings.Contains(got, "⠋ REVIEW\033[0m") || !strings.Contains(got, "ATTEMPT") || !strings.Contains(got, "\r\033[2K") {
 		t.Fatalf("terminal progress spinner or cleanup missing from output: %q", got)
 	}
 }

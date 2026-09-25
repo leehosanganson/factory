@@ -62,7 +62,7 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(w.Out, "Run: %s\n", runDir)
+	fmt.Fprintf(w.Out, "Run: %s\n", safeProgressPath(runDir, progressLogLineLimit-5))
 	var reader io.Reader = bufio.NewReader(w.In)
 	if _, ok := w.In.(ContextLineReader); ok {
 		reader = w.In
@@ -143,8 +143,9 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 			stageTask += "\n\nFeedback from the previous attempt:\n" + retryFeedback
 		}
 		progress := startProgress(w.Out, w.Terminal, stage, attempt, stageLog)
-		runErr := runAgentWithContext(ctx, w.Agent, stage, prompt, stageTask, stageWorkdir, stageLog)
-		progress.finish(runErr)
+		runErr := runWithProgress(progress, func() error {
+			return runAgentWithContext(ctx, w.Agent, stage, prompt, stageTask, stageWorkdir, stageLog)
+		})
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
@@ -176,22 +177,26 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 		}
 		evaluatorLog := filepath.Join(runDir, fmt.Sprintf("%02d-evaluate-%s.log", attempt, stage))
 		progress = startProgress(w.Out, w.Terminal, "evaluate "+stage, attempt, evaluatorLog)
-		protocolOutput, evalErr := runEvaluatorWithContext(ctx, w.Agent, evaluatorPrompt, evaluatorTask, w.Workdir, evaluatorLog)
-		progress.finish(evalErr)
+		var protocolOutput []byte
+		evalErr := runWithProgress(progress, func() error {
+			var err error
+			protocolOutput, err = runEvaluatorWithContext(ctx, w.Agent, evaluatorPrompt, evaluatorTask, w.Workdir, evaluatorLog)
+			return err
+		})
 		if ctx.Err() != nil {
 			return false, ctx.Err()
 		}
 		output := readLog(evaluatorLog)
 		passed := protocolOutput != nil && evaluatorPassed(string(protocolOutput))
 		if evalErr == nil && passed {
-			fmt.Fprintf(w.Out, "Evaluation: PASS — %s; log: %s\n", stage, evaluatorLog)
+			fmt.Fprintf(w.Out, "Evaluation: PASS — %s; log: %s\n", stage, safeProgressPath(evaluatorLog, evaluatorOutputLimit-64))
 		} else {
 			if evalErr != nil {
 				fmt.Fprintf(w.Out, "Evaluation: ERROR — %s: %s\n", stage, boundedOutput(evalErr.Error(), evaluatorOutputLimit))
 			} else {
 				fmt.Fprintf(w.Out, "Evaluation: FAIL — %s; first non-empty stdout line was not exactly PASS.\n", stage)
 			}
-			fmt.Fprintf(w.Out, "Evaluator findings/output:\n%s\nEvaluator log: %s\n", boundedOutput(output, evaluatorOutputLimit), evaluatorLog)
+			fmt.Fprintf(w.Out, "Evaluator findings/output:\n%s\nEvaluator log: %s\n", boundedOutput(output, evaluatorOutputLimit), safeProgressPath(evaluatorLog, evaluatorOutputLimit-20))
 		}
 		if evalErr != nil || !passed {
 			if attempt == 4 {
@@ -239,6 +244,17 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 		return true, nil
 	}
 	return false, nil
+}
+
+func runWithProgress(progress *stageProgress, run func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			progress.finish(errors.New("invocation panicked"))
+			panic(recovered)
+		}
+		progress.finish(err)
+	}()
+	return run()
 }
 
 type contextAgent interface {

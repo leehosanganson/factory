@@ -503,6 +503,55 @@ func TestWorkflowRequiresApprovalAtEverySuccessfulGate(t *testing.T) {
 	}
 }
 
+type panickingAgent struct{ panicStage bool }
+
+func (a panickingAgent) Run(string, string, string, string, string) error {
+	if a.panicStage {
+		panic("stage panic")
+	}
+	return nil
+}
+func (a panickingAgent) RunWithContext(context.Context, string, string, string, string, string) error {
+	if a.panicStage {
+		panic("stage panic")
+	}
+	return nil
+}
+func (panickingAgent) RunWithOutputContext(context.Context, string, string, string, string, string) (string, error) {
+	panic("evaluator panic")
+}
+
+func TestWorkflowRestoresProgressOnAgentAndEvaluatorPanic(t *testing.T) {
+	for _, stage := range []string{"requirements", "evaluate"} {
+		t.Run(stage, func(t *testing.T) {
+			t.Setenv("TERM", "xterm")
+			t.Setenv("COLUMNS", "80")
+			t.Setenv("LINES", "24")
+			stateDir := filepath.Join(t.TempDir(), "state")
+			var output strings.Builder
+			workflow := Workflow{
+				Agent: panickingAgent{panicStage: stage == "requirements"}, Config: Config{StateDir: stateDir}, In: strings.NewReader(""),
+				Out: &output, Workdir: t.TempDir(), Terminal: true, Stages: []string{"requirements"},
+			}
+			func() {
+				defer func() {
+					if recover() == nil {
+						t.Fatal("workflow should preserve and re-panic agent failure")
+					}
+				}()
+				_ = workflow.Run("task")
+			}()
+			got := output.String()
+			if !strings.Contains(got, "\033[?25h\033[?1049l") {
+				t.Fatalf("%s panic left terminal modes altered: %q", stage, got)
+			}
+			if strings.Count(got, "\033[?1049h") != strings.Count(got, "\033[?1049l") {
+				t.Fatalf("%s panic did not balance alternate-screen entry/exit: %q", stage, got)
+			}
+		})
+	}
+}
+
 func TestWorkflowSanitizesFailedStageLogAndAgentErrorOnStdout(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	agent := &fakeAgent{outputs: map[string][]string{"requirements": {

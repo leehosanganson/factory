@@ -1,142 +1,406 @@
 package factory
 
 import (
-	"errors"
+	"context"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-type heartbeatTestWriter struct {
-	mu        sync.Mutex
-	output    strings.Builder
-	heartbeat chan struct{}
+type progressTestWriter struct {
+	mu     sync.Mutex
+	output strings.Builder
+	pulse  chan struct{}
 }
 
-func newHeartbeatTestWriter() *heartbeatTestWriter {
-	return &heartbeatTestWriter{heartbeat: make(chan struct{}, 8)}
+func newProgressTestWriter() *progressTestWriter {
+	return &progressTestWriter{pulse: make(chan struct{}, 16)}
 }
 
-func (w *heartbeatTestWriter) Write(p []byte) (int, error) {
+func (w *progressTestWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	n, err := w.output.Write(p)
-	if strings.Contains(string(p), "Progress ") {
+	if strings.Contains(string(p), "Progress update") {
 		select {
-		case w.heartbeat <- struct{}{}:
+		case w.pulse <- struct{}{}:
 		default:
 		}
 	}
 	return n, err
 }
 
-func (w *heartbeatTestWriter) String() string {
+func (w *progressTestWriter) String() string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.output.String()
 }
 
-func (w *heartbeatTestWriter) waitForHeartbeats(t *testing.T, count int) {
+func (w *progressTestWriter) waitPulse(t *testing.T) {
 	t.Helper()
-	for i := 0; i < count; i++ {
-		select {
-		case <-w.heartbeat:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for heartbeat %d of %d", i+1, count)
-		}
+	select {
+	case <-w.pulse:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for progress update")
 	}
 }
 
-func TestProgressIsStaticAndIncludesAttemptElapsedAndLogPathOutsideTTY(t *testing.T) {
-	var output strings.Builder
-	progress := startProgress(&output, false, "requirements", 2, "/state/run/02-requirements.log")
+func TestProgressNonTTYProvidesPlainProgressAndSafeBoundedPaths(t *testing.T) {
+	logPath := "\x1b]0;hostile title\a" + strings.Repeat("/long/path", 40) + "\nlatest.log"
+	output := newProgressTestWriter()
+	progress := startProgressWithIntervals(output, false, "implement", 2, logPath, 10*time.Millisecond, time.Hour)
+	output.waitPulse(t)
 	progress.finish(nil)
 	got := output.String()
-	for _, want := range []string{"Running requirements attempt 2/4", "completed in", "log: /state/run/02-requirements.log"} {
+	for _, want := range []string{"Stage: implement", "Attempt: 2/4", "Elapsed:", "Latest: waiting for log output", "completed in"} {
 		if !strings.Contains(got, want) {
-			t.Errorf("static progress missing %q: %q", want, got)
+			t.Errorf("plain progress missing %q: %q", want, got)
 		}
 	}
-	if strings.Contains(got, "\033") || strings.Contains(got, "\r") {
-		t.Errorf("non-TTY progress contains terminal control characters: %q", got)
+	if strings.ContainsAny(got, "\x1b\a\r") || strings.Contains(got, "hostile title") || strings.Contains(got, "\nlatest.log") {
+		t.Fatalf("plain progress path was not terminal-safe: %q", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "Log: ") || strings.Contains(line, "; log: ") {
+			if len([]rune(line)) > progressLogLineLimit+8 {
+				t.Errorf("plain path line was not bounded: width=%d line=%q", len([]rune(line)), line)
+			}
+		}
 	}
 }
 
-func TestProgressNonTTYHeartbeatIncludesLatestSanitizedLogActivity(t *testing.T) {
+func TestTTYProgressUsesCursorRowsWithoutClearingEachFrame(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLUMNS", "72")
+	t.Setenv("LINES", "16")
+	t.Setenv("NO_COLOR", "")
 	logPath := filepath.Join(t.TempDir(), "stage.log")
-	if err := os.WriteFile(logPath, []byte("starting\n\033[31mwriting tests\033[0m\n"), 0o600); err != nil {
+	if err := os.WriteFile(logPath, []byte("preparing\nwriting focused tests\nverifying behavior\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	output := newHeartbeatTestWriter()
-	progress := startProgressWithIntervals(output, false, "implement", 1, logPath, 10*time.Millisecond, time.Hour)
-	output.waitForHeartbeats(t, 2)
+	var output strings.Builder
+	progress := startProgressWithSizeQuery(&output, true, "implement", 3, logPath, time.Hour, time.Hour, func(uintptr) (int, int, error) {
+		return 72, 16, nil
+	})
 	progress.finish(nil)
 	got := output.String()
-	if !strings.Contains(got, "Progress implement attempt 1/4 after") || !strings.Contains(got, "latest: writing tests") {
-		t.Fatalf("heartbeat did not report stage activity: %q", got)
+	for _, want := range []string{"\033[?1049h", "\033[?25l", "FACTORY", "CURRENT OPERATION", "IMPLEMENT", "ATTEMPT", "RECENT ACTIVITY", "verifying behavior", "LOG", "\033[?25h\033[?1049l", "implement attempt 3/4 completed in"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("full-screen progress missing %q: %q", want, got)
+		}
 	}
-	if strings.Contains(got, "\033") || strings.Contains(got, "\r") {
-		t.Errorf("non-TTY heartbeat contains terminal control characters: %q", got)
+	if strings.Count(got, "\033[2J") != 1 {
+		t.Errorf("expected only entry to clear screen, got %d clears", strings.Count(got, "\033[2J"))
 	}
-	if strings.Count(got, "Progress implement attempt") < 2 {
-		t.Errorf("expected periodic heartbeat output, got: %q", got)
+	if strings.Count(got, "\033[1;1H") != 2 {
+		t.Errorf("expected cursor-positioned initial and completion draws, got output %q", got)
+	}
+	if strings.Index(got, "\033[?25h\033[?1049l") > strings.Index(got, "implement attempt 3/4 completed in") {
+		t.Fatal("completion summary was not written after returning to the original screen")
 	}
 }
 
-func TestTTYProgressDrawsFiveLineCardAndLeavesCompletedSummary(t *testing.T) {
+func TestTTYAnimationUpdatesRowsWithoutClearingViewport(t *testing.T) {
 	t.Setenv("TERM", "xterm")
-	t.Setenv("COLUMNS", "100")
-	t.Setenv("NO_COLOR", "")
-	logPath := filepath.Join(t.TempDir(), "long", "path", "03-stage.log")
+	t.Setenv("NO_COLOR", "1")
+	file, err := os.CreateTemp(t.TempDir(), "progress-animation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	progress := startProgressWithSizeQuery(file, true, "animation", 1, "/tmp/animation.log", time.Hour, time.Millisecond, func(uintptr) (int, int, error) {
+		return 80, 24, nil
+	})
+	time.Sleep(15 * time.Millisecond)
+	progress.finish(nil)
+	data, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if clears := strings.Count(got, "\033[2J"); clears != 1 {
+		t.Fatalf("animation cleared viewport %d times, want only once on entry", clears)
+	}
+	if redraws := strings.Count(got, "\033[5;1H"); redraws < 3 {
+		t.Fatalf("animation did not redraw the changed operation row: %d redraws", redraws)
+	}
+}
+
+func TestProgressResizeBetweenRendersRedrawsCurrentViewport(t *testing.T) {
+	t.Setenv("TERM", "xterm")
+	t.Setenv("NO_COLOR", "1")
+	file, err := os.CreateTemp(t.TempDir(), "progress-screen")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	queries := 0
+	progress := startProgressWithSizeQuery(file, true, "resize test", 1, "/tmp/a-very-long-stage-log-name.log", time.Hour, time.Hour, func(uintptr) (int, int, error) {
+		queries++
+		if queries == 1 {
+			return 72, 16, nil
+		}
+		return 48, 8, nil
+	})
+	progress.finish(nil)
+	if queries != 2 || progress.width != 48 || progress.rows != 8 {
+		t.Fatalf("resize query/dimensions = %d, %dx%d; want 2 queries and 48x8", queries, progress.width, progress.rows)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Count(got, "\033[2J") != 2 {
+		t.Errorf("expected entry and resize redraw clears, got %d", strings.Count(got, "\033[2J"))
+	}
+	clear := strings.LastIndex(got, "\033[2J")
+	if clear < 0 {
+		t.Fatal("resize did not redraw the viewport")
+	}
+	resizedDraw := strings.SplitN(got[clear+len("\033[2J"):], "\033[?25h", 2)[0]
+	if !strings.Contains(resizedDraw, "\033[1;1H\r\033[2K") {
+		t.Errorf("resized draw omitted first row: %q", resizedDraw)
+	}
+	for row := 2; row <= 8; row++ {
+		if !strings.Contains(resizedDraw, "\033["+itoa(row)+";1H\r\033[2K") {
+			t.Errorf("resized draw omitted row %d: %q", row, resizedDraw)
+		}
+	}
+	if strings.Contains(resizedDraw, "\033[9;1H") {
+		t.Errorf("resized draw wrote beyond the 8-row viewport: %q", resizedDraw)
+	}
+	for _, row := range strings.Split(resizedDraw, "\033[") {
+		if end := strings.Index(row, "H"); end >= 0 {
+			text := row[end+1:]
+			if width := progressTextWidth(stripProgressANSI(text)); width > 48 {
+				t.Errorf("resized row width %d exceeds 48 columns: %q", width, text)
+			}
+		}
+	}
+}
+
+func TestProgressResizeToFiveRowsKeepsStatusAttemptAndSanitizedLogPath(t *testing.T) {
+	t.Setenv("TERM", "xterm")
+	t.Setenv("NO_COLOR", "1")
+	logPath := filepath.Join(t.TempDir(), "run\x1b]0;hostile title\a", "02-implement.log")
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(logPath, []byte("preparing\n\033[32mwriting focused tests\033[0m\nverifying behavior\n"), 0o600); err != nil {
+	if err := os.WriteFile(logPath, []byte("latest activity\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	var output strings.Builder
-	progress := startProgressWithIntervals(&output, true, "evaluate requirements", 3, logPath, time.Hour, time.Hour)
+	file, err := os.CreateTemp(t.TempDir(), "progress-resize-small")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	queries := 0
+	progress := startProgressWithSizeQuery(file, true, "implement", 3, logPath, time.Hour, time.Hour, func(uintptr) (int, int, error) {
+		queries++
+		if queries == 1 {
+			return 72, 16, nil
+		}
+		return 72, 5, nil
+	})
 	progress.finish(nil)
-	got := output.String()
-	for _, want := range []string{"FACTORY / RUNNING", "evaluate requirements", "[■■■□]", "ACTIVE", "writing focused tests", "verifying behavior", "03-stage.log", "FACTORY / COMPLETED", "evaluate requirements attempt 3/4 completed in", "\033[5A", "\r\033[2K"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("TTY dashboard missing %q: %q", want, got)
+	if queries != 2 || progress.rows != 5 {
+		t.Fatalf("resize query/dimensions = %d, %d rows; want 2 queries and 5 rows", queries, progress.rows)
+	}
+	data, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "\033[?25h\033[?1049l") {
+		t.Fatal("resizing active TUI did not restore cursor and alternate screen on finish")
+	}
+	redraw := strings.SplitN(got[strings.LastIndex(got, "\033[2J")+len("\033[2J"):], "\033[?25h", 2)[0]
+	rows := 0
+	for _, sequence := range strings.Split(redraw, "\033[") {
+		if strings.Contains(sequence, ";1H") {
+			rows++
+			if strings.HasPrefix(sequence, "6;") {
+				t.Fatalf("5-row viewport wrote row 6: %q", redraw)
+			}
 		}
 	}
-	initialRows := strings.SplitN(got, "\n", progressCardRows+1)
-	if len(initialRows) < progressCardRows+1 {
-		t.Fatalf("initial card has fewer than %d rows: %q", progressCardRows, got)
+	if rows != 5 {
+		t.Fatalf("resized render wrote %d rows, want 5: %q", rows, redraw)
 	}
-	if !strings.HasPrefix(initialRows[0], "┌") || !strings.HasPrefix(initialRows[1], "│") || !strings.HasPrefix(initialRows[2], "│") || !strings.HasPrefix(initialRows[3], "│") || !strings.HasPrefix(initialRows[4], "└") {
-		t.Fatalf("initial card does not have header, three content rows, and footer: %#v", initialRows[:progressCardRows])
+	for _, want := range []string{"IMPLEMENT · COMPLETED", "Attempt: 3/4", "02-implement.log"} {
+		if !strings.Contains(redraw, want) {
+			t.Errorf("five-row render omitted %q: %q", want, redraw)
+		}
 	}
-	if strings.Contains(got, "\033[31mwriting focused tests") || strings.Contains(got, "\033[0m\nverifying behavior") {
-		t.Errorf("log-provided ANSI styling leaked into dashboard: %q", got)
-	}
-	if strings.Count(got, "\033[2K") < progressCardRows {
-		t.Errorf("dashboard should clear every card row on redraw: %q", got)
+	if strings.Contains(redraw, "latest activity") || strings.Contains(redraw, "\033]") || strings.Contains(redraw, "hostile title") {
+		t.Errorf("compact render should prioritize status/attempt/path without unsafe controls: %q", redraw)
 	}
 }
 
-func TestTTYProgressHonorsNO_COLOR(t *testing.T) {
+func TestCompactProgressScreenPreservesEssentialFieldsInTinyViewports(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	for rows := 1; rows <= 5; rows++ {
+		t.Run(itoa(rows), func(t *testing.T) {
+			lines := renderProgressScreen(80, rows, "build", 2, "/state/run/01-build.log", time.Second, "ACTIVE", false)
+			if len(lines) > rows {
+				t.Fatalf("rendered %d lines in %d-row viewport", len(lines), rows)
+			}
+			for _, line := range lines {
+				if progressTextWidth(line) > 80 {
+					t.Errorf("line exceeds viewport width: %q", line)
+				}
+			}
+			joined := strings.Join(lines, "\n")
+			for _, want := range []string{"BUILD", "2/4", "01-build.log"} {
+				if !strings.Contains(joined, want) {
+					t.Errorf("%d-row render omitted %q: %q", rows, want, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestProgressWidthFallbackClippingAndWideUnicode(t *testing.T) {
+	t.Setenv("COLUMNS", "invalid")
+	t.Setenv("LINES", "0")
+	width, rows := resolveProgressSize(&strings.Builder{}, nil, "invalid", "0")
+	if width != progressDefaultWidth || rows != progressDefaultRows {
+		t.Fatalf("invalid dimensions fallback = %dx%d, want %dx%d", width, rows, progressDefaultWidth, progressDefaultRows)
+	}
+	t.Setenv("COLUMNS", "56")
+	t.Setenv("LINES", "14")
+	file, err := os.CreateTemp(t.TempDir(), "progress-width")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	width, rows = resolveProgressSize(file, func(fd uintptr) (int, int, error) {
+		if fd != file.Fd() {
+			t.Errorf("terminal query fd=%d, want %d", fd, file.Fd())
+		}
+		return 42, 9, nil
+	}, "56", "14")
+	if width != 42 || rows != 9 {
+		t.Fatalf("terminal dimensions = %dx%d, want queried 42x9", width, rows)
+	}
+	for _, text := range []string{"long 世界 activity", "界界界 wide", "⌚x"} {
+		clipped := truncateProgressText(text, 2)
+		if progressTextWidth(clipped) > 1 || !strings.HasSuffix(clipped, "…") {
+			t.Errorf("clipped %q = %q with width %d; expected <= 1 and ellipsis", text, clipped, progressTextWidth(clipped))
+		}
+	}
+	if got := truncateProgressText("unchanged", 12); got != "unchanged" {
+		t.Errorf("fitting text changed: %q", got)
+	}
+	wrapped := wrapProgressText("wide 世界 activity", 7)
+	if len(wrapped) < 2 {
+		t.Fatalf("wide activity was not wrapped: %#v", wrapped)
+	}
+	for _, line := range wrapped {
+		if progressTextWidth(line) > 7 {
+			t.Errorf("wrapped line exceeds width: %q", line)
+		}
+	}
+}
+
+func TestProgressTerminalFallbackAndNoColor(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		term    string
+		columns string
+		rows    string
+	}{
+		{name: "non tty", term: "xterm", columns: "80", rows: "24"},
+		{name: "dumb terminal", term: "dumb", columns: "80", rows: "24"},
+		{name: "narrow terminal", term: "xterm", columns: "39", rows: "24"},
+		{name: "short terminal", term: "xterm", columns: "80", rows: "5"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("TERM", test.term)
+			t.Setenv("COLUMNS", test.columns)
+			t.Setenv("LINES", test.rows)
+			var output strings.Builder
+			progress := startProgressWithIntervals(&output, test.name != "non tty", "build", 1, "/tmp/build.log", time.Hour, time.Hour)
+			progress.finish(nil)
+			if strings.Contains(output.String(), "\033") {
+				t.Fatalf("plain fallback emitted ANSI: %q", output.String())
+			}
+		})
+	}
+
 	t.Setenv("TERM", "xterm")
+	t.Setenv("COLUMNS", "80")
+	t.Setenv("LINES", "24")
 	t.Setenv("NO_COLOR", "1")
 	var output strings.Builder
-	progress := startProgressWithIntervals(&output, true, "build", 1, "/tmp/build.log", time.Hour, time.Hour)
-	progress.finish(errors.New("build failed"))
+	progress := startProgressWithSizeQuery(&output, true, "build", 1, "/tmp/build.log", time.Hour, time.Hour, func(uintptr) (int, int, error) { return 80, 24, nil })
+	progress.finish(nil)
 	got := output.String()
-	if strings.Contains(got, "\033[3") || strings.Contains(got, "\033[9") {
-		t.Errorf("NO_COLOR output includes ANSI styling: %q", got)
+	if strings.Contains(got, "\033[1;36m") || strings.Contains(got, "\033[1;33m") || !strings.Contains(got, "\033[?1049h") {
+		t.Fatalf("NO_COLOR should remove styling but retain screen controls: %q", got)
 	}
-	if !strings.Contains(got, "\033[5A") {
-		t.Errorf("NO_COLOR should retain card redraw controls: %q", got)
+}
+
+func TestProgressCancellationUsesContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	t.Setenv("TERM", "xterm")
+	t.Setenv("COLUMNS", "80")
+	t.Setenv("LINES", "24")
+	t.Setenv("NO_COLOR", "1")
+	var output strings.Builder
+	progress := startProgressWithSizeQuery(&output, true, "evaluate review", 2, "/tmp/evaluator.log", time.Hour, time.Hour, func(uintptr) (int, int, error) { return 80, 24, nil })
+	progress.finish(ctx.Err())
+	got := output.String()
+	if !strings.Contains(got, "\033[?25h\033[?1049l") || !strings.Contains(got, "evaluate review attempt 2/4 failed in") {
+		t.Fatalf("cancellation finish did not restore terminal and report outcome: %q", got)
 	}
-	if !strings.Contains(got, "build attempt 1/4 failed in") {
-		t.Errorf("failure summary missing: %q", got)
+}
+
+func TestFullScreenPathIsSanitizedAndWidthBounded(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	path := "/tmp/\x1b]0;hostile title\a" + strings.Repeat("very-long-directory/", 8) + "stage.log\ncontinued"
+	lines := renderProgressScreen(40, 12, "review", 1, path, time.Second, "ACTIVE", true)
+	if len(lines) != 12 {
+		t.Fatalf("rendered %d rows, want 12", len(lines))
+	}
+	for i, line := range lines {
+		if strings.ContainsAny(line, "\x1b\a\r\n") || strings.Contains(line, "hostile title") {
+			t.Errorf("row %d contains unsanitized path data: %q", i, line)
+		}
+		if width := progressTextWidth(line); width > 40 {
+			t.Errorf("row %d width %d exceeds 40: %q", i, width, line)
+		}
+	}
+	summary := safeProgressPath(path, 38)
+	if strings.ContainsAny(summary, "\x1b\a\r\n") || progressTextWidth(summary) > 38 {
+		t.Errorf("summary path is unsafe or too wide: %q (width %d)", summary, progressTextWidth(summary))
+	}
+}
+
+func TestReadProgressLogBoundsTailAndDisplayedLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "large.log")
+	content := strings.Repeat("discarded output\n", progressTailBytes) + "latest one\nlatest two\nlatest three\nlatest four\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lines := readProgressLog(path)
+	if len(lines) != progressLogLines || strings.Join(lines, "|") != "latest two|latest three|latest four" {
+		t.Fatalf("readProgressLog tail = %#v, want latest three lines", lines)
+	}
+	if err := os.WriteFile(path, []byte("\x1b]0;private title\a\x1b[31mvisible\x1b[0m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lines = readProgressLog(path)
+	if strings.Join(lines, "\n") != "visible" {
+		t.Fatalf("readProgressLog should sanitize terminal controls, got %#v", lines)
 	}
 }
 
@@ -147,190 +411,17 @@ func TestSanitizeProgressLineRemovesTerminalControls(t *testing.T) {
 	}
 }
 
-func TestProgressFallsBackFromDumbTerminalAndTruncatesToWidth(t *testing.T) {
-	t.Setenv("TERM", "dumb")
-	t.Setenv("COLUMNS", "24")
-	logPath := filepath.Join(t.TempDir(), "stage.log")
-	if err := os.WriteFile(logPath, []byte(strings.Repeat("activity ", 20)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	output := newHeartbeatTestWriter()
-	progress := startProgressWithIntervals(output, true, "implement", 2, logPath, 10*time.Millisecond, time.Hour)
-	output.waitForHeartbeats(t, 1)
-	progress.finish(nil)
-	got := output.String()
-	if strings.Contains(got, "\033[") || strings.Contains(got, "\r") {
-		t.Fatalf("TERM=dumb should not receive cursor controls: %q", got)
-	}
-	if !strings.Contains(got, "Running implement attempt 2/4") || !strings.Contains(got, "completed in") || !strings.Contains(got, "Progress implement attempt 2/4 after") {
-		t.Fatalf("TERM=dumb should use readable start and heartbeat progress: %q", got)
-	}
-
-	if truncated := truncateProgressText("wide 世界 activity", 10); progressTextWidth(truncated) > 9 || !strings.HasSuffix(truncated, "…") {
-		t.Errorf("truncateProgressText = %q, want UTF-8-safe output under width", truncated)
-	}
-	if got := truncateProgressText("unchanged", 10); got != "unchanged" {
-		t.Errorf("truncateProgressText changed fitting text: %q", got)
-	}
-}
-
-func TestProgressCardTruncatesRowsAtConfiguredWidth(t *testing.T) {
-	t.Setenv("TERM", "xterm")
-	t.Setenv("NO_COLOR", "1")
-	for _, columns := range []string{"18", "120"} {
-		t.Run(columns, func(t *testing.T) {
-			t.Setenv("COLUMNS", columns)
-			logPath := filepath.Join(t.TempDir(), "a-very-long-log-directory", "long-stage-log.log")
-			if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(logPath, []byte(strings.Repeat("long activity 世界 ", 10)), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			query := func(uintptr) (int, error) { return 0, errors.New("not attached to a terminal") }
-			maxWidth, _ := strconv.Atoi(columns)
-			if maxWidth < 40 {
-				output := newHeartbeatTestWriter()
-				progress := startProgressWithWidthQuery(output, true, "a very long stage name", 4, logPath, 10*time.Millisecond, time.Hour, query)
-				output.waitForHeartbeats(t, 1)
-				progress.finish(nil)
-				got := output.String()
-				if progress.terminal || strings.Contains(got, "\033") || strings.Contains(got, "\r") {
-					t.Fatalf("narrow terminal should use plain heartbeat output: %q", got)
-				}
-				if !strings.Contains(got, "Running a very long stage name attempt 4/4") || !strings.Contains(got, "Progress a very long stage name attempt 4/4 after") {
-					t.Fatalf("narrow fallback missing start or heartbeat: %q", got)
-				}
-				return
-			}
-			var output strings.Builder
-			progress := startProgressWithWidthQuery(&output, true, "a very long stage name", 4, logPath, time.Hour, time.Hour, query)
-			progress.finish(nil)
-			got := output.String()
-			rows := strings.SplitN(got, "\n", progressCardRows+1)
-			if len(rows) < progressCardRows+1 {
-				t.Fatalf("missing card rows: %q", got)
-			}
-			for i, row := range rows[:progressCardRows] {
-				if width := progressTextWidth(row); width > maxWidth-1 {
-					t.Errorf("card row %d width = %d, terminal allows %d: %q", i, width, maxWidth-1, row)
-				}
-			}
-			if !strings.Contains(rows[progressCardRows-1], "log:") {
-				t.Errorf("bottom row should identify the shortened log path: %q", rows[progressCardRows-1])
-			}
-		})
-	}
-}
-
-func TestResolveProgressWidthPrefersTerminalQueryAndFallsBackSafely(t *testing.T) {
-	query := func(uintptr) (int, error) { return 63, nil }
-	widthFile, err := os.CreateTemp(t.TempDir(), "progress-width")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer widthFile.Close()
-	if got := resolveProgressWidth(widthFile, query, "120"); got != 63 {
-		t.Fatalf("terminal query width = %d, want 63", got)
-	}
-
-	t.Setenv("TERM", "xterm")
-	t.Setenv("COLUMNS", "120")
-	t.Setenv("NO_COLOR", "1")
-	queries := 0
-	outputFile, err := os.CreateTemp(t.TempDir(), "progress-output")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer outputFile.Close()
-	wantFD := outputFile.Fd()
-	var queriedFD uintptr
-	progress := startProgressWithWidthQuery(outputFile, true, "build", 1, "", time.Hour, time.Hour, func(fd uintptr) (int, error) {
-		queries++
-		queriedFD = fd
-		return 42, nil
-	})
-	progress.finish(nil)
-	if _, err := outputFile.Seek(0, 0); err != nil {
-		t.Fatal(err)
-	}
-	output, err := os.ReadFile(outputFile.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	rows := strings.SplitN(string(output), "\n", progressCardRows+1)
-	if queries != 1 || queriedFD != wantFD || progress.width != 42 || len(rows) < progressCardRows {
-		t.Fatalf("terminal query did not use the output descriptor once before rendering: queries=%d fd=%d want=%d width=%d output=%q", queries, queriedFD, wantFD, progress.width, output)
-	}
-	for i, row := range rows[:progressCardRows] {
-		if width := progressTextWidth(row); width > 41 {
-			t.Errorf("card row %d width = %d, exceeds queried terminal width minus reserved column: %q", i, width, row)
+func stripProgressANSI(text string) string {
+	var out strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] == '\033' {
+			i = skipProgressEscape(text, i)
+			continue
 		}
+		out.WriteByte(text[i])
+		i++
 	}
-	failedQuery := func(uintptr) (int, error) { return 0, errors.New("ioctl failed") }
-	for _, test := range []struct {
-		columns string
-		want    int
-	}{{"48", 48}, {"invalid", progressDefaultWidth}, {"0", progressDefaultWidth}} {
-		if got := resolveProgressWidth(widthFile, failedQuery, test.columns); got != test.want {
-			t.Errorf("resolveProgressWidth(%q) = %d, want %d", test.columns, got, test.want)
-		}
-	}
+	return out.String()
 }
 
-func TestProgressWidthQueryRequiresTerminalAndFileOutput(t *testing.T) {
-	t.Setenv("TERM", "xterm")
-	t.Setenv("COLUMNS", "72")
-	queryCalls := 0
-	query := func(uintptr) (int, error) {
-		queryCalls++
-		return 120, nil
-	}
-
-	var mockOutput strings.Builder
-	progress := startProgressWithWidthQuery(&mockOutput, true, "build", 1, "", time.Hour, time.Hour, query)
-	progress.finish(nil)
-	if queryCalls != 0 || progress.width != 72 || !progress.terminal {
-		t.Fatalf("non-file writer should use COLUMNS without querying: calls=%d width=%d terminal=%v", queryCalls, progress.width, progress.terminal)
-	}
-
-	file, err := os.CreateTemp(t.TempDir(), "progress-not-terminal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	progress = startProgressWithWidthQuery(file, false, "build", 1, "", time.Hour, time.Hour, query)
-	progress.finish(nil)
-	if queryCalls != 0 || progress.terminal {
-		t.Fatalf("non-terminal output should never query terminal width: calls=%d terminal=%v", queryCalls, progress.terminal)
-	}
-
-	t.Setenv("TERM", "dumb")
-	progress = startProgressWithWidthQuery(file, true, "build", 1, "", time.Hour, time.Hour, query)
-	progress.finish(nil)
-	if queryCalls != 0 || progress.terminal {
-		t.Fatalf("TERM=dumb should never query terminal width: calls=%d terminal=%v", queryCalls, progress.terminal)
-	}
-}
-
-func TestProgressCardAllocatesTwoColumnsForWatchEmoji(t *testing.T) {
-	got := progressCardRow("⌚x", 6)
-	if want := "│⌚x   │"; got != want {
-		t.Fatalf("progressCardRow with watch emoji = %q, want %q", got, want)
-	}
-}
-
-func TestReadProgressLogBoundsAndLimitsDisplayedLines(t *testing.T) {
-	logPath := filepath.Join(t.TempDir(), "large.log")
-	content := strings.Repeat("discarded output\n", progressTailBytes) + "latest one\nlatest two\nlatest three\nlatest four\n"
-	if err := os.WriteFile(logPath, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	lines := readProgressLog(logPath)
-	if len(lines) != progressLogLines {
-		t.Fatalf("readProgressLog returned %d lines, want %d: %#v", len(lines), progressLogLines, lines)
-	}
-	if strings.Join(lines, "|") != "latest two|latest three|latest four" {
-		t.Fatalf("readProgressLog returned wrong tail: %#v", lines)
-	}
-}
+func itoa(n int) string { return string(rune('0' + n)) }
