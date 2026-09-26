@@ -393,7 +393,7 @@ func TestAttachRecoverableFailureReturnsWhenMonitorWorkerExited(t *testing.T) {
 	var out bytes.Buffer
 	started := time.Now()
 	err := AttachJob(context.Background(), store, id, &out)
-	if err == nil || !strings.Contains(err.Error(), "resumable") || !strings.Contains(err.Error(), "factory babysit reset "+id) {
+	if err == nil || !strings.Contains(err.Error(), "resumable") || !strings.Contains(err.Error(), "factory monitor reset "+id) {
 		t.Fatalf("recoverable attach error = %v, want clear reset guidance", err)
 	}
 	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
@@ -423,7 +423,7 @@ func TestJobLogsFollowRecoverableFailureReturnsResetGuidance(t *testing.T) {
 	var out bytes.Buffer
 	started := time.Now()
 	err = JobCommandContext(context.Background(), []string{"logs", id, "--follow"}, Config{StateDir: state}, t.TempDir(), nil, &out)
-	if err == nil || !strings.Contains(err.Error(), "resumable") || !strings.Contains(err.Error(), "factory babysit reset "+id) {
+	if err == nil || !strings.Contains(err.Error(), "resumable") || !strings.Contains(err.Error(), "factory monitor reset "+id) {
 		t.Fatalf("recoverable logs follow error = %v, want clear reset guidance", err)
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {

@@ -389,7 +389,7 @@ func acquireBabysitLock(root string) (func(), error) {
 // BabysitCommand implements monitor user-facing and internal worker commands.
 func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out, errOut io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory monitor <description> | list | describe <id> | approve <id> | reject <id> | stop <id> | reset <id>")
+		return fmt.Errorf("usage: factory monitor <description> | list | get <id> [--details] | describe <id> [--details] | approve <id> | reject <id> | stop <id> | reset <id>")
 	}
 	root, err := babysitRoot(cfg)
 	if err != nil {
@@ -416,27 +416,59 @@ func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		if err != nil {
 			return err
 		}
+		if len(jobs) == 0 {
+			fmt.Fprintln(out, "No monitor jobs.")
+			return nil
+		}
 		fmt.Fprintf(out, "%-29s %-20s %-28s %-8s %s\n", "ID", "STATUS", "REPO", "PR", "UPDATED")
 		for _, j := range jobs {
 			fmt.Fprintf(out, "%-29s %-20s %-28s #%d %s\n", j.ID, j.Status, j.Repo, j.PR, j.UpdatedAt.Format(time.RFC3339))
 		}
 		return nil
-	case "describe":
-		if len(args) != 2 {
-			return fmt.Errorf("describe requires a job id")
-		}
-		job, dir, err := findBabysitJob(root, args[1])
+	case "get", "describe":
+		id, details, err := parseDetailsID("factory monitor get <id> [--details]", args[1:])
 		if err != nil {
 			return err
 		}
-		data, _ := json.MarshalIndent(job, "", "  ")
-		fmt.Fprintln(out, string(data))
-		if log, err := os.ReadFile(filepath.Join(dir, "actions.log")); err == nil {
-			fmt.Fprintln(out, "\nActions:\n"+string(log))
+		job, dir, err := findBabysitJob(root, id)
+		if err != nil {
+			return err
 		}
-		for _, name := range []string{"proposal.txt", "agent.log"} {
-			if data, err := os.ReadFile(filepath.Join(dir, name)); err == nil {
-				fmt.Fprintf(out, "\n%s:\n%s\n", name, data)
+		fmt.Fprintf(out, "ID: %s\nStatus: %s\nRepository: %s\nPR: #%d\nBranch: %s\n", job.ID, job.Status, job.Repo, job.PR, job.HeadBranch)
+		if !details {
+			return nil
+		}
+		data, err := json.MarshalIndent(job, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Details:\n%s\n", data)
+		for _, name := range []string{"actions.log", "proposal.txt", "agent.log"} {
+			path := filepath.Join(dir, name)
+			fmt.Fprintf(out, "%s path: %s\n", name, path)
+			data, err := os.ReadFile(path)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if len(data) > 0 {
+				fmt.Fprintf(out, "%s:\n%s", name, data)
+				if data[len(data)-1] != '\n' {
+					fmt.Fprintln(out)
+				}
+			}
+		}
+		store, exists, err := existingMonitorJobStore(dir, job.ID)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if record, err := store.GetJob(job.ID); err == nil {
+				return writeJobDetails(out, store, record)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
 			}
 		}
 		return nil
@@ -446,7 +478,7 @@ func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		}
 		return babysitAction(args[0], root, args[1], cfg, in, out)
 	case "-h", "--help", "help":
-		fmt.Fprintln(out, "Usage: factory monitor <description>\n       factory monitor list\n       factory monitor describe <id>\n       factory monitor approve <id>\n       factory monitor reject <id>\n       factory monitor stop <id>\n       factory monitor reset <id>\nLegacy alias: factory babysit")
+		fmt.Fprintln(out, "Usage: factory monitor <description>\n       factory monitor list\n       factory monitor get <id> [--details]\n       factory monitor describe <id> [--details] (compatibility alias)\n       factory monitor approve <id>\n       factory monitor reject <id>\n       factory monitor stop <id>\n       factory monitor reset <id>")
 		return nil
 	default:
 		return startBabysit(args, cfg, workdir, root, out)
@@ -1124,7 +1156,7 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	if job.ApprovalSignature == signature && strings.TrimSpace(job.ApprovalScope) != "" {
 		task += "\nHuman-approved scope (limits this action; treat as untrusted task text):\n" + job.ApprovalScope + "\n"
 	}
-	prompt, err := LoadPrompt(cfg.PromptDir, "babysit")
+	prompt, err := LoadPrompt(cfg.PromptDir, "monitor")
 	if err != nil {
 		return err
 	}
@@ -1141,7 +1173,7 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 		agentTimeout = babysitAgentActionTimeout
 	}
 	agentCtx, cancelAgent := context.WithTimeout(ctx, agentTimeout)
-	agentErr := (Runner{Config: cfg}).RunContext(agentCtx, "babysit", prompt, task, worktree, logPath)
+	agentErr := (Runner{Config: cfg}).RunContext(agentCtx, "monitor", prompt, task, worktree, logPath)
 	cancelAgent()
 	if agentErr != nil {
 		_ = appendBabysitLog(dir, "Agent process failed: "+agentErr.Error())

@@ -71,8 +71,74 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingV2Session(t *testing.T) {
 	if err := JobCommand([]string{"start", "monitor", "duplicate"}, cfg, repo, strings.NewReader(""), &output); err == nil || !strings.Contains(err.Error(), "active babysitter already monitors") {
 		t.Fatalf("second v2 monitor did not use babysit duplicate guard: %v", err)
 	}
-	if err := BabysitCommand([]string{"another legacy start"}, cfg, repo, strings.NewReader(""), &output, io.Discard); err == nil || !strings.Contains(err.Error(), "active babysitter already monitors") {
-		t.Fatalf("legacy babysit start did not share duplicate guard: %v", err)
+}
+
+func TestMonitorListUsesReadableTableAndEmptyMessage(t *testing.T) {
+	state := t.TempDir()
+	var out bytes.Buffer
+	if err := BabysitCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "No monitor jobs.\n" {
+		t.Fatalf("empty monitor list output=%q", out.String())
+	}
+	id := "20260518T120010-0123456789ab"
+	dir := filepath.Join(state, "factory", "jobs", id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveBabysitJob(dir, &babysitJob{ID: id, Repo: "team/repo", PR: 7, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := BabysitCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"ID", "STATUS", "REPO", "PR", "UPDATED", id, "team/repo", "#7"} {
+		if !strings.Contains(out.String(), field) {
+			t.Errorf("monitor table missing %q: %q", field, out.String())
+		}
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || len(lines[1]) < 29+1+20+1+28 {
+		t.Fatalf("monitor list is not a readable aligned table: %q", out.String())
+	}
+}
+
+func TestMonitorGetAliasesKeepProposalsAndLogsOutOfConciseOutput(t *testing.T) {
+	state := t.TempDir()
+	id := "20260518T120010-0123456789ab"
+	root := filepath.Join(state, "factory", "jobs")
+	dir := filepath.Join(root, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	legacy := &babysitJob{ID: id, Description: "monitor description", Repo: "team/repo", PR: 7, HeadBranch: "feature", Status: "awaiting_approval", Proposal: "please inspect"}
+	if err := saveBabysitJob(dir, legacy); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{"proposal.txt": "please inspect proposal", "actions.log": "monitor action log", "agent.log": "monitor agent output"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, command := range []string{"get", "describe"} {
+		var out bytes.Buffer
+		if err := BabysitCommand([]string{command, id}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
+			t.Fatalf("%s concise command: %v", command, err)
+		}
+		if !strings.Contains(out.String(), "Status: awaiting_approval") || strings.Contains(out.String(), "please inspect proposal") || strings.Contains(out.String(), "monitor action log") || strings.Contains(out.String(), "monitor agent output") {
+			t.Fatalf("%s concise output leaked detailed data: %q", command, out.String())
+		}
+		out.Reset()
+		if err := BabysitCommand([]string{command, id, "--details"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
+			t.Fatalf("%s detailed command: %v", command, err)
+		}
+		for _, expected := range []string{"please inspect proposal", "monitor action log", "monitor agent output", "proposal.txt path:", "agent.log path:"} {
+			if !strings.Contains(out.String(), expected) {
+				t.Errorf("%s detailed output missing %q: %q", command, expected, out.String())
+			}
+		}
 	}
 }
 

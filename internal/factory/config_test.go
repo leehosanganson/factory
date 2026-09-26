@@ -169,17 +169,23 @@ func TestConfigPathHonorsXDGAndRequiresAbsolute(t *testing.T) {
 	}
 }
 
-func TestLoadBabysitPromptExternalOverrideAndEmbeddedFallback(t *testing.T) {
+func TestLoadMonitorPromptExternalOverridesAndEmbeddedFallback(t *testing.T) {
 	dir := t.TempDir()
-	prompt, err := LoadPrompt(dir, "babysit")
+	prompt, err := LoadPrompt(dir, "monitor")
 	if err != nil || !strings.Contains(prompt, "FACTORY_STATUS=FIXED") || !strings.Contains(prompt, "re-derives and validates") || !strings.Contains(prompt, "snapshot guards") {
-		t.Fatalf("embedded babysit prompt = %q, %v", prompt, err)
+		t.Fatalf("embedded monitor prompt = %q, %v", prompt, err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "babysit.md"), []byte(" custom babysit prompt "), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "babysit.md"), []byte(" legacy babysit prompt "), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := LoadPrompt(dir, "babysit"); err != nil || got != "custom babysit prompt" {
-		t.Fatalf("external babysit prompt = %q, %v", got, err)
+	if got, err := LoadPrompt(dir, "monitor"); err != nil || got != "legacy babysit prompt" {
+		t.Fatalf("legacy external babysit prompt = %q, %v", got, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "monitor.md"), []byte(" custom monitor prompt "), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := LoadPrompt(dir, "monitor"); err != nil || got != "custom monitor prompt" {
+		t.Fatalf("external monitor prompt = %q, %v", got, err)
 	}
 }
 

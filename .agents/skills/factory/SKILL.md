@@ -36,18 +36,18 @@ worker. Mention when recursion was avoided if it affects the chosen workflow.
 
 Choose the workflow that matches the work. `implement` is the canonical task
 workflow (`pipeline` remains an alias); `tidy` is the canonical clean workflow
-(`clean` remains an alias); `monitor` is the canonical detached PR monitor
-(`babysit` remains an alias, including management commands). Preserve the user's
-authority over scope and decisions; honor any enabled approval gate and never
-present automation as a substitute for review.
+(`clean` remains an alias); `monitor` is the canonical detached PR monitor.
+Preserve the user's authority over scope and decisions; honor any enabled
+approval gate and never present automation as a substitute for review.
 
 ## Detached implementation jobs
 
 `factory job` supports detached `implementation` and `monitor` types. Monitor
 jobs use the existing babysit engine and share its PR-specific duplicate guard;
-`factory monitor` uses the existing babysit engine. The legacy `factory
-babysit` command and its management subcommands remain available. Current job
-commands are:
+`factory monitor` uses the existing monitor engine. The removed `factory
+babysit` CLI command is not an alias; legacy babysit-named persisted metadata,
+configuration, and environment-variable identifiers remain for compatibility.
+Current job commands are:
 
 ```text
 factory job start implementation <description>
@@ -67,7 +67,7 @@ job-level `workflow` session; monitor jobs use
 the babysit ID for the v2 job and `monitor` session. Generic and legacy stop and
 reset operations interoperate. These commands are distinct from the supported
 `factory monitor list/describe/approve/reject/stop/reset` management commands
-below; the legacy `factory babysit` alias remains available.
+below.
 
 ## Choose the right workflow
 
@@ -78,10 +78,10 @@ below; the legacy `factory babysit` alias remains available.
   successful agent-process exit; there is no independent correctness
   evaluation. Approval prompts are off by default; use `--gate`
   for explicit human approval between stages.
-- Use **monitor** (legacy alias: **babysit**) only for routine, low-risk fixes
-  to an existing open pull request: failed checks, concrete review comments, or
-  relevant PR/check snapshot changes. It monitors that PR in a detached,
-  isolated worktree and may automatically commit and push a verified routine fix.
+- Use **monitor** only for routine, low-risk fixes to an existing open pull
+  request: failed checks, concrete review comments, or relevant PR/check
+  snapshot changes. It monitors that PR in a detached, isolated worktree and may
+  automatically commit and push a verified routine fix.
 - Do not use monitor as a general-purpose autonomous engineer, for ambiguous or
   high-impact decisions, to merge a PR, or as a security sandbox. Pause for
   human direction when the work exceeds a narrow, concrete routine fix.
@@ -195,7 +195,6 @@ Start from a clean checkout on the branch for the open PR:
 
 ```sh
 factory monitor address the failing test and concrete review feedback
-# Legacy alias: factory babysit address the failing test and concrete review feedback
 ```
 
 Factory validates the PR/repository and baseline, then launches a detached
@@ -228,7 +227,6 @@ factory monitor approve <id>
 factory monitor reject <id>
 factory monitor stop <id>
 factory monitor reset <id>
-# All management commands also remain available as `factory babysit ...`.
 ```
 
 `describe` includes job details and available logs/proposals. `approve` asks for

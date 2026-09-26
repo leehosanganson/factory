@@ -19,7 +19,7 @@ func TestRunnerRunContextStopsAgentWhenCanceled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunContext(ctx, "babysit", "prompt", "task", dir, filepath.Join(dir, "agent.log"))
+	err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunContext(ctx, "monitor", "prompt", "task", dir, filepath.Join(dir, "agent.log"))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("canceled agent error = %v, want context deadline exceeded", err)
 	}

@@ -426,7 +426,7 @@ func (a *parallelWorkflowAgent) RunWithOutputContext(ctx context.Context, stage,
 
 func initTestGitRepo(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := canonicalTestPath(t, t.TempDir())
 	for _, args := range [][]string{{"init", "-q", dir}, {"-C", dir, "config", "user.email", "factory-test@example.invalid"}, {"-C", dir, "config", "user.name", "Factory Test"}} {
 		cmd := exec.Command("git", args...)
 		if output, err := cmd.CombinedOutput(); err != nil {

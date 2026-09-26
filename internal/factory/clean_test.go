@@ -257,7 +257,7 @@ func TestCleanGitAtReceivesOriginalAndIsolatedWorkdirs(t *testing.T) {
 	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
 	var workdirs []string
 	workflow.GitAt = func(ctx context.Context, workdir, name string, args ...string) ([]byte, error) {
-		workdirs = append(workdirs, filepath.Clean(workdir))
+		workdirs = append(workdirs, canonicalTestPath(t, workdir))
 		cmd := exec.CommandContext(ctx, name, args...)
 		cmd.Dir = workdir
 		return cmd.Output()
@@ -267,8 +267,8 @@ func TestCleanGitAtReceivesOriginalAndIsolatedWorkdirs(t *testing.T) {
 	}
 	seenOriginal, seenIsolated := false, false
 	for _, workdir := range workdirs {
-		seenOriginal = seenOriginal || workdir == filepath.Clean(repo.work)
-		seenIsolated = seenIsolated || workdir != filepath.Clean(repo.work)
+		seenOriginal = seenOriginal || workdir == canonicalTestPath(t, repo.work)
+		seenIsolated = seenIsolated || workdir != canonicalTestPath(t, repo.work)
 	}
 	if !seenOriginal || !seenIsolated {
 		t.Fatalf("GitAt workdirs = %v, want original %q and isolated checkout", workdirs, repo.work)
@@ -2090,11 +2090,12 @@ func cleanTestWorkflow(work string, agent Agent) CleanWorkflow {
 			if err != nil {
 				return "", nil, err
 			}
-			cleanTestWorkdirs.Store(filepath.Clean(target), path)
+			key := canonicalCleanTestKey(target)
+			cleanTestWorkdirs.Store(key, path)
 
 			wrappedCleanup := func() error {
-				defer cleanTestWorkdirs.Delete(filepath.Clean(target))
-				defer cleanTestPublishing.Delete(filepath.Clean(target))
+				defer cleanTestWorkdirs.Delete(key)
+				defer cleanTestPublishing.Delete(key)
 				return cleanup()
 			}
 			switch a := agent.(type) {
@@ -2116,7 +2117,7 @@ var cleanTestWorkdirScopes sync.Map
 var cleanTestPublishing sync.Map
 
 func cleanTestGitScope(target string, args []string) func() {
-	key := filepath.Clean(target)
+	key := canonicalCleanTestKey(target)
 	if _, ok := cleanTestWorkdirs.Load(key); !ok {
 		return func() {}
 	}
@@ -2140,7 +2141,7 @@ func cleanTestGitScope(target string, args []string) func() {
 }
 
 func cleanTestWorkdir(target string) string {
-	key := filepath.Clean(target)
+	key := canonicalCleanTestKey(target)
 	if _, publishing := cleanTestPublishing.Load(key); publishing {
 		return target
 	}
@@ -2148,6 +2149,14 @@ func cleanTestWorkdir(target string) string {
 		return path.(string)
 	}
 	return target
+}
+
+func canonicalCleanTestKey(path string) string {
+	resolved, err := canonicalPath(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return resolved
 }
 
 type stdoutProtocolTestAgent struct {

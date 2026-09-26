@@ -61,10 +61,10 @@ func TestHelpAndMonitorUsage(t *testing.T) {
 	}
 	help := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
 	for _, want := range []string{
-		"factory version", "build version", "defaults to dev", "factory implement", "factory tidy", "factory monitor", "factory pipeline", "factory clean", "factory babysit",
+		"factory version", "build version", "defaults to dev", "factory implement", "factory tidy", "factory monitor", "factory pipeline", "factory clean",
 		"factory run list", "factory run stop", "factory job start implementation", "factory job start monitor",
-		"factory monitor list", "factory babysit", "factory run events", "factory job attach", "-h, --help",
-		"babysit", "make clean", "origin/<branch>", "only if that remote branch does not already exist",
+		"factory monitor list", "factory run events", "factory job attach", "-h, --help",
+		"make clean", "origin/<branch>", "only if that remote branch does not already exist",
 		"pristine mode", "dirty safe mode", "does not stage, commit, or push", "does not require an upstream or origin",
 		"not an independent correctness evaluation", "each agent stage runs once", "30-minute active agent-execution budget",
 		"no overall job deadline", "agent_timeout (default 60m)", "exact lowercase yes", "optional placeholders: {workdir} and {stage}",
@@ -74,17 +74,90 @@ func TestHelpAndMonitorUsage(t *testing.T) {
 			t.Errorf("help missing %q: %s", want, out.String())
 		}
 	}
+	if strings.Contains(help, "factory babysit") {
+		t.Fatalf("public help must not advertise the removed babysit alias: %s", out.String())
+	}
 	if strings.Contains(help, "retry") {
 		t.Fatalf("help must not make retry claims: %s", out.String())
 	}
 	if err := run([]string{"job", "start", "clean", "unsupported"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "unsupported job type") {
 		t.Fatalf("clean job type should remain unsupported: err=%v", err)
 	}
-	for _, command := range []string{"monitor", "babysit"} {
-		err := run([]string{command}, strings.NewReader(""), &out, &errOut)
-		if err == nil || !strings.Contains(err.Error(), "usage: factory monitor <description>") || !strings.Contains(err.Error(), "reset <id>") {
-			t.Fatalf("%s should show canonical monitor usage including reset: err=%v", command, err)
+	err := run([]string{"monitor"}, strings.NewReader(""), &out, &errOut)
+	if err == nil || !strings.Contains(err.Error(), "usage: factory monitor <description>") || !strings.Contains(err.Error(), "reset <id>") {
+		t.Fatalf("monitor should show canonical usage including reset: err=%v", err)
+	}
+	if err := run([]string{"babysit"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), `unknown command "babysit"`) {
+		t.Fatalf("removed public babysit command should be rejected: err=%v", err)
+	}
+}
+
+func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
+	configHome := t.TempDir()
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte("not valid config"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateHome := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_STATE_HOME", stateHome)
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+		omit []string
+	}{
+		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}},
+		{name: "pipeline alias", args: []string{"pipeline", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}},
+		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean", "Dirty safe mode"}, omit: []string{"Detached jobs", "factory job", "Monitor management"}},
+		{name: "clean alias", args: []string{"clean", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean"}},
+		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"factory job start implementation", "factory job start monitor"}, omit: []string{"factory run", "Monitor management"}},
+		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "show remains an alias"}, omit: []string{"factory job start", "factory run"}},
+		{name: "job show alias", args: []string{"job", "show", "--help"}, want: []string{"factory job get", "--details", "show remains an alias"}},
+		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"factory run events"}, omit: []string{"factory job", "Monitor management"}},
+		{name: "run show alias", args: []string{"run", "show", "--help"}, want: []string{"factory run get", "--details", "show remains an alias"}},
+		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "describe remains an alias"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			if err := run(tc.args, strings.NewReader(""), &out, &errOut); err != nil {
+				t.Fatalf("help with invalid config: %v", err)
+			}
+			text := strings.Join(strings.Fields(out.String()), " ")
+			if errOut.Len() != 0 {
+				t.Fatalf("help wrote stderr: %q", errOut.String())
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(text, want) {
+					t.Errorf("help missing %q: %s", want, text)
+				}
+			}
+			for _, omitted := range tc.omit {
+				if strings.Contains(text, omitted) {
+					t.Errorf("focused help unexpectedly includes %q: %s", omitted, text)
+				}
+			}
+		})
+	}
+	if err := os.Remove(filepath.Join(factoryConfig, "config.json")); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"tidy", "--help"}, {"job", "list", "--help"}, {"run", "list", "--help"}, {"monitor", "list", "--help"}} {
+		var out bytes.Buffer
+		if err := run(args, strings.NewReader(""), &out, io.Discard); err != nil || out.Len() == 0 {
+			t.Errorf("help %v with no config: output=%q err=%v", args, out.String(), err)
 		}
+	}
+	entries, err := os.ReadDir(filepath.Join(stateHome, "factory"))
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("help started work or created state: %v", entries)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("inspect state after help: %v", err)
 	}
 }
 
@@ -555,7 +628,10 @@ func TestImplementAndPipelineDefaultToAttachedImplementationJob(t *testing.T) {
 	for _, name := range []string{"implement", "pipeline"} {
 		t.Run(name, func(t *testing.T) {
 			state := t.TempDir()
-			target := t.TempDir()
+			target, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
 			configDir := filepath.Join(t.TempDir(), "config", "factory")
 			if err := os.MkdirAll(configDir, 0o700); err != nil {
 				t.Fatal(err)
@@ -631,7 +707,7 @@ func TestPipelineArgumentsBecomeTaskWithoutPrompt(t *testing.T) {
 	}
 }
 
-func TestBabysitListAndDescribePersistedMetadata(t *testing.T) {
+func TestMonitorListAndDescribePersistedMetadata(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)
 	_ = factory.DefaultConfig()
@@ -649,28 +725,21 @@ func TestBabysitListAndDescribePersistedMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	if err := run([]string{"babysit", "list"}, strings.NewReader(""), &out, &errOut); err != nil {
-		t.Fatal(err)
-	}
-	legacyList := out.String()
-	if !strings.Contains(legacyList, id) || !strings.Contains(legacyList, "owner/repo") {
-		t.Fatalf("list omitted persisted job: %s", legacyList)
-	}
-	out.Reset()
 	if err := run([]string{"monitor", "list"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
-	if out.String() != legacyList {
-		t.Fatalf("monitor list differs from legacy babysit list: monitor=%q babysit=%q", out.String(), legacyList)
+	monitorList := out.String()
+	if !strings.Contains(monitorList, id) || !strings.Contains(monitorList, "owner/repo") {
+		t.Fatalf("list omitted persisted job: %s", monitorList)
 	}
 	out.Reset()
-	if err := run([]string{"babysit", "describe", id}, strings.NewReader(""), &out, &errOut); err != nil {
+	if err := run([]string{"monitor", "describe", id, "--details"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "watch task") || !strings.Contains(out.String(), "worker started") {
 		t.Fatalf("describe omitted metadata/log: %s", out.String())
 	}
-	if err := run([]string{"babysit", "describe", "../escape"}, strings.NewReader(""), &out, &errOut); err == nil {
+	if err := run([]string{"monitor", "describe", "../escape"}, strings.NewReader(""), &out, &errOut); err == nil {
 		t.Fatal("unsafe job id accepted")
 	}
 }

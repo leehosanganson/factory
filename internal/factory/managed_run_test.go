@@ -57,12 +57,16 @@ func TestRunCommandListsShowsEventsAndCooperativelyStopsOnlyManagedRuns(t *testi
 
 	var out bytes.Buffer
 	cfg := Config{StateDir: stateRoot}
-	if err := RunCommand(context.Background(), []string{"list"}, cfg, &out); err != nil || !strings.Contains(out.String(), state.ID+"\trunning\theartbeat_fresh") {
+	if err := RunCommand(context.Background(), []string{"list"}, cfg, &out); err != nil || !strings.Contains(out.String(), "ID") || !strings.Contains(out.String(), "LIVENESS") || !strings.Contains(out.String(), state.ID) || !strings.Contains(out.String(), "heartbeat_fresh") {
 		t.Fatalf("list output=%q err=%v", out.String(), err)
 	}
 	out.Reset()
-	if err := RunCommand(context.Background(), []string{"show", state.ID}, cfg, &out); err != nil || !strings.Contains(out.String(), "Liveness: heartbeat_fresh") {
+	if err := RunCommand(context.Background(), []string{"show", state.ID}, cfg, &out); err != nil || !strings.Contains(out.String(), "Liveness: heartbeat_fresh") || strings.Contains(out.String(), "Description:") {
 		t.Fatalf("show output=%q err=%v", out.String(), err)
+	}
+	out.Reset()
+	if err := RunCommand(context.Background(), []string{"get", state.ID, "--details"}, cfg, &out); err != nil || !strings.Contains(out.String(), "Description: gated task") || !strings.Contains(out.String(), "workflow-events.jsonl path:") || !strings.Contains(out.String(), `"stage":"requirements"`) {
+		t.Fatalf("detailed get output=%q err=%v", out.String(), err)
 	}
 	out.Reset()
 	if err := RunCommand(context.Background(), []string{"events", state.ID}, cfg, &out); err != nil || !strings.Contains(out.String(), `"stage":"requirements"`) {
@@ -180,6 +184,23 @@ func TestManagedWorkflowRequiresApprovalGate(t *testing.T) {
 	workflow := Workflow{Managed: true, Config: Config{}, Workdir: t.TempDir(), In: strings.NewReader(""), Out: io.Discard}
 	if err := workflow.Run("task"); err == nil || !strings.Contains(err.Error(), "reserved for gated") {
 		t.Fatalf("ungated managed workflow error = %v", err)
+	}
+}
+
+func TestRunListEmptyIsHumanReadable(t *testing.T) {
+	var out bytes.Buffer
+	if err := RunCommand(context.Background(), []string{"list"}, Config{StateDir: t.TempDir()}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "No gated runs.\n" {
+		t.Fatalf("empty run list output=%q", out.String())
+	}
+	out.Reset()
+	if err := RunCommand(context.Background(), []string{"list"}, Config{StateDir: t.TempDir()}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "No gated runs.\n" {
+		t.Fatalf("run list containing only unmanaged state output=%q", out.String())
 	}
 }
 

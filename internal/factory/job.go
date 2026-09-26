@@ -28,7 +28,7 @@ func JobCommand(args []string, cfg Config, target string, in io.Reader, out io.W
 // stops this observer; it never signals the detached worker.
 func JobCommandContext(ctx context.Context, args []string, cfg Config, target string, in io.Reader, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory job start <type> <description> | list | show <id> | logs <id> [--session <id>] [--follow] | attach <id> | stop <id>")
+		return fmt.Errorf("usage: factory job start <type> <description> | list | get <id> [--details] | show <id> [--details] | logs <id> [--session <id>] [--follow] | attach <id> | stop <id>")
 	}
 	root, err := JobStateRoot(cfg.StateDir)
 	if err != nil {
@@ -75,27 +75,20 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			fmt.Fprintln(out, "No jobs.")
 			return nil
 		}
-		for _, job := range jobs {
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", job.ID, job.Type, job.Status, job.TaskDescription)
-		}
+		writeJobTable(out, jobs)
 		return err
-	case "show":
-		if len(args) != 2 {
-			return fmt.Errorf("usage: factory job show <id>")
-		}
-		job, err := store.reconcileJob(args[1])
+	case "get", "show":
+		id, details, err := parseDetailsID("factory job get <id> [--details]", args[1:])
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "ID: %s\nType: %s\nStatus: %s\nTarget: %s\nDescription: %s\nCreated: %s\nUpdated: %s\n", job.ID, job.Type, job.Status, job.TargetPath, job.TaskDescription, job.CreatedAt.Format(time.RFC3339), job.UpdatedAt.Format(time.RFC3339))
-		if !job.StartedAt.IsZero() {
-			fmt.Fprintf(out, "Started: %s\n", job.StartedAt.Format(time.RFC3339))
+		job, err := store.reconcileJob(id)
+		if err != nil {
+			return err
 		}
-		if !job.EndedAt.IsZero() {
-			fmt.Fprintf(out, "Ended: %s\n", job.EndedAt.Format(time.RFC3339))
-		}
-		for _, session := range job.Sessions {
-			fmt.Fprintf(out, "Session: %s\t%s\n", session.ID, session.Status)
+		writeJobSummary(out, job, details)
+		if details {
+			return writeJobDetails(out, store, job)
 		}
 		return nil
 	case "attach":
@@ -184,6 +177,81 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 	default:
 		return fmt.Errorf("unknown job command %q", args[0])
 	}
+}
+
+func parseDetailsID(usage string, args []string) (string, bool, error) {
+	if len(args) < 1 || len(args) > 2 {
+		return "", false, fmt.Errorf("usage: %s", usage)
+	}
+	if len(args) == 2 && args[1] != "--details" {
+		return "", false, fmt.Errorf("usage: %s", usage)
+	}
+	return args[0], len(args) == 2, nil
+}
+
+func writeJobTable(out io.Writer, jobs []JobRecord) {
+	const descriptionWidth = 56
+	fmt.Fprintf(out, "%-24s %-16s %-20s %-*s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "TARGET")
+	for _, job := range jobs {
+		description := strings.Join(strings.Fields(job.TaskDescription), " ")
+		runes := []rune(description)
+		if len(runes) > descriptionWidth {
+			description = string(runes[:descriptionWidth-1]) + "…"
+		}
+		fmt.Fprintf(out, "%-24s %-16s %-20s %-*s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, job.TargetPath)
+	}
+}
+
+func writeJobSummary(out io.Writer, job JobRecord, details bool) {
+	fmt.Fprintf(out, "ID: %s\nType: %s\nStatus: %s\n", job.ID, job.Type, job.Status)
+	if !details {
+		fmt.Fprintf(out, "Target: %s\n", job.TargetPath)
+		return
+	}
+	fmt.Fprintf(out, "Target: %s\nCreated: %s\nUpdated: %s\n", job.TargetPath, job.CreatedAt.Format(time.RFC3339), job.UpdatedAt.Format(time.RFC3339))
+	if !job.StartedAt.IsZero() {
+		fmt.Fprintf(out, "Started: %s\n", job.StartedAt.Format(time.RFC3339))
+	}
+	if !job.EndedAt.IsZero() {
+		fmt.Fprintf(out, "Ended: %s\n", job.EndedAt.Format(time.RFC3339))
+	}
+	fmt.Fprintf(out, "Description: %s\n", job.TaskDescription)
+	for _, session := range job.Sessions {
+		fmt.Fprintf(out, "Session: %s (%s)\n", session.ID, session.Status)
+	}
+}
+
+func writeJobDetails(out io.Writer, store *JobStore, job JobRecord) error {
+	paths := []struct{ label, path string }{}
+	jobLog, err := store.JobLogPath(job.ID)
+	if err != nil {
+		return err
+	}
+	paths = append(paths, struct{ label, path string }{"Job log", jobLog})
+	for _, session := range job.Sessions {
+		path, err := store.SessionLogPath(job.ID, session.ID)
+		if err != nil {
+			return err
+		}
+		paths = append(paths, struct{ label, path string }{"Session log " + session.ID, path})
+	}
+	for _, item := range paths {
+		fmt.Fprintf(out, "%s path: %s\n", item.label, item.path)
+		data, err := os.ReadFile(item.path)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if len(data) > 0 {
+			fmt.Fprintf(out, "%s:\n%s", item.label, data)
+			if data[len(data)-1] != '\n' {
+				fmt.Fprintln(out)
+			}
+		}
+	}
+	return nil
 }
 
 func StartImplementationJob(cfg Config, target, description string) (string, error) {

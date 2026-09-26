@@ -13,7 +13,7 @@ import (
 )
 
 func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -73,7 +73,7 @@ func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) 
 	}
 }
 
-func TestBabysitAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
+func TestMonitorAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		ctx         func() (context.Context, context.CancelFunc)
@@ -82,11 +82,11 @@ func TestBabysitAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
 		hangAt      string
 		maxElapsed  time.Duration
 	}{
-		{name: "configured agent timeout", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "100ms", hangAt: "babysit", maxElapsed: 3 * time.Second},
-		{name: "monitor action ceiling", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "3s", actionLimit: 100 * time.Millisecond, hangAt: "babysit", maxElapsed: time.Second},
+		{name: "configured agent timeout", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "100ms", hangAt: "monitor", maxElapsed: 3 * time.Second},
+		{name: "monitor action ceiling", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "3s", actionLimit: 100 * time.Millisecond, hangAt: "monitor", maxElapsed: time.Second},
 		{name: "parent cancellation", ctx: func() (context.Context, context.CancelFunc) {
 			return context.WithTimeout(context.Background(), 100*time.Millisecond)
-		}, timeout: "3s", hangAt: "babysit", maxElapsed: time.Second},
+		}, timeout: "3s", hangAt: "monitor", maxElapsed: time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			previousActionLimit := babysitAgentActionTimeout
@@ -118,7 +118,7 @@ func TestBabysitAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
 			}
 			script := filepath.Join(base, "agent")
 			scriptBody := `#!/bin/sh
-if [ "$HANG_AT" = babysit ]; then exec sleep 30; fi
+if [ "$HANG_AT" = monitor ]; then exec sleep 30; fi
 printf changed > tracked
 printf 'FACTORY_STATUS=FIXED\n'
 exit 0
@@ -139,10 +139,10 @@ exit 0
 			started := time.Now()
 			err = processBabysitEventContext(ctx, dir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}, AgentTimeout: tc.timeout}, &babysitSnapshot{HeadRefOID: head}, strings.Repeat("a", 64))
 			if err == nil {
-				t.Fatal("babysit agent unexpectedly completed")
+				t.Fatal("monitor agent unexpectedly completed")
 			}
 			if elapsed := time.Since(started); elapsed > tc.maxElapsed {
-				t.Fatalf("canceled babysit call took %s to return", elapsed)
+				t.Fatalf("canceled monitor call took %s to return", elapsed)
 			}
 		})
 	}
@@ -191,7 +191,7 @@ func TestOwnedLockReclaimsOnlyDeadOwners(t *testing.T) {
 }
 
 func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -234,7 +234,7 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 	agentStarted := filepath.Join(base, "agent-started")
 	t.Setenv("AGENT_STARTED", agentStarted)
 	agent := filepath.Join(base, "agent")
-	if err := os.WriteFile(agent, []byte("#!/bin/sh\nif [ \"$1\" = babysit ]; then touch \"$AGENT_STARTED\"; exec sleep 30; fi\n"), 0o700); err != nil {
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\nif [ \"$1\" = monitor ]; then touch \"$AGENT_STARTED\"; exec sleep 30; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	job := &babysitJob{ID: id, Description: "monitor", RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: head, OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
@@ -374,7 +374,7 @@ func TestBabysitIDsAndAtomicMetadata(t *testing.T) {
 }
 
 func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	gh := filepath.Join(base, "gh")
 	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -556,7 +556,7 @@ func TestBabysitChangedPathsIncludeStagedUntrackedAndNoRenameEndpoints(t *testin
 }
 
 func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -602,7 +602,7 @@ printf 'FACTORY_STATUS=APPROVAL_REQUIRED\n'
 }
 
 func TestBabysitFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -652,7 +652,7 @@ exit 1
 	agent := filepath.Join(base, "agent")
 	script := `#!/bin/sh
 stage="$1"
-if [ "$stage" = "babysit" ]; then
+if [ "$stage" = "monitor" ]; then
   printf 'after\n' > README.md
   printf 'FACTORY_STATUS=FIXED\n'
   exit 0
@@ -707,7 +707,7 @@ func TestBabysitBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			base := t.TempDir()
+			base := canonicalTestPath(t, t.TempDir())
 			bare := filepath.Join(base, "remote.git")
 			repo := filepath.Join(base, "repo")
 			runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -748,7 +748,7 @@ func TestBabysitBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 }
 
 func TestBabysitStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -878,7 +878,7 @@ type monitorPushFixture struct {
 
 func newMonitorPushFixture(t *testing.T) monitorPushFixture {
 	t.Helper()
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)

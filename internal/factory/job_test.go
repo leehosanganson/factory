@@ -14,7 +14,7 @@ import (
 
 func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	state := t.TempDir()
-	target := t.TempDir()
+	target := canonicalTestPath(t, t.TempDir())
 	script := filepath.Join(t.TempDir(), "fake-agent")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.2\ncase \"$2\" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 		return err == nil && isTerminalStatus(job.Status) && len(job.Sessions) == 1 && job.Sessions[0].Status == job.Status
 	})
 	job, err := store.GetJob(id)
-	if err != nil || job.Status != "complete" || job.Type != implementationJobType || job.TargetPath != target || job.TaskDescription != "exercise detached job" {
+	if err != nil || job.Status != "complete" || job.Type != implementationJobType || job.TargetPath != canonicalTestPath(t, target) || job.TaskDescription != "exercise detached job" {
 		t.Fatalf("job record = %+v, err=%v", job, err)
 	}
 	if len(job.Sessions) != 1 || job.Sessions[0].Status != "complete" {
@@ -95,6 +95,13 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	cliOutput.Reset()
 	if err := JobCommand([]string{"show", id}, Config{StateDir: state}, target, strings.NewReader(""), &cliOutput); err != nil || !strings.Contains(cliOutput.String(), "Status: complete") {
 		t.Fatalf("job show output=%q err=%v", cliOutput.String(), err)
+	}
+	if strings.Contains(cliOutput.String(), "requirements completed") || strings.Contains(cliOutput.String(), "Description:") {
+		t.Fatalf("concise job output leaked detailed content: %q", cliOutput.String())
+	}
+	cliOutput.Reset()
+	if err := JobCommand([]string{"get", id, "--details"}, Config{StateDir: state}, target, strings.NewReader(""), &cliOutput); err != nil || !strings.Contains(cliOutput.String(), "Description: exercise detached job") || !strings.Contains(cliOutput.String(), "requirements completed") || !strings.Contains(cliOutput.String(), "Job log path:") {
+		t.Fatalf("detailed job output=%q err=%v", cliOutput.String(), err)
 	}
 	events, err := store.SessionEvents(id, "workflow")
 	if err != nil || len(events) < 4 {
@@ -377,14 +384,19 @@ func TestJobListPrintsReadableJobsAlongsideReconciliationErrors(t *testing.T) {
 		t.Fatalf("job list error = %v, want both aggregate reconciliation errors", listErr)
 	}
 	got := output.String()
-	badWorkerLine := "bad-worker\t" + implementationJobType + "\trunning\tworker metadata is corrupt"
-	malformedWorkerLine := "bad-worker-metadata\t" + implementationJobType + "\trunning\tworker metadata is malformed"
-	goodJobLine := "good-job\t" + implementationJobType + "\tcomplete\tstill available"
-	if !strings.Contains(got, badWorkerLine) || !strings.Contains(got, malformedWorkerLine) || !strings.Contains(got, goodJobLine) {
-		t.Fatalf("job list omitted readable records despite reconciliation errors: %q", got)
+	badWorkerLine := "bad-worker"
+	malformedWorkerLine := "bad-worker-metadata"
+	goodJobLine := "good-job"
+	if !strings.Contains(got, "ID") || !strings.Contains(got, "DESCRIPTION") || !strings.Contains(got, "TARGET") ||
+		!strings.Contains(got, "worker metadata is corrupt") || !strings.Contains(got, "worker metadata is malformed") || !strings.Contains(got, "still available") {
+		t.Fatalf("job list omitted readable table records despite reconciliation errors: %q", got)
 	}
 	if strings.Index(got, badWorkerLine) > strings.Index(got, malformedWorkerLine) || strings.Index(got, malformedWorkerLine) > strings.Index(got, goodJobLine) {
 		t.Fatalf("job list records are not sorted newest first: %q", got)
+	}
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 4 || len(lines[1]) < 24+1+16+1+20+1+56 {
+		t.Fatalf("job list is not a human-readable aligned table: %q", got)
 	}
 }
 
@@ -395,6 +407,9 @@ func TestJobListSaysNoJobsWhenStoreIsEmpty(t *testing.T) {
 	}
 	if output.String() != "No jobs.\n" {
 		t.Fatalf("empty job list output = %q, want No jobs", output.String())
+	}
+	if err := JobCommand([]string{"get", "missing"}, Config{StateDir: t.TempDir()}, t.TempDir(), strings.NewReader(""), &output); err == nil {
+		t.Fatal("get accepted a missing job")
 	}
 }
 
@@ -437,7 +452,7 @@ func TestJobListReconcilesEveryStaleJobWithoutStealingLiveTargets(t *testing.T) 
 		if err != nil || job.Status != want {
 			t.Errorf("job %s after list = %+v err=%v, want status %s", id, job, err, want)
 		}
-		if !strings.Contains(output.String(), id+"\t"+implementationJobType+"\t"+want) {
+		if !strings.Contains(output.String(), id) || !strings.Contains(output.String(), want) {
 			t.Errorf("list output %q does not report %s as %s", output.String(), id, want)
 		}
 	}

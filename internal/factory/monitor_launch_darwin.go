@@ -1,4 +1,4 @@
-//go:build linux
+//go:build darwin
 
 package factory
 
@@ -19,10 +19,10 @@ func launchBabysitWorker(id, stateRoot string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	cmd := exec.Command(executable, "babysit", "--worker", id)
+	cmd := exec.Command(executable, "__monitor-worker", id)
 	cmd.Stdin = nil
 	cmd.Stdout, cmd.Stderr = log, log
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		_ = log.Close()
 		return 0, fmt.Errorf("start detached worker: %w", err)

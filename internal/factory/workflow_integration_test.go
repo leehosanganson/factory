@@ -67,7 +67,7 @@ func TestWorkflowIntegrationHelper(t *testing.T) {
 }
 
 func TestWorkflowIntegrationFailsAfterOneRunnerInvocationAndKeepsArtifactsOutsideTarget(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalTestPath(t, t.TempDir())
 	target := filepath.Join(base, "target")
 	state := filepath.Join(base, "state")
 	actualState := filepath.Join(base, "actual-state")
@@ -109,7 +109,7 @@ func TestWorkflowIntegrationFailsAfterOneRunnerInvocationAndKeepsArtifactsOutsid
 	if len(calls) != 1 || calls[0].Stage != "requirements" {
 		t.Fatalf("process calls = %+v, want one requirements invocation and no follow-up stages", calls)
 	}
-	if !strings.Contains(calls[0].Task, "Target repository: "+target) || !strings.Contains(calls[0].Task, task) {
+	if !strings.Contains(calls[0].Task, "Target repository: "+canonicalTestPath(t, target)) || !strings.Contains(calls[0].Task, task) {
 		t.Errorf("requirements did not receive target context and original task: %q", calls[0].Task)
 	}
 	canonicalState, err := canonicalPath(state)

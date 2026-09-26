@@ -1,18 +1,18 @@
 # Factory
 
-`factory` is a standard-library-only Go CLI with task (`factory implement`), clean/review/verify (`factory tidy`), and detached PR monitor (`factory monitor` or `factory job start monitor`) workflows. The legacy `pipeline`, `clean`, and `babysit` commands remain aliases. `implement` starts an implementation job and attaches to its output by default; `--gate` retains the interactive foreground workflow so approvals remain usable. The implementation workflow does not create branches or commits; `tidy` publishes generated changes only in pristine mode and has a non-publishing safe mode for initially dirty worktrees. Running `factory` with no subcommand remains an interactive alias for `factory implement`.
+`factory` is a standard-library-only Go CLI with task (`factory implement`), clean/review/verify (`factory tidy`), and detached PR monitor (`factory monitor` or `factory job start monitor`) workflows. The legacy `pipeline` and `clean` commands remain aliases. `implement` starts an implementation job and attaches to its output by default; `--gate` retains the interactive foreground workflow so approvals remain usable. The implementation workflow does not create branches or commits; `tidy` publishes generated changes only in pristine mode and has a non-publishing safe mode for initially dirty worktrees. Running `factory` with no subcommand remains an interactive alias for `factory implement`.
 
 Factory’s primary value is managing a durable workflow through sequential stages, from requirements to implementation, review, and documentation. Pi subagents complement that lifecycle by handling focused, bounded slices of work—often independent tasks that can run in parallel—and can be used within a Factory workflow where appropriate. Factory also supports opt-in parallel implementation; that capability does not replace its durable stage orchestration.
 
 ## Detached implementation jobs
 
-`factory job` supports detached `implementation` and `monitor` types. Jobs persist under the separate jobs/v2 state root. Implementation jobs serialize work against other Factory jobs for the same canonical target; monitor jobs use the existing detached babysit engine and its PR-specific duplicate guard. The legacy `factory babysit` commands retain their behavior and share their monitor lifecycle with the v2 record.
+`factory job` supports detached `implementation` and `monitor` types. Jobs persist under the separate jobs/v2 state root. Implementation jobs serialize work against other Factory jobs for the same canonical target; monitor jobs use the detached monitoring engine and its PR-specific duplicate guard.
 
 ```sh
 factory job start implementation <description>
 factory job start monitor <description>
 factory job list
-factory job show <id>
+factory job get <id> [--details]
 factory job logs <id>
 factory job logs <id> --session workflow
 factory job logs <id> --follow
@@ -20,7 +20,9 @@ factory job attach <id>
 factory job stop <id>
 ```
 
-`start` returns after launching the worker. Workflow events and worker output are retained in job/session logs. `attach` follows worker output to terminal state; Ctrl-C detaches only the observer, and the worker continues. Reattach later with the same command or use `job logs --follow`. `stop` writes a durable cooperative cancellation request; the worker polls it and cancels active work. Implementation sessions use one job-level `workflow` session. Monitor jobs use the babysit ID for both the v2 job and its `monitor` session; the existing `factory babysit stop/reset` commands remain available, and reset resumes that same v2 record and session.
+`start` returns after launching the worker. Workflow events and worker output are retained in job/session logs. `attach` follows worker output to terminal state; Ctrl-C detaches only the observer, and the worker continues. Reattach later with the same command or use `job logs --follow`. `stop` writes a durable cooperative cancellation request; the worker polls it and cancels active work. Implementation sessions use one job-level `workflow` session. Monitor jobs use the monitor ID for both the v2 job and its `monitor` session; `factory monitor stop/reset` operate on that same v2 record and session.
+
+Use `factory job get <id> [--details]` as the canonical inspection command; `factory job show <id>` remains a compatibility alias. The same interface applies to `factory run get <id> [--details]` (`run show` alias) and `factory monitor get <id> [--details]` (`monitor describe` alias). The agreed default is concise, tabulated output; `--details` exposes long descriptions, records, proposals, and logs. Current list output is tabulated and individual `get` output is concise labeled fields; tabulating those individual summaries remains outstanding.
 
 ## Requirements
 
@@ -50,7 +52,7 @@ CI runs on pull requests targeting `main` and pushes to `main`. Releases are sep
 
 ## Interactive task workflow
 
-Run `factory implement` from the repository to change (`factory pipeline` remains a legacy alias). By default it starts a durable implementation job and attaches to its output until completion. Ctrl-C detaches the terminal observer without stopping the job; use `factory job attach <id>` to reattach or `factory job stop <id>` to request cancellation. Gated foreground runs are managed with `factory run list/show/events/stop`; stop requests are cooperative and never signal a PID. With no description arguments, pipeline requires an interactive terminal and prompts for task text (one line per paragraph; a line containing only `.` ends input). Interactive input lines are limited to 64 KiB. The no-argument `factory` alias behaves the same. `factory implement`, `factory pipeline`, and bare `factory` route to the same workflow. To provide the task directly without a task-entry prompt, pass its description as arguments; Factory joins them with spaces:
+Run `factory implement` from the repository to change (`factory pipeline` remains a legacy alias). By default it starts a durable implementation job and attaches to its output until completion. Ctrl-C detaches the terminal observer without stopping the job; use `factory job attach <id>` to reattach or `factory job stop <id>` to request cancellation. Gated foreground runs are managed with `factory run list/get/events/stop`; stop requests are cooperative and never signal a PID. With no description arguments, pipeline requires an interactive terminal and prompts for task text (one line per paragraph; a line containing only `.` ends input). Interactive input lines are limited to 64 KiB. The no-argument `factory` alias behaves the same. `factory implement`, `factory pipeline`, and bare `factory` route to the same workflow. To provide the task directly without a task-entry prompt, pass its description as arguments; Factory joins them with spaces:
 
 ```sh
 factory implement add a small feature
@@ -67,7 +69,7 @@ Parallel implementation is disabled by default. Set `parallel_implementation` to
 
 The requirements agent's working directory is the run-state directory outside the target repository; it receives the target path as task context. Later stage agents run with the target repository as their working directory. Pipeline agent processes use the configured `agent_timeout` (default `60m`) as a per-process timeout, capped in practice by the 30-minute active execution budget for each stage. The stage budget pauses during approvals and other non-agent work.
 
-Foreground run records, task text, and logs are stored outside the target repository. The run directory is printed at startup. Gated `pipeline --gate` runs persist an owner PID and heartbeat alongside the run state; `factory run list` and `factory run show <id>` classify liveness conservatively from the persisted heartbeat freshness; they do not infer that a process is dead from a PID alone. These controls apply only to gated runs. `factory run events <id> [--follow]` reads the persisted workflow event stream; `factory run stop <id>` writes a durable cooperative stop request checked during the gated workflow, including approval input. On a TTY, each active stage uses a full-screen operations console in the terminal's alternate screen, with a prominent stage and elapsed-time status, recent log activity, and log path. The original screen and cursor are restored when that stage completes, fails, or panics; the completion summary is then printed on the original screen. The console adapts to the terminal viewport and uses color unless `NO_COLOR` is set. At startup, `TERM=dumb`, terminals narrower than 40 columns or shorter than 6 rows, and non-TTY output use plain progress updates with `Stage`, `Elapsed`, and `Latest` fields; if an active TTY is resized below 6 rows, the console switches to a compact layout to keep the stage and log location visible. Stage progress and completion output identify the log path; use it to inspect full output (for example, `tail -f <log-path>`). Ctrl-C or SIGTERM cancels foreground agent runs and interactive task/approval waits. Workflow agent implementations must honor the supplied context through `RunWithContext`; an agent that only implements synchronous `Run` is rejected rather than being allowed to block cancellation. Factory does not create a branch or commit for the pipeline. Agent and babysit processes retain a per-process `agent_timeout` default of `60m`; active pipeline/clean agent work is additionally capped by its 30-minute stage budget, and each babysit action by its 30-minute active agent budget. These budgets do not impose an overall job deadline and pause during approvals, checks, polling, and other non-agent waits. This is not a security sandbox: configured agents and their tools may still access or modify the repository. Factory does not copy its program source into the target.
+Foreground run records, task text, and logs are stored outside the target repository. The run directory is printed at startup. Gated `pipeline --gate` runs persist an owner PID and heartbeat alongside the run state; `factory run list` and `factory run get <id>` classify liveness conservatively from the persisted heartbeat freshness; they do not infer that a process is dead from a PID alone. These controls apply only to gated runs. `factory run events <id> [--follow]` reads the persisted workflow event stream; `factory run stop <id>` writes a durable cooperative stop request checked during the gated workflow, including approval input. On a TTY, each active stage uses a full-screen operations console in the terminal's alternate screen, with a prominent stage and elapsed-time status, recent log activity, and log path. The original screen and cursor are restored when that stage completes, fails, or panics; the completion summary is then printed on the original screen. The console adapts to the terminal viewport and uses color unless `NO_COLOR` is set. At startup, `TERM=dumb`, terminals narrower than 40 columns or shorter than 6 rows, and non-TTY output use plain progress updates with `Stage`, `Elapsed`, and `Latest` fields; if an active TTY is resized below 6 rows, the console switches to a compact layout to keep the stage and log location visible. Stage progress and completion output identify the log path; use it to inspect full output (for example, `tail -f <log-path>`). Ctrl-C or SIGTERM cancels foreground agent runs and interactive task/approval waits. Workflow agent implementations must honor the supplied context through `RunWithContext`; an agent that only implements synchronous `Run` is rejected rather than being allowed to block cancellation. Factory does not create a branch or commit for the pipeline. Agent and babysit processes retain a per-process `agent_timeout` default of `60m`; active pipeline/clean agent work is additionally capped by its 30-minute stage budget, and each babysit action by its 30-minute active agent budget. These budgets do not impose an overall job deadline and pause during approvals, checks, polling, and other non-agent waits. This is not a security sandbox: configured agents and their tools may still access or modify the repository. Factory does not copy its program source into the target.
 
 ## Clean workflow
 
@@ -77,38 +79,43 @@ Foreground run records, task text, and logs are stored outside the target reposi
 
 **Dirty safe mode** applies when staged, unstaged, and/or untracked changes exist at startup. It warns before running agents that agents and formatters may affect existing work. It then runs review, fix, documentation, and all three checks, but does not stage, commit, or push any files. This mode does not require an upstream or `origin`, because it does not publish. The warning is not a guarantee that existing work will remain unchanged; back up important changes first. Neither mode is a security sandbox: configured agents and formatters can access the repository. `factory tidy` is distinct from `make clean`, which only removes local build artifacts.
 
-## Detached PR babysitter
+## Detached PR monitor
+
+`factory monitor` is the supported CLI command; `factory babysit` was removed
+and is not a command alias. The `babysit` name remains in legacy persisted
+metadata and compatibility identifiers, including `FACTORY_BABYSIT_POLL_INTERVAL`
+and the default state path described below. These legacy names do not imply a
+`factory babysit` command.
 
 Start monitoring the open PR associated with the current checkout's branch:
 
 ```sh
 factory monitor <description>
-# Legacy alias: factory babysit <description>
 ```
 
 Each babysit agent action has a 30-minute active agent-execution budget, capped by the configured per-process `agent_timeout` (default `60m`). The budget pauses during approval waits, GitHub checks/snapshot queries, polling, and other non-agent work; there is no overall job deadline. A GitHub PR/check snapshot query has a separate two-minute timeout. Consecutive snapshot failures use bounded exponential backoff (starting at one second and capped at one minute); after eight failures the job enters `recoverable_failure` instead of retrying indefinitely.
 
-The current directory must be a Git checkout with a clean working tree, a checked-out branch, and an `origin` that matches the PR head repository. The local branch head must equal the validated open PR head. The GitHub CLI must be able to identify and read the current PR. Factory rejects a second active babysitter for the same PR. The same start path is used by `factory job start monitor <description>` and legacy `factory babysit <description>`. `factory monitor` and `factory babysit` route to the same start and management handler.
+The current directory must be a Git checkout with a clean working tree, a checked-out branch, and an `origin` that matches the PR head repository. The local branch head must equal the validated open PR head. The GitHub CLI must be able to identify and read the current PR. Factory rejects a second active monitor for the same PR. The same start path is used by `factory job start monitor <description>` and `factory monitor`.
 
-Factory creates a detached worker and an isolated Git worktree on a `factory-babysit/...` branch; it does not run the babysit agent in the user's checkout. The monitor polls the PR and its checks (30 seconds by default; configurable with `FACTORY_BABYSIT_POLL_INTERVAL`, which must be at least `1s`). It can respond to failed checks or a changed PR/check snapshot; a new comment can also trigger an initial response. Monitoring ends when the PR is merged or closed. If the PR head changes outside the babysitter or repository identity/baseline checks fail, it refuses stale work rather than applying it.
+Factory creates a detached worker and an isolated Git worktree on a `factory-babysit/...` branch; it does not run the monitor agent in the user's checkout. The monitor polls the PR and its checks (30 seconds by default; configurable with `FACTORY_BABYSIT_POLL_INTERVAL`, which must be at least `1s`). It can respond to failed checks or a changed PR/check snapshot; a new comment can also trigger an initial response. Monitoring ends when the PR is merged or closed. If the PR head changes outside the monitor or repository identity/baseline checks fail, it refuses stale work rather than applying it.
 
 A babysit agent's `FIXED` response signals successful completion of its action. Factory derives the complete changed-path set from Git, then revalidates the target checkout, worker worktree/branch/baseline and origin, safe relative file paths, and the live PR/check snapshot before committing and pushing. It stages only the Git-derived changed paths and does not force-push. There is no independent evaluator or correctness check: successful agent exit is not a correctness verdict. Agent errors, unsafe paths, a changed/stale snapshot, failed guardrails, or a stop request prevent the corresponding commit/push. A cooperative stop after a local commit but before push can leave that commit in the isolated worktree without pushing it.
 
-If the agent requests human review, the job pauses with a proposal. After three automatic actions against an unchanged snapshot, the job also requires explicit approval. Approval requires the exact lowercase answer `y` and non-empty task text defining the approved scope; the approval is tied to the current PR/check snapshot and is invalidated if that snapshot changes. Rejecting a proposal resumes monitoring without repeating that action. Babysit approval authorizes a scoped agent action, but does not bypass Git-derived path selection or commit/push guardrails.
+If the agent requests human review, the job pauses with a proposal. After three automatic actions against an unchanged snapshot, the job also requires explicit approval. Approval requires the exact lowercase answer `y` and non-empty task text defining the approved scope; the approval is tied to the current PR/check snapshot and is invalidated if that snapshot changes. Rejecting a proposal resumes monitoring without repeating that action. Monitor approval authorizes a scoped agent action, but does not bypass Git-derived path selection or commit/push guardrails.
 
 Manage jobs with these commands (use the job ID printed at startup or shown by `list`):
 
 ```sh
 factory monitor list
-factory monitor describe <id>
+factory monitor get <id> [--details]
 factory monitor approve <id>
 factory monitor reject <id>
 factory monitor stop <id>
 factory monitor reset <id>
-# Same commands are available under legacy `factory babysit`.
+
 ```
 
-`describe` shows job details and available actions/logs. `stop` cancels any active agent subprocess (including its process group) and asks the worker to stop at a safe point; it does not forcibly kill the detached worker itself. `reset` is available only for a `recoverable_failure` job whose worker is no longer running. It clears the snapshot-failure count and restarts the detached worker, allowing monitoring to resume after the eight-failure cap.
+The agreed `get` view is concise and tabulated by default; use `get <id> --details` for proposals, actions, logs, and long values. `describe <id>` remains a compatibility alias. Current list output is tabulated; individual monitor `get` output remains concise labeled fields. `stop` cancels any active agent subprocess (including its process group) and asks the worker to stop at a safe point; it does not forcibly kill the detached worker itself. `reset` is available only for a `recoverable_failure` job whose worker is no longer running. It clears the snapshot-failure count and restarts the detached worker, allowing monitoring to resume after the eight-failure cap.
 
 ## Configuration and state
 
@@ -118,11 +125,11 @@ Configuration is read from `${XDG_CONFIG_HOME:-~/.config}/factory/config.json`. 
 pi -p --no-session --append-system-prompt {system_prompt} {task}
 ```
 
-Embedded prompts can be overridden by stage-name files in `prompt_dir`, including `requirements.md`, `implement.md`, `review.md`, `document.md`, and `babysit.md`.
+Embedded prompts can be overridden by stage-name files in `prompt_dir`, including `requirements.md`, `implement.md`, `review.md`, `document.md`, and the canonical `monitor.md`. For compatibility, if `monitor.md` is absent, `babysit.md` is also accepted as a monitor prompt override.
 
-By default, foreground run state is stored under `${XDG_STATE_HOME:-~/.local/state}/factory/runs`; legacy babysit metadata remains under `${XDG_STATE_HOME:-~/.local/state}/factory/jobs`, and v2 implementation/monitor records use `${XDG_STATE_HOME:-~/.local/state}/factory/jobs/v2`. When `state_dir` is configured, foreground runs use `<state_dir>/runs`, babysit metadata uses `<state_dir>/factory/jobs`, and v2 records use `<state_dir>/factory/jobs/v2`. State directories must resolve outside the target repository. Babysit polling can be changed with `FACTORY_BABYSIT_POLL_INTERVAL`.
+By default, foreground run state is stored under `${XDG_STATE_HOME:-~/.local/state}/factory/runs`; legacy babysit-named monitor metadata remains under `${XDG_STATE_HOME:-~/.local/state}/factory/jobs`, and v2 implementation/monitor records use `${XDG_STATE_HOME:-~/.local/state}/factory/jobs/v2`. When `state_dir` is configured, foreground runs use `<state_dir>/runs`, legacy monitor metadata uses `<state_dir>/factory/jobs`, and v2 records use `<state_dir>/factory/jobs/v2`. The legacy metadata directory name is for persisted-state compatibility, not a CLI alias. State directories must resolve outside the target repository. Monitor polling can be changed with the legacy environment variable `FACTORY_BABYSIT_POLL_INTERVAL`.
 
-Use `factory help` (or `factory -h`) for the CLI usage summary. `factory monitor help` (also `factory babysit help`) lists monitor-specific commands, including recovery with `reset`.
+Use `factory help` (or `factory -h`) for the CLI usage summary. `factory monitor help` lists monitor-specific commands, including recovery with `reset`.
 
 ## Go package layout
 

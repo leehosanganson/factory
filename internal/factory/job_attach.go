@@ -148,7 +148,7 @@ func monitorRecoverableFailureStopped(store *JobStore, id string) (bool, error) 
 }
 
 func monitorStoppedError(id string) error {
-	return fmt.Errorf("job %s is resumable but its worker exited with status recoverable_failure; use factory babysit reset %s to resume monitoring", id, id)
+	return fmt.Errorf("job %s is resumable but its worker exited with status recoverable_failure; use factory monitor reset %s to resume monitoring", id, id)
 }
 
 // AttachJob follows a worker transcript until it reaches a terminal lifecycle state.

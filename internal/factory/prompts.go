@@ -11,7 +11,7 @@ import (
 //go:embed prompts/*.md
 var embeddedPrompts embed.FS
 
-var stages = []string{"requirements", "implement", "review", "fix", "document", "babysit"}
+var stages = []string{"requirements", "implement", "review", "fix", "document", "monitor"}
 
 // LoadPrompt returns an external stage override when present, otherwise the embedded prompt.
 func LoadPrompt(promptDir, stage string) (string, error) {
@@ -19,13 +19,19 @@ func LoadPrompt(promptDir, stage string) (string, error) {
 		return "", fmt.Errorf("unknown prompt stage %q", stage)
 	}
 	if promptDir != "" {
-		path := filepath.Join(promptDir, stage+".md")
-		content, err := os.ReadFile(path)
-		if err == nil {
-			return strings.TrimSpace(string(content)), nil
+		overrides := []string{stage + ".md"}
+		if stage == "monitor" {
+			overrides = append(overrides, "babysit.md")
 		}
-		if !os.IsNotExist(err) {
-			return "", fmt.Errorf("read prompt override %s: %w", path, err)
+		for _, name := range overrides {
+			path := filepath.Join(promptDir, name)
+			content, err := os.ReadFile(path)
+			if err == nil {
+				return strings.TrimSpace(string(content)), nil
+			}
+			if !os.IsNotExist(err) {
+				return "", fmt.Errorf("read prompt override %s: %w", path, err)
+			}
 		}
 	}
 	content, err := embeddedPrompts.ReadFile("prompts/" + stage + ".md")

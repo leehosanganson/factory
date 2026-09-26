@@ -27,13 +27,24 @@ func main() {
 
 func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	if len(args) > 0 {
+		if commandHelpRequested(args) {
+			printCommandHelp(out, args)
+			return nil
+		}
 		if args[0] == "__job-worker" {
 			if len(args) != 3 {
 				return fmt.Errorf("invalid private worker invocation")
 			}
 			return factory.RunJobWorker(args[1], args[2])
 		}
-		if len(args) > 1 && args[0] != "babysit" && args[0] != "job" && args[0] != "run" && args[0] != "pipeline" && args[0] != "implement" && args[0] != "clean" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "--gate" {
+		if args[0] == "__monitor-worker" {
+			cfg, err := factory.LoadConfig("")
+			if err != nil {
+				return err
+			}
+			return factory.BabysitCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
+		}
+		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "pipeline" && args[0] != "implement" && args[0] != "clean" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
@@ -63,7 +74,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			ctx, stop := foregroundContext()
 			defer stop()
 			return factory.JobCommandContext(ctx, args[1:], cfg, workdir, in, out)
-		case "babysit", "monitor":
+		case "monitor":
 			cfg, err := factory.LoadConfig("")
 			if err != nil {
 				return err
@@ -108,6 +119,146 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	ctx, stop := foregroundContext()
 	defer stop()
 	return runPipelineContext(ctx, nil, false, in, out)
+}
+
+func commandHelpRequested(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	switch args[0] {
+	case "implement", "pipeline", "tidy", "clean", "job", "run", "monitor":
+		for _, arg := range args[1:] {
+			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func printCommandHelp(out io.Writer, args []string) {
+	command, subcommand := args[0], ""
+	if len(args) > 1 {
+		subcommand = args[1]
+	}
+	canonical := command
+	if command == "pipeline" {
+		canonical = "implement"
+	}
+	if command == "clean" {
+		canonical = "tidy"
+	}
+
+	var title string
+	var commands []helpCommand
+	var paragraphs []string
+	switch canonical {
+	case "implement":
+		title = "Implement workflow"
+		commands = []helpCommand{
+			{"factory implement [--gate] [description...]", "Start an implementation workflow; default mode starts a job and attaches to output."},
+			{"factory pipeline [--gate] [description...]", "Legacy alias for factory implement."},
+		}
+		paragraphs = []string{"Examples: factory implement add a small feature; factory implement --gate add a small feature.", "With no description, task entry requires an interactive terminal. Ctrl-C detaches from the default job; --gate runs the workflow in the foreground for approvals."}
+	case "tidy":
+		title = "Tidy workflow"
+		commands = []helpCommand{
+			{"factory tidy [--gate]", "Review, fix, document, and verify the repository."},
+			{"factory clean [--gate]", "Legacy alias for factory tidy."},
+		}
+		paragraphs = []string{"Example: factory tidy --gate.", "Pristine mode requires an interactive terminal and exact lowercase yes before publication. Dirty safe mode warns that existing work may be affected but does not stage, commit, or push files. This differs from make clean."}
+	case "job":
+		title = "Detached jobs"
+		commands, paragraphs = jobHelp(subcommand)
+	case "run":
+		title = "Gated runs"
+		commands, paragraphs = runHelp(subcommand)
+	case "monitor":
+		title = "Monitor management"
+		commands, paragraphs = monitorHelp(subcommand)
+	}
+	width := detectHelpWidth(out)
+	_, noColor := os.LookupEnv("NO_COLOR")
+	color := helpOutputIsTerminal(out) && !noColor && width >= 40
+	if width <= 0 {
+		width = 80
+	}
+	style := func(text string) string {
+		if color {
+			return "\033[1;34m" + text + "\033[0m"
+		}
+		return text
+	}
+	fmt.Fprintln(out, style("factory - "+title))
+	if len(commands) > 0 {
+		printHelpCommands(out, commands, width)
+	}
+	for _, paragraph := range paragraphs {
+		for _, line := range wrapHelpText(paragraph, width) {
+			fmt.Fprintln(out, line)
+		}
+	}
+}
+
+func jobHelp(subcommand string) ([]helpCommand, []string) {
+	all := []helpCommand{
+		{"factory job start implementation <description>", "Start a detached implementation job."},
+		{"factory job start monitor <description>", "Start a detached PR monitor."},
+		{"factory job list", "List detached jobs."},
+		{"factory job get <id> [--details]", "Get job status; --details adds metadata and sessions (show remains an alias)."},
+		{"factory job show <id> [--details]", "Compatibility alias for job get."},
+		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow worker/session logs."},
+		{"factory job attach <id>", "Follow worker output; Ctrl-C detaches."},
+		{"factory job stop <id>", "Request cooperative cancellation."},
+	}
+	return selectCommandHelp(all, subcommand, "Example: factory job start implementation update the parser.")
+}
+
+func runHelp(subcommand string) ([]helpCommand, []string) {
+	all := []helpCommand{
+		{"factory run list", "List gated foreground runs."},
+		{"factory run get <id> [--details]", "Get run status; --details adds liveness and metadata (show remains an alias)."},
+		{"factory run show <id> [--details]", "Compatibility alias for run get."},
+		{"factory run events <id> [--follow]", "Read or follow workflow events."},
+		{"factory run stop <id>", "Request cooperative cancellation."},
+	}
+	return selectCommandHelp(all, subcommand, "Example: factory run events <id> --follow.")
+}
+
+func monitorHelp(subcommand string) ([]helpCommand, []string) {
+	all := []helpCommand{
+		{"factory monitor <description>", "Start detached monitoring for a routine fix on an open PR."},
+		{"factory monitor list", "List active and recent jobs."},
+		{"factory monitor get <id> [--details]", "Get monitor status; --details adds proposals and actions (describe remains an alias)."},
+		{"factory monitor describe <id> [--details]", "Compatibility alias for monitor get."},
+		{"factory monitor approve <id>", "Approve a proposal with an exact, non-empty scope."},
+		{"factory monitor reject <id>", "Reject a pending proposal."},
+		{"factory monitor stop <id>", "Request a stop and cancel active agent processes."},
+		{"factory monitor reset <id>", "Restart a recoverable-failure job after its worker exits."},
+	}
+	commands, _ := selectCommandHelp(all, subcommand, "Example: factory monitor address a failing check on this PR.")
+	return commands, []string{"Example: factory monitor address a failing check on this PR.", "Monitoring is for narrow, routine fixes on an existing open PR; it may publish a guarded fix but does not merge the PR."}
+}
+
+func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCommand, []string) {
+	if subcommand == "" || subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
+		return all, []string{example}
+	}
+	name := subcommand
+	if name == "show" || name == "describe" {
+		name = "get"
+	}
+	var selected []helpCommand
+	for _, command := range all {
+		fields := strings.Fields(command.usage)
+		if len(fields) >= 3 && (fields[2] == name || fields[2] == "get" && (subcommand == "show" || subcommand == "describe")) {
+			selected = append(selected, command)
+		}
+	}
+	if len(selected) == 0 {
+		return all, []string{example}
+	}
+	return selected, nil
 }
 
 func foregroundContext() (context.Context, context.CancelFunc) {
@@ -391,11 +542,11 @@ func printHelpWithOptions(out io.Writer, width int, terminal, noColor bool) {
 			{"factory version", "Print the build version (defaults to dev)."},
 			{"factory implement [--gate] [description...]", "Start an implementation job and attach to its output (alias: factory pipeline)."},
 			{"factory tidy [--gate]", "Review, fix, document, and verify (alias: factory clean)."},
-			{"factory monitor <description>", "Start detached monitoring for a routine fix on an open PR (alias: factory babysit)."},
+			{"factory monitor <description>", "Start detached monitoring for a routine fix on an open PR."},
 			{"factory [--gate] [description...]", "Interactive alias for factory implement."},
 			{"factory help, -h, --help", "Show this help."},
 		}, paragraphs: []string{
-			"Legacy command forms: factory pipeline -> factory implement; factory clean -> factory tidy; factory babysit -> factory monitor.",
+			"Legacy command forms: factory pipeline -> factory implement; factory clean -> factory tidy.",
 			"Build version is set by the release tag at link time; development builds report dev.",
 		}},
 
@@ -403,26 +554,26 @@ func printHelpWithOptions(out io.Writer, width int, terminal, noColor bool) {
 			{"factory job start implementation <description>", "Start a detached implementation job."},
 			{"factory job start monitor <description>", "Start a detached PR monitor."},
 			{"factory job list", "List detached jobs."},
-			{"factory job show <id>", "Show job details."},
+			{"factory job get <id> [--details]", "Get job status; --details adds metadata and sessions (show remains an alias)."},
 			{"factory job logs <id> [--session <id>] [--follow]", "Read or follow worker/session logs."},
 			{"factory job attach <id>", "Follow worker output; Ctrl-C detaches."},
 			{"factory job stop <id>", "Request cooperative cancellation."},
 		}},
 		{title: "Gated runs", commands: []helpCommand{
 			{"factory run list", "List gated foreground runs."},
-			{"factory run show <id>", "Show status and liveness."},
+			{"factory run get <id> [--details]", "Get run status; --details adds liveness and metadata (show remains an alias)."},
 			{"factory run events <id> [--follow]", "Read or follow workflow events."},
 			{"factory run stop <id>", "Request cooperative cancellation."},
 		}},
 		{title: "Monitor management", commands: []helpCommand{
 			{"factory monitor list", "List active and recent jobs."},
-			{"factory monitor describe <id>", "Show job details, proposals, and actions."},
+			{"factory monitor get <id> [--details]", "Get monitor status; --details adds proposals and actions (describe remains an alias)."},
 			{"factory monitor approve <id>", "Approve a proposal with an exact, non-empty scope."},
 			{"factory monitor reject <id>", "Reject a pending proposal."},
 			{"factory monitor stop <id>", "Request a stop and cancel active agent processes."},
 			{"factory monitor reset <id>", "Restart a recoverable-failure job after its worker exits."},
 		}, paragraphs: []string{
-			"The same management commands remain available as factory babysit. Approval requires exact lowercase y and scoped task text; it is invalidated if the PR/check snapshot changes. After three automatic actions against an unchanged snapshot, the monitor pauses for approval.",
+			"Approval requires exact lowercase y and scoped task text; it is invalidated if the PR/check snapshot changes. After three automatic actions against an unchanged snapshot, the monitor pauses for approval.",
 			"Monitoring runs in an isolated worktree and stops when the PR closes or merges. Before publishing, Factory revalidates the checkout, branch, safe paths, and live PR/check snapshot. It may push a guarded routine fix, but does not merge the PR.",
 		}},
 		{title: "Examples", paragraphs: []string{

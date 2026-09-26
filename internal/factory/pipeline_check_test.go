@@ -83,7 +83,8 @@ func TestWorkflowRunsConfiguredChecksAndPersistsCompleteLogs(t *testing.T) {
 		{Type: "check.started", Outcome: "", ExitCode: nil, Command: result.Command, Transcript: result.Log, StartedAt: timePointer(result.StartedAt)},
 		{Type: "check.completed", Outcome: "success", ExitCode: intPointer(0), Command: result.Command, Transcript: result.Log, StartedAt: timePointer(result.StartedAt), EndedAt: timePointer(result.EndedAt)},
 	})
-	if len(result.Command) != 2 || result.Command[0] != os.Args[0] || result.Command[1] != "-test.run=^TestPipelineCheckProcessHelper$" {
+	executable := canonicalTestPath(t, os.Args[0])
+	if len(result.Command) != 2 || canonicalTestPath(t, result.Command[0]) != executable || result.Command[1] != "-test.run=^TestPipelineCheckProcessHelper$" {
 		t.Fatalf("recorded argv = %q, want executable and helper test args", result.Command)
 	}
 	logData, err := os.ReadFile(filepath.Join(runDir, result.Log))
@@ -109,7 +110,7 @@ func TestWorkflowFailedCheckPersistsResultAndFailsRun(t *testing.T) {
 		t.Fatalf("Run() error = %v, want check failure with exit code 7", err)
 	}
 	state, runDir := readPipelineCheckState(t, stateDir)
-	transcriptPath := filepath.Join(runDir, "pipeline-check-01.log")
+	transcriptPath := canonicalTestPath(t, filepath.Join(runDir, "pipeline-check-01.log"))
 	if !strings.Contains(err.Error(), transcriptPath) {
 		t.Fatalf("Run() error = %v, want full transcript path %q", err, transcriptPath)
 	}
@@ -246,8 +247,8 @@ func TestWorkflowRunsChecksInTargetWorkdir(t *testing.T) {
 	}
 	state, runDir := readPipelineCheckState(t, stateDir)
 	data, err := os.ReadFile(filepath.Join(runDir, state.Checks[0].Log))
-	if err != nil || string(data) != workdir {
-		t.Fatalf("check workdir = %q, %v; want %q", data, err, workdir)
+	if err != nil || string(data) != canonicalTestPath(t, workdir) {
+		t.Fatalf("check workdir = %q, %v; want %q", data, err, canonicalTestPath(t, workdir))
 	}
 }
 

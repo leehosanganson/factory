@@ -155,7 +155,7 @@ func managedRunRoot(override string) (string, error) {
 // RunCommand controls only gated, foreground pipeline records.
 func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory run list | show <id> | events <id> [--follow] | stop <id>")
+		return fmt.Errorf("usage: factory run list | get <id> [--details] | show <id> [--details] | events <id> [--follow] | stop <id>")
 	}
 	root, err := managedRunRoot(cfg.StateDir)
 	if err != nil {
@@ -174,6 +174,7 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 		if err != nil {
 			return err
 		}
+		var rows []string
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue
@@ -193,14 +194,23 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 					return err
 				}
 			}
-			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", state.ID, state.Status, life, state.Stage)
+			rows = append(rows, fmt.Sprintf("%-32s %-16s %-20s %s", state.ID, state.Status, life, state.Stage))
+		}
+		if len(rows) == 0 {
+			fmt.Fprintln(out, "No gated runs.")
+			return nil
+		}
+		fmt.Fprintf(out, "%-32s %-16s %-20s %s\n", "ID", "STATUS", "LIVENESS", "STAGE")
+		for _, row := range rows {
+			fmt.Fprintln(out, row)
 		}
 		return nil
-	case "show":
-		if len(args) != 2 {
-			return fmt.Errorf("usage: factory run show <id>")
+	case "get", "show":
+		id, details, err := parseDetailsID("factory run get <id> [--details]", args[1:])
+		if err != nil {
+			return err
 		}
-		dir, state, err := managedRunByID(root, args[1])
+		dir, state, err := managedRunByID(root, id)
 		if err != nil {
 			return err
 		}
@@ -211,7 +221,28 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 				return err
 			}
 		}
-		fmt.Fprintf(out, "ID: %s\nStatus: %s\nLiveness: %s\nStage: %s\nTarget: %s\nUpdated: %s\n", state.ID, state.Status, life, state.Stage, state.Workdir, state.UpdatedAt.Format(time.RFC3339))
+		fmt.Fprintf(out, "ID: %s\nStatus: %s\nLiveness: %s\nStage: %s\n", state.ID, state.Status, life, state.Stage)
+		if !details {
+			return nil
+		}
+		fmt.Fprintf(out, "Target: %s\nUpdated: %s\nDescription: %s\n", state.Workdir, state.UpdatedAt.Format(time.RFC3339), state.Task)
+		for _, name := range []string{"task.txt", "workflow-events.jsonl"} {
+			path := filepath.Join(dir, name)
+			fmt.Fprintf(out, "%s path: %s\n", name, path)
+			data, err := os.ReadFile(path)
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if len(data) > 0 {
+				fmt.Fprintf(out, "%s:\n%s", name, data)
+				if data[len(data)-1] != '\n' {
+					fmt.Fprintln(out)
+				}
+			}
+		}
 		return nil
 	case "events":
 		follow := false
