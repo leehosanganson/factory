@@ -579,10 +579,12 @@ func TestWorkflowObserverPersistsSingleInvocationFailureLifecycle(t *testing.T) 
 	}
 	agent := &fakeAgent{outputs: map[string][]string{"implement": {"ERROR: transient", "success"}}}
 	var output strings.Builder
+	var runDir string
 	workflow := Workflow{
 		Agent: agent, Config: Config{StateDir: filepath.Join(base, "state")}, In: strings.NewReader(""),
 		Out: &output, Workdir: t.TempDir(), Stages: []string{"implement"},
-		Observer: JobSessionObserver{Store: store, JobID: "job", SessionID: "session"},
+		Observer:   JobSessionObserver{Store: store, JobID: "job", SessionID: "session"},
+		RunCreated: func(dir, _ string) { runDir = dir },
 	}
 	if err := workflow.Run("task"); err == nil {
 		t.Fatal("failed stage invocation should fail workflow")
@@ -607,15 +609,8 @@ func TestWorkflowObserverPersistsSingleInvocationFailureLifecycle(t *testing.T) 
 			t.Fatalf("new session event contains retry/attempt details: %+v", event)
 		}
 	}
-	var runDir string
-	for _, line := range strings.Split(output.String(), "\n") {
-		if strings.HasPrefix(line, "Run: ") {
-			runDir = strings.TrimPrefix(line, "Run: ")
-			break
-		}
-	}
 	if runDir == "" {
-		t.Fatalf("workflow output did not expose run directory: %s", output.String())
+		t.Fatal("workflow did not expose the canonical run directory")
 	}
 	localEvents, err := os.ReadFile(filepath.Join(runDir, "workflow-events.jsonl"))
 	if err != nil {
