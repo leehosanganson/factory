@@ -1175,6 +1175,13 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	agentCtx, cancelAgent := context.WithTimeout(ctx, agentTimeout)
 	agentErr := (Runner{Config: cfg}).RunContext(agentCtx, "monitor", prompt, task, worktree, logPath)
 	cancelAgent()
+	output, logErr := os.ReadFile(logPath)
+	if logErr != nil {
+		return logErr
+	}
+	if err := appendMonitorAgentLog(dir, job.ID, output); err != nil {
+		return fmt.Errorf("append monitor agent log to session: %w", err)
+	}
 	if agentErr != nil {
 		_ = appendBabysitLog(dir, "Agent process failed: "+agentErr.Error())
 		return agentErr
@@ -1184,10 +1191,6 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	} else if stopped {
 		job.Status = "stopped"
 		return babysitEvent(dir, job, "Stopped after agent; no commit or push.")
-	}
-	output, err := os.ReadFile(logPath)
-	if err != nil {
-		return err
 	}
 	protocol, proposal := agentProtocol(string(output))
 	switch protocol {
@@ -1218,7 +1221,7 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 		job.Status = "stopped"
 		return babysitEvent(dir, job, "Stopped after agent; no commit or push.")
 	}
-	if err := guardedCommitPush(dir, job, signature, s, changed); err != nil {
+	if err := guardedCommitPush(ctx, dir, job, signature, s, changed); err != nil {
 		_ = appendBabysitLog(dir, "Commit/push stopped safely: "+err.Error())
 		if strings.Contains(err.Error(), "stop requested") {
 			job.Status = "stopped"
@@ -1353,7 +1356,10 @@ func validChangePath(path string) bool {
 	return true
 }
 
-func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *babysitSnapshot, files []string) error {
+func guardedCommitPush(ctx context.Context, dir string, job *babysitJob, signature string, snapshot *babysitSnapshot, files []string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("operation canceled before commit: %w", err)
+	}
 	if stopped, _ := jobStopped(dir); stopped {
 		return errors.New("stop requested before commit")
 	}
@@ -1394,8 +1400,17 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 	if err := validateWorker(job); err != nil {
 		return err
 	}
-	live, liveSignature, err := readSnapshot(context.Background(), job)
-	if err != nil || liveSignature != signature || live.HeadRefOID != snapshot.HeadRefOID {
+	live, liveSignature, err := readSnapshot(ctx, job)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("operation canceled before commit: %w", ctxErr)
+		}
+		return errors.New("PR/check snapshot changed before commit")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("operation canceled before commit: %w", err)
+	}
+	if liveSignature != signature || live.HeadRefOID != snapshot.HeadRefOID {
 		return errors.New("PR/check snapshot changed before commit")
 	}
 	args := []string{"add", "--"}
@@ -1413,6 +1428,9 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 	}
 	if err := validateTarget(job); err != nil {
 		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("operation canceled before commit: %w", err)
 	}
 	if _, err := runGit(context.Background(), job.Worktree, "commit", "-m", "fix: address PR feedback via factory babysit"); err != nil {
 		return err
@@ -1435,8 +1453,17 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 	if err != nil || workerBranch != job.WorkerBranch {
 		return errors.New("worker branch changed before push")
 	}
-	live, sig, err := readSnapshot(context.Background(), job)
-	if err != nil || sig != signature || live.HeadRefOID != snapshot.HeadRefOID {
+	live, sig, err := readSnapshot(ctx, job)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("operation canceled before push: %w", ctxErr)
+		}
+		return errors.New("PR/check snapshot changed before push")
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("operation canceled before push: %w", err)
+	}
+	if sig != signature || live.HeadRefOID != snapshot.HeadRefOID {
 		return errors.New("PR/check snapshot changed before push")
 	}
 	if stopped, _ := jobStopped(dir); stopped {
@@ -1454,6 +1481,9 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 		return errors.New("committed head does not descend from the validated PR head; refusing push")
 	}
 	ref := "refs/heads/" + job.HeadBranch
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("operation canceled before push: %w", err)
+	}
 	if _, err := runGit(context.Background(), job.Worktree, "push", "--force-with-lease="+ref+":"+snapshot.HeadRefOID, pushURL, pushed+":"+ref); err != nil {
 		return err
 	}

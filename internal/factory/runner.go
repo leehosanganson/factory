@@ -25,7 +25,7 @@ type Runner struct {
 	Config Config
 }
 
-const stdoutProtocolCaptureLimit = 8 * 1024
+const stdoutProtocolCaptureLimit = maxSubtaskPlanBytes
 
 type protocolCapture struct {
 	bytes.Buffer
@@ -34,6 +34,7 @@ type protocolCapture struct {
 	whitespaceOverflow bool
 	pendingRune        []byte
 	startedProtocol    bool
+	truncated          bool
 }
 
 func (c *protocolCapture) Write(p []byte) (int, error) {
@@ -80,10 +81,12 @@ func (c *protocolCapture) Write(p []byte) (int, error) {
 }
 
 func (c *protocolCapture) append(p []byte) {
-	if remaining := c.limit - c.Len(); remaining > 0 {
-		if len(p) > remaining {
-			p = p[:remaining]
-		}
+	remaining := c.limit - c.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+		c.truncated = true
+	}
+	if len(p) > 0 {
 		_, _ = c.Buffer.Write(p)
 	}
 }
@@ -121,6 +124,9 @@ func (r Runner) RunWithOutputContext(parent context.Context, stage, systemPrompt
 	defer cancel()
 	stdout := &protocolCapture{limit: stdoutProtocolCaptureLimit}
 	err = r.runContext(ctx, stage, systemPrompt, task, workdir, logPath, stdout)
+	if err == nil && stdout.truncated {
+		err = fmt.Errorf("agent stdout protocol exceeds %d bytes", stdoutProtocolCaptureLimit)
+	}
 	return stdout.String(), err
 }
 

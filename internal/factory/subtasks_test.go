@@ -257,6 +257,62 @@ func TestParallelImplementationLaterWaveFailureLeavesTargetUnchanged(t *testing.
 	}
 }
 
+func TestParallelImplementationDoesNotApplyAfterCancellationBeforeIntegration(t *testing.T) {
+	dir := initTestGitRepo(t)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	workflow := Workflow{
+		Agent: &parallelWorkflowAgent{}, Config: Config{StateDir: stateDir, ParallelImplementation: &ParallelImplementationConfig{Enabled: true}},
+		In: strings.NewReader(""), Out: ioDiscard{}, Workdir: dir, Stages: []string{"implement"},
+		Observer: WorkflowObserverFunc(func(event WorkflowEvent) error {
+			if event.Type == "subtask.staged" {
+				cancel()
+			}
+			return nil
+		}),
+	}
+	if err := workflow.RunContext(ctx, "cancel after work is staged"); err == nil || !strings.Contains(err.Error(), context.Canceled.Error()) {
+		t.Fatalf("canceled workflow error = %v, want context cancellation", err)
+	}
+	for _, path := range []string{"feature-one.txt", "feature-two.txt"} {
+		if _, err := os.Lstat(filepath.Join(dir, path)); !os.IsNotExist(err) {
+			t.Errorf("canceled staged output %q was applied to target: %v", path, err)
+		}
+	}
+}
+
+func TestSubtaskBaselineCapturesAndVerifiesTrackedSymlinkWithoutFollowingIt(t *testing.T) {
+	dir := initTestGitRepo(t)
+	if err := os.Symlink("missing-target", filepath.Join(dir, "tracked-link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	cmd := exec.Command("git", "-C", dir, "add", "tracked-link")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add tracked symlink: %v: %s", err, output)
+	}
+	cmd = exec.Command("git", "-C", dir, "commit", "-q", "-m", "add tracked symlink")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("commit tracked symlink: %v: %s", err, output)
+	}
+	baseline, err := captureSubtaskBaseline(dir, dir)
+	if err != nil {
+		t.Fatalf("capture tracked symlink baseline: %v", err)
+	}
+	if err := verifySubtaskBaseline(dir, dir, baseline); err != nil {
+		t.Fatalf("verify unchanged tracked symlink baseline: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "tracked-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("different-target", filepath.Join(dir, "tracked-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifySubtaskBaseline(dir, dir, baseline); err == nil {
+		t.Fatal("changed symlink unexpectedly matched the captured baseline")
+	}
+}
+
 func TestParallelImplementationCancelsSiblingOnWorkerError(t *testing.T) {
 	dir := initTestGitRepo(t)
 	agent := &parallelWorkflowAgent{cancelSibling: true}

@@ -1,8 +1,10 @@
 package factory
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -93,6 +95,58 @@ func TestRunCommandListsShowsEventsAndCooperativelyStopsOnlyManagedRuns(t *testi
 	}
 	if err := RunCommand(context.Background(), []string{"show", "unmanaged"}, cfg, &out); err == nil {
 		t.Fatal("run control accepted an unmanaged or missing run")
+	}
+}
+
+func TestManagedWorkflowStartupFailurePersistsFailedOutcome(t *testing.T) {
+	stateRoot := t.TempDir()
+	workdir := t.TempDir()
+	var runDir string
+	workflow := Workflow{
+		Agent: &fakeAgent{outputs: map[string][]string{}}, Config: Config{StateDir: stateRoot},
+		In: strings.NewReader(""), Out: io.Discard, Workdir: workdir,
+		Gate: true, Managed: true,
+		RunCreated: func(dir, _ string) {
+			runDir = dir
+			if err := os.Mkdir(filepath.Join(dir, "owner.json"), 0o700); err != nil {
+				t.Errorf("block managed owner record: %v", err)
+			}
+		},
+	}
+
+	err := workflow.Run("managed task")
+	if err == nil || !strings.Contains(err.Error(), "owner.json") {
+		t.Fatalf("workflow error = %v, want preserved managed startup owner write failure", err)
+	}
+	if runDir == "" {
+		t.Fatal("workflow did not create a persisted run")
+	}
+	state, stateErr := readManagedState(runDir)
+	if stateErr != nil || !state.Managed || state.Status != "failed" {
+		t.Fatalf("persisted state = %+v, err=%v; want managed failed state", state, stateErr)
+	}
+
+	file, err := os.Open(filepath.Join(runDir, "workflow-events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var terminal *workflowEventRecord
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var event workflowEventRecord
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			t.Fatalf("parse workflow event %q: %v", scanner.Text(), err)
+		}
+		if event.Type == "workflow.transition" && event.Message == "failed" {
+			terminal = &event
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if terminal == nil || terminal.Outcome != "failure" {
+		t.Fatalf("terminal failure event = %+v, want workflow failure outcome", terminal)
 	}
 }
 

@@ -106,6 +106,7 @@ func TestRunnerBoundsProtocolCaptureAndPreservesFirstNonemptyLine(t *testing.T) 
 		body     string
 		want     string
 		wantPass bool
+		wantErr  bool
 	}{
 		{
 			name: "large empty prefix before PASS",
@@ -116,6 +117,7 @@ func TestRunnerBoundsProtocolCaptureAndPreservesFirstNonemptyLine(t *testing.T) 
 			name:     "oversized first nonempty line before PASS",
 			body:     "printf 'FAIL'; head -c 1048576 /dev/zero | tr '\\000' 'x'; printf '\\nPASS\\n'",
 			wantPass: false,
+			wantErr:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,7 +128,11 @@ func TestRunnerBoundsProtocolCaptureAndPreservesFirstNonemptyLine(t *testing.T) 
 			}
 			logPath := filepath.Join(dir, "agent.log")
 			stdout, err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunWithOutputContext(context.Background(), "implement", "prompt", "task", dir, logPath)
-			if err != nil {
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "exceeds") {
+					t.Fatalf("oversized protocol error = %v, want bounded-capture rejection", err)
+				}
+			} else if err != nil {
 				t.Fatal(err)
 			}
 			if len(stdout) > stdoutProtocolCaptureLimit {
@@ -144,6 +150,55 @@ func TestRunnerBoundsProtocolCaptureAndPreservesFirstNonemptyLine(t *testing.T) 
 			}
 			if info.Size() < 1<<20 {
 				t.Fatalf("combined log size=%d, want full output >= 1 MiB", info.Size())
+			}
+		})
+	}
+}
+
+func TestRunnerCapturesAndValidatesPlanSizedProtocolWithoutChangingWhitespace(t *testing.T) {
+	plan := `{"subtasks":[{"id":"model","task":"Implement the model","files":["internal/model.go"],"depends_on":[]},{"id":"tests","task":"Add model tests","files":["internal/model_test.go"],"depends_on":[]}]}`
+	const trailingWhitespaceBytes = 12 * 1024
+	protocol := plan + strings.Repeat(" ", trailingWhitespaceBytes)
+	if len(protocol) <= 8*1024 || len(protocol) > maxSubtaskPlanBytes {
+		t.Fatalf("test protocol size=%d, want between 8 KiB and %d bytes", len(protocol), maxSubtaskPlanBytes)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		output     string
+		wantError  bool
+		wantOutput string
+	}{
+		{name: "within plan limit", output: protocol, wantOutput: protocol},
+		{name: "over plan limit", output: protocol + strings.Repeat("x", maxSubtaskPlanBytes), wantError: true, wantOutput: protocol + strings.Repeat("x", maxSubtaskPlanBytes-len(protocol))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script := filepath.Join(dir, "agent.sh")
+			if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' '"+tc.output+"'\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunWithOutputContext(context.Background(), "plan", "prompt", "task", dir, filepath.Join(dir, "agent.log"))
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "exceeds") {
+					t.Fatalf("over-limit protocol error = %v, want bounded-capture rejection", err)
+				}
+			} else if err != nil {
+				t.Fatalf("within-limit protocol rejected: %v", err)
+			}
+			if stdout != tc.wantOutput {
+				t.Fatalf("captured protocol length=%d, want exact length=%d", len(stdout), len(tc.wantOutput))
+			}
+			if len(stdout) > maxSubtaskPlanBytes {
+				t.Fatalf("captured protocol length=%d exceeds limit %d", len(stdout), maxSubtaskPlanBytes)
+			}
+			if !tc.wantError {
+				if _, err := validateImplementationPlan([]byte(stdout)); err != nil {
+					t.Fatalf("captured protocol failed plan validation: %v", err)
+				}
+				if !strings.HasSuffix(stdout, strings.Repeat(" ", trailingWhitespaceBytes)) {
+					t.Fatal("captured protocol did not preserve trailing JSON whitespace")
+				}
 			}
 		})
 	}

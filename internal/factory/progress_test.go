@@ -48,6 +48,47 @@ func (w *progressTestWriter) waitPulse(t *testing.T) {
 	}
 }
 
+func TestProgressPathTruncationPreservesBasenameInPlainAndCompletionOutput(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	logPath := filepath.Join(t.TempDir(), strings.Repeat("long-directory-", 12), "01-implementation.log")
+	output := newProgressTestWriter()
+	progress := startProgressWithIntervals(output, false, "implement", logPath, time.Hour, time.Hour)
+	progress.finish(nil)
+
+	got := output.String()
+	if !strings.Contains(got, "completed in") {
+		t.Fatalf("completion output missing: %q", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "Log: ") {
+			if !strings.HasSuffix(line, "01-implementation.log") {
+				t.Errorf("plain progress path did not preserve basename: %q", line)
+			}
+			if progressTextWidth(line) > progressDefaultWidth {
+				t.Errorf("plain path line was not bounded: width=%d line=%q", progressTextWidth(line), line)
+			}
+		}
+		if strings.Contains(line, "; log: ") && !strings.HasSuffix(line, "01-implementation.log") {
+			t.Errorf("completion path did not preserve basename: %q", line)
+		}
+	}
+}
+
+func TestOneRowProgressLayoutKeepsLogPathVisible(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	path := filepath.Join("/state", strings.Repeat("nested-directory/", 8), "01-build.log")
+	lines := renderProgressScreen(48, 1, "build", path, time.Second, "ACTIVE", false)
+	if len(lines) != 1 {
+		t.Fatalf("rendered %d lines in one-row viewport", len(lines))
+	}
+	if !strings.Contains(lines[0], "01-build.log") || !strings.Contains(lines[0], "LOG") {
+		t.Fatalf("one-row layout dropped or truncated the log basename: %q", lines[0])
+	}
+	if width := progressTextWidth(lines[0]); width > 48 {
+		t.Fatalf("one-row layout width %d exceeds 48 columns: %q", width, lines[0])
+	}
+}
+
 func TestProgressNonTTYProvidesPlainProgressAndSafeBoundedPaths(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	logPath := "\x1b]0;hostile title\a" + strings.Repeat("/long/path", 40) + "\nlatest.log"

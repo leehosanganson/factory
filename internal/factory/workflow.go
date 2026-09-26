@@ -133,7 +133,12 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	if w.Managed {
 		managed, err = startManagedRun(ctx, runDir)
 		if err != nil {
-			return err
+			state.Status = "failed"
+			stateErr := writeState(runDir, state)
+			eventErr := persistWorkflowEvent(runDir, WorkflowEvent{
+				RunID: state.ID, Type: "workflow.transition", Message: "failed", Outcome: "failure",
+			})
+			return errors.Join(err, stateErr, eventErr)
 		}
 		defer managed.close()
 		ctx = managed.ctx

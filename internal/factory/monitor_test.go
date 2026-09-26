@@ -1,12 +1,16 @@
 package factory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -579,6 +583,16 @@ func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
 	if err := saveBabysitJob(jobDir, job); err != nil {
 		t.Fatal(err)
 	}
+	store, err := NewJobStore(filepath.Join(base, "v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: job.ID, Type: monitorJobType, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(job.ID, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
 	worktree := filepath.Join(base, "worker")
 	runTestCommand(t, repo, "git", "worktree", "add", "-b", "worker", worktree, head)
 	job.Worktree, job.WorkerBranch = worktree, "worker"
@@ -649,6 +663,16 @@ exit 1
 	if err := saveBabysitJob(jobDir, job); err != nil {
 		t.Fatal(err)
 	}
+	store, err := NewJobStore(filepath.Join(root, "v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: job.ID, Type: monitorJobType, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(job.ID, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
 	agent := filepath.Join(base, "agent")
 	script := `#!/bin/sh
 stage="$1"
@@ -688,6 +712,24 @@ exit 9
 	}
 	if job.BaselineHead != remoteHead {
 		t.Fatalf("job baseline %q not advanced to %q", job.BaselineHead, remoteHead)
+	}
+	sessionLog, err := store.SessionLogPath(job.ID, monitorSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBytes, err := os.ReadFile(sessionLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentBytes, err := os.ReadFile(filepath.Join(jobDir, "agent.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(sessionBytes, agentBytes) || bytes.Count(sessionBytes, agentBytes) != 1 {
+		t.Fatalf("v2 monitor session log = %q, want raw agent log exactly once at the start", sessionBytes)
+	}
+	if !bytes.Equal(sessionBytes[:len(agentBytes)], agentBytes) {
+		t.Fatalf("v2 monitor session log did not preserve exact agent bytes: got prefix %q want %q", sessionBytes[:len(agentBytes)], agentBytes)
 	}
 	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
 		t.Fatal(err)
@@ -736,7 +778,7 @@ func TestBabysitBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 				t.Fatal(err)
 			}
 			tc.alter(t, repo, worktree)
-			if err := guardedCommitPush(dir, job, "sig", &babysitSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
+			if err := guardedCommitPush(context.Background(), dir, job, "sig", &babysitSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
 				t.Fatal("unsafe commit/push accepted")
 			}
 			got, _ := runGit(context.Background(), bare, "rev-parse", "refs/heads/feature")
@@ -780,7 +822,7 @@ func TestBabysitStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
 	if err := saveBabysitJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
-	if err := guardedCommitPush(dir, job, "sig", &babysitSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
+	if err := guardedCommitPush(context.Background(), dir, job, "sig", &babysitSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
 		t.Fatal("stop request did not block commit")
 	}
 	got, err := runGit(context.Background(), worktree, "rev-parse", "HEAD")
@@ -799,7 +841,7 @@ func TestBabysitRejectsDifferentConfiguredPushURL(t *testing.T) {
 	runTestCommand(t, fixture.base, "git", "init", "--bare", wrongRemote)
 	runTestCommand(t, fixture.repo, "git", "config", "remote.origin.pushurl", wrongRemote)
 
-	err := guardedCommitPush(fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"})
+	err := guardedCommitPush(context.Background(), fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"})
 	if err == nil || !strings.Contains(err.Error(), "push URL does not point") {
 		t.Fatalf("different configured push URL was not rejected: %v", err)
 	}
@@ -853,7 +895,7 @@ func TestBabysitPushLeaseRejectsRemoteHeadRace(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fixture.base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if err := guardedCommitPush(fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"}); err == nil {
+	if err := guardedCommitPush(context.Background(), fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"}); err == nil {
 		t.Fatal("push with stale expected-old head unexpectedly succeeded")
 	}
 	if _, err := os.Stat(marker); err != nil {
@@ -919,6 +961,86 @@ func newMonitorPushFixture(t *testing.T) monitorPushFixture {
 		t.Fatal(err)
 	}
 	return monitorPushFixture{base: base, bare: bare, repo: repo, dir: dir, job: job, snapshot: snapshot, signature: signature, head: head}
+}
+
+func TestGuardedCommitPushCancellationAbortsSnapshotCheckpoint(t *testing.T) {
+	for _, checkpoint := range []int{1, 2} {
+		t.Run(fmt.Sprintf("snapshot %d", checkpoint), func(t *testing.T) {
+			fixture := newMonitorPushFixture(t)
+			ghPath := filepath.Join(fixture.base, "gh")
+			countPath := filepath.Join(fixture.base, "gh-count")
+			startedPath := filepath.Join(fixture.base, "gh-started")
+			jsonData := `{"number":17,"state":"OPEN","title":"Fix","url":"https://github.com/team/repo/pull/17","headRefName":"feature","headRefOid":"` + fixture.head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + fixture.head + `","comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
+			script := "#!/bin/sh\nn=0\n[ ! -f '" + countPath + "' ] || n=$(cat '" + countPath + "')\nn=$((n+1))\nprintf '%s' \"$n\" > '" + countPath + "'\ntouch '" + startedPath + "'\nif [ $n -eq " + strconv.Itoa(checkpoint) + " ]; then exec sleep 30; else printf '%s\\n' '" + jsonData + "'; fi\n"
+			if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancelStarted := make(chan struct{})
+			go func() {
+				defer close(cancelStarted)
+				deadline := time.Now().Add(3 * time.Second)
+				for time.Now().Before(deadline) {
+					if _, err := os.Stat(startedPath); err == nil {
+						count, _ := os.ReadFile(countPath)
+						if string(count) == strconv.Itoa(checkpoint) {
+							cancel()
+							return
+						}
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				cancel()
+			}()
+			err := guardedCommitPush(ctx, fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"})
+			<-cancelStarted
+			if err == nil || !errors.Is(err, context.Canceled) {
+				t.Fatalf("guarded commit/push error = %v, want cancellation", err)
+			}
+			remote, err := runGit(context.Background(), fixture.bare, "rev-parse", "refs/heads/feature")
+			if err != nil || remote != fixture.head {
+				t.Fatalf("canceled operation changed remote: head=%s err=%v", remote, err)
+			}
+			count, _ := os.ReadFile(countPath)
+			if string(count) != strconv.Itoa(checkpoint) {
+				t.Fatalf("snapshot calls=%s, want cancellation at call %d", count, checkpoint)
+			}
+		})
+	}
+}
+
+func TestMonitorAgentSessionAppendFailureFailsAction(t *testing.T) {
+	fixture := newMonitorPushFixture(t)
+	storeRoot := filepath.Join(filepath.Dir(fixture.dir), "v2")
+	store, err := NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: fixture.job.ID, Type: monitorJobType, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(fixture.job.ID, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	logPath, err := store.SessionLogPath(fixture.job.ID, monitorSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(logPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(fixture.base, "missing"), logPath); err != nil {
+		t.Fatal(err)
+	}
+	agent := filepath.Join(fixture.base, "agent")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'FACTORY_STATUS=NO_ACTION\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Command: agent, Args: []string{"{stage}", "{task}", "{system_prompt}"}}
+	err = processBabysitEventContext(context.Background(), fixture.dir, fixture.job, cfg, fixture.snapshot, fixture.signature)
+	if err == nil || !strings.Contains(err.Error(), "append monitor agent log to session") {
+		t.Fatalf("monitor action error = %v, want session append failure", err)
+	}
 }
 
 func newBabysitRepo(t *testing.T) string {

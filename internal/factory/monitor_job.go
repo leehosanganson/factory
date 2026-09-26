@@ -2,10 +2,22 @@ package factory
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
 )
+
+func appendMonitorAgentLog(dir, id string, data []byte) error {
+	store, exists, err := existingMonitorJobStore(dir, id)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("v2 monitor job %s does not exist", id)
+	}
+	return store.AppendSessionLog(id, monitorSessionID, data)
+}
 
 func existingMonitorJobStore(dir, id string) (*JobStore, bool, error) {
 	root := filepath.Join(filepath.Dir(dir), "v2")

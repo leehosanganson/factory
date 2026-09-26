@@ -565,6 +565,9 @@ func (w Workflow) runParallelImplementation(ctx context.Context, task, stageLog,
 	if err := verifySubtaskBaseline(root, w.Workdir, baseline); err != nil {
 		return true, err
 	}
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
 	rollbackApplied, err = applyStagedSubtaskFiles(w.Workdir, stagingRoot, staged)
 	if err != nil {
 		return true, fmt.Errorf("apply staged subtask changes: %w", err)
@@ -604,7 +607,7 @@ func captureSubtaskBaseline(root, target string) (subtaskBaseline, error) {
 		if path == "" {
 			continue
 		}
-		digest, err := fileDigest(filepath.Join(target, filepath.FromSlash(path)))
+		digest, err := trackedPathDigest(filepath.Join(target, filepath.FromSlash(path)))
 		if err != nil {
 			return subtaskBaseline{}, fmt.Errorf("snapshot tracked path %q: %w", path, err)
 		}
@@ -641,7 +644,7 @@ func verifySubtaskBaseline(root, target string, baseline subtaskBaseline) error 
 			continue
 		}
 		key := filepath.ToSlash(path)
-		digest, err := fileDigest(filepath.Join(target, filepath.FromSlash(key)))
+		digest, err := trackedPathDigest(filepath.Join(target, filepath.FromSlash(key)))
 		if err != nil {
 			return fmt.Errorf("snapshot tracked path %q: %w", key, err)
 		}
@@ -1016,6 +1019,35 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 
 func subtaskMode(mode os.FileMode) os.FileMode {
 	return mode.Perm() | mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky)
+}
+
+func trackedPathDigest(path string) (string, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	var data []byte
+	if info.Mode().IsRegular() {
+		data, err = os.ReadFile(path)
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		var target string
+		target, err = os.Readlink(path)
+		data = []byte(target)
+	} else {
+		return "", fmt.Errorf("tracked path %q has unsafe type %s", path, info.Mode().Type())
+	}
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	_, _ = fmt.Fprintf(hash, "%#o\x00", subtaskMode(info.Mode()))
+	if info.Mode()&os.ModeSymlink != 0 {
+		_, _ = hash.Write([]byte("symlink\x00"))
+	} else {
+		_, _ = hash.Write([]byte("regular\x00"))
+	}
+	_, _ = hash.Write(data)
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func fileDigest(path string) (string, error) {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -228,9 +229,12 @@ func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.D
 		} else if rows == 2 {
 			lines = []string{stageLine, logLine()}
 		} else if rows == 1 {
-			prefix := stageLine + " · LOG "
-			pathWidth := max(1, width-progressTextWidth(prefix))
-			lines = []string{prefix + styledLogPath(shortProgressPath(terminalSafeProgressPath(logPath), pathWidth), !noColor)}
+			path := terminalSafeProgressPath(logPath)
+			pathWidth := min(width/2, progressTextWidth(filepath.Base(path))+1)
+			pathWidth = max(1, pathWidth)
+			stageWidth := max(1, width-pathWidth-progressTextWidth(" · LOG "))
+			prefix := truncateProgressText(stageLine, stageWidth+1) + " · LOG "
+			lines = []string{prefix + styledLogPath(shortProgressPath(path, pathWidth), !noColor)}
 		}
 		for len(lines) < rows {
 			lines = append(lines, "")
@@ -410,10 +414,7 @@ func wrapProgressText(text string, width int) []string {
 
 func safeProgressPath(path string, width int) string {
 	path = terminalSafeProgressPath(path)
-	if width <= 0 {
-		return ""
-	}
-	return truncateProgressText(path, width+1)
+	return shortProgressPath(path, width)
 }
 
 func terminalSafeProgressPath(path string) string {
