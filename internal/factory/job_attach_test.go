@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,12 @@ func (b *synchronizedBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.Buffer.Write(data)
+}
+
+func (b *synchronizedBuffer) ReadFrom(reader io.Reader) (int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.ReadFrom(reader)
 }
 
 func (b *synchronizedBuffer) String() string {

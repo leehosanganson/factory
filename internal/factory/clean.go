@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -463,6 +464,23 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if err := w.approveCleanPublication(ctx, workflowInput, runOutput.runDir); err != nil {
 		return err
 	}
+	if err := revalidateClean(git, baseline, paths, paths); err != nil {
+		return err
+	}
+	if err := verifyCleanSnapshot(git, root, paths, snapshot); err != nil {
+		return fmt.Errorf("clean outputs changed after publication approval; refusing commit: %w", err)
+	}
+	if err := verifyStagedSnapshot(git, paths, snapshot); err != nil {
+		return fmt.Errorf("staged clean outputs changed after publication approval; refusing commit: %w", err)
+	}
+	stagedStatus, err = git("git", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all")
+	if err != nil || !samePaths(statusPaths(stagedStatus), paths) {
+		return fmt.Errorf("worktree paths changed after publication approval; refusing commit")
+	}
+	unstaged, err = git("git", "diff", "--name-only", "-z", "--no-renames")
+	if err != nil || len(unstaged) != 0 {
+		return fmt.Errorf("unstaged changes appeared after publication approval; refusing commit")
+	}
 	if err := cleanContextCheck(ctx); err != nil {
 		return err
 	}
@@ -588,13 +606,54 @@ func createCleanWorktree(ctx context.Context, target, head string) (string, func
 	return path, cleanup, nil
 }
 
-func transferCleanPaths(target, source string, paths []string, expected map[string]cleanFileSnapshot) error {
-	patchCmd := exec.Command("git", "-C", source, "diff", "--binary", "HEAD", "--")
+func transferCleanPaths(target, source string, paths []string, expected map[string]cleanFileSnapshot) (transferErr error) {
+	before, err := snapshotCleanPaths(func(name string, args ...string) ([]byte, error) {
+		cmd := exec.Command(name, args...)
+		cmd.Dir = target
+		return cmd.Output()
+	}, target, paths)
+	if err != nil {
+		return fmt.Errorf("snapshot original paths before transfer: %w", err)
+	}
+	beforeModes := make(map[string]os.FileMode, len(paths))
+	for _, path := range paths {
+		info, err := os.Lstat(filepath.Join(target, filepath.FromSlash(path)))
+		if err == nil {
+			beforeModes[path] = info.Mode().Perm()
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect original mode for %q: %w", path, err)
+		}
+	}
+	createdDirs := make([]string, 0)
+	touched := make(map[string]bool)
+	defer func() {
+		if transferErr == nil {
+			return
+		}
+		changedPaths := make([]string, 0, len(touched))
+		for path := range touched {
+			changedPaths = append(changedPaths, path)
+		}
+		sort.Strings(changedPaths)
+		if rollbackErr := rollbackCleanTransfer(target, changedPaths, before, beforeModes, createdDirs); rollbackErr != nil {
+			transferErr = errors.Join(transferErr, fmt.Errorf("rollback isolated clean transfer: %w", rollbackErr))
+		}
+	}()
+	patchArgs := append([]string{"-C", source, "diff", "--binary", "HEAD", "--"}, paths...)
+	patchCmd := exec.Command("git", patchArgs...)
 	patch, err := patchCmd.Output()
 	if err != nil {
 		return fmt.Errorf("create isolated tracked-change patch: %w", err)
 	}
 	if len(patch) != 0 {
+		changedCmd := exec.Command("git", append([]string{"-C", source, "diff", "--name-only", "-z", "--no-renames", "HEAD", "--"}, paths...)...)
+		changed, err := changedCmd.Output()
+		if err != nil {
+			return fmt.Errorf("inspect isolated tracked changes: %w", err)
+		}
+		for _, path := range nulPaths(changed) {
+			touched[path] = true
+		}
 		apply := exec.Command("git", "-C", target, "apply", "--binary", "-")
 		apply.Stdin = bytes.NewReader(patch)
 		if output, err := apply.CombinedOutput(); err != nil {
@@ -626,6 +685,7 @@ func transferCleanPaths(target, source string, paths []string, expected map[stri
 				if err := os.Mkdir(parent, 0o755); err != nil {
 					return fmt.Errorf("create parent for %q: %w", path, err)
 				}
+				createdDirs = append(createdDirs, parent)
 				continue
 			}
 			if err != nil {
@@ -639,6 +699,7 @@ func transferCleanPaths(target, source string, paths []string, expected map[stri
 			if err := os.Symlink(string(entry.content), destination); err != nil {
 				return fmt.Errorf("create isolated symlink %q without replacing existing content: %w", path, err)
 			}
+			touched[path] = true
 			continue
 		}
 		if entry.mode != "100644" && entry.mode != "100755" {
@@ -648,6 +709,7 @@ func transferCleanPaths(target, source string, paths []string, expected map[stri
 		if err != nil {
 			return fmt.Errorf("create isolated file %q without replacing existing content: %w", path, err)
 		}
+		touched[path] = true
 		_, writeErr := file.Write(entry.content)
 		closeErr := file.Close()
 		if err := errors.Join(writeErr, closeErr); err != nil {
@@ -659,6 +721,70 @@ func transferCleanPaths(target, source string, paths []string, expected map[stri
 		}
 		if err := os.Chmod(destination, mode); err != nil {
 			return fmt.Errorf("set mode for isolated file %q: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func rollbackCleanTransfer(target string, paths []string, before map[string]cleanFileSnapshot, beforeModes map[string]os.FileMode, createdDirs []string) error {
+	var rollbackErr error
+	for i := len(paths) - 1; i >= 0; i-- {
+		path := paths[i]
+		fullPath := filepath.Join(target, filepath.FromSlash(path))
+		if err := ensureCleanTransferParents(target, filepath.Dir(fullPath)); err != nil {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("inspect rollback parent for %q: %w", path, err))
+			continue
+		}
+		if err := os.Remove(fullPath); err != nil && !os.IsNotExist(err) {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove partial transfer for %q: %w", path, err))
+			continue
+		}
+		entry := before[path]
+		switch entry.mode {
+		case "":
+		case "120000":
+			if err := os.Symlink(string(entry.content), fullPath); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore symlink %q: %w", path, err))
+			}
+		case "100644", "100755":
+			mode := beforeModes[path]
+			if mode == 0 {
+				mode = 0o644
+			}
+			if err := os.WriteFile(fullPath, entry.content, mode); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore file %q: %w", path, err))
+			} else if err := os.Chmod(fullPath, mode); err != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("restore mode for %q: %w", path, err))
+			}
+		default:
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("cannot restore unsupported prior type %q for %q", entry.mode, path))
+		}
+	}
+	for i := len(createdDirs) - 1; i >= 0; i-- {
+		if err := os.Remove(createdDirs[i]); err != nil && !os.IsNotExist(err) && !errors.Is(err, syscall.ENOTEMPTY) {
+			rollbackErr = errors.Join(rollbackErr, fmt.Errorf("remove created directory %s: %w", createdDirs[i], err))
+		}
+	}
+	return rollbackErr
+}
+
+func ensureCleanTransferParents(root, parent string) error {
+	rel, err := filepath.Rel(root, parent)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("parent escapes target checkout")
+	}
+	current := root
+	if rel == "." {
+		return nil
+	}
+	for _, component := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unsafe parent directory %s", current)
 		}
 	}
 	return nil

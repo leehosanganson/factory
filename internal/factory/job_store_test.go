@@ -265,6 +265,40 @@ func TestJobStoreRejectsUnsupportedRecordVersion(t *testing.T) {
 	}
 }
 
+func TestTerminalJobSessionReconcilesAfterSessionWriteFailure(t *testing.T) {
+	store := newTestJobStore(t)
+	if err := store.CreateJob(JobRecord{ID: "terminal-repair", Type: implementationJobType, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	session, err := store.CreateSession("terminal-repair", "workflow", "running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.writeSessionRecord = func(string, SessionRecord) error {
+		return errors.New("injected session persistence failure")
+	}
+	if err := finishJob(store, "terminal-repair", "failed"); err == nil || !strings.Contains(err.Error(), "injected session persistence failure") {
+		t.Fatalf("finishJob error = %v, want controlled session write failure", err)
+	}
+	job, err := store.GetJob("terminal-repair")
+	if err != nil || job.Status != "failed" || len(job.Sessions) != 1 || job.Sessions[0].Status != "running" {
+		t.Fatalf("job state after controlled session write failure = %+v err=%v", job, err)
+	}
+
+	store.writeSessionRecord = nil
+	repaired, err := store.reconcileJob("terminal-repair")
+	if err != nil {
+		t.Fatalf("reconcile terminal job: %v", err)
+	}
+	session, err = store.GetSession("terminal-repair", "workflow")
+	if err != nil || session.Status != "failed" || session.EndedAt.IsZero() {
+		t.Fatalf("repaired session = %+v err=%v", session, err)
+	}
+	if repaired.Status != "failed" || len(repaired.Sessions) != 1 || repaired.Sessions[0].Status != "failed" || repaired.Sessions[0].EndedAt.IsZero() {
+		t.Fatalf("reconciled job/session metadata = %+v", repaired)
+	}
+}
+
 func TestJobStoreStatusHistoryAndConcurrentAtomicUpdates(t *testing.T) {
 	store := newTestJobStore(t)
 	createTestJob(t, store, "counted")

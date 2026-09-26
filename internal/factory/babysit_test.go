@@ -793,6 +793,134 @@ func TestBabysitStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
 	}
 }
 
+func TestBabysitRejectsDifferentConfiguredPushURL(t *testing.T) {
+	fixture := newMonitorPushFixture(t)
+	wrongRemote := filepath.Join(fixture.base, "wrong.git")
+	runTestCommand(t, fixture.base, "git", "init", "--bare", wrongRemote)
+	runTestCommand(t, fixture.repo, "git", "config", "remote.origin.pushurl", wrongRemote)
+
+	err := guardedCommitPush(fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"})
+	if err == nil || !strings.Contains(err.Error(), "push URL does not point") {
+		t.Fatalf("different configured push URL was not rejected: %v", err)
+	}
+	got, err := runGit(context.Background(), wrongRemote, "rev-parse", "--verify", "refs/heads/feature")
+	if err == nil {
+		t.Fatalf("unsafe destination received commit %s", got)
+	}
+	got, err = runGit(context.Background(), fixture.bare, "rev-parse", "refs/heads/feature")
+	if err != nil || got != fixture.head {
+		t.Fatalf("validated remote changed: head=%s err=%v", got, err)
+	}
+}
+
+func TestBabysitRejectsPushURLRewrites(t *testing.T) {
+	for _, rewrite := range []string{"insteadOf", "pushInsteadOf"} {
+		t.Run(rewrite, func(t *testing.T) {
+			fixture := newMonitorPushFixture(t)
+			pushURL := fixture.bare
+			redirect := filepath.Join(fixture.base, "redirect")
+			runTestCommand(t, fixture.repo, "git", "config", "remote.origin.pushurl", pushURL)
+			runTestCommand(t, fixture.repo, "git", "config", "url."+redirect+"."+rewrite, fixture.bare)
+			if _, err := validatedPushURL(fixture.job.Worktree, fixture.job); err == nil || !strings.Contains(err.Error(), "URL rewrite") {
+				t.Fatalf("applicable %s rewrite was not rejected: %v", rewrite, err)
+			}
+			got, err := runGit(context.Background(), fixture.bare, "rev-parse", "refs/heads/feature")
+			if err != nil || got != fixture.head {
+				t.Fatalf("rewritten push changed validated remote: head=%s err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestBabysitPushLeaseRejectsRemoteHeadRace(t *testing.T) {
+	fixture := newMonitorPushFixture(t)
+	competitor := filepath.Join(fixture.base, "competitor")
+	runTestCommand(t, fixture.base, "git", "clone", fixture.bare, competitor)
+	runTestCommand(t, competitor, "git", "checkout", "feature")
+	runTestCommand(t, competitor, "git", "config", "user.name", "Concurrent Writer")
+	runTestCommand(t, competitor, "git", "config", "user.email", "writer@example.test")
+	if err := os.WriteFile(filepath.Join(competitor, "race"), []byte("concurrent update\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(fixture.base, "git")
+	marker := filepath.Join(fixture.base, "race-pushed")
+	wrapperScript := "#!/bin/sh\nfor arg do\n  if [ \"$arg\" = push ] && [ ! -e '" + marker + "' ]; then\n    touch '" + marker + "'\n    '" + gitPath + "' -C '" + competitor + "' add race\n    '" + gitPath + "' -C '" + competitor + "' commit -m 'concurrent update'\n    '" + gitPath + "' -C '" + competitor + "' push origin feature\n    break\n  fi\ndone\nexec '" + gitPath + "' \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(wrapperScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fixture.base+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := guardedCommitPush(fixture.dir, fixture.job, fixture.signature, fixture.snapshot, []string{"f"}); err == nil {
+		t.Fatal("push with stale expected-old head unexpectedly succeeded")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("competing update did not occur at push boundary: %v", err)
+	}
+	concurrentHead, err := runGit(context.Background(), fixture.bare, "rev-parse", "refs/heads/feature")
+	if err != nil || concurrentHead == fixture.head {
+		t.Fatalf("concurrent writer did not advance remote: head=%s err=%v", concurrentHead, err)
+	}
+	got, err := runGit(context.Background(), fixture.bare, "rev-parse", "refs/heads/feature")
+	if err != nil || got != concurrentHead {
+		t.Fatalf("stale work replaced concurrent remote head: got=%s want=%s err=%v", got, concurrentHead, err)
+	}
+}
+
+type monitorPushFixture struct {
+	base, bare, repo, dir string
+	job                   *babysitJob
+	snapshot              *babysitSnapshot
+	signature, head       string
+}
+
+func newMonitorPushFixture(t *testing.T) monitorPushFixture {
+	t.Helper()
+	base := t.TempDir()
+	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
+	runTestCommand(t, base, "git", "init", "--bare", bare)
+	runTestCommand(t, base, "git", "clone", bare, repo)
+	runTestCommand(t, repo, "git", "checkout", "-b", "feature")
+	runTestCommand(t, repo, "git", "config", "user.name", "Factory Test")
+	runTestCommand(t, repo, "git", "config", "user.email", "factory@example.test")
+	if err := os.WriteFile(filepath.Join(repo, "f"), []byte("before\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runTestCommand(t, repo, "git", "add", "f")
+	runTestCommand(t, repo, "git", "commit", "-m", "initial")
+	runTestCommand(t, repo, "git", "push", "-u", "origin", "feature")
+	head, err := runGit(context.Background(), repo, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh := filepath.Join(base, "gh")
+	ghJSON := `{"number":17,"state":"OPEN","title":"Fix","url":"https://github.com/team/repo/pull/17","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
+	ghScript := "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then printf '%s\\n' '" + ghJSON + "'; exit 0; fi\nexit 1\n"
+	if err := os.WriteFile(gh, []byte(ghScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := filepath.Join(base, "jobs", "20260518T120003-0123456789ab")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, signature, err := readSnapshot(context.Background(), &babysitJob{Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &babysitJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: filepath.Join(base, "worker"), WorkerBranch: "worker", Snapshot: signature}
+	runTestCommand(t, repo, "git", "worktree", "add", "-b", job.WorkerBranch, job.Worktree, head)
+	if err := os.WriteFile(filepath.Join(job.Worktree, "f"), []byte("agent update\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveBabysitJob(dir, job); err != nil {
+		t.Fatal(err)
+	}
+	return monitorPushFixture{base: base, bare: bare, repo: repo, dir: dir, job: job, snapshot: snapshot, signature: signature, head: head}
+}
+
 func newBabysitRepo(t *testing.T) string {
 	t.Helper()
 	repo := filepath.Join(t.TempDir(), "repo")

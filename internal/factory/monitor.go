@@ -1403,10 +1403,6 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 	if err != nil || workerBranch != job.WorkerBranch {
 		return errors.New("worker branch changed before push")
 	}
-	origin, err := runGit(context.Background(), job.Worktree, "remote", "get-url", "origin")
-	if err != nil || !sameRepoURL(origin, job.OriginURL) {
-		return errors.New("worker origin changed before push")
-	}
 	live, sig, err := readSnapshot(context.Background(), job)
 	if err != nil || sig != signature || live.HeadRefOID != snapshot.HeadRefOID {
 		return errors.New("PR/check snapshot changed before push")
@@ -1414,11 +1410,19 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 	if stopped, _ := jobStopped(dir); stopped {
 		return errors.New("stop requested immediately before push")
 	}
-	if _, err := runGit(context.Background(), job.Worktree, "push", "origin", "HEAD:refs/heads/"+job.HeadBranch); err != nil {
+	pushURL, err := validatedPushURL(job.Worktree, job)
+	if err != nil {
 		return err
 	}
 	pushed, err := runGit(context.Background(), job.Worktree, "rev-parse", "HEAD")
 	if err != nil {
+		return err
+	}
+	if _, err := runGit(context.Background(), job.Worktree, "merge-base", "--is-ancestor", snapshot.HeadRefOID, pushed); err != nil {
+		return errors.New("committed head does not descend from the validated PR head; refusing push")
+	}
+	ref := "refs/heads/" + job.HeadBranch
+	if _, err := runGit(context.Background(), job.Worktree, "push", "--force-with-lease="+ref+":"+snapshot.HeadRefOID, pushURL, pushed+":"+ref); err != nil {
 		return err
 	}
 	job.BaselineHead = pushed
@@ -1430,6 +1434,58 @@ func guardedCommitPush(dir string, job *babysitJob, signature string, snapshot *
 	job.Status = "running"
 	job.ApprovalScope, job.ApprovalSignature = "", ""
 	return babysitEvent(dir, job, "Validated changed paths; committed and pushed guarded changes to "+job.HeadBranch+".")
+}
+
+func validatedPushURL(worktree string, job *babysitJob) (string, error) {
+	config, err := runGit(context.Background(), worktree, "config", "--null", "--list")
+	if err != nil {
+		return "", fmt.Errorf("cannot inspect Git push configuration; refusing push: %w", err)
+	}
+	var pushURLs, remoteURLs []string
+	for _, entry := range strings.Split(config, "\x00") {
+		if entry == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(entry, "\n")
+		if !ok {
+			return "", errors.New("cannot parse Git push configuration; refusing push")
+		}
+		switch strings.ToLower(key) {
+		case "remote.origin.pushurl":
+			pushURLs = append(pushURLs, value)
+		case "remote.origin.url":
+			remoteURLs = append(remoteURLs, value)
+		}
+	}
+	pushURL := ""
+	if len(pushURLs) > 0 {
+		if len(pushURLs) != 1 {
+			return "", errors.New("origin must have exactly one push URL; refusing push")
+		}
+		pushURL = pushURLs[0]
+	} else {
+		if len(remoteURLs) != 1 {
+			return "", errors.New("origin must have exactly one URL; refusing push")
+		}
+		pushURL = remoteURLs[0]
+	}
+	if strings.TrimSpace(pushURL) == "" || (!sameRepoURL(pushURL, job.OriginURL) && !sameRepoURL(pushURL, job.HeadRepoURL)) {
+		return "", errors.New("origin push URL does not point to the validated PR head repository; refusing push")
+	}
+	for _, entry := range strings.Split(config, "\x00") {
+		if entry == "" {
+			continue
+		}
+		key, value, ok := strings.Cut(entry, "\n")
+		if !ok {
+			return "", errors.New("cannot parse Git URL rewrite configuration; refusing push")
+		}
+		key = strings.ToLower(key)
+		if strings.HasPrefix(key, "url.") && strings.HasPrefix(pushURL, value) && (strings.HasSuffix(key, ".insteadof") || strings.HasSuffix(key, ".pushinsteadof")) {
+			return "", errors.New("matching Git URL rewrite rule; refusing push")
+		}
+	}
+	return pushURL, nil
 }
 
 func sameRepoURL(a, b string) bool {

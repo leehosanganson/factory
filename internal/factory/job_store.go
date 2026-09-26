@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"sync"
@@ -94,7 +95,8 @@ type SessionEvent struct {
 
 // JobStore provides concurrency-safe persistence beneath a jobs state root.
 type JobStore struct {
-	root string
+	root               string
+	writeSessionRecord func(string, SessionRecord) error
 }
 
 // JobSessionObserver records workflow lifecycle events in a job session.
@@ -675,7 +677,77 @@ func (s *JobStore) reconcileJob(id string) (JobRecord, error) {
 	if _, err := s.reconcileOrphan(job); err != nil {
 		return JobRecord{}, err
 	}
+	if err := s.reconcileTerminalSession(id); err != nil {
+		return JobRecord{}, err
+	}
 	return s.GetJob(id)
+}
+
+// reconcileTerminalSession repairs the workflow session after the job's terminal
+// record has been persisted. Each record is replaced atomically, so a later call
+// can finish the repair if either write is interrupted.
+func (s *JobStore) reconcileTerminalSession(id string) error {
+	unlock, err := s.LockJob(id)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	job, err := s.GetJob(id)
+	if err != nil {
+		return err
+	}
+	if job.Type != implementationJobType || !isTerminalStatus(job.Status) {
+		return nil
+	}
+	session, err := s.GetSession(id, "workflow")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	now := time.Now().UTC()
+	if session.Status != job.Status || session.EndedAt.IsZero() {
+		setLifecycleTimes(session.Status, job.Status, &session.StartedAt, &session.EndedAt)
+		session.Status = job.Status
+		session.UpdatedAt = now
+		dir, err := s.sessionDir(id, "workflow", false)
+		if err != nil {
+			return err
+		}
+		if s.writeSessionRecord != nil {
+			if err := s.writeSessionRecord(dir, session); err != nil {
+				return err
+			}
+		} else if err := writeJSONAtomic(dir, "session.json", session); err != nil {
+			return err
+		}
+	}
+
+	metadata := sessionMetadata(session)
+	found := false
+	for i := range job.Sessions {
+		if job.Sessions[i].ID != "workflow" {
+			continue
+		}
+		found = true
+		if reflect.DeepEqual(job.Sessions[i], metadata) {
+			return nil
+		}
+		job.Sessions[i] = metadata
+		break
+	}
+	if !found {
+		job.Sessions = append(job.Sessions, metadata)
+	}
+	job.UpdatedAt = now
+	jobDir, err := s.jobDir(id, false)
+	if err != nil {
+		return err
+	}
+	return writeJSONAtomic(jobDir, "job.json", job)
 }
 
 // reconcileJobs scans every persisted job and applies orphan recovery before returning them.
@@ -846,7 +918,11 @@ func (s *JobStore) UpdateSession(jobID, sessionID string, update func(*SessionRe
 	if err != nil {
 		return SessionRecord{}, err
 	}
-	if err := writeJSONAtomic(dir, "session.json", session); err != nil {
+	if s.writeSessionRecord != nil {
+		if err := s.writeSessionRecord(dir, session); err != nil {
+			return SessionRecord{}, err
+		}
+	} else if err := writeJSONAtomic(dir, "session.json", session); err != nil {
 		return SessionRecord{}, err
 	}
 	job, err := s.GetJob(jobID)

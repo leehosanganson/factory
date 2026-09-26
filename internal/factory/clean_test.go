@@ -773,6 +773,45 @@ func TestCleanCommitDoesNotIncludeChangesOutsideApprovedPaths(t *testing.T) {
 	}
 }
 
+func TestCleanRefusesIndexMutationWhilePublicationApprovalIsPending(t *testing.T) {
+	repo := newCleanRepo(t)
+	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
+	workflow.In = &cleanApprovalMutationReader{mutate: func() {
+		cmd := exec.Command("git", "hash-object", "-w", "--stdin")
+		cmd.Dir = repo.work
+		cmd.Stdin = strings.NewReader("changed during approval\n")
+		blob, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		gitClean(t, repo.work, "update-index", "--cacheinfo", "100644,"+strings.TrimSpace(string(blob))+",fix.txt")
+	}}
+	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "staged clean outputs changed after publication approval") {
+		t.Fatalf("approval-time index mutation error = %v", err)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {
+		t.Fatalf("approval-time mutation created a commit: initial=%s head=%s", initial, got)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initial {
+		t.Fatalf("approval-time mutation was pushed: initial=%s remote=%s", initial, got)
+	}
+}
+
+type cleanApprovalMutationReader struct {
+	mutate func()
+	read   bool
+}
+
+func (r *cleanApprovalMutationReader) Read(p []byte) (int, error) {
+	if !r.read {
+		r.read = true
+		r.mutate()
+		return copy(p, "yes\n"), nil
+	}
+	return 0, io.EOF
+}
+
 func TestCleanRefusesCommitWithIndexMutationAndNeverPushes(t *testing.T) {
 	repo := newCleanRepo(t)
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
@@ -1875,6 +1914,42 @@ func TestCleanNormalPushRejectsRemoteDivergence(t *testing.T) {
 	if remotePaths != "remote.txt" {
 		t.Fatalf("failed push changed remote contents: head=%s paths=%q", remoteHead, remotePaths)
 	}
+}
+
+func TestTransferCleanPathsRollsBackPartialTrackedAndUntrackedChanges(t *testing.T) {
+	target := newCleanRepo(t)
+	source := cloneCleanRepo(t, target.bare)
+	writeCleanFilePathRaw(source, "README.md", "tracked source change\n")
+	writeCleanFilePathRaw(source, "new.txt", "new isolated file\n")
+	writeCleanFilePathRaw(source, "z-existing.txt", "isolated replacement attempt\n")
+	writeCleanFilePathRaw(target.work, "z-existing.txt", "preserve pre-existing file\n")
+	paths := []string{"README.md", "new.txt", "z-existing.txt"}
+	expected := map[string]cleanFileSnapshot{
+		"README.md":      {mode: "100644", content: []byte("tracked source change\n")},
+		"new.txt":        {mode: "100644", content: []byte("new isolated file\n")},
+		"z-existing.txt": {mode: "100644", content: []byte("isolated replacement attempt\n")},
+	}
+	if err := transferCleanPaths(target.work, source, paths, expected); err == nil {
+		t.Fatal("transfer unexpectedly replaced a pre-existing destination")
+	}
+	if got := string(mustReadCleanFile(t, filepath.Join(target.work, "README.md"))); got != "initial\n" {
+		t.Fatalf("tracked patch remained after transfer failure: %q", got)
+	}
+	if _, err := os.Lstat(filepath.Join(target.work, "new.txt")); !os.IsNotExist(err) {
+		t.Fatalf("partial untracked addition remains: err=%v", err)
+	}
+	if got := string(mustReadCleanFile(t, filepath.Join(target.work, "z-existing.txt"))); got != "preserve pre-existing file\n" {
+		t.Fatalf("pre-existing destination changed: %q", got)
+	}
+}
+
+func mustReadCleanFile(t *testing.T, path string) []byte {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return content
 }
 
 type cleanPristineTransferAgent struct{}
