@@ -1,14 +1,38 @@
 ---
 name: factory
 description: >-
-  Use Factory's pipeline for deliberate feature and engineering work, or its
-  detached monitor for routine, low-risk fixes on an existing open PR.
-  Pipeline approval prompts are opt-in; use `--gate` when explicit approvals are
-  wanted. Preserve bounded retries and user control; do not treat Factory as an
-  autonomous engineering or security-sandbox system.
+  Use Factory's implement workflow first for substantive engineering changes
+  in this repository, or its detached monitor for routine, low-risk fixes on an
+  existing open PR. Skip research, review-only work, and small isolated edits;
+  never start a nested workflow from an active Factory run. Pipeline approval
+  prompts are opt-in; use `--gate` when explicit approvals are wanted. Preserve
+  bounded retries and user control; do not treat Factory as an autonomous
+  engineering or security-sandbox system.
 ---
 
 # Factory operating guidance
+
+## When to use Factory
+
+For substantive engineering work in this repository—features, behavioral
+fixes, multi-file changes, meaningful acceptance criteria, or work that
+benefits from requirements, implementation, review, and documentation—use
+`factory implement <description>`. Use `factory implement --gate <description>`
+when explicit approval between stages is wanted and an interactive terminal is
+available.
+
+Do not start an implementation workflow for a simple question, research or
+explanation, review-only request, mechanical one-line correction, or another
+small isolated edit whose scope and verification are already clear. Do not use
+`factory monitor` as a general implementation workflow; it is for bounded,
+routine maintenance on an existing open PR. Use `factory tidy` only when the
+requested task is a repository-wide review/fix/document/verify pass.
+
+Before launching a workflow, determine whether this task is already running
+inside Factory. If so, continue within that workflow instead of starting
+`factory implement`, `factory pipeline`, a detached implementation job, or any
+other Factory workflow recursively. If unsure, ask rather than starting another
+worker. Mention when recursion was avoided if it affects the chosen workflow.
 
 Choose the workflow that matches the work. `implement` is the canonical task
 workflow (`pipeline` remains an alias); `tidy` is the canonical clean workflow
@@ -216,6 +240,17 @@ requests a cooperative stop and cancels the active agent process.
 running; it clears the snapshot-failure count and restarts monitoring. Do not
 claim that stop forcibly kills the detached worker or that reset fixes the
 underlying cause of a failure.
+
+## Verification and reporting
+
+After an implementation workflow, inspect the resulting diff and run relevant
+repository checks, such as `make test`, `make vet`, and `make build`. A
+successful agent exit is not an independent correctness evaluation. Report the
+workflow used (including when recursion was avoided), checks and results, and
+any friction encountered. Report friction only when observed and supported by
+reproducible steps or concrete evidence. Record only current, reproducible
+product pain points in `to-fix.md` with evidence, and close findings that have
+been fixed or become stale.
 
 ## Safe operation
 
