@@ -102,7 +102,7 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 	if err := run([]string{"job", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "factory job start implementation") || strings.Contains(out.String(), "full command overview") {
+	if !strings.Contains(out.String(), "factory job start implementation") || !strings.Contains(out.String(), "factory job start tidy") || strings.Contains(out.String(), "full command overview") {
 		t.Fatalf("command-specific help should remain concise: %s", out.String())
 	}
 	if err := run([]string{"job", "start", "clean", "unsupported"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "unsupported job type") {
@@ -138,7 +138,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
-		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
+		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
 		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "factory job show"}},
 		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"Gated runs", "factory run events"}, omit: []string{"factory job", "Monitor management", "Example:"}},
 		{name: "run get canonical", args: []string{"run", "get", "--help"}, want: []string{"factory run get", "--details", "metadata"}, omit: []string{"factory run show"}},
@@ -658,6 +658,63 @@ func TestGateParsingSupportsImplementAndBareForms(t *testing.T) {
 	if _, _, err := parseGate([]string{"--gate", "--gate"}); err == nil {
 		t.Fatal("duplicate --gate accepted")
 	}
+	for _, args := range [][]string{{"--detach", "-d"}, {"-d", "--detach"}} {
+		if _, _, _, err := parseWorkflowOptions(args); err == nil {
+			t.Fatalf("duplicate detach flags accepted: %v", args)
+		}
+	}
+	for _, args := range [][]string{{"implement", "--gate", "--detach"}, {"tidy", "-d", "--gate"}} {
+		gate, detach, _, err := parseWorkflowOptions(args[1:])
+		if err != nil || !gate || !detach {
+			t.Fatalf("options %v parse = gate=%v detach=%v err=%v", args, gate, detach, err)
+		}
+	}
+}
+
+func TestGateDetachConflictIsRejectedBeforeConfigLoading(t *testing.T) {
+	configHome := t.TempDir()
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte("not valid config"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+
+	var output, errOutput bytes.Buffer
+	err := run([]string{"--gate", "-d", "x"}, strings.NewReader(""), &output, &errOutput)
+	if err == nil || !strings.Contains(err.Error(), "factory implement --gate cannot be combined with --detach") {
+		t.Fatalf("gate/detach conflict = %v, want conflict validation error", err)
+	}
+	if strings.Contains(err.Error(), "config") || strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("configuration was loaded before conflict validation: %v", err)
+	}
+}
+
+func TestDetachHelpAndGateConflictValidation(t *testing.T) {
+	for _, command := range []string{"implement", "tidy"} {
+		var output, errors bytes.Buffer
+		if err := run([]string{command, "--help"}, strings.NewReader(""), &output, &errors); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(output.String(), "--detach") || !strings.Contains(output.String(), "-d") {
+			t.Errorf("%s help omitted detach aliases: %q", command, output.String())
+		}
+	}
+	for _, args := range [][]string{
+		{"implement", "--gate", "--detach", "work"},
+		{"implement", "-d", "--gate", "work"},
+		{"--gate", "-d", "work"},
+		{"tidy", "--gate", "--detach"},
+		{"tidy", "--detach", "--gate"},
+	} {
+		var output, errors bytes.Buffer
+		err := run(args, strings.NewReader(""), &output, &errors)
+		if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+			t.Errorf("CLI accepted conflicting flags %v: %v", args, err)
+		}
+	}
 }
 
 func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
@@ -716,10 +773,157 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 	}
 }
 
-func TestTidyRejectsTaskArguments(t *testing.T) {
+func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
+	state := t.TempDir()
+	configHome := t.TempDir()
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.4\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+	target, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	command := exec.Command(binary, "implement", "-d", "test", "detached")
+	command.Dir = target
+	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("detached implement: %v\n%s", err, output)
+	}
+	if time.Since(started) > 300*time.Millisecond || !strings.Contains(string(output), "Started implementation job") || strings.Contains(string(output), "requirements completed") {
+		t.Fatalf("detached command did not return promptly with job ID: duration=%s output=%q", time.Since(started), output)
+	}
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ListJobs()
+	if err != nil || len(jobs) != 1 || jobs[0].Type != "implementation" || jobs[0].TaskDescription != "test detached" {
+		t.Fatalf("detached CLI job state=%+v err=%v", jobs, err)
+	}
+}
+
+func TestDetachedTidyCLIUsesDefaultDescriptionAndNeverPublishes(t *testing.T) {
+	state := t.TempDir()
+	configHome := t.TempDir()
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agent := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, agent, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+
+	target := t.TempDir()
+	git := func(args ...string) []byte {
+		t.Helper()
+		command := exec.Command("git", args...)
+		command.Dir = target
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+		return output
+	}
+	git("init", "-q")
+	git("config", "user.name", "Factory Test")
+	git("config", "user.email", "factory-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "tracked.txt")
+	git("commit", "-qm", "baseline")
+	initialHead := strings.TrimSpace(string(git("rev-parse", "HEAD")))
+	if err := os.WriteFile(filepath.Join(target, "preexisting.txt"), []byte("keep me\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	command := exec.Command(binary, "tidy", "--detach")
+	command.Dir = target
+	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("detached tidy CLI: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Started tidy job ") || !strings.Contains(string(output), "remain unpublished") {
+		t.Fatalf("CLI did not report tidy dispatch and nonpublishing mode: %q", output)
+	}
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jobs []factory.JobRecord
+	waitUntil := time.Now().Add(10 * time.Second)
+	for time.Now().Before(waitUntil) {
+		jobs, err = store.ListJobs()
+		if err == nil && len(jobs) == 1 && jobs[0].Status == "complete" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err != nil || len(jobs) != 1 || jobs[0].Type != "tidy" || jobs[0].Status != "complete" || jobs[0].TaskDescription != "Review, fix, document, and verify the target repository without publishing changes." {
+		t.Fatalf("detached tidy job record = %+v err=%v", jobs, err)
+	}
+	if got := strings.TrimSpace(string(git("rev-parse", "HEAD"))); got != initialHead {
+		t.Fatalf("detached tidy published a commit: HEAD=%s want=%s", got, initialHead)
+	}
+	if got, err := os.ReadFile(filepath.Join(target, "preexisting.txt")); err != nil || string(got) != "keep me\n" {
+		t.Fatalf("detached tidy did not preserve existing work: %q err=%v", got, err)
+	}
+	if status := strings.TrimSpace(string(git("status", "--porcelain"))); status == "" {
+		t.Fatal("detached tidy unexpectedly cleaned or committed the pre-existing change")
+	}
+}
+
+func TestTidyRejectsTaskArgumentsUnlessDetached(t *testing.T) {
 	var out, errOut bytes.Buffer
 	err := run([]string{"tidy", "unexpected"}, strings.NewReader(""), &out, &errOut)
-	if err == nil || err.Error() != "factory tidy accepts only --gate" {
+	if err == nil || !strings.Contains(err.Error(), "factory tidy accepts only --gate") {
 		t.Fatalf("tidy argument error = %v", err)
 	}
 }

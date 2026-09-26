@@ -2,8 +2,10 @@ package factory
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -142,6 +144,209 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	}
 }
 
+func TestDetachedTidyJobRunsNonpublishingAndIsListed(t *testing.T) {
+	state := t.TempDir()
+	repo := newCleanRepo(t)
+	target := canonicalTestPath(t, repo.work)
+	if err := os.WriteFile(filepath.Join(target, "Makefile"), []byte("fmt test vet:\n\t@true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(t.TempDir(), "fake-agent")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configDir := filepath.Join(t.TempDir(), "config", "factory")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := newJobID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: id, Type: tidyJobType, TaskDescription: "tidy task", TargetPath: target, Status: "queued"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, "workflow", "queued"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobLog(id); err != nil {
+		t.Fatal(err)
+	}
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- RunJobWorker(id, store.Root()) }()
+	select {
+	case err = <-workerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("tidy worker did not finish")
+	}
+	if err != nil {
+		t.Fatalf("tidy worker failed: %v", err)
+	}
+	job, err := store.GetJob(id)
+	if err != nil || job.Type != tidyJobType || job.Status != "complete" || len(job.Sessions) != 1 || job.Sessions[0].ID != "workflow" {
+		t.Fatalf("tidy job lifecycle = %+v err=%v", job, err)
+	}
+	var output bytes.Buffer
+	if err := JobCommand([]string{"get", id, "--details"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil || !strings.Contains(output.String(), "Description: tidy task") || !strings.Contains(output.String(), "Session: workflow (complete)") {
+		t.Fatalf("tidy details unavailable: output=%q err=%v", output.String(), err)
+	}
+	output.Reset()
+	if err := JobCommand([]string{"logs", id, "--session", "workflow"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil || !strings.Contains(output.String(), "stage.started") {
+		t.Fatalf("tidy session log unavailable: output=%q err=%v", output.String(), err)
+	}
+	output.Reset()
+	if err := AttachJob(context.Background(), store, id, &output); err != nil {
+		t.Fatalf("attach to completed tidy job: %v", err)
+	}
+	output.Reset()
+	if err := JobCommand([]string{"list"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil || !strings.Contains(output.String(), id) || !strings.Contains(output.String(), tidyJobType) {
+		t.Fatalf("job list omitted tidy: output=%q err=%v", output.String(), err)
+	}
+	logPath, err := store.SessionLogPath(id, "workflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil || !strings.Contains(string(log), "stage.started") {
+		t.Fatalf("tidy workflow session unavailable: %q err=%v", log, err)
+	}
+}
+
+func TestDetachedTidyJobFailureAndStopStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		scriptBody string
+		stop       bool
+		wantStatus string
+	}{
+		{name: "failure", scriptBody: "exit 9\n", wantStatus: "failed"},
+		{name: "stop", scriptBody: "exec sleep 30\n", stop: true, wantStatus: "stopped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := t.TempDir()
+			repo := newCleanRepo(t)
+			target := canonicalTestPath(t, repo.work)
+			_ = os.WriteFile(filepath.Join(target, "Makefile"), []byte("fmt test vet:\n\t@true\n"), 0o600)
+			script := filepath.Join(t.TempDir(), "agent")
+			if err := os.WriteFile(script, []byte("#!/bin/sh\n"+tc.scriptBody), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			configDir := filepath.Join(t.TempDir(), "config", "factory")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
+			store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := newJobID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJob(JobRecord{ID: id, Type: tidyJobType, TaskDescription: "test", TargetPath: target, Status: "queued"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSession(id, "workflow", "queued"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJobLog(id); err != nil {
+				t.Fatal(err)
+			}
+			workerDone := make(chan error, 1)
+			go func() { workerDone <- RunJobWorker(id, store.Root()) }()
+			if tc.stop {
+				waitFor(t, 3*time.Second, func() bool {
+					job, err := store.GetJob(id)
+					return err == nil && job.Status == "running"
+				})
+				if err := JobCommand([]string{"stop", id}, Config{StateDir: state}, target, strings.NewReader(""), io.Discard); err != nil {
+					t.Fatal(err)
+				}
+			}
+			select {
+			case <-workerDone:
+			case <-time.After(8 * time.Second):
+				t.Fatal("tidy job worker did not exit")
+			}
+			job, err := store.reconcileJob(id)
+			if err != nil || job.Status != tc.wantStatus || job.Sessions[0].Status != tc.wantStatus {
+				t.Fatalf("tidy lifecycle status=%+v err=%v, want %s", job, err, tc.wantStatus)
+			}
+		})
+	}
+}
+
+func TestDetachedImplementationJobFailurePersistsWorkflowStatus(t *testing.T) {
+	state := t.TempDir()
+	target := t.TempDir()
+	script := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexit 7\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configDir := filepath.Join(t.TempDir(), "config", "factory")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := newJobID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: id, Type: implementationJobType, TaskDescription: "failing task", TargetPath: target, Status: "queued"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, "workflow", "queued"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobLog(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunJobWorker(id, store.Root()); err == nil {
+		t.Fatal("failing implementation worker returned success")
+	}
+	job, err := store.reconcileJob(id)
+	if err != nil || job.Status != "failed" || len(job.Sessions) != 1 || job.Sessions[0].Status != "failed" {
+		t.Fatalf("failed implementation lifecycle=%+v err=%v", job, err)
+	}
+}
+
+func TestDetachedWorkflowTypesShareTargetAdmission(t *testing.T) {
+	state, target := t.TempDir(), t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: "active-tidy", Type: tidyJobType, TargetPath: target, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := startImplementationJob(store, target, "duplicate implementation"); err == nil || !strings.Contains(err.Error(), "already targets") {
+		t.Fatalf("implementation admission did not conflict with tidy: %v", err)
+	}
+	if _, err := startTidyJob(store, target, "duplicate tidy"); err == nil || !strings.Contains(err.Error(), "already targets") {
+		t.Fatalf("tidy admission did not conflict with active tidy: %v", err)
+	}
+}
+
 func TestJobShowAliasIsRejectedByHandler(t *testing.T) {
 	var output bytes.Buffer
 	if err := JobCommand([]string{"show", "missing"}, Config{StateDir: t.TempDir()}, t.TempDir(), strings.NewReader(""), &output); err == nil || !strings.Contains(err.Error(), `unknown job command "show"`) {
@@ -165,6 +370,9 @@ func TestDetachedJobStopAndSameTargetAdmission(t *testing.T) {
 	var out bytes.Buffer
 	if err := JobCommand([]string{"start", "implementation", "another"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err == nil || !strings.Contains(err.Error(), "already targets") {
 		t.Fatalf("duplicate target start error = %v", err)
+	}
+	if err := JobCommand([]string{"start", "tidy", "another"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err == nil || !strings.Contains(err.Error(), "already targets") {
+		t.Fatalf("cross-type duplicate target start error = %v", err)
 	}
 	if err := store.CreateJob(JobRecord{ID: "to-stop", Type: implementationJobType, TargetPath: t.TempDir(), Status: "running"}); err != nil {
 		t.Fatal(err)

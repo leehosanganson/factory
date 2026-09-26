@@ -42,12 +42,16 @@ approval gate and never present automation as a substitute for review.
 
 ## Detached implementation jobs
 
-`factory job` supports detached `implementation` and `monitor` types. Monitor
-jobs use the detached monitoring engine and its PR-specific duplicate guard.
-Current job commands are:
+Detached `factory job` is the lifecycle for implement, tidy, and monitor
+workflows. The job list contains only actual detached jobs; foreground and
+approval-gated `factory run` records are managed separately and are not
+projected into it. Implement and tidy jobs use sequential Factory stages and
+share same-target admission locking. Monitor jobs use the detached PR-specific
+engine and duplicate guard. Current job commands are:
 
 ```text
 factory job start implementation <description>
+factory job start tidy <description>
 factory job start monitor <description>
 factory job list
 factory job get <id> [--details]
@@ -95,7 +99,9 @@ factory                         # starts the interactive implementation workflow
 ```
 
 By default, the implementation workflow starts an implementation job and attaches to its output
-until terminal state. Ctrl-C detaches without stopping the worker; use
+until terminal state. `factory implement --detach <description>` (or `-d`) starts the job and
+returns immediately; use `factory job list/get/logs/attach/stop` for its lifecycle. This is not
+available with `--gate`, which remains foreground/run-controlled. Ctrl-C detaches without stopping the worker; use
 `factory job attach <id>` to reattach or `factory job stop <id>` to request
 cooperative cancellation. `--gate` keeps the interactive foreground workflow,
 since detached workers cannot safely proxy approval input.
@@ -138,7 +144,12 @@ and run appropriate checks rather than treating process success as independent
 verification.
 
 The foreground implementation workflow does not create branches or commits; Factory itself does
-not commit implementation work. Agents and their tools can still modify the target
+not commit implementation work. For each active primary agent stage, a separate status-only agent
+invocation runs approximately once per minute with a bounded sanitized tail of that stage's log.
+Statuses are shown in progress activity and persisted to the workflow session log when one exists.
+The monitor does not control workflow outcome and errors/timeouts are non-fatal. The built-in Pi
+adapter adds `--no-tools` to this status invocation only. Custom adapters are used as configured;
+their status invocation is not guaranteed read-only or sandboxed. Agents and their tools can still modify the target
 repository, so this is not a sandbox. Keep the user in control of scope and
 inspect changes as appropriate.
 
@@ -152,7 +163,11 @@ finding.
 ## Tidy: pristine publishing and dirty safe mode
 
 Run `factory tidy` for review, fixes, documentation, then `make fmt`, `make test`,
-and `make vet`. It has two distinct modes:
+and `make vet`. `factory tidy --detach [description...]` (or `-d`) launches a detached tidy job managed by the
+regular `factory job` commands; `--gate --detach` is rejected. Detached tidy is explicitly
+nonpublishing: it never commits or pushes, including existing local commits, and generated
+changes remain in the target checkout with an unpublished summary. Foreground tidy retains its
+two distinct modes:
 
 - **Pristine mode** applies when the initial index, tracked worktree, and untracked
   set are empty. On a non-detached branch, it uses the configured non-local

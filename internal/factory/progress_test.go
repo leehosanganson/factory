@@ -478,6 +478,23 @@ func TestFullScreenPathIsSanitizedAndWidthBounded(t *testing.T) {
 	}
 }
 
+func TestReadProgressLogFiltersOnlyKnownWarningSubstring(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "warning.log")
+	warning := "Dynamic tool activation requires Pi 0.86.1 or newer; web tools remain eagerly available."
+	stored := "before activity\n[pi-web-access] " + warning + " after warning\nunrelated activity\n"
+	if err := os.WriteFile(path, []byte(stored), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	activity := strings.Join(readProgressLog(path), "|")
+	if strings.Contains(activity, warning) || strings.Contains(activity, "[pi-web-access]") || !strings.Contains(activity, "before activity") || strings.Contains(activity, "after warning") || !strings.Contains(activity, "unrelated activity") {
+		t.Fatalf("activity filter removed too much or too little: %q", activity)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || string(raw) != stored || !strings.Contains(string(raw), warning) {
+		t.Fatalf("saved log changed while filtering display: %q err=%v", raw, err)
+	}
+}
+
 func TestReadProgressLogTracksCarriageReturnAndNewlineRecords(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "large.log")
 	content := strings.Repeat("discarded output\n", progressTailBytes) + "old status\rnew status\r\nlast status\npartial status"

@@ -666,7 +666,7 @@ func (s *JobStore) reconcileTerminalSession(id string) error {
 	if err != nil {
 		return err
 	}
-	if job.Type != implementationJobType || !isTerminalStatus(job.Status) {
+	if (job.Type != implementationJobType && job.Type != tidyJobType) || !isTerminalStatus(job.Status) {
 		return nil
 	}
 	session, err := s.GetSession(id, "workflow")

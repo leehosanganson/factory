@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -25,18 +26,20 @@ const (
 )
 
 type stageProgress struct {
-	out         io.Writer
-	stage       string
-	logPath     string
-	started     time.Time
-	terminal    bool
-	width       int
-	rows        int
-	lastLines   []string
-	hasRendered bool
-	stop        chan struct{}
-	done        chan struct{}
-	sizeQuery   func(uintptr) (int, int, error)
+	out          io.Writer
+	stage        string
+	logPath      string
+	started      time.Time
+	terminal     bool
+	width        int
+	rows         int
+	lastLines    []string
+	hasRendered  bool
+	stop         chan struct{}
+	done         chan struct{}
+	sizeQuery    func(uintptr) (int, int, error)
+	statusMu     sync.RWMutex
+	latestStatus string
 }
 
 func startProgress(out io.Writer, terminal bool, stage, logPath string) *stageProgress {
@@ -123,12 +126,38 @@ func (p *stageProgress) finish(err error) {
 	if p.terminal {
 		pathWidth = max(1, p.width-32)
 	}
+	p.statusMu.RLock()
+	latestStatus := p.latestStatus
+	p.statusMu.RUnlock()
 	summary := fmt.Sprintf("%s %s in %s; log: %s", p.stage, result, elapsed, styledLogPath(safeProgressPath(p.logPath, pathWidth), os.Getenv("NO_COLOR") == ""))
+	if latestStatus != "" {
+		summary += "; status: " + latestStatus
+	}
 	fmt.Fprintln(p.out, truncateProgressText(summary, p.width+1))
 }
 
-func (p *stageProgress) renderHeartbeat() {
+func (p *stageProgress) setStatus(status string) {
+	p.statusMu.Lock()
+	p.latestStatus = status
+	p.statusMu.Unlock()
+}
+
+func (p *stageProgress) activity() []string {
 	lines := readProgressLog(p.logPath)
+	p.statusMu.RLock()
+	status := p.latestStatus
+	p.statusMu.RUnlock()
+	if len(lines) > progressLogLines {
+		lines = lines[len(lines)-progressLogLines:]
+	}
+	if status != "" {
+		lines = append(lines, "Status: "+status)
+	}
+	return lines
+}
+
+func (p *stageProgress) renderHeartbeat() {
+	lines := p.activity()
 	activity := "waiting for log output"
 	if len(lines) > 0 {
 		activity = lines[len(lines)-1]
@@ -148,7 +177,7 @@ func (p *stageProgress) render(animated bool, status string, frame ...int) {
 			}
 		}
 	}
-	lines := renderProgressScreen(width, rows, p.stage, p.logPath, time.Since(p.started), status, animated, frame...)
+	lines := renderProgressScreenWithActivity(width, rows, p.stage, p.logPath, time.Since(p.started), status, animated, p.activity(), frame...)
 	if !p.hasRendered || resized {
 		fmt.Fprint(p.out, "\033[2J")
 	}
@@ -168,6 +197,10 @@ func (p *stageProgress) render(animated bool, status string, frame ...int) {
 }
 
 func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.Duration, status string, animated bool, frame ...int) []string {
+	return renderProgressScreenWithActivity(width, rows, stage, logPath, elapsed, status, animated, readProgressLog(logPath), frame...)
+}
+
+func renderProgressScreenWithActivity(width, rows int, stage, logPath string, elapsed time.Duration, status string, animated bool, activityLines []string, frame ...int) []string {
 	width, rows = boundedProgressWidth(width), boundedProgressRows(rows)
 	noColor := os.Getenv("NO_COLOR") != ""
 	spinner := "✓"
@@ -195,10 +228,14 @@ func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.D
 		stageLine := statusText(spinner + " " + strings.ToUpper(stage) + " · " + state)
 		lines := []string{stageLine, fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
 		if rows == 3 {
-			lines[1] = "RECENT  " + readProgressActivity(logPath)
+			activity := activityLines
+			if len(activity) == 0 {
+				activity = []string{"waiting for agent output"}
+			}
+			lines[1] = "RECENT  " + activity[len(activity)-1]
 		}
 		if rows >= 8 {
-			activity := readProgressLog(logPath)
+			activity := activityLines
 			if len(activity) == 0 {
 				activity = []string{"waiting for agent output"}
 			}
@@ -219,9 +256,9 @@ func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.D
 			}
 			lines = append(lines, logLine())
 		} else if rows == 7 {
-			lines = []string{statusText("FACTORY  " + state), strings.Repeat("─", max(0, width-1)), stageLine, "RECENT ACTIVITY", readProgressActivity(logPath), fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
+			lines = []string{statusText("FACTORY  " + state), strings.Repeat("─", max(0, width-1)), stageLine, "RECENT ACTIVITY", recentActivity(activityLines), fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
 		} else if rows == 6 {
-			lines = []string{statusText("FACTORY  " + state), stageLine, "RECENT ACTIVITY", readProgressActivity(logPath), fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
+			lines = []string{statusText("FACTORY  " + state), stageLine, "RECENT ACTIVITY", recentActivity(activityLines), fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
 		} else if rows == 5 {
 			lines = []string{statusText("FACTORY  " + state), strings.Repeat("─", max(0, width-1)), stageLine, fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
 		} else if rows == 4 {
@@ -245,7 +282,6 @@ func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.D
 		return lines
 	}
 
-	activityLines := readProgressLog(logPath)
 	if len(activityLines) == 0 {
 		activityLines = []string{"waiting for agent output"}
 	}
@@ -293,8 +329,16 @@ func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.D
 	return content
 }
 
+func recentActivity(lines []string) string {
+	if len(lines) == 0 {
+		return "waiting for agent output"
+	}
+	return lines[len(lines)-1]
+}
+
 func readProgressActivity(path string) string {
 	lines := readProgressLog(path)
+	lines = filterProgressWarnings(lines)
 	if len(lines) == 0 {
 		return "waiting for agent output"
 	}
@@ -559,6 +603,10 @@ func readProgressLog(path string) []string {
 	lines := make([]string, 0, progressLogLines)
 	for _, part := range parts {
 		clean := sanitizeProgressLine(part)
+		if strings.Contains(clean, "Dynamic tool activation requires Pi 0.86.1 or newer; web tools remain eagerly available.") {
+			continue
+		}
+		clean = strings.TrimSpace(clean)
 		if clean == "" {
 			continue
 		}
@@ -568,6 +616,17 @@ func readProgressLog(path string) []string {
 		lines = lines[len(lines)-progressLogLines:]
 	}
 	return lines
+}
+
+func filterProgressWarnings(lines []string) []string {
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "Dynamic tool activation requires Pi 0.86.1 or newer; web tools remain eagerly available.", ""))
+		if line != "" {
+			filtered = append(filtered, line)
+		}
+	}
+	return filtered
 }
 
 func splitProgressRecords(data []byte) []string {

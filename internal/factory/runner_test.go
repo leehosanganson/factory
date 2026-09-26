@@ -76,6 +76,58 @@ func TestRunnerRunContextUsesOnlyCallerContext(t *testing.T) {
 	}
 }
 
+func TestProgressFiltersOnlyKnownWarningAndLeavesTranscriptRaw(t *testing.T) {
+	dir := t.TempDir()
+	warning := "[pi-web-access] Dynamic tool activation requires Pi 0.86.1 or newer; web tools remain eagerly available."
+	script := filepath.Join(dir, "agent.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s\\n' "+shellQuote(warning)+" >&2\nprintf '%s\\n' 'other activity'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(dir, "agent.log")
+	if err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunContext(context.Background(), "implement", "prompt", "task", dir, logPath); err != nil {
+		t.Fatal(err)
+	}
+	rendered := strings.Join(readProgressLog(logPath), "\\n")
+	if strings.Contains(rendered, "Dynamic tool activation") || strings.Contains(rendered, "[pi-web-access]") || !strings.Contains(rendered, "other activity") {
+		t.Fatalf("rendered activity not precisely filtered: %q", rendered)
+	}
+	stored, err := os.ReadFile(logPath)
+	if err != nil || !strings.Contains(string(stored), warning) {
+		t.Fatalf("raw transcript did not preserve warning: %q err=%v", stored, err)
+	}
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
+func TestConfiguredStatusAdapterAddsNoToolsOnlyForPi(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    bool
+	}{
+		{command: "pi", want: true},
+		{command: "/opt/bin/pi", want: true},
+		{command: "custom-agent", want: false},
+	} {
+		got := configuredSecondaryStatusCall(Config{Command: tc.command, Args: []string{"-p", "--append-system-prompt", "{system_prompt}", "{task}"}}, t.TempDir())
+		statusConfig := secondaryStatusConfig(Config{Command: tc.command, Args: []string{"-p", "--append-system-prompt", "{system_prompt}", "{task}"}})
+		has := false
+		for _, arg := range statusConfig.Args {
+			has = has || arg == "--no-tools"
+		}
+		if has != tc.want || got == nil {
+			t.Errorf("status adapter command %q no-tools=%v want %v", tc.command, has, tc.want)
+		}
+		if tc.want && statusConfig.Args[0] != "--no-tools" {
+			t.Errorf("Pi status call did not prepend --no-tools: %#v", statusConfig.Args)
+		}
+		if !tc.want && strings.Join(statusConfig.Args, " ") != "-p --append-system-prompt {system_prompt} {task}" {
+			t.Errorf("custom adapter arguments were changed: %#v", statusConfig.Args)
+		}
+	}
+}
+
 func TestRunnerReturnsStdoutProtocolAndLogsBothStreams(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "agent.sh")

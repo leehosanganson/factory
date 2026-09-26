@@ -91,29 +91,48 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(args[1:], cfg, workdir, in, out, errOut)
 		case "implement":
-			gate, task, err := parseGate(args[1:])
+			gate, detached, task, err := parseWorkflowOptions(args[1:])
 			if err != nil {
 				return err
+			}
+			if gate && detached {
+				return fmt.Errorf("factory implement --gate cannot be combined with --detach")
+			}
+			if detached {
+				return startDetachedImplementation(strings.Join(task, " "), out)
 			}
 			ctx, stop := foregroundContext()
 			defer stop()
 			return runPipelineContext(ctx, task, gate, in, out)
 		case "tidy":
-			gate, task, err := parseGate(args[1:])
+			gate, detached, task, err := parseWorkflowOptions(args[1:])
 			if err != nil {
 				return err
 			}
+			if gate && detached {
+				return fmt.Errorf("factory tidy --gate cannot be combined with --detach")
+			}
+			if detached {
+				description := strings.TrimSpace(strings.Join(task, " "))
+				if description == "" {
+					description = "Review, fix, document, and verify the target repository without publishing changes."
+				}
+				return startDetachedTidy(description, out)
+			}
 			if len(task) != 0 {
-				return fmt.Errorf("factory tidy accepts only --gate")
+				return fmt.Errorf("factory tidy accepts only --gate; use --detach with a description for a detached job")
 			}
 			ctx, stop := foregroundContext()
 			defer stop()
 			return runCleanContext(ctx, gate, in, out, errOut)
 		default:
 			if args[0] == "--gate" {
-				gate, task, err := parseGate(args)
+				gate, detached, task, err := parseWorkflowOptions(args)
 				if err != nil {
 					return err
+				}
+				if gate && detached {
+					return fmt.Errorf("factory implement --gate cannot be combined with --detach")
 				}
 				ctx, stop := foregroundContext()
 				defer stop()
@@ -177,12 +196,12 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "implement":
 		title = "Implement workflow"
 		commands = []helpCommand{
-			{"factory implement [--gate] [description...]", "Start an implementation workflow; --gate runs in the foreground."},
+			{"factory implement [-d|--detach] [--gate] [description...]", "Start an implementation workflow; --gate runs in the foreground."},
 		}
 	case "tidy":
 		title = "Tidy workflow"
 		commands = []helpCommand{
-			{"factory tidy [--gate]", "Review, fix, document, and verify the repository."},
+			{"factory tidy [-d|--detach] [--gate] [description...]", "Review, fix, document, and verify; detached mode returns immediately."},
 		}
 	case "job":
 		title = "Detached jobs"
@@ -220,6 +239,7 @@ func printCommandHelp(out io.Writer, args []string) {
 func jobHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
 		{"factory job start implementation <description>", "Start an implementation job."},
+		{"factory job start tidy <description>", "Start a nonpublishing tidy job."},
 		{"factory job start monitor <description>", "Start a PR monitor."},
 		{"factory job list", "List detached jobs."},
 		{"factory job get <id> [--details]", "Show job status; --details includes metadata."},
@@ -282,19 +302,30 @@ func foregroundContext() (context.Context, context.CancelFunc) {
 }
 
 func parseGate(args []string) (bool, []string, error) {
-	gate := false
+	gate, _, task, err := parseWorkflowOptions(args)
+	return gate, task, err
+}
+
+func parseWorkflowOptions(args []string) (bool, bool, []string, error) {
+	gate, detached := false, false
 	task := make([]string, 0, len(args))
 	for _, arg := range args {
-		if arg == "--gate" {
+		switch arg {
+		case "--gate":
 			if gate {
-				return false, nil, fmt.Errorf("--gate may only be specified once")
+				return false, false, nil, fmt.Errorf("--gate may only be specified once")
 			}
 			gate = true
-			continue
+		case "--detach", "-d":
+			if detached {
+				return false, false, nil, fmt.Errorf("--detach may only be specified once")
+			}
+			detached = true
+		default:
+			task = append(task, arg)
 		}
-		task = append(task, arg)
 	}
-	return gate, task, nil
+	return gate, detached, task, nil
 }
 
 func runPipeline(args []string, gate bool, in io.Reader, out io.Writer) error {
@@ -345,6 +376,43 @@ func runPipelineContextWithTerminalCheck(ctx context.Context, args []string, gat
 		}
 		return factory.AttachJob(ctx, store, id, out)
 	})
+}
+
+func startDetachedImplementation(task string, out io.Writer) error {
+	if strings.TrimSpace(task) == "" {
+		return fmt.Errorf("detached implementation requires a description")
+	}
+	cfg, err := factory.LoadConfig("")
+	if err != nil {
+		return err
+	}
+	workdir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get target repository directory: %w", err)
+	}
+	id, err := factory.StartImplementationJob(cfg, workdir, task)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Started implementation job %s. Use factory job attach %s to follow progress.\n", id, id)
+	return nil
+}
+
+func startDetachedTidy(task string, out io.Writer) error {
+	cfg, err := factory.LoadConfig("")
+	if err != nil {
+		return err
+	}
+	workdir, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get target repository directory: %w", err)
+	}
+	id, err := factory.StartTidyJob(cfg, workdir, task)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "Started tidy job %s. Changes will remain unpublished; use factory job attach %s to follow progress.\n", id, id)
+	return nil
 }
 
 func runClean(gate bool, in io.Reader, out, errOut io.Writer) error {
@@ -529,8 +597,8 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 	}
 	fmt.Fprintln(out)
 	commands := []helpCommand{
-		{"factory implement [--gate] [description...]", "Start an implementation workflow."},
-		{"factory tidy [--gate]", "Review, fix, document, and verify."},
+		{"factory implement [-d|--detach] [--gate] [description...]", "Start an implementation workflow."},
+		{"factory tidy [-d|--detach] [--gate] [description...]", "Review, fix, document, and verify."},
 		{"factory monitor <description>", "Monitor an open pull request."},
 		{"factory job <command>", "Manage detached jobs."},
 		{"factory run <command>", "Manage gated runs."},

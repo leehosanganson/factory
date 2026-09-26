@@ -9,10 +9,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
 )
+
+type blockingStatusTestAgent struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (a *blockingStatusTestAgent) Run(string, string, string, string, string) error {
+	return errors.New("context-aware execution required")
+}
+
+func (a *blockingStatusTestAgent) RunWithContext(ctx context.Context, _, _, _, _, logPath string) error {
+	a.once.Do(func() { close(a.started) })
+	select {
+	case <-a.release:
+		return os.WriteFile(logPath, []byte("primary finished\n"), 0o600)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 type fakeAgent struct {
 	outputs map[string][]string
@@ -50,6 +71,135 @@ func (f *fakeAgent) run(stage, task, logPath string) (string, error) {
 		return output, errors.New(strings.TrimPrefix(output, "ERROR:"))
 	}
 	return output, nil
+}
+
+func TestSecondaryStatusRunsDuringActiveStageAndPersistsSanitizedUpdate(t *testing.T) {
+	base := t.TempDir()
+	store, err := NewJobStore(filepath.Join(base, "jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: "status-job", Type: implementationJobType, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession("status-job", "workflow", "running"); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	statusCalled := make(chan struct{})
+	agent := &blockingStatusTestAgent{started: started, release: make(chan struct{})}
+	var output strings.Builder
+	workflow := Workflow{
+		Agent: agent, Config: Config{StateDir: filepath.Join(base, "state")}, Out: &output, Workdir: t.TempDir(),
+		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		Observer: JobSessionObserver{Store: store, JobID: "status-job", SessionID: "workflow"},
+		statusCall: func(ctx context.Context, _, _, _, _ string) (string, error) {
+			select {
+			case <-started:
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+			select {
+			case <-statusCalled:
+			default:
+				close(statusCalled)
+			}
+			return " progress\x1b[31m status " + strings.Repeat("x", secondaryStatusLimit+10), nil
+		},
+	}
+	workflowDone := make(chan error, 1)
+	go func() { workflowDone <- workflow.Run("task") }()
+	select {
+	case <-statusCalled:
+	case <-time.After(time.Second):
+		t.Fatal("secondary status call did not run during the active stage")
+	}
+	close(agent.release)
+	if err := <-workflowDone; err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.SessionEvents("status-job", "workflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Type == "stage.status" {
+			found = true
+			if strings.ContainsAny(event.Message, "\x1b\r\n") || len(event.Message) > secondaryStatusLimit+100 {
+				t.Fatalf("status event was not bounded/sanitized: %q", event.Message)
+			}
+		}
+	}
+	if !found || !strings.Contains(output.String(), "status: p…") {
+		t.Fatalf("status was not persisted and rendered: events=%+v output=%q", events, output.String())
+	}
+}
+
+func TestSecondaryStatusCancellationStopsObserverAndPrimary(t *testing.T) {
+	base := t.TempDir()
+	primaryStarted := make(chan struct{})
+	observerStarted := make(chan struct{})
+	observerCanceled := make(chan struct{})
+	agent := &blockingStatusTestAgent{started: primaryStarted, release: make(chan struct{})}
+	workflow := Workflow{
+		Agent: agent, Config: Config{StateDir: filepath.Join(base, "state")}, Out: io.Discard, Workdir: t.TempDir(),
+		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		statusCall: func(ctx context.Context, _, _, _, _ string) (string, error) {
+			close(observerStarted)
+			<-ctx.Done()
+			close(observerCanceled)
+			return "", ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	workflowDone := make(chan error, 1)
+	go func() { workflowDone <- workflow.RunContext(ctx, "cancel task") }()
+	select {
+	case <-primaryStarted:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("primary stage was not started")
+	}
+	select {
+	case <-observerStarted:
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("observer was not started")
+	}
+	cancel()
+	select {
+	case err := <-workflowDone:
+		if err == nil || !strings.Contains(err.Error(), "canceled") {
+			t.Fatalf("workflow cancellation error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("workflow did not join canceled status invocation")
+	}
+	select {
+	case <-observerCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("status invocation did not receive cancellation")
+	}
+}
+
+func TestSecondaryStatusErrorsAreNonFatalAndDoesNotStartAfterPrimary(t *testing.T) {
+	base := t.TempDir()
+	calls := 0
+	workflow := Workflow{
+		Agent: &fakeAgent{outputs: map[string][]string{}}, Config: Config{StateDir: filepath.Join(base, "state")}, Out: io.Discard, Workdir: t.TempDir(),
+		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		statusCall: func(context.Context, string, string, string, string) (string, error) {
+			calls++
+			return "ignored", errors.New("observer failed")
+		},
+	}
+	if err := workflow.Run("quick task"); err != nil {
+		t.Fatalf("status failure affected primary stage: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("status invocation launched after the short primary stage finished: %d", calls)
+	}
 }
 
 func TestWorkflowOrderGatesAndOutOfTreePersistence(t *testing.T) {

@@ -14,6 +14,7 @@ import (
 )
 
 const implementationJobType = "implementation"
+const tidyJobType = "tidy"
 const monitorJobType = "monitor"
 const monitorSessionID = "monitor"
 const jobHeartbeatInterval = 5 * time.Second
@@ -41,7 +42,7 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 	switch args[0] {
 	case "start":
 		if len(args) < 3 {
-			return fmt.Errorf("usage: factory job start <implementation|monitor> <description>")
+			return fmt.Errorf("usage: factory job start <implementation|tidy|monitor> <description>")
 		}
 		description := strings.TrimSpace(strings.Join(args[2:], " "))
 		if description == "" {
@@ -53,14 +54,14 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			}
 			return startMonitor([]string{description}, cfg, target, root, out)
 		}
-		if args[1] != implementationJobType {
-			return fmt.Errorf("unsupported job type %q (supported: implementation, monitor)", args[1])
+		if args[1] != implementationJobType && args[1] != tidyJobType {
+			return fmt.Errorf("unsupported job type %q (supported: implementation, tidy, monitor)", args[1])
 		}
-		id, err := startImplementationJob(store, target, description)
+		id, err := startWorkflowJob(store, target, description, args[1])
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "Started implementation job %s\n", id)
+		fmt.Fprintf(out, "Started %s job %s\n", args[1], id)
 		return nil
 	case "list":
 		if len(args) != 1 {
@@ -247,6 +248,20 @@ func writeJobDetails(out io.Writer, store *JobStore, job JobRecord) error {
 }
 
 func StartImplementationJob(cfg Config, target, description string) (string, error) {
+	return StartWorkflowJob(cfg, target, description, implementationJobType)
+}
+
+func StartTidyJob(cfg Config, target, description string) (string, error) {
+	return StartWorkflowJob(cfg, target, description, tidyJobType)
+}
+
+func StartWorkflowJob(cfg Config, target, description, jobType string) (string, error) {
+	if jobType != implementationJobType && jobType != tidyJobType {
+		return "", fmt.Errorf("unsupported workflow job type %q", jobType)
+	}
+	if strings.TrimSpace(description) == "" {
+		return "", fmt.Errorf("job description must not be empty")
+	}
 	root, err := JobStateRoot(cfg.StateDir)
 	if err != nil {
 		return "", err
@@ -255,10 +270,24 @@ func StartImplementationJob(cfg Config, target, description string) (string, err
 	if err != nil {
 		return "", err
 	}
-	return startImplementationJob(store, target, description)
+	return startWorkflowJob(store, target, description, jobType)
 }
 
 func startImplementationJob(store *JobStore, target, description string) (string, error) {
+	return startWorkflowJob(store, target, description, implementationJobType)
+}
+
+func startTidyJob(store *JobStore, target, description string) (string, error) {
+	return startWorkflowJob(store, target, description, tidyJobType)
+}
+
+func startWorkflowJob(store *JobStore, target, description, jobType string) (string, error) {
+	if jobType != implementationJobType && jobType != tidyJobType {
+		return "", fmt.Errorf("unsupported workflow job type %q", jobType)
+	}
+	if strings.TrimSpace(description) == "" {
+		return "", fmt.Errorf("job description must not be empty")
+	}
 	canonicalTarget, err := canonicalPath(target)
 	if err != nil {
 		return "", fmt.Errorf("resolve target directory: %w", err)
@@ -294,7 +323,7 @@ func startImplementationJob(store *JobStore, target, description string) (string
 	if err != nil {
 		return "", err
 	}
-	job := JobRecord{ID: id, Type: implementationJobType, TaskDescription: description, TargetPath: canonicalTarget, Status: "queued"}
+	job := JobRecord{ID: id, Type: jobType, TaskDescription: description, TargetPath: canonicalTarget, Status: "queued"}
 	if err := store.CreateJob(job); err != nil {
 		return "", err
 	}
@@ -334,7 +363,7 @@ func RunJobWorker(id, root string) error {
 	if err != nil {
 		return err
 	}
-	if job.Type != implementationJobType {
+	if job.Type != implementationJobType && job.Type != tidyJobType {
 		return fmt.Errorf("unsupported worker job type %q", job.Type)
 	}
 	unlock, err := store.LockTarget(job.TargetPath)
@@ -394,11 +423,20 @@ func RunJobWorker(id, root string) error {
 			}
 		}
 	}()
-	workflow := Workflow{
-		Agent: Runner{Config: cfg}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
-		Workdir: job.TargetPath, Observer: JobSessionObserver{Store: store, JobID: id, SessionID: "workflow"},
+	observer := JobSessionObserver{Store: store, JobID: id, SessionID: "workflow"}
+	var runErr error
+	if job.Type == tidyJobType {
+		runErr = (CleanWorkflow{
+			Agent: Runner{Config: cfg}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
+			Workdir: job.TargetPath, Observer: observer, NeverPublish: true,
+		}).RunContext(ctx, job.TaskDescription)
+	} else {
+		workflow := Workflow{
+			Agent: Runner{Config: cfg}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
+			Workdir: job.TargetPath, Observer: observer,
+		}
+		runErr = workflow.RunContext(ctx, job.TaskDescription)
 	}
-	runErr := workflow.RunContext(ctx, job.TaskDescription)
 	cancel()
 	<-watchDone
 	status := "complete"

@@ -11,7 +11,7 @@ import (
 //go:embed prompts/*.md
 var embeddedPrompts embed.FS
 
-var stages = []string{"requirements", "implement", "review", "fix", "document", "monitor"}
+var stages = []string{"requirements", "implement", "review", "fix", "document", "monitor", "status"}
 
 // LoadPrompt returns an external stage override when present, otherwise the embedded prompt.
 func LoadPrompt(promptDir, stage string) (string, error) {

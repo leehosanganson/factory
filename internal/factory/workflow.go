@@ -87,6 +87,8 @@ type Workflow struct {
 	Managed          bool
 	RunCreated       func(runDir, runID string)
 	stageBudgetLimit time.Duration
+	statusInterval   time.Duration
+	statusCall       func(context.Context, string, string, string, string) (string, error)
 }
 
 // Run starts a persisted run and executes the complete human-gated workflow.
@@ -414,15 +416,17 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 	}
 	progress := startProgress(w.Out, w.Terminal, stage, stageLog)
 	runErr := runWithProgress(progress, func() error {
-		if stage == "implement" {
-			parallelWorkflow := w
-			parallelWorkflow.Agent = stageAgent
-			used, err := parallelWorkflow.runParallelImplementation(ctx, stageTask, stageLog, runDir, state, observe)
-			if used || err != nil {
-				return err
+		return runWithSecondaryStatus(ctx, w, progress, stage, stageTask, stageWorkdir, stageLog, observe, func(primaryCtx context.Context) error {
+			if stage == "implement" {
+				parallelWorkflow := w
+				parallelWorkflow.Agent = stageAgent
+				used, err := parallelWorkflow.runParallelImplementation(primaryCtx, stageTask, stageLog, runDir, state, observe)
+				if used || err != nil {
+					return err
+				}
 			}
-		}
-		return runAgentWithContext(ctx, stageAgent, stage, prompt, stageTask, stageWorkdir, stageLog)
+			return runAgentWithContext(primaryCtx, stageAgent, stage, prompt, stageTask, stageWorkdir, stageLog)
+		})
 	})
 	if runErr != nil {
 		if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.failed", Stage: stage, Message: boundedOutput(runErr.Error()+"\n"+stageLog, evaluatorOutputLimit)}); err != nil {

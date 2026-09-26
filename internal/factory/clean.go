@@ -26,6 +26,7 @@ type CleanWorkflow struct {
 	Workdir       string
 	Terminal      bool
 	Gate          bool
+	NeverPublish  bool
 	Observer      WorkflowObserver
 	Git           func(string, ...string) ([]byte, error)
 	GitContext    func(context.Context, string, ...string) ([]byte, error)
@@ -37,6 +38,7 @@ type CleanWorkflow struct {
 
 type cleanBaseline struct {
 	dirty        bool
+	publishing   bool
 	branch       string
 	upstream     string
 	head         string
@@ -121,12 +123,15 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		}
 		return gitAt(originalRoot, name, args...)
 	}
-	baseline, err := inspectCleanBaseline(git)
+	baseline, err := inspectCleanBaselineForWorkflow(git, !w.NeverPublish)
 	if err != nil {
 		return err
 	}
 	if baseline.dirty {
 		fmt.Fprintln(w.Out, "Warning: the initial worktree/index is dirty. Existing changes may be affected by agents or formatters; Factory will not commit or push anything in this run.")
+	}
+	if w.NeverPublish {
+		fmt.Fprintln(w.Out, "Detached tidy never commits or pushes, including existing local commits. Generated changes stay in the target checkout and remain unpublished.")
 	}
 	var cleanupWorktree func() error
 	isolatedWorktree := false
@@ -169,7 +174,9 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		task = "Review the current repository and work performed in this clean run. Fix every issue found, then document the changes. Preserve the user's intent and avoid unrelated changes."
 	}
 	finalApproval := "commit and push clean changes"
-	if baseline.dirty {
+	if w.NeverPublish {
+		finalApproval = "finish without committing or pushing changes"
+	} else if baseline.dirty {
 		finalApproval = "verify and complete without committing or pushing changes"
 	}
 	runOutput := &cleanRunOutput{out: w.Out}
@@ -395,6 +402,14 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		}
 	}
 	root = originalRoot
+	if w.NeverPublish {
+		if len(paths) == 0 {
+			fmt.Fprintln(w.Out, "Detached tidy verification succeeded with no generated changes. Nothing was committed or pushed; existing local commits were not published.")
+		} else {
+			fmt.Fprintf(w.Out, "Detached tidy verification succeeded. %d generated path(s) remain in the target checkout, uncommitted and unpublished.\n", len(paths))
+		}
+		return nil
+	}
 	if len(paths) == 0 {
 		if err := revalidateClean(git, baseline, nil, nil); err != nil {
 			return err
@@ -875,6 +890,10 @@ func cleanContextCheck(ctx context.Context) error {
 }
 
 func inspectCleanBaseline(git func(string, ...string) ([]byte, error)) (cleanBaseline, error) {
+	return inspectCleanBaselineForWorkflow(git, true)
+}
+
+func inspectCleanBaselineForWorkflow(git func(string, ...string) ([]byte, error), publishing bool) (cleanBaseline, error) {
 	status, err := git("git", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all")
 	if err != nil {
 		return cleanBaseline{}, fmt.Errorf("inspect initial git status: %w", err)
@@ -890,7 +909,10 @@ func inspectCleanBaseline(git func(string, ...string) ([]byte, error)) (cleanBas
 	}
 	headName := strings.TrimSpace(string(head))
 	if len(status) != 0 {
-		return cleanBaseline{dirty: true, branch: branchName, head: headName}, nil
+		return cleanBaseline{dirty: true, publishing: publishing, branch: branchName, head: headName}, nil
+	}
+	if !publishing {
+		return cleanBaseline{branch: branchName, publishing: false, head: headName}, nil
 	}
 	remote, remoteRef, configuredUpstream, err := cleanUpstreamConfig(git, branchName)
 	if err != nil {
@@ -943,7 +965,7 @@ func inspectCleanBaseline(git func(string, ...string) ([]byte, error)) (cleanBas
 			return cleanBaseline{}, fmt.Errorf("factory clean requires configured upstream to be an ancestor of local HEAD; upstream-ahead or diverged branches are refused")
 		}
 	}
-	return cleanBaseline{branch: branchName, upstream: upstreamName, head: headName, upstreamHead: string(upstreamHead), remote: remote, remoteRef: remoteRef, pushURL: pushURL}, nil
+	return cleanBaseline{branch: branchName, upstream: upstreamName, head: headName, upstreamHead: string(upstreamHead), remote: remote, remoteRef: remoteRef, pushURL: pushURL, publishing: true}, nil
 }
 
 func validateCleanDestination(git func(string, ...string) ([]byte, error), baseline cleanBaseline, context string) error {
@@ -1013,14 +1035,16 @@ func revalidateClean(git func(string, ...string) ([]byte, error), baseline clean
 	if err != nil || strings.TrimSpace(string(branch)) != baseline.branch {
 		return fmt.Errorf("branch changed or became detached during clean")
 	}
-	if err := validateCleanDestination(git, baseline, "during clean"); err != nil {
-		return err
+	if baseline.publishing {
+		if err := validateCleanDestination(git, baseline, "during clean"); err != nil {
+			return err
+		}
 	}
 	head, err := git("git", "rev-parse", "HEAD")
 	if err != nil || strings.TrimSpace(string(head)) != baseline.head {
 		return fmt.Errorf("local HEAD changed during clean")
 	}
-	if baseline.upstream != "" {
+	if baseline.publishing && baseline.upstream != "" {
 		upstreamHead, err := git("git", "rev-parse", "@{upstream}")
 		if err != nil || strings.TrimSpace(string(upstreamHead)) != baseline.upstreamHead {
 			return fmt.Errorf("upstream HEAD changed during clean")

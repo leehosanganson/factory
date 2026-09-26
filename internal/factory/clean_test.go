@@ -16,6 +16,76 @@ import (
 	"time"
 )
 
+func TestDetachedCleanRetainsChangesAndNeverPublishesIncludingExistingAheadCommits(t *testing.T) {
+	for _, hasChanges := range []bool{true, false} {
+		t.Run(fmt.Sprintf("changes=%v", hasChanges), func(t *testing.T) {
+			repo := newCleanRepo(t)
+			if !hasChanges {
+				writeCleanFile(t, repo.work, "ahead.txt", "local commit\n")
+				gitClean(t, repo.work, "add", "ahead.txt")
+				gitClean(t, repo.work, "commit", "-m", "local ahead")
+			}
+			initialHead := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+			var agent Agent = &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+			if !hasChanges {
+				agent = &cleanNoopAgent{}
+			}
+			workflow := cleanTestWorkflow(repo.work, agent)
+			workflow.NeverPublish = true
+			var output bytes.Buffer
+			workflow.Out = &output
+			if err := workflow.Run(""); err != nil {
+				t.Fatalf("detached tidy: %v", err)
+			}
+			if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initialHead {
+				t.Fatalf("detached tidy changed HEAD: got %s want %s", got, initialHead)
+			}
+			if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "refs/remotes/origin/main"))); got != strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))) {
+				t.Fatalf("remote changed during detached tidy: %s", got)
+			}
+			if hasChanges {
+				if got, err := os.ReadFile(filepath.Join(repo.work, "fix.txt")); err != nil || string(got) != "fixed\n" {
+					t.Fatalf("generated changes were not retained: %q err=%v", got, err)
+				}
+				if status := strings.TrimSpace(string(gitClean(t, repo.work, "status", "--porcelain"))); status == "" {
+					t.Fatal("generated changes were not left uncommitted")
+				}
+			} else if !strings.Contains(output.String(), "no generated changes") || !strings.Contains(output.String(), "existing local commits were not published") {
+				t.Fatalf("no-change summary did not explain unpublished ahead commits: %q", output.String())
+			}
+		})
+	}
+}
+
+func TestDetachedCleanCompletesWithoutRemoteOrUpstreamAndNeverPublishes(t *testing.T) {
+	repo := newCleanRepo(t)
+	gitClean(t, repo.work, "remote", "remove", "origin")
+	initialHead := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.NeverPublish = true
+	var output bytes.Buffer
+	workflow.Out = &output
+
+	if err := workflow.Run(""); err != nil {
+		t.Fatalf("detached tidy without remote/upstream: %v", err)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initialHead {
+		t.Fatalf("detached tidy changed HEAD: got %s want %s", got, initialHead)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "log", "-1", "--format=%H"))); got != initialHead {
+		t.Fatalf("detached tidy created a commit: got %s want %s", got, initialHead)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initialHead {
+		t.Fatalf("detached tidy pushed a commit: remote HEAD=%s want=%s", got, initialHead)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "remote"))); got != "" {
+		t.Fatalf("detached tidy unexpectedly added a remote: %q", got)
+	}
+	if !strings.Contains(output.String(), "Nothing was committed or pushed") {
+		t.Fatalf("detached tidy summary does not confirm no publication: %q", output.String())
+	}
+}
+
 func TestCleanPristineUsesIsolatedWorktreeAndPublishesOnlyItsChanges(t *testing.T) {
 	repo := newCleanRepo(t)
 	record := filepath.Join(t.TempDir(), "check-workdirs")
