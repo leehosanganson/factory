@@ -70,8 +70,15 @@ func TestWorkflowIntegrationFailsAfterOneRunnerInvocationAndKeepsArtifactsOutsid
 	base := t.TempDir()
 	target := filepath.Join(base, "target")
 	state := filepath.Join(base, "state")
+	actualState := filepath.Join(base, "actual-state")
 	if err := os.Mkdir(target, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Mkdir(actualState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(actualState, state); err != nil {
+		t.Skipf("state directory symlinks unavailable: %v", err)
 	}
 	trace := filepath.Join(base, "processes.jsonl")
 	counter := filepath.Join(base, "invocation-count")
@@ -105,8 +112,12 @@ func TestWorkflowIntegrationFailsAfterOneRunnerInvocationAndKeepsArtifactsOutsid
 	if !strings.Contains(calls[0].Task, "Target repository: "+target) || !strings.Contains(calls[0].Task, task) {
 		t.Errorf("requirements did not receive target context and original task: %q", calls[0].Task)
 	}
-	if calls[0].Workdir == target || !isWithin(state, calls[0].Workdir) {
-		t.Errorf("requirements workdir = %q, want a run directory under external state %q", calls[0].Workdir, state)
+	canonicalState, err := canonicalPath(state)
+	if err != nil {
+		t.Fatalf("resolve external state directory: %v", err)
+	}
+	if calls[0].Workdir == target || !isWithin(canonicalState, calls[0].Workdir) {
+		t.Errorf("requirements workdir = %q, want a run directory under external state %q", calls[0].Workdir, canonicalState)
 	}
 	if count, err := os.ReadFile(counter); err != nil || strings.TrimSpace(string(count)) != "1" {
 		t.Errorf("requirements agent invocation count = %q, err=%v", count, err)
