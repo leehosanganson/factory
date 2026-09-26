@@ -56,9 +56,10 @@ factory job attach <id>
 factory job stop <id>
 ```
 
-Detached jobs are stored under `<state-base>/factory/detached-jobs`. A start
-returns after launching the worker, and stop requests cooperative cancellation
-through a durable file.
+Detached jobs are stored under
+`${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs` (or
+`<state_dir>/factory/detached-jobs`). A start returns after launching the
+worker, and stop requests cooperative cancellation through a durable file.
 Attach follows worker output; Ctrl-C detaches the observer without stopping the
 worker, which can be reattached later. The implementation workflow uses one
 job-level `workflow` session; monitor jobs use the monitor ID for the detached
@@ -82,7 +83,7 @@ for monitor management.
   high-impact decisions, to merge a PR, or as a security sandbox. Pause for
   human direction when the work exceeds a narrow, concrete routine fix.
 
-## Pipeline: deliberate task workflow
+## Implementation workflow
 
 Run in the target repository:
 
@@ -93,7 +94,7 @@ factory implement --gate add a small feature
 factory                         # starts the interactive implementation workflow
 ```
 
-By default, pipeline starts an implementation job and attaches to its output
+By default, the implementation workflow starts an implementation job and attaches to its output
 until terminal state. Ctrl-C detaches without stopping the worker; use
 `factory job attach <id>` to reattach or `factory job stop <id>` to request
 cooperative cancellation. `--gate` keeps the interactive foreground workflow,
@@ -119,7 +120,7 @@ Operate the stages in this order:
    correctness verdict. With `--gate`, require exact `yes` after each successful
    stage; any other response stops the workflow.
 
-Each pipeline stage has a 30-minute active agent-execution budget shared across
+Each implementation stage has a 30-minute active agent-execution budget shared across
 attempts and implementation workers. The budget pauses during approvals and
 other non-agent work; it is not a whole-job deadline.
 
@@ -136,19 +137,19 @@ its `runs` subdirectory. Progress is informational; inspect the agent output
 and run appropriate checks rather than treating process success as independent
 verification.
 
-The foreground pipeline does not create branches or commits; Factory itself does
-not commit pipeline work. Agents and their tools can still modify the target
+The foreground implementation workflow does not create branches or commits; Factory itself does
+not commit implementation work. Agents and their tools can still modify the target
 repository, so this is not a sandbox. Keep the user in control of scope and
 inspect changes as appropriate.
 
 ### Failures
 
-Inspect persisted run state and stage logs when a stage fails. Pipeline stages
+Inspect persisted run state and stage logs when a stage fails. Implementation stages
 are invoked once and are not retried. Resolve ambiguity with the user when
 needed; do not represent a successful process exit as an independent correctness
 finding.
 
-## Clean: pristine publishing and dirty safe mode
+## Tidy: pristine publishing and dirty safe mode
 
 Run `factory tidy` for review, fixes, documentation, then `make fmt`, `make test`,
 and `make vet`. It has two distinct modes:
@@ -174,12 +175,12 @@ and `make vet`. It has two distinct modes:
   preserve or back up important work first.
 
 Each agent stage is invoked once; an agent error fails that stage. There is no
-independent evaluator. Each clean stage has a
+independent evaluator. Each tidy stage has a
 30-minute active agent-execution budget, which pauses during approvals, checks,
 and other non-agent work; it is not a whole-job deadline. Successful-stage approval
 prompts are skipped by default; `factory tidy --gate` restores explicit gates.
 Pristine publication still requires an interactive terminal and exact lowercase
-`yes`, regardless of `--gate`. Neither mode is a security sandbox. This workflow
+`yes`, regardless of `--gate`. Neither mode is a security sandbox. Tidy
 is distinct from `make clean`, which removes local build artifacts.
 
 ## Monitor: bounded routine PR maintenance
@@ -258,22 +259,21 @@ been fixed or become stale.
   needed. Factory constrains its own workflow but does not sandbox configured
   agents or their tools.
 - Never promise arbitrary autonomous engineering, a merge, or a guaranteed
-  commit/push. Monitor may push guarded routine fixes to the PR branch; pipeline
-  itself does not branch or commit.
+  commit/push. Monitor may push guarded routine fixes to the PR branch; the
+  foreground implementation workflow itself does not branch or commit.
 
 Configuration defaults to `${XDG_CONFIG_HOME:-~/.config}/factory/config.json`
 and can be reviewed alongside `config.json.example`. The `agent_timeout`
 duration string sets the per-process agent timeout and defaults to `60m`.
-Pipeline and clean additionally cap active agent work at 30 minutes per stage;
+The implementation and tidy workflows additionally cap active agent work at 30 minutes per stage;
 monitor caps active agent work at 30 minutes per action. These budgets pause
 while waiting for approvals, checks, GitHub queries, polling, and other
 non-agent work; there is no overall job deadline. `agent_timeout` does not
-change the separate two-minute GitHub PR/check snapshot timeout or clean
-verification commands. Foreground runs and monitor jobs/logs are persisted
-outside the target repository by default under
-`${XDG_STATE_HOME:-~/.local/state}/factory/`. New detached job records use
-`${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs`. Configured
-`state_dir` uses `<state_dir>/factory/detached-jobs` for detached jobs. Monitor
-polling is controlled by `FACTORY_MONITOR_POLL_INTERVAL`. Do not infer
-additional resume, rollback, or control commands beyond those provided by the
-CLI.
+change the separate two-minute GitHub PR/check snapshot timeout or tidy
+verification commands. Foreground runs are persisted under
+`${XDG_STATE_HOME:-~/.local/state}/factory/runs` (or `<state_dir>/runs`). Detached
+jobs and their logs are stored under
+`${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs` (or
+`<state_dir>/factory/detached-jobs`). Monitor polling is controlled by
+`FACTORY_MONITOR_POLL_INTERVAL`. Do not infer additional resume, rollback, or
+control commands beyond those provided by the CLI.

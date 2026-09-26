@@ -155,7 +155,7 @@ func managedRunRoot(override string) (string, error) {
 // RunCommand controls only gated, foreground pipeline records.
 func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory run list | get <id> [--details] | show <id> [--details] | events <id> [--follow] | stop <id>")
+		return fmt.Errorf("usage: factory run list | get <id> [--details] | events <id> [--follow] | stop <id>")
 	}
 	root, err := managedRunRoot(cfg.StateDir)
 	if err != nil {
@@ -205,7 +205,7 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 			fmt.Fprintln(out, row)
 		}
 		return nil
-	case "get", "show":
+	case "get":
 		id, details, err := parseDetailsID("factory run get <id> [--details]", args[1:])
 		if err != nil {
 			return err
@@ -333,8 +333,8 @@ func readManagedState(dir string) (State, error) {
 	if err := readJSONRegular(filepath.Join(dir, "state.json"), &state); err != nil {
 		return state, err
 	}
-	if state.ID != filepath.Base(dir) {
-		return State{}, fmt.Errorf("invalid run record")
+	if state.ID != filepath.Base(dir) || state.Managed && state.StageHistoryVersion != 1 {
+		return State{}, fmt.Errorf("invalid or unsupported run record")
 	}
 	return state, nil
 }

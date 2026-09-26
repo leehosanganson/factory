@@ -144,56 +144,44 @@ func TestAttachSurfacesFailedAndStoppedLifecycle(t *testing.T) {
 	}
 }
 
-func TestBabysitEventAppendFailurePreventsLegacyAndDetachedUpdates(t *testing.T) {
+func TestMonitorEventAppendFailureDoesNotChangeCanonicalMonitorRecord(t *testing.T) {
 	state := t.TempDir()
-	legacyDir := filepath.Join(state, "factory", "jobs", "20260518T120016-0123456789ab")
-	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	id := filepath.Base(legacyDir)
-	target := t.TempDir()
-	legacy := &babysitJob{ID: id, RepoRoot: target, Status: "running", LastEvent: "previous event"}
-	if err := writeBabysitJob(legacyDir, legacy); err != nil {
-		t.Fatal(err)
-	}
-	cfg := Config{StateDir: state}
-	if err := createMonitorJobRecord(cfg, legacy); err != nil {
-		t.Fatal(err)
-	}
-	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	root, err := JobStateRoot(state)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldOpen := babysitLogOpenFile
-	babysitLogOpenFile = func(string, int, os.FileMode) (*os.File, error) {
-		return nil, errors.New("injected actions log failure")
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { babysitLogOpenFile = oldOpen })
-
-	legacy.Status = "completed"
-	err = babysitEvent(legacyDir, legacy, "PR merged")
-	if err == nil || !strings.Contains(err.Error(), "injected actions log failure") {
-		t.Fatalf("babysitEvent error = %v, want append failure", err)
+	id := "20260518T120016-0123456789ab"
+	monitor := &monitorJob{ID: id, RepoRoot: t.TempDir(), Status: "running", LastEvent: "previous event"}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: monitor.RepoRoot, Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
 	}
-	persisted, err := readBabysitJob(legacyDir)
+	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, id)
+	oldAppend := monitorSessionLogAppend
+	monitorSessionLogAppend = func(*JobStore, string, []byte) error { return errors.New("injected session log failure") }
+	t.Cleanup(func() { monitorSessionLogAppend = oldAppend })
+	monitor.Status = "complete"
+	err = monitorEvent(dir, monitor, "PR merged")
+	if err == nil || !strings.Contains(err.Error(), "injected session log failure") {
+		t.Fatalf("monitorEvent error=%v", err)
+	}
+	persisted, err := readMonitorJob(dir)
 	if err != nil || persisted.Status != "running" || persisted.LastEvent != "previous event" {
-		t.Fatalf("legacy state changed after log append failure: %+v err=%v", persisted, err)
-	}
-	detachedJob, err := store.GetJob(id)
-	if err != nil || detachedJob.Status != "queued" {
-		t.Fatalf("detached job status changed after log append failure: %+v err=%v", detachedJob, err)
-	}
-	session, err := store.GetSession(id, monitorSessionID)
-	if err != nil || session.Status != "queued" {
-		t.Fatalf("detached job session changed after log append failure: %+v err=%v", session, err)
+		t.Fatalf("monitor record changed: %+v err=%v", persisted, err)
 	}
 	events, err := store.SessionEvents(id, monitorSessionID)
 	if err != nil || len(events) != 0 {
-		t.Fatalf("detached job event persisted after append failure: %+v err=%v", events, err)
+		t.Fatalf("event persisted despite log failure: %+v err=%v", events, err)
 	}
 }
 
-func TestAttachMonitorDrainsTerminalLegacyEventBeforeStatusTransition(t *testing.T) {
+func TestAttachMonitorUsesCanonicalMonitorRecordAndSessionLog(t *testing.T) {
 	state := t.TempDir()
 	root, err := JobStateRoot(state)
 	if err != nil {
@@ -205,53 +193,33 @@ func TestAttachMonitorDrainsTerminalLegacyEventBeforeStatusTransition(t *testing
 	}
 	const id = "20260518T120012-0123456789ab"
 	target := t.TempDir()
-	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: target, Status: "running"}); err != nil {
+	monitor := &monitorJob{ID: id, RepoRoot: target, Status: "complete", LastEvent: "PR is merged; monitoring stopped."}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: target, Status: "complete", Monitor: monitor}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+	if _, err := store.CreateSession(id, monitorSessionID, "complete"); err != nil {
 		t.Fatal(err)
 	}
-	legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", id)
-	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
+	if err := store.AppendSessionLog(id, monitorSessionID, []byte("canonical monitor transcript\n")); err != nil {
 		t.Fatal(err)
 	}
-	legacy := &babysitJob{ID: id, RepoRoot: target, Status: "running"}
-	if err := writeBabysitJob(legacyDir, legacy); err != nil {
+	var out bytes.Buffer
+	if err := AttachJob(context.Background(), store, id, &out); err != nil {
 		t.Fatal(err)
 	}
-
-	const finalMessage = "PR is merged; monitoring stopped."
-	legacy.Status = "completed"
-	if err := babysitEvent(legacyDir, legacy, finalMessage); err != nil {
-		t.Fatalf("record terminal babysit event: %v", err)
+	if got := out.String(); got != "canonical monitor transcript\n" {
+		t.Fatalf("attach output=%q", got)
 	}
-
-	job, err := store.GetJob(id)
-	if err != nil || job.Status != "merged" {
-		t.Fatalf("terminal monitor status = %q, err=%v", job.Status, err)
+	out.Reset()
+	if err := JobCommand([]string{"logs", id}, Config{StateDir: state}, t.TempDir(), nil, &out); err != nil {
+		t.Fatal(err)
 	}
-	session, err := store.GetSession(id, monitorSessionID)
-	if err != nil || session.Status != "merged" {
-		t.Fatalf("terminal monitor session status = %q, err=%v", session.Status, err)
-	}
-	events, err := store.SessionEvents(id, monitorSessionID)
-	if err != nil || len(events) != 1 || events[0].Message != finalMessage {
-		t.Fatalf("persisted terminal monitor event = %+v, err=%v", events, err)
-	}
-	if !events[0].At.Before(job.EndedAt) {
-		t.Fatalf("terminal event time %s was not persisted before job terminal transition %s", events[0].At, job.EndedAt)
-	}
-
-	var output bytes.Buffer
-	if err := AttachJob(context.Background(), store, id, &output); err != nil {
-		t.Fatalf("attach completed monitor: %v", err)
-	}
-	if !strings.Contains(output.String(), finalMessage) {
-		t.Fatalf("attach omitted final legacy event %q: %q", finalMessage, output.String())
+	if got := out.String(); got != "canonical monitor transcript\n" {
+		t.Fatalf("logs output=%q", got)
 	}
 }
 
-func TestAttachMonitorUsesMonitorSessionLog(t *testing.T) {
+func TestAttachMonitorIgnoresOldMonitorRootAndActionsLog(t *testing.T) {
 	state := t.TempDir()
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
@@ -259,132 +227,50 @@ func TestAttachMonitorUsesMonitorSessionLog(t *testing.T) {
 	}
 	const id = "20260518T120013-0123456789ab"
 	target := t.TempDir()
-	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: target, Status: "complete"}); err != nil {
+	monitor := &monitorJob{ID: id, RepoRoot: target, Status: "complete"}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: target, Status: "complete", Monitor: monitor}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.CreateSession(id, monitorSessionID, "complete"); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateJobLog(id); err != nil {
+	if err := store.AppendSessionLog(id, monitorSessionID, []byte("canonical session\n")); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.AppendSessionLog(id, monitorSessionID, []byte("monitor transcript\n")); err != nil {
+	oldDir := filepath.Join(state, "factory", "jobs", id)
+	if err := os.MkdirAll(oldDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", id)
-	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	legacy := &babysitJob{ID: id, RepoRoot: target, Status: "completed"}
-	if err := writeBabysitJob(legacyDir, legacy); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacyDir, "actions.log"), []byte("legacy actions transcript\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	jobLog, err := store.JobLogPath(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(jobLog, []byte("wrong worker log\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(oldDir, "actions.log"), []byte("old transcript\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
 	if err := AttachJob(context.Background(), store, id, &out); err != nil {
 		t.Fatal(err)
 	}
-	if got := out.String(); got != "legacy actions transcript\n" {
-		t.Fatalf("monitor attach output = %q, want validated legacy actions transcript", got)
-	}
-	out.Reset()
-	if err := JobCommand([]string{"logs", id}, Config{StateDir: state}, t.TempDir(), nil, &out); err != nil {
-		t.Fatalf("monitor logs command: %v", err)
-	}
-	if got := out.String(); got != "legacy actions transcript\n" {
-		t.Fatalf("monitor logs output = %q, want same validated legacy transcript as attach", got)
-	}
-	out.Reset()
-	if err := JobCommand([]string{"logs", id, "--follow"}, Config{StateDir: state}, t.TempDir(), nil, &out); err != nil {
-		t.Fatalf("monitor logs follow: %v", err)
-	}
-	if got := out.String(); got != "legacy actions transcript\n" {
-		t.Fatalf("monitor logs follow output = %q, want same validated legacy transcript as attach", got)
+	if got := out.String(); got != "canonical session\n" {
+		t.Fatalf("old monitor root was read: %q", got)
 	}
 }
 
-func TestAttachMonitorFallsBackAndRejectsUnsafeLegacyActionLog(t *testing.T) {
-	for _, test := range []struct {
-		name         string
-		setup        func(*testing.T, string)
-		wantFallback bool
-	}{
-		{name: "missing legacy directory", wantFallback: true},
-		{name: "missing actions log", setup: func(t *testing.T, dir string) {
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-		}, wantFallback: true},
-		{name: "symlink actions log", setup: func(t *testing.T, dir string) {
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			outside := filepath.Join(t.TempDir(), "outside.log")
-			if err := os.WriteFile(outside, []byte("outside\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Symlink(outside, filepath.Join(dir, "actions.log")); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			store := newTestJobStore(t)
-			const id = "20260518T120014-0123456789ab"
-			target := t.TempDir()
-			if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: target, Status: "complete"}); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := store.CreateSession(id, monitorSessionID, "complete"); err != nil {
-				t.Fatal(err)
-			}
-			if err := store.AppendSessionLog(id, monitorSessionID, []byte("detached job session fallback\n")); err != nil {
-				t.Fatal(err)
-			}
-			legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", id)
-			if test.setup != nil {
-				test.setup(t, legacyDir)
-			}
-			var out bytes.Buffer
-			if test.setup != nil {
-				if _, err := os.Lstat(filepath.Join(legacyDir, "actions.log")); errors.Is(err, os.ErrNotExist) {
-					legacy := &babysitJob{ID: id, RepoRoot: target, Status: "completed"}
-					if err := writeBabysitJob(legacyDir, legacy); err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			err := AttachJob(context.Background(), store, id, &out)
-			if test.wantFallback {
-				if err != nil || out.String() != "detached job session fallback\n" {
-					t.Fatalf("attach fallback output=%q err=%v", out.String(), err)
-				}
-			} else if err == nil {
-				t.Fatalf("attach with unsafe legacy log succeeded: %q", out.String())
-			} else {
-				out.Reset()
-				state := filepath.Dir(filepath.Dir(store.Root()))
-				if err := JobCommand([]string{"logs", id}, Config{StateDir: state}, t.TempDir(), nil, &out); err == nil {
-					t.Fatalf("logs command accepted unsafe legacy log: %q", out.String())
-				}
-			}
-		})
+func TestCanonicalJobStatusesDefineTerminalOutcomes(t *testing.T) {
+	for _, status := range []string{"complete", "closed", "failed", "stopped", "cancelled", "interrupted"} {
+		if !isTerminalStatus(status) {
+			t.Errorf("canonical final status %q must be terminal", status)
+		}
+	}
+	for _, status := range []string{"queued", "running", "recoverable_failure", "completed", "merged"} {
+		if isTerminalStatus(status) {
+			t.Errorf("noncanonical or resumable status %q must not be terminal", status)
+		}
 	}
 }
 
 func TestAttachRecoverableFailureReturnsWhenMonitorWorkerExited(t *testing.T) {
 	store := newTestJobStore(t)
 	const id = "20260518T120017-0123456789ab"
-	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, Status: "recoverable_failure"}); err != nil {
+	monitor := &monitorJob{ID: id, Status: "recoverable_failure"}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, Status: "recoverable_failure", Monitor: monitor}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.CreateSession(id, monitorSessionID, "recoverable_failure"); err != nil {
@@ -411,7 +297,8 @@ func TestJobLogsFollowRecoverableFailureReturnsResetGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 	const id = "20260518T120015-0123456789ab"
-	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, Status: "recoverable_failure"}); err != nil {
+	monitor := &monitorJob{ID: id, Status: "recoverable_failure"}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, Status: "recoverable_failure", Monitor: monitor}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.CreateSession(id, monitorSessionID, "recoverable_failure"); err != nil {

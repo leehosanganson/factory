@@ -8,34 +8,32 @@ import (
 	"time"
 )
 
+func monitorJobStore(dir string) (*JobStore, bool, error) {
+	id := filepath.Base(dir)
+	store, err := NewJobStore(filepath.Dir(dir))
+	if err != nil {
+		return nil, false, err
+	}
+	if _, err := store.GetJob(id); errors.Is(err, os.ErrNotExist) {
+		return store, false, nil
+	} else if err != nil {
+		return nil, false, err
+	}
+	return store, true, nil
+}
+
 func appendMonitorAgentLog(dir, id string, data []byte) error {
-	store, exists, err := existingMonitorJobStore(dir, id)
+	store, exists, err := monitorJobStore(dir)
 	if err != nil {
 		return err
 	}
 	if !exists {
 		return fmt.Errorf("detached monitor job %s does not exist", id)
 	}
-	return store.AppendSessionLog(id, monitorSessionID, data)
+	return monitorSessionLogAppend(store, id, data)
 }
 
-func existingMonitorJobStore(dir, id string) (*JobStore, bool, error) {
-	factoryRoot := filepath.Dir(filepath.Dir(dir))
-	root, err := JobStateRoot(filepath.Dir(factoryRoot))
-	if err != nil {
-		return nil, false, err
-	}
-	path := filepath.Join(root, id, "job.json")
-	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
-		return nil, false, nil
-	} else if err != nil {
-		return nil, false, err
-	}
-	store, err := NewJobStore(root)
-	return store, err == nil, err
-}
-
-func createMonitorJobRecord(cfg Config, legacy *babysitJob) error {
+func createMonitorJobRecord(cfg Config, monitor *monitorJob) error {
 	root, err := JobStateRoot(cfg.StateDir)
 	if err != nil {
 		return err
@@ -44,48 +42,37 @@ func createMonitorJobRecord(cfg Config, legacy *babysitJob) error {
 	if err != nil {
 		return err
 	}
-	job := JobRecord{
-		ID: legacy.ID, Type: monitorJobType, TaskDescription: legacy.Description,
-		TargetPath: legacy.RepoRoot, Status: "queued",
-	}
+	copy := *monitor
+	job := JobRecord{ID: monitor.ID, Type: monitorJobType, TaskDescription: monitor.Description, TargetPath: monitor.RepoRoot, Status: "queued", Monitor: &copy}
 	if err := store.CreateJob(job); err != nil {
 		return err
 	}
-	if _, err := store.CreateSession(legacy.ID, monitorSessionID, "queued"); err != nil {
-		_ = os.RemoveAll(filepath.Join(store.Root(), legacy.ID))
+	if _, err := store.CreateSession(monitor.ID, monitorSessionID, "queued"); err != nil {
+		_ = os.RemoveAll(filepath.Join(store.Root(), monitor.ID))
 		return err
 	}
 	return nil
 }
 
-func syncMonitorJobStatus(dir string, legacy *babysitJob) error {
-	return syncMonitorJob(dir, legacy, false)
+func syncMonitorJobStatus(dir string, monitor *monitorJob) error {
+	return syncMonitorJob(dir, monitor, false)
 }
 
-func syncMonitorJobEvent(dir string, legacy *babysitJob) error {
-	return syncMonitorJob(dir, legacy, true)
+func syncMonitorJobEvent(dir string, monitor *monitorJob) error {
+	return syncMonitorJob(dir, monitor, true)
 }
 
-func syncMonitorJob(dir string, legacy *babysitJob, recordEvent bool) error {
-	store, exists, err := existingMonitorJobStore(dir, legacy.ID)
+func syncMonitorJob(dir string, monitor *monitorJob, recordEvent bool) error {
+	store, exists, err := monitorJobStore(dir)
 	if err != nil || !exists {
 		return err
 	}
-	job, err := store.GetJob(legacy.ID)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	job, err := store.GetJob(monitor.ID)
 	if err != nil {
 		return err
 	}
-	status := monitorRecordStatus(legacy.Status)
-	if status == "" {
-		return nil
-	}
-	session, err := store.GetSession(legacy.ID, monitorSessionID)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	status := monitor.Status
+	session, err := store.GetSession(monitor.ID, monitorSessionID)
 	if err != nil {
 		return err
 	}
@@ -93,15 +80,17 @@ func syncMonitorJob(dir string, legacy *babysitJob, recordEvent bool) error {
 	if !recordEvent && !statusChanged {
 		return nil
 	}
-	message := legacy.LastEvent
+	message := monitor.LastEvent
 	if message == "" {
 		message = "Monitor status changed to " + status + "."
 	}
-	if err := (JobSessionObserver{Store: store, JobID: legacy.ID, SessionID: monitorSessionID}).ObserveWorkflowEvent(WorkflowEvent{Type: "monitor.status", Message: message}); err != nil {
-		return err
+	if recordEvent {
+		if err := store.AppendSessionEvent(monitor.ID, monitorSessionID, "monitor.status", message); err != nil {
+			return err
+		}
 	}
 	if job.Status != status {
-		if _, err := store.UpdateJob(legacy.ID, func(record *JobRecord) error {
+		if _, err := store.UpdateJob(monitor.ID, func(record *JobRecord) error {
 			record.Status = status
 			return nil
 		}); err != nil {
@@ -109,7 +98,7 @@ func syncMonitorJob(dir string, legacy *babysitJob, recordEvent bool) error {
 		}
 	}
 	if session.Status != status {
-		_, err = store.UpdateSession(legacy.ID, monitorSessionID, func(session *SessionRecord) error {
+		_, err = store.UpdateSession(monitor.ID, monitorSessionID, func(session *SessionRecord) error {
 			session.Status = status
 			return nil
 		})
@@ -117,27 +106,8 @@ func syncMonitorJob(dir string, legacy *babysitJob, recordEvent bool) error {
 	return err
 }
 
-func monitorRecordStatus(status string) string {
-	switch status {
-	case "starting":
-		return "queued"
-	case "running", "awaiting_approval":
-		return "running"
-	case "recoverable_failure":
-		return status
-	case "completed", "complete", "merged":
-		return "merged"
-	case "closed":
-		return "closed"
-	case "stopped", "failed", "interrupted", "cancelled":
-		return status
-	default:
-		return ""
-	}
-}
-
 func storeMonitorSessionRunning(id, dir string) error {
-	store, exists, err := existingMonitorJobStore(dir, id)
+	store, exists, err := monitorJobStore(dir)
 	if err != nil || !exists {
 		return err
 	}
@@ -154,12 +124,11 @@ func storeMonitorSessionRunning(id, dir string) error {
 	if err != nil {
 		return err
 	}
-	event := WorkflowEvent{Type: "monitor.started", Message: "Detached PR monitor worker registered."}
-	return (JobSessionObserver{Store: store, JobID: id, SessionID: monitorSessionID}).ObserveWorkflowEvent(event)
+	return store.AppendSessionEvent(id, monitorSessionID, "monitor.started", "Detached PR monitor worker registered.")
 }
 
 func registerMonitorWorkerIfMissing(id, dir string, pid int) error {
-	store, exists, err := existingMonitorJobStore(dir, id)
+	store, exists, err := monitorJobStore(dir)
 	if err != nil || !exists {
 		return err
 	}
@@ -172,7 +141,7 @@ func registerMonitorWorkerIfMissing(id, dir string, pid int) error {
 }
 
 func registerMonitorWorker(id, dir string, pid int) error {
-	store, exists, err := existingMonitorJobStore(dir, id)
+	store, exists, err := monitorJobStore(dir)
 	if err != nil || !exists {
 		return err
 	}
@@ -180,7 +149,7 @@ func registerMonitorWorker(id, dir string, pid int) error {
 }
 
 func heartbeatMonitorWorker(id, dir string) error {
-	store, exists, err := existingMonitorJobStore(dir, id)
+	store, exists, err := monitorJobStore(dir)
 	if err != nil || !exists {
 		return err
 	}
@@ -189,7 +158,7 @@ func heartbeatMonitorWorker(id, dir string) error {
 }
 
 func clearMonitorWorker(id, dir string) error {
-	store, exists, err := existingMonitorJobStore(dir, id)
+	store, exists, err := monitorJobStore(dir)
 	if err != nil || !exists {
 		return err
 	}

@@ -93,8 +93,8 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 		t.Fatalf("job list output=%q err=%v", cliOutput.String(), err)
 	}
 	cliOutput.Reset()
-	if err := JobCommand([]string{"show", id}, Config{StateDir: state}, target, strings.NewReader(""), &cliOutput); err != nil || !strings.Contains(cliOutput.String(), "Status: complete") {
-		t.Fatalf("job show output=%q err=%v", cliOutput.String(), err)
+	if err := JobCommand([]string{"get", id}, Config{StateDir: state}, target, strings.NewReader(""), &cliOutput); err != nil || !strings.Contains(cliOutput.String(), "Status: complete") {
+		t.Fatalf("job get output=%q err=%v", cliOutput.String(), err)
 	}
 	if strings.Contains(cliOutput.String(), "requirements completed") || strings.Contains(cliOutput.String(), "Description:") {
 		t.Fatalf("concise job output leaked detailed content: %q", cliOutput.String())
@@ -142,45 +142,13 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	}
 }
 
-func TestJobCommandsControlJobsPersistedInLegacyStateRoot(t *testing.T) {
-	state := t.TempDir()
-	target := t.TempDir()
-	legacyRoot := filepath.Join(state, "factory", "jobs", "v2")
-	legacyStore, err := NewJobStore(legacyRoot)
-	if err != nil {
-		t.Fatal(err)
+func TestJobShowAliasIsRejectedByHandler(t *testing.T) {
+	var output bytes.Buffer
+	if err := JobCommand([]string{"show", "missing"}, Config{StateDir: t.TempDir()}, t.TempDir(), strings.NewReader(""), &output); err == nil || !strings.Contains(err.Error(), `unknown job command "show"`) {
+		t.Fatalf("job show alias error = %v, want handler rejection", err)
 	}
-	if err := legacyStore.CreateJob(JobRecord{ID: "legacy-active", Type: implementationJobType, TaskDescription: "pre-upgrade work", TargetPath: target, Status: "running"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := legacyStore.CreateSession("legacy-active", "workflow", "running"); err != nil {
-		t.Fatal(err)
-	}
-	if err := legacyStore.CreateJobLog("legacy-active"); err != nil {
-		t.Fatal(err)
-	}
-
-	var out bytes.Buffer
-	if err := JobCommand([]string{"list"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err != nil || !strings.Contains(out.String(), "legacy-active") {
-		t.Fatalf("legacy job list=%q err=%v", out.String(), err)
-	}
-	out.Reset()
-	if err := JobCommand([]string{"start", "implementation", "must not overlap"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err == nil || !strings.Contains(err.Error(), "already targets") {
-		t.Fatalf("legacy active job did not block duplicate target admission: %v", err)
-	}
-	out.Reset()
-	if err := JobCommand([]string{"get", "legacy-active"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err != nil || !strings.Contains(out.String(), "Status: running") {
-		t.Fatalf("legacy job get=%q err=%v", out.String(), err)
-	}
-	out.Reset()
-	if err := JobCommand([]string{"stop", "legacy-active"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err != nil {
-		t.Fatal(err)
-	}
-	if !legacyStore.StopRequested("legacy-active") {
-		t.Fatal("stop request was not written beside the existing worker's legacy job")
-	}
-	if _, err := os.Stat(filepath.Join(state, "factory", "detached-jobs")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("CLI controls split the existing worker into a new root: %v", err)
+	if output.Len() != 0 {
+		t.Fatalf("rejected job alias wrote output: %q", output.String())
 	}
 }
 
@@ -207,7 +175,7 @@ func TestDetachedJobStopAndSameTargetAdmission(t *testing.T) {
 	if !store.StopRequested("to-stop") {
 		t.Fatal("stop command did not write its durable request")
 	}
-	for _, kind := range []string{"clean", "babysit", "Implementation"} {
+	for _, kind := range []string{"clean", "monitoring", "Implementation"} {
 		if err := JobCommand([]string{"start", kind, "unsupported"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &out); err == nil || !strings.Contains(err.Error(), "unsupported job type") {
 			t.Errorf("job type %q was accepted: err=%v", kind, err)
 		}
@@ -500,7 +468,7 @@ func TestJobListReconcilesEveryStaleJobWithoutStealingLiveTargets(t *testing.T) 
 	}
 }
 
-func TestJobShowReconcilesOnlyRequestedStaleJob(t *testing.T) {
+func TestJobGetReconcilesOnlyRequestedStaleJob(t *testing.T) {
 	state := t.TempDir()
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
@@ -513,11 +481,11 @@ func TestJobShowReconcilesOnlyRequestedStaleJob(t *testing.T) {
 		makeJobStale(t, store, id)
 	}
 	var output bytes.Buffer
-	if err := JobCommand([]string{"show", "show-stale"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output); err != nil {
+	if err := JobCommand([]string{"get", "show-stale"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(output.String(), "Status: interrupted") {
-		t.Fatalf("show output=%q, want reconciled status", output.String())
+		t.Fatalf("get output=%q, want reconciled status", output.String())
 	}
 	shown, err := store.GetJob("show-stale")
 	if err != nil || shown.Status != "interrupted" {
@@ -525,7 +493,7 @@ func TestJobShowReconcilesOnlyRequestedStaleJob(t *testing.T) {
 	}
 	unrelated, err := store.GetJob("show-unrelated")
 	if err != nil || unrelated.Status != "running" {
-		t.Fatalf("show reconciled unrelated job: %+v err=%v", unrelated, err)
+		t.Fatalf("get reconciled unrelated job: %+v err=%v", unrelated, err)
 	}
 }
 

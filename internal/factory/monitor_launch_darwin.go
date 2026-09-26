@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-func launchBabysitWorker(id, stateRoot string) (int, error) {
+func launchMonitorWorker(id, stateRoot string) (int, error) {
 	executable, err := os.Executable()
 	if err != nil {
 		return 0, err

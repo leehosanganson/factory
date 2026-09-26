@@ -659,27 +659,6 @@ func TestWorkflowCancellationStopsAgentAndPersistsInterruptedStatus(t *testing.T
 	}
 }
 
-func TestStateUnmarshalsLegacyJSONWithAttemptHistory(t *testing.T) {
-	legacy := `{"id":"run-1","task":"legacy task","workdir":"/repo","stage":"review","status":"running","updated_at":"2026-01-02T03:04:05Z","stages":[{"name":"review","status":"passed","attempts":[{"outcome":"passed","started_at":"2026-01-02T03:04:05Z"}]}]}`
-	var state State
-	if err := json.Unmarshal([]byte(legacy), &state); err != nil {
-		t.Fatalf("unmarshal legacy state: %v", err)
-	}
-	if state.Stage != "review" || state.Status != "running" {
-		t.Fatalf("legacy stage/status = %q/%q, want review/running", state.Stage, state.Status)
-	}
-	if state.StageHistoryVersion != 0 || len(state.Stages) != 1 || state.Stages[0].Name != "review" || state.Stages[0].Status != "passed" {
-		t.Fatalf("legacy stage record failed to decode while ignoring attempts: version=%d stages=%+v", state.StageHistoryVersion, state.Stages)
-	}
-	encoded, err := json.Marshal(state.Stages[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(encoded), "attempt") {
-		t.Fatalf("re-encoded legacy history retained removed attempt fields: %s", encoded)
-	}
-}
-
 func TestWorkflowCancellationAfterStageRejectionPersistsInterruptedStatus(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	ctx, cancel := context.WithCancel(context.Background())

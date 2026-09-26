@@ -63,8 +63,8 @@ func TestRunCommandListsShowsEventsAndCooperativelyStopsOnlyManagedRuns(t *testi
 		t.Fatalf("list output=%q err=%v", out.String(), err)
 	}
 	out.Reset()
-	if err := RunCommand(context.Background(), []string{"show", state.ID}, cfg, &out); err != nil || !strings.Contains(out.String(), "Liveness: heartbeat_fresh") || strings.Contains(out.String(), "Description:") {
-		t.Fatalf("show output=%q err=%v", out.String(), err)
+	if err := RunCommand(context.Background(), []string{"get", state.ID}, cfg, &out); err != nil || !strings.Contains(out.String(), "Liveness: heartbeat_fresh") || strings.Contains(out.String(), "Description:") {
+		t.Fatalf("get output=%q err=%v", out.String(), err)
 	}
 	out.Reset()
 	if err := RunCommand(context.Background(), []string{"get", state.ID, "--details"}, cfg, &out); err != nil || !strings.Contains(out.String(), "Description: gated task") || !strings.Contains(out.String(), "workflow-events.jsonl path:") || !strings.Contains(out.String(), `"stage":"requirements"`) {
@@ -93,8 +93,43 @@ func TestRunCommandListsShowsEventsAndCooperativelyStopsOnlyManagedRuns(t *testi
 	if !managedStopRequested(runDir) {
 		t.Fatal("stop command did not persist its cooperative request")
 	}
-	if err := RunCommand(context.Background(), []string{"show", "unmanaged"}, cfg, &out); err == nil {
+	if err := RunCommand(context.Background(), []string{"get", "unmanaged"}, cfg, &out); err == nil {
 		t.Fatal("run control accepted an unmanaged or missing run")
+	}
+}
+
+func TestManagedRunStateRequiresSupportedStageHistoryVersion(t *testing.T) {
+	runsRoot, err := StateRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{
+		"missing":     `{"id":"missing","status":"running","managed":true}`,
+		"unsupported": `{"id":"unsupported","status":"running","managed":true,"stage_history_version":2}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			runDir := filepath.Join(runsRoot, name)
+			if err := os.MkdirAll(runDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(runDir, "state.json"), []byte(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readManagedState(runDir); err == nil || !strings.Contains(err.Error(), "unsupported run record") {
+				t.Fatalf("managed state with %s stage history version error = %v", name, err)
+			}
+		})
+	}
+}
+
+func TestRunShowAliasIsRejectedByHandler(t *testing.T) {
+	var out bytes.Buffer
+	err := RunCommand(context.Background(), []string{"show", "missing"}, Config{StateDir: t.TempDir()}, &out)
+	if err == nil || !strings.Contains(err.Error(), `unknown run command "show"`) {
+		t.Fatalf("run show alias error = %v, want handler rejection", err)
+	}
+	if out.Len() != 0 {
+		t.Fatalf("rejected run alias wrote output: %q", out.String())
 	}
 }
 
@@ -265,7 +300,7 @@ func TestRunCommandsRejectNonManagedRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out bytes.Buffer
-	if err := RunCommand(context.Background(), []string{"show", filepath.Base(dir)}, Config{StateDir: filepath.Dir(root)}, &out); err == nil || !strings.Contains(err.Error(), "not a gated, manageable run") {
-		t.Fatalf("show unmanaged run error = %v", err)
+	if err := RunCommand(context.Background(), []string{"get", filepath.Base(dir)}, Config{StateDir: filepath.Dir(root)}, &out); err == nil || !strings.Contains(err.Error(), "not a gated, manageable run") {
+		t.Fatalf("get unmanaged run error = %v", err)
 	}
 }

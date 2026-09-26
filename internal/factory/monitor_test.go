@@ -35,14 +35,14 @@ func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Join(base, "jobs")
+	root := filepath.Join(base, "factory", "detached-jobs")
 	id := "20260518T120001-0123456789ab"
 	dir := filepath.Join(root, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: id, RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "main", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", SnapshotFailures: 7}
-	if err := saveBabysitJob(dir, job); err != nil {
+	job := &monitorJob{ID: id, RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "main", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", SnapshotFailures: 7}
+	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
 	gh := filepath.Join(base, "gh")
@@ -50,29 +50,29 @@ func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	oldDelay, oldLauncher := babysitRetryDelay, babysitWorkerLauncher
-	babysitRetryDelay = func(int) time.Duration { return 0 }
+	oldDelay, oldLauncher := monitorRetryDelay, monitorWorkerLauncher
+	monitorRetryDelay = func(int) time.Duration { return 0 }
 	launched := 0
-	babysitWorkerLauncher = func(gotID, gotRoot string) (int, error) {
+	monitorWorkerLauncher = func(gotID, gotRoot string) (int, error) {
 		launched++
 		if gotID != id || gotRoot != root {
 			t.Errorf("launcher got %s %s", gotID, gotRoot)
 		}
-		return 0, nil
+		return os.Getpid(), nil
 	}
-	t.Cleanup(func() { babysitRetryDelay, babysitWorkerLauncher = oldDelay, oldLauncher })
-	if err := runBabysitWorker(id, root, Config{Command: "/bin/true", Args: []string{"{task}", "{system_prompt}"}}); err != nil {
+	t.Cleanup(func() { monitorRetryDelay, monitorWorkerLauncher = oldDelay, oldLauncher })
+	if err := runMonitorWorker(id, root, Config{Command: "/bin/true", Args: []string{"{task}", "{system_prompt}"}}); err != nil {
 		t.Fatal(err)
 	}
-	failed, err := readBabysitJob(dir)
-	if err != nil || failed.Status != "recoverable_failure" || failed.SnapshotFailures != babysitSnapshotMaxRetries {
+	failed, err := readMonitorJob(dir)
+	if err != nil || failed.Status != "recoverable_failure" || failed.SnapshotFailures != monitorSnapshotMaxRetries {
 		t.Fatalf("job did not enter recoverable failure at retry cap: job=%+v err=%v", failed, err)
 	}
-	if err := babysitAction("reset", root, id, Config{}, nil, io.Discard); err != nil {
+	if err := monitorAction("reset", root, id, Config{}, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	reset, err := readBabysitJob(dir)
-	if err != nil || reset.Status != "starting" || reset.SnapshotFailures != 0 || launched != 1 {
+	reset, err := readMonitorJob(dir)
+	if err != nil || reset.Status != "queued" || reset.SnapshotFailures != 0 || launched != 1 {
 		t.Fatalf("reset semantics failed: job=%+v launches=%d err=%v", reset, launched, err)
 	}
 }
@@ -93,11 +93,11 @@ func TestMonitorAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
 		}, timeout: "3s", hangAt: "monitor", maxElapsed: time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			previousActionLimit := babysitAgentActionTimeout
+			previousActionLimit := monitorAgentActionTimeout
 			if tc.actionLimit > 0 {
-				babysitAgentActionTimeout = tc.actionLimit
+				monitorAgentActionTimeout = tc.actionLimit
 			}
-			t.Cleanup(func() { babysitAgentActionTimeout = previousActionLimit })
+			t.Cleanup(func() { monitorAgentActionTimeout = previousActionLimit })
 			base := t.TempDir()
 			bare := filepath.Join(base, "remote.git")
 			repo := filepath.Join(base, "repo")
@@ -130,8 +130,8 @@ exit 0
 			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			job := &babysitJob{ID: "20260518T120005-0123456789ab", Description: "monitor", RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", Attempts: 1, CreatedAt: time.Now().UTC()}
-			if err := saveBabysitJob(dir, job); err != nil {
+			job := &monitorJob{ID: "20260518T120005-0123456789ab", Description: "monitor", RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", Attempts: 1, CreatedAt: time.Now().UTC()}
+			if err := saveMonitorJob(dir, job); err != nil {
 				t.Fatal(err)
 			}
 			worktree := filepath.Join(base, "worktree")
@@ -141,7 +141,7 @@ exit 0
 			defer cancel()
 			t.Setenv("HANG_AT", tc.hangAt)
 			started := time.Now()
-			err = processBabysitEventContext(ctx, dir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}, AgentTimeout: tc.timeout}, &babysitSnapshot{HeadRefOID: head}, strings.Repeat("a", 64))
+			err = processMonitorEventContext(ctx, dir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}, AgentTimeout: tc.timeout}, &monitorSnapshot{HeadRefOID: head}, strings.Repeat("a", 64))
 			if err == nil {
 				t.Fatal("monitor agent unexpectedly completed")
 			}
@@ -213,7 +213,7 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Join(base, "state", "factory", "jobs")
+	root := filepath.Join(base, "state", "factory", "detached-jobs")
 	id := "20260518T120002-0123456789ab"
 	dir := filepath.Join(root, id)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -234,23 +234,23 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 	t.Setenv("GH_FAIL", failMarker)
 	t.Setenv("GH_RESPONSE", responsePath)
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("FACTORY_BABYSIT_POLL_INTERVAL", "1s")
+	t.Setenv("FACTORY_MONITOR_POLL_INTERVAL", "1s")
 	agentStarted := filepath.Join(base, "agent-started")
 	t.Setenv("AGENT_STARTED", agentStarted)
 	agent := filepath.Join(base, "agent")
 	if err := os.WriteFile(agent, []byte("#!/bin/sh\nif [ \"$1\" = monitor ]; then touch \"$AGENT_STARTED\"; exec sleep 30; fi\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: id, Description: "monitor", RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: head, OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
-	if err := saveBabysitJob(dir, job); err != nil {
+	job := &monitorJob{ID: id, Description: "monitor", RepoRoot: repo, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: head, OriginURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
+	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
 	cfg := Config{Command: agent, Args: []string{"{stage}", "{task}", "{system_prompt}"}, StateDir: filepath.Join(base, "state")}
 	workerDone := make(chan error, 1)
-	go func() { workerDone <- runBabysitWorker(id, root, cfg) }()
+	go func() { workerDone <- runMonitorWorker(id, root, cfg) }()
 	waitForJobStatus(t, dir, "running")
 	waitForFile(t, agentStarted)
-	if err := babysitAction("stop", root, id, cfg, nil, io.Discard); err != nil {
+	if err := monitorAction("stop", root, id, cfg, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -259,11 +259,11 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(5 * time.Second):
-		actions, _ := os.ReadFile(filepath.Join(dir, "actions.log"))
+		actions, _ := os.ReadFile(filepath.Join(filepath.Dir(dir), "sessions", monitorSessionID, "session.log"))
 		agentLog, _ := os.ReadFile(filepath.Join(dir, "agent.log"))
 		t.Fatalf("worker did not stop promptly; actions=%s agent=%s", actions, agentLog)
 	}
-	stopped, _ := readBabysitJob(dir)
+	stopped, _ := readMonitorJob(dir)
 	if stopped.Status != "stopped" {
 		t.Fatalf("worker status after stop = %q", stopped.Status)
 	}
@@ -272,26 +272,32 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 		stopped.Worktree, stopped.WorkerBranch = "", ""
 	}
 	stopped.Status, stopped.StopRequested, stopped.SnapshotFailures = "running", false, 7
-	if err := saveBabysitJob(dir, stopped); err != nil {
+	if err := saveMonitorJob(dir, stopped); err != nil {
 		t.Fatal(err)
 	}
-	_ = os.Remove(filepath.Join(dir, "stop.requested"))
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ClearStopRequest(id); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(failMarker, []byte("fail"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	oldDelay, oldLauncher := babysitRetryDelay, babysitWorkerLauncher
-	babysitRetryDelay = func(int) time.Duration { return 0 }
+	oldDelay, oldLauncher := monitorRetryDelay, monitorWorkerLauncher
+	monitorRetryDelay = func(int) time.Duration { return 0 }
 	var nextWorker chan error
-	babysitWorkerLauncher = func(gotID, gotRoot string) (int, error) {
+	monitorWorkerLauncher = func(gotID, gotRoot string) (int, error) {
 		nextWorker = make(chan error, 1)
-		go func() { nextWorker <- runBabysitWorker(gotID, gotRoot, cfg) }()
-		return 0, nil
+		go func() { nextWorker <- runMonitorWorker(gotID, gotRoot, cfg) }()
+		return os.Getpid(), nil
 	}
-	t.Cleanup(func() { babysitRetryDelay, babysitWorkerLauncher = oldDelay, oldLauncher })
-	if err := runBabysitWorker(id, root, cfg); err != nil {
+	t.Cleanup(func() { monitorRetryDelay, monitorWorkerLauncher = oldDelay, oldLauncher })
+	if err := runMonitorWorker(id, root, cfg); err != nil {
 		t.Fatal(err)
 	}
-	recoverable, err := readBabysitJob(dir)
+	recoverable, err := readMonitorJob(dir)
 	if err != nil || recoverable.Status != "recoverable_failure" || recoverable.SnapshotFailures != 8 {
 		t.Fatalf("snapshot retry cap status=%+v err=%v", recoverable, err)
 	}
@@ -301,7 +307,7 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 	if err := os.WriteFile(responsePath, []byte(closedResponse), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := babysitAction("reset", root, id, cfg, nil, io.Discard); err != nil {
+	if err := monitorAction("reset", root, id, cfg, nil, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -312,9 +318,17 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("reset worker did not poll closed PR")
 	}
-	closed, err := readBabysitJob(dir)
+	closed, err := readMonitorJob(dir)
 	if err != nil || closed.Status != "closed" {
 		t.Fatalf("closed PR status=%+v err=%v", closed, err)
+	}
+	record, err := store.GetJob(id)
+	if err != nil || record.Status != closed.Status {
+		t.Fatalf("closed PR job record status=%q monitor status=%q err=%v", record.Status, closed.Status, err)
+	}
+	session, err := store.GetSession(id, monitorSessionID)
+	if err != nil || session.Status != closed.Status {
+		t.Fatalf("closed PR session status=%q monitor status=%q err=%v", session.Status, closed.Status, err)
 	}
 }
 
@@ -334,50 +348,58 @@ func waitForJobStatus(t *testing.T, dir, status string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		job, err := readBabysitJob(dir)
+		job, err := readMonitorJob(dir)
 		if err == nil && job.Status == status && job.Snapshot != "" {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	job, _ := readBabysitJob(dir)
+	job, _ := readMonitorJob(dir)
 	t.Fatalf("job did not reach %s with a polled snapshot: %+v", status, job)
 }
 
-func TestBabysitIDsAndAtomicMetadata(t *testing.T) {
+func TestMonitorIDsAndAtomicMetadata(t *testing.T) {
 	root := t.TempDir()
-	id, err := babysitID()
+	id, err := monitorID()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !babysitIDPattern.MatchString(id) {
+	if !monitorIDPattern.MatchString(id) {
 		t.Fatalf("generated invalid id %q", id)
 	}
-	if _, err := babysitJobDir(root, "../escape"); err == nil {
+	if _, err := monitorJobDir(root, "../escape"); err == nil {
 		t.Fatal("path traversal id accepted")
 	}
 	dir := filepath.Join(root, id)
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: id, Description: "track PR", Status: "running", CreatedAt: time.Now().UTC()}
-	if err := saveBabysitJob(dir, job); err != nil {
+	job := &monitorJob{ID: id, Description: "track PR", Status: "running", CreatedAt: time.Now().UTC()}
+	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := readBabysitJob(dir)
+	loaded, err := readMonitorJob(dir)
 	if err != nil || loaded.Description != job.Description {
 		t.Fatalf("metadata round trip: %#v %v", loaded, err)
 	}
-	entries, err := os.ReadDir(dir)
+	store, err := NewJobStore(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 1 || entries[0].Name() != "job.json" {
-		t.Fatalf("temporary metadata leaked: %v", entries)
+	record, err := store.GetJob(id)
+	if err != nil || record.Monitor == nil || record.Monitor.Description != job.Description {
+		t.Fatalf("canonical generic job record missing monitor metadata: %#v %v", record, err)
+	}
+	if _, err := store.GetSession(id, monitorSessionID); err != nil {
+		t.Fatalf("canonical monitor session missing: %v", err)
+	}
+	sessionDir := filepath.Join(root, id, "sessions", monitorSessionID)
+	if info, err := os.Stat(sessionDir); err != nil || !info.IsDir() {
+		t.Fatalf("canonical monitor session directory missing: info=%v err=%v", info, err)
 	}
 }
 
-func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testing.T) {
+func TestMonitorApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testing.T) {
 	base := canonicalTestPath(t, t.TempDir())
 	gh := filepath.Join(base, "gh")
 	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
@@ -391,7 +413,7 @@ func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testi
 	}
 	t.Setenv("GH_RESPONSE", file)
 	cfg := Config{StateDir: filepath.Join(base, "state")}
-	root, err := babysitRoot(cfg)
+	root, err := monitorRoot(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -400,19 +422,19 @@ func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testi
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: id, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: "base123", BaselineHead: "head123", Status: "awaiting_approval", PendingSignature: "placeholder", Proposal: "Scope requested", CreatedAt: time.Now().UTC()}
+	job := &monitorJob{ID: id, Repo: "team/repo", PR: 7, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: "base123", BaselineHead: "head123", Status: "running", PendingSignature: "placeholder", Proposal: "Scope requested", CreatedAt: time.Now().UTC()}
 	_, signature, err := readSnapshot(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
 	}
 	job.PendingSignature = signature
-	if err := saveBabysitJob(dir, job); err != nil {
+	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
-	if err := babysitAction("approve", root, id, cfg, strings.NewReader("y\nFix only README typo\n"), &strings.Builder{}); err != nil {
+	if err := monitorAction("approve", root, id, cfg, strings.NewReader("y\nFix only README typo\n"), &strings.Builder{}); err != nil {
 		t.Fatal(err)
 	}
-	approved, err := readBabysitJob(dir)
+	approved, err := readMonitorJob(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,16 +445,16 @@ func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testi
 	if err := os.WriteFile(file, []byte(changed), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	approved.Status = "awaiting_approval"
+	approved.Status = "running"
 	approved.PendingSignature = signature
 	approved.Proposal = "Proposal for prior snapshot"
-	if err := saveBabysitJob(dir, approved); err != nil {
+	if err := saveMonitorJob(dir, approved); err != nil {
 		t.Fatal(err)
 	}
-	if err := babysitAction("approve", root, id, cfg, strings.NewReader("y\nBroader scope\n"), &strings.Builder{}); err == nil {
+	if err := monitorAction("approve", root, id, cfg, strings.NewReader("y\nBroader scope\n"), &strings.Builder{}); err == nil {
 		t.Fatal("changed proposal snapshot was approved")
 	}
-	invalidated, err := readBabysitJob(dir)
+	invalidated, err := readMonitorJob(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -441,7 +463,7 @@ func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testi
 	}
 }
 
-func TestBabysitSnapshotValidationAndSignature(t *testing.T) {
+func TestMonitorSnapshotValidationAndSignature(t *testing.T) {
 	root := t.TempDir()
 	gh := filepath.Join(root, "gh")
 	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
@@ -454,7 +476,7 @@ func TestBabysitSnapshotValidationAndSignature(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("GH_RESPONSE", file)
-	job := &babysitJob{PR: 7, Repo: "team/repo", HeadRepo: "team/fork", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: "base123"}
+	job := &monitorJob{PR: 7, Repo: "team/repo", HeadRepo: "team/fork", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: "base123"}
 	first, sig, err := readSnapshot(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
@@ -510,7 +532,7 @@ func TestParsePRURL(t *testing.T) {
 	}
 }
 
-func TestBabysitProtocolRequiresOneExactFinalStatus(t *testing.T) {
+func TestMonitorProtocolRequiresOneExactFinalStatus(t *testing.T) {
 	for _, tc := range []struct{ out, want string }{{"tests ok\nFACTORY_STATUS=FIXED\n", "FIXED"}, {"FACTORY_STATUS=FIXED\n", "FIXED"}, {"FACTORY_STATUS=FIXED\nFACTORY_STATUS=APPROVAL_REQUIRED\n", ""}, {"FACTORY_STATUS=FIXED extra\n", ""}} {
 		got, _ := agentProtocol(tc.out)
 		if got != tc.want {
@@ -519,8 +541,8 @@ func TestBabysitProtocolRequiresOneExactFinalStatus(t *testing.T) {
 	}
 }
 
-func TestBabysitChangedPathsIncludeStagedUntrackedAndNoRenameEndpoints(t *testing.T) {
-	repo := newBabysitRepo(t)
+func TestMonitorChangedPathsIncludeStagedUntrackedAndNoRenameEndpoints(t *testing.T) {
+	repo := newMonitorRepo(t)
 	if err := os.WriteFile(filepath.Join(repo, "tracked.go"), []byte("package test\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -559,7 +581,7 @@ func TestBabysitChangedPathsIncludeStagedUntrackedAndNoRenameEndpoints(t *testin
 	}
 }
 
-func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
+func TestMonitorApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
 	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
@@ -575,22 +597,12 @@ func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
 	runTestCommand(t, repo, "git", "commit", "-m", "initial")
 	runTestCommand(t, repo, "git", "push", "-u", "origin", "feature")
 	head := runTestCommand(t, repo, "git", "rev-parse", "HEAD")
-	jobDir := filepath.Join(base, "state", "factory", "jobs", "20260518T120000-0123456789ab")
+	jobDir := filepath.Join(base, "state", "factory", "detached-jobs", "20260518T120000-0123456789ab")
 	if err := os.MkdirAll(jobDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: "20260518T120000-0123456789ab", Description: "Fix docs", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
-	if err := saveBabysitJob(jobDir, job); err != nil {
-		t.Fatal(err)
-	}
-	store, err := NewJobStore(filepath.Join(base, "state", "factory", "detached-jobs"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CreateJob(JobRecord{ID: job.ID, Type: monitorJobType, Status: "running"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.CreateSession(job.ID, monitorSessionID, "running"); err != nil {
+	job := &monitorJob{ID: "20260518T120000-0123456789ab", Description: "Fix docs", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
+	if err := saveMonitorJob(jobDir, job); err != nil {
 		t.Fatal(err)
 	}
 	worktree := filepath.Join(base, "worker")
@@ -604,10 +616,10 @@ printf 'FACTORY_STATUS=APPROVAL_REQUIRED\n'
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := processBabysitEvent(jobDir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}}, &babysitSnapshot{HeadRefOID: head}, strings.Repeat("a", 64)); err != nil {
+	if err := processMonitorEvent(jobDir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}}, &monitorSnapshot{HeadRefOID: head}, strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
-	if job.Status != "awaiting_approval" || job.Proposal != "Need human review" {
+	if job.Status != "running" || job.Proposal != "Need human review" {
 		t.Fatalf("approval state = %q, proposal %q; want awaiting approval", job.Status, job.Proposal)
 	}
 	if got := runTestCommand(t, bare, "git", "rev-parse", "refs/heads/feature"); got != head {
@@ -615,7 +627,7 @@ printf 'FACTORY_STATUS=APPROVAL_REQUIRED\n'
 	}
 }
 
-func TestBabysitFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
+func TestMonitorFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
 	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
@@ -634,7 +646,7 @@ func TestBabysitFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Join(base, "state", "factory", "jobs")
+	root := filepath.Join(base, "state", "factory", "detached-jobs")
 	jobDir := filepath.Join(root, "20260518T120000-0123456789ab")
 	if err := os.MkdirAll(jobDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -654,23 +666,17 @@ exit 1
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
 	snapshotJSON := `{"number":17,"state":"OPEN","title":"Fix docs","url":"https://github.com/team/repo/pull/17","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
 	t.Setenv("GH_SNAPSHOT", snapshotJSON)
-	job := &babysitJob{ID: "20260518T120000-0123456789ab", Description: "Fix the documented typo", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
+	job := &monitorJob{ID: "20260518T120000-0123456789ab", Description: "Fix the documented typo", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
 	snap, sig, err := readSnapshot(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
 	}
 	job.Snapshot = sig
-	if err := saveBabysitJob(jobDir, job); err != nil {
+	if err := saveMonitorJob(jobDir, job); err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewJobStore(filepath.Join(base, "state", "factory", "detached-jobs"))
+	store, err := NewJobStore(root)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CreateJob(JobRecord{ID: job.ID, Type: monitorJobType, Status: "running"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.CreateSession(job.ID, monitorSessionID, "running"); err != nil {
 		t.Fatal(err)
 	}
 	agent := filepath.Join(base, "agent")
@@ -688,7 +694,7 @@ exit 9
 		t.Fatal(err)
 	}
 	cfg := Config{Command: agent, Args: []string{"{stage}", "{task}", "{system_prompt}"}, StateDir: filepath.Join(base, "state")}
-	if err := processBabysitEvent(jobDir, job, cfg, snap, sig); err != nil {
+	if err := processMonitorEvent(jobDir, job, cfg, snap, sig); err != nil {
 		t.Fatal(err)
 	}
 	remoteHead, err := runGit(context.Background(), bare, "rev-parse", "refs/heads/feature")
@@ -696,9 +702,10 @@ exit 9
 		t.Fatal(err)
 	}
 	if remoteHead == head {
-		log, _ := os.ReadFile(filepath.Join(jobDir, "actions.log"))
+		sessionPath, _ := store.SessionLogPath(job.ID, monitorSessionID)
+		log, _ := os.ReadFile(sessionPath)
 		agentLog, _ := os.ReadFile(filepath.Join(jobDir, "agent.log"))
-		t.Fatalf("FIXED changes were not pushed; actions=%s agent=%s", log, agentLog)
+		t.Fatalf("FIXED changes were not pushed; session=%s agent=%s", log, agentLog)
 	}
 	if _, err := os.Stat(filepath.Join(jobDir, "evaluation.log")); !os.IsNotExist(err) {
 		t.Fatalf("runtime evaluator transcript exists: %v", err)
@@ -736,7 +743,7 @@ exit 9
 	}
 }
 
-func TestBabysitBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
+func TestMonitorBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		alter func(t *testing.T, repo, worktree string)
@@ -773,12 +780,12 @@ func TestBabysitBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			job := &babysitJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: worktree, WorkerBranch: "worker", Snapshot: "sig"}
-			if err := saveBabysitJob(dir, job); err != nil {
+			job := &monitorJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: worktree, WorkerBranch: "worker", Snapshot: "sig"}
+			if err := saveMonitorJob(dir, job); err != nil {
 				t.Fatal(err)
 			}
 			tc.alter(t, repo, worktree)
-			if err := guardedCommitPush(context.Background(), dir, job, "sig", &babysitSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
+			if err := guardedCommitPush(context.Background(), dir, job, "sig", &monitorSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
 				t.Fatal("unsafe commit/push accepted")
 			}
 			got, _ := runGit(context.Background(), bare, "rev-parse", "refs/heads/feature")
@@ -789,7 +796,7 @@ func TestBabysitBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 	}
 }
 
-func TestBabysitStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
+func TestMonitorStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
 	base := canonicalTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
@@ -813,16 +820,16 @@ func TestBabysitStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worktree, "f"), []byte("two\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	root := filepath.Join(base, "jobs")
+	root := filepath.Join(base, "factory", "detached-jobs")
 	dir := filepath.Join(root, "20260518T120001-0123456789ab")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: worktree, WorkerBranch: "worker", Snapshot: "sig", StopRequested: true}
-	if err := saveBabysitJob(dir, job); err != nil {
+	job := &monitorJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: worktree, WorkerBranch: "worker", Snapshot: "sig", StopRequested: true}
+	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
-	if err := guardedCommitPush(context.Background(), dir, job, "sig", &babysitSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
+	if err := guardedCommitPush(context.Background(), dir, job, "sig", &monitorSnapshot{HeadRefOID: head}, []string{"f"}); err == nil {
 		t.Fatal("stop request did not block commit")
 	}
 	got, err := runGit(context.Background(), worktree, "rev-parse", "HEAD")
@@ -835,7 +842,7 @@ func TestBabysitStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
 	}
 }
 
-func TestBabysitRejectsDifferentConfiguredPushURL(t *testing.T) {
+func TestMonitorRejectsDifferentConfiguredPushURL(t *testing.T) {
 	fixture := newMonitorPushFixture(t)
 	wrongRemote := filepath.Join(fixture.base, "wrong.git")
 	runTestCommand(t, fixture.base, "git", "init", "--bare", wrongRemote)
@@ -855,7 +862,7 @@ func TestBabysitRejectsDifferentConfiguredPushURL(t *testing.T) {
 	}
 }
 
-func TestBabysitRejectsPushURLRewrites(t *testing.T) {
+func TestMonitorRejectsPushURLRewrites(t *testing.T) {
 	for _, rewrite := range []string{"insteadOf", "pushInsteadOf"} {
 		t.Run(rewrite, func(t *testing.T) {
 			fixture := newMonitorPushFixture(t)
@@ -874,7 +881,7 @@ func TestBabysitRejectsPushURLRewrites(t *testing.T) {
 	}
 }
 
-func TestBabysitPushLeaseRejectsRemoteHeadRace(t *testing.T) {
+func TestMonitorPushLeaseRejectsRemoteHeadRace(t *testing.T) {
 	fixture := newMonitorPushFixture(t)
 	competitor := filepath.Join(fixture.base, "competitor")
 	runTestCommand(t, fixture.base, "git", "clone", fixture.bare, competitor)
@@ -913,8 +920,8 @@ func TestBabysitPushLeaseRejectsRemoteHeadRace(t *testing.T) {
 
 type monitorPushFixture struct {
 	base, bare, repo, dir string
-	job                   *babysitJob
-	snapshot              *babysitSnapshot
+	job                   *monitorJob
+	snapshot              *monitorSnapshot
 	signature, head       string
 }
 
@@ -944,20 +951,20 @@ func newMonitorPushFixture(t *testing.T) monitorPushFixture {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	dir := filepath.Join(base, "state", "factory", "jobs", "20260518T120003-0123456789ab")
+	dir := filepath.Join(base, "state", "factory", "detached-jobs", "20260518T120003-0123456789ab")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, signature, err := readSnapshot(context.Background(), &babysitJob{Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main"})
+	snapshot, signature, err := readSnapshot(context.Background(), &monitorJob{Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	job := &babysitJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: filepath.Join(base, "worker"), WorkerBranch: "worker", Snapshot: signature}
+	job := &monitorJob{ID: filepath.Base(dir), RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Worktree: filepath.Join(base, "worker"), WorkerBranch: "worker", Snapshot: signature}
 	runTestCommand(t, repo, "git", "worktree", "add", "-b", job.WorkerBranch, job.Worktree, head)
 	if err := os.WriteFile(filepath.Join(job.Worktree, "f"), []byte("agent update\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveBabysitJob(dir, job); err != nil {
+	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
 	return monitorPushFixture{base: base, bare: bare, repo: repo, dir: dir, job: job, snapshot: snapshot, signature: signature, head: head}
@@ -1011,39 +1018,34 @@ func TestGuardedCommitPushCancellationAbortsSnapshotCheckpoint(t *testing.T) {
 
 func TestMonitorAgentSessionAppendFailureFailsAction(t *testing.T) {
 	fixture := newMonitorPushFixture(t)
-	storeRoot := filepath.Join(filepath.Dir(filepath.Dir(fixture.dir)), "factory", "detached-jobs")
-	store, err := NewJobStore(storeRoot)
+	store, err := NewJobStore(filepath.Dir(fixture.dir))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CreateJob(JobRecord{ID: fixture.job.ID, Type: monitorJobType, Status: "running"}); err != nil {
-		t.Fatal(err)
+	job, err := store.GetJob(fixture.job.ID)
+	if err != nil || job.Type != monitorJobType || job.Monitor == nil {
+		t.Fatalf("canonical monitor job record missing: %+v err=%v", job, err)
 	}
-	if _, err := store.CreateSession(fixture.job.ID, monitorSessionID, "running"); err != nil {
-		t.Fatal(err)
+	if _, err := store.GetSession(fixture.job.ID, monitorSessionID); err != nil {
+		t.Fatalf("canonical monitor session missing: %v", err)
 	}
-	logPath, err := store.SessionLogPath(fixture.job.ID, monitorSessionID)
-	if err != nil {
-		t.Fatal(err)
+	oldAppend := monitorSessionLogAppend
+	monitorSessionLogAppend = func(*JobStore, string, []byte) error {
+		return errors.New("injected session append failure")
 	}
-	if err := os.Remove(logPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(filepath.Join(fixture.base, "missing"), logPath); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { monitorSessionLogAppend = oldAppend })
 	agent := filepath.Join(fixture.base, "agent")
 	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'FACTORY_STATUS=NO_ACTION\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	cfg := Config{Command: agent, Args: []string{"{stage}", "{task}", "{system_prompt}"}}
-	err = processBabysitEventContext(context.Background(), fixture.dir, fixture.job, cfg, fixture.snapshot, fixture.signature)
+	err = processMonitorEventContext(context.Background(), fixture.dir, fixture.job, cfg, fixture.snapshot, fixture.signature)
 	if err == nil || !strings.Contains(err.Error(), "append monitor agent log to session") {
 		t.Fatalf("monitor action error = %v, want session append failure", err)
 	}
 }
 
-func newBabysitRepo(t *testing.T) string {
+func newMonitorRepo(t *testing.T) string {
 	t.Helper()
 	repo := filepath.Join(t.TempDir(), "repo")
 	if err := os.Mkdir(repo, 0o700); err != nil {

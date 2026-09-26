@@ -34,7 +34,6 @@ var jobLockByPath = make(map[string]*sync.Mutex)
 type JobRecord struct {
 	Version         int               `json:"version"`
 	ID              string            `json:"id"`
-	Kind            string            `json:"kind,omitempty"` // Deprecated: use Type.
 	Type            string            `json:"type"`
 	TaskDescription string            `json:"task_description,omitempty"`
 	TargetPath      string            `json:"target_path,omitempty"`
@@ -44,6 +43,7 @@ type JobRecord struct {
 	StartedAt       time.Time         `json:"started_at,omitempty"`
 	EndedAt         time.Time         `json:"ended_at,omitempty"`
 	Sessions        []SessionMetadata `json:"sessions,omitempty"`
+	Monitor         *monitorJob       `json:"monitor,omitempty"`
 }
 
 // SessionMetadata preserves session order and lifecycle metadata in the job record.
@@ -97,6 +97,7 @@ type SessionEvent struct {
 type JobStore struct {
 	root               string
 	writeSessionRecord func(string, SessionRecord) error
+	appendSessionLog   func(string, string, []byte) error
 }
 
 // JobSessionObserver records workflow lifecycle events in a job session.
@@ -155,58 +156,7 @@ func JobStateRoot(override string) (string, error) {
 	if !filepath.IsAbs(base) {
 		return "", fmt.Errorf("state directory must be absolute")
 	}
-	root := filepath.Join(base, "factory", "detached-jobs")
-	legacyRoot := filepath.Join(base, "factory", "jobs", "v2")
-	legacyHasJobs, err := hasJobRecords(legacyRoot)
-	if err != nil {
-		return "", err
-	}
-	currentHasJobs, err := hasJobRecords(root)
-	if err != nil {
-		return "", err
-	}
-	if legacyHasJobs && currentHasJobs {
-		return "", fmt.Errorf("job records exist in both %s and %s; refusing to split job state and target locks", legacyRoot, root)
-	}
-	if legacyHasJobs {
-		return legacyRoot, nil
-	}
-	return root, nil
-}
-
-func hasJobRecords(root string) (bool, error) {
-	info, err := os.Lstat(root)
-	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("inspect job state root %s: %w", root, err)
-	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("job state root %s must be a real directory", root)
-	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		return false, fmt.Errorf("read job state root %s: %w", root, err)
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() || validateStoredID(entry.Name()) != nil {
-			continue
-		}
-		jobPath := filepath.Join(root, entry.Name(), "job.json")
-		jobInfo, err := os.Lstat(jobPath)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return false, fmt.Errorf("inspect job record %s: %w", jobPath, err)
-		}
-		if !jobInfo.Mode().IsRegular() {
-			return false, fmt.Errorf("job record %s must be a regular file", jobPath)
-		}
-		return true, nil
-	}
-	return false, nil
+	return filepath.Join(base, "factory", "detached-jobs"), nil
 }
 
 // Root returns the canonical filesystem path backing this store.
@@ -394,48 +344,6 @@ func (s *JobStore) reconcileMonitorOrphan(job JobRecord) (bool, error) {
 		return false, nil
 	}
 
-	legacyRoot := filepath.Dir(s.root)
-	if filepath.Base(s.root) != "v2" {
-		legacyRoot = filepath.Join(legacyRoot, "jobs")
-	}
-	legacyDir := filepath.Join(legacyRoot, current.ID)
-	legacyPath := filepath.Join(legacyDir, "job.json")
-	legacy, err := func() (*babysitJob, error) {
-		if _, err := os.Lstat(legacyDir); errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		} else if err != nil {
-			return nil, err
-		}
-		if err := ensureRealDirectory(legacyRoot, legacyDir); err != nil {
-			return nil, err
-		}
-		if err := ensureRegularIfExists(legacyPath); err != nil {
-			return nil, err
-		}
-		return readBabysitJob(legacyDir)
-	}()
-	if errors.Is(err, os.ErrNotExist) {
-		legacy = nil
-	} else if err != nil {
-		return false, fmt.Errorf("read legacy monitor job: %w", err)
-	}
-	if legacy != nil {
-		if !filepath.IsAbs(current.TargetPath) || !filepath.IsAbs(legacy.RepoRoot) {
-			return false, fmt.Errorf("legacy monitor job has an invalid target path")
-		}
-		canonicalTarget, err := canonicalPath(current.TargetPath)
-		if err != nil {
-			return false, fmt.Errorf("resolve monitor target path: %w", err)
-		}
-		legacyTarget, err := canonicalPath(legacy.RepoRoot)
-		if err != nil {
-			return false, fmt.Errorf("resolve legacy monitor target path: %w", err)
-		}
-		if legacy.ID != current.ID || legacyTarget != canonicalTarget {
-			return false, fmt.Errorf("legacy monitor job does not match detached job %s", current.ID)
-		}
-	}
-
 	session, err := s.GetSession(current.ID, monitorSessionID)
 	if err != nil {
 		return false, fmt.Errorf("read monitor session: %w", err)
@@ -466,12 +374,14 @@ func (s *JobStore) reconcileMonitorOrphan(job JobRecord) (bool, error) {
 	if err := writeJSONAtomic(sessionDir, "session.json", session); err != nil {
 		return false, err
 	}
-	if legacy != nil {
-		legacy.Status = "interrupted"
-		legacy.LastEvent = "Monitor worker was stale; reconciliation marked the job interrupted."
-		if err := writeBabysitJob(legacyDir, legacy); err != nil {
-			return false, fmt.Errorf("update legacy monitor job: %w", err)
-		}
+	if current.Monitor == nil {
+		return false, fmt.Errorf("monitor job is missing its canonical monitor state")
+	}
+	current.Monitor.Status = "interrupted"
+	current.Monitor.LastEvent = "Monitor worker was stale; reconciliation marked the job interrupted."
+	current.Monitor.UpdatedAt = current.UpdatedAt
+	if err := writeJSONAtomic(jobDir, "job.json", current); err != nil {
+		return false, err
 	}
 	if err := s.clearWorkerLocked(current.ID); err != nil {
 		return false, err
@@ -601,11 +511,8 @@ func (s *JobStore) CreateJob(job JobRecord) error {
 	}
 	now := time.Now().UTC()
 	job.Version = jobRecordVersion
-	if job.Type == "" {
-		job.Type = job.Kind
-	}
-	if job.Kind == "" {
-		job.Kind = job.Type
+	if job.Type == monitorJobType && job.Monitor == nil {
+		job.Monitor = &monitorJob{ID: job.ID, Description: job.TaskDescription, RepoRoot: job.TargetPath, Status: job.Status, CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt}
 	}
 	if job.TargetPath != "" {
 		if !filepath.IsAbs(job.TargetPath) {
@@ -618,6 +525,14 @@ func (s *JobStore) CreateJob(job JobRecord) error {
 	}
 	if job.CreatedAt.IsZero() {
 		job.CreatedAt = now
+	}
+	if job.Monitor != nil {
+		job.Monitor.ID = job.ID
+		job.Monitor.Description = job.TaskDescription
+		job.Monitor.RepoRoot = job.TargetPath
+		job.Monitor.Status = job.Status
+		job.Monitor.CreatedAt = job.CreatedAt
+		job.Monitor.UpdatedAt = now
 	}
 	job.UpdatedAt = now
 	if job.Status == "running" && job.StartedAt.IsZero() {
@@ -642,8 +557,6 @@ func (s *JobStore) GetJob(id string) (JobRecord, error) {
 	if job.Version != jobRecordVersion || job.ID != id {
 		return JobRecord{}, fmt.Errorf("invalid or unsupported job record")
 	}
-	job.Type = firstNonEmpty(job.Type, job.Kind)
-	job.Kind = firstNonEmpty(job.Kind, job.Type)
 	return job, nil
 }
 
@@ -698,8 +611,9 @@ func (s *JobStore) UpdateJob(id string, update func(*JobRecord) error) (JobRecor
 		return JobRecord{}, fmt.Errorf("job ID and creation time are immutable")
 	}
 	job.Version = jobRecordVersion
-	job.Type = firstNonEmpty(job.Type, job.Kind)
-	job.Kind = firstNonEmpty(job.Kind, job.Type)
+	if job.Type == monitorJobType && job.Monitor == nil {
+		job.Monitor = &monitorJob{ID: job.ID, Description: job.TaskDescription, RepoRoot: job.TargetPath, Status: job.Status}
+	}
 	if job.TargetPath != "" {
 		if !filepath.IsAbs(job.TargetPath) {
 			return JobRecord{}, fmt.Errorf("job target path must be absolute")
@@ -1101,6 +1015,9 @@ func (s *JobStore) AppendSessionEvent(jobID, sessionID, eventType, message strin
 
 // AppendSessionLog appends private, human-readable output to a session log.
 func (s *JobStore) AppendSessionLog(jobID, sessionID string, data []byte) error {
+	if s.appendSessionLog != nil {
+		return s.appendSessionLog(jobID, sessionID, data)
+	}
 	unlock, err := s.LockJob(jobID)
 	if err != nil {
 		return err
@@ -1365,15 +1282,6 @@ func (s *JobStore) sessionDir(jobID, sessionID string, create bool) (string, err
 	return dir, nil
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
-}
-
 func setLifecycleTimes(oldStatus, newStatus string, startedAt, endedAt *time.Time) {
 	now := time.Now().UTC()
 	if oldStatus != "running" && newStatus == "running" && startedAt.IsZero() {
@@ -1390,7 +1298,7 @@ func setLifecycleTimes(oldStatus, newStatus string, startedAt, endedAt *time.Tim
 
 func isTerminalStatus(status string) bool {
 	switch status {
-	case "complete", "completed", "closed", "merged", "failed", "stopped", "cancelled", "interrupted":
+	case "complete", "closed", "failed", "stopped", "cancelled", "interrupted":
 		return true
 	default:
 		return false

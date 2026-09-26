@@ -24,20 +24,23 @@ import (
 )
 
 const (
-	babysitPollDefault        = 30 * time.Second
-	babysitSnapshotMaxRetries = 8
+	monitorPollDefault        = 30 * time.Second
+	monitorSnapshotMaxRetries = 8
 )
 
 var (
-	babysitWorkerLauncher     = launchBabysitWorker
-	babysitRetryDelay         = snapshotRetryDelay
-	babysitLogOpenFile        = os.OpenFile
-	babysitAgentActionTimeout = 30 * time.Minute
+	monitorWorkerLauncher   = launchMonitorWorker
+	monitorRetryDelay       = snapshotRetryDelay
+	monitorLogOpenFile      = os.OpenFile
+	monitorSessionLogAppend = func(store *JobStore, id string, data []byte) error {
+		return store.AppendSessionLog(id, monitorSessionID, data)
+	}
+	monitorAgentActionTimeout = 30 * time.Minute
 )
 
-var babysitIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$`)
+var monitorIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$`)
 
-type babysitJob struct {
+type monitorJob struct {
 	ID                 string    `json:"id"`
 	Description        string    `json:"description"`
 	RepoRoot           string    `json:"repo_root"`
@@ -74,7 +77,7 @@ type babysitJob struct {
 	SnapshotFailures   int       `json:"snapshot_failures,omitempty"`
 }
 
-type babysitSnapshot struct {
+type monitorSnapshot struct {
 	Number            int             `json:"number"`
 	State             string          `json:"state"`
 	Title             string          `json:"title"`
@@ -94,7 +97,7 @@ type ghRepository struct {
 	SSHURL        string `json:"sshUrl"`
 }
 
-func babysitRoot(cfg Config) (string, error) {
+func monitorRoot(cfg Config) (string, error) {
 	base := cfg.StateDir
 	if base == "" {
 		base = os.Getenv("XDG_STATE_HOME")
@@ -109,121 +112,101 @@ func babysitRoot(cfg Config) (string, error) {
 	if !filepath.IsAbs(base) {
 		return "", fmt.Errorf("state directory must be absolute")
 	}
-	return filepath.Join(base, "factory", "jobs"), nil
+	return JobStateRoot(base)
 }
 
-func babysitJobDir(root, id string) (string, error) {
-	if !babysitIDPattern.MatchString(id) {
+func monitorJobDir(root, id string) (string, error) {
+	if !monitorIDPattern.MatchString(id) {
 		return "", fmt.Errorf("invalid job id")
 	}
 	return filepath.Join(root, id), nil
 }
 
-func saveBabysitJob(dir string, job *babysitJob) error {
-	if err := writeBabysitJob(dir, job); err != nil {
+func saveMonitorJob(dir string, job *monitorJob) error {
+	if err := writeMonitorJob(dir, job); err != nil {
 		return err
 	}
 	return syncMonitorJobStatus(dir, job)
 }
 
-func writeBabysitJob(dir string, job *babysitJob) error {
-	job.UpdatedAt = time.Now().UTC()
-	if job.PID != 0 {
-		job.Heartbeat = time.Now().UTC()
+func writeMonitorJob(dir string, monitor *monitorJob) error {
+	monitor.UpdatedAt = time.Now().UTC()
+	if monitor.PID != 0 {
+		monitor.Heartbeat = monitor.UpdatedAt
 	}
-	data, err := json.MarshalIndent(job, "", "  ")
+	store, exists, err := monitorJobStore(dir)
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".job-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	ok := false
-	defer func() {
-		tmp.Close()
-		if !ok {
-			os.Remove(name)
+	if !exists {
+		copy := *monitor
+		if err := store.CreateJob(JobRecord{ID: monitor.ID, Type: monitorJobType, TaskDescription: monitor.Description, TargetPath: monitor.RepoRoot, Status: monitor.Status, Monitor: &copy}); err != nil {
+			return err
 		}
-	}()
-	if err := tmp.Chmod(0o600); err != nil {
-		return err
+		if _, err := store.CreateSession(monitor.ID, monitorSessionID, monitor.Status); err != nil {
+			return err
+		}
 	}
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(name, filepath.Join(dir, "job.json")); err != nil {
-		return err
-	}
-	ok = true
-	return nil
+	_, err = store.UpdateJob(monitor.ID, func(job *JobRecord) error {
+		copy := *monitor
+		job.Monitor = &copy
+		return nil
+	})
+	return err
 }
 
-func readBabysitJob(dir string) (*babysitJob, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "job.json"))
+func readMonitorJob(dir string) (*monitorJob, error) {
+	store, _, err := monitorJobStore(dir)
 	if err != nil {
 		return nil, err
 	}
-	var job babysitJob
-	if err := json.Unmarshal(data, &job); err != nil {
+	job, err := store.GetJob(filepath.Base(dir))
+	if err != nil {
 		return nil, err
 	}
-	if !babysitIDPattern.MatchString(job.ID) || filepath.Base(dir) != job.ID {
-		return nil, fmt.Errorf("invalid job metadata")
+	if job.Type != monitorJobType || job.Monitor == nil || job.Monitor.ID != job.ID {
+		return nil, fmt.Errorf("invalid canonical monitor job record")
 	}
-	return &job, nil
+	return job.Monitor, nil
 }
 
-func appendBabysitLog(dir, message string) error {
-	path := filepath.Join(dir, "actions.log")
-	if err := ensureRegularIfExists(path); err != nil {
-		return err
-	}
-	f, err := babysitLogOpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+func appendMonitorLog(dir, message string) error {
+	store, exists, err := monitorJobStore(dir)
 	if err != nil {
 		return err
 	}
-	_, writeErr := fmt.Fprintf(f, "[%s] %s\n", time.Now().UTC().Format(time.RFC3339), message)
-	closeErr := f.Close()
-	return errors.Join(writeErr, closeErr)
+	if !exists {
+		return fmt.Errorf("detached monitor job %s does not exist", filepath.Base(dir))
+	}
+	line := fmt.Sprintf("[%s] %s\n", time.Now().UTC().Format(time.RFC3339), message)
+	return monitorSessionLogAppend(store, filepath.Base(dir), []byte(line))
 }
 
-func babysitEvent(dir string, job *babysitJob, message string) error {
-	if err := appendBabysitLog(dir, message); err != nil {
+func monitorEvent(dir string, job *monitorJob, message string) error {
+	if err := appendMonitorLog(dir, message); err != nil {
 		return err
 	}
 	job.LastEvent = message
-	if err := writeBabysitJob(dir, job); err != nil {
+	if err := writeMonitorJob(dir, job); err != nil {
 		return err
 	}
 	return syncMonitorJobEvent(dir, job)
 }
 
-func loadJobs(root string) ([]babysitJob, error) {
-	entries, err := os.ReadDir(root)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+func loadJobs(root string) ([]monitorJob, error) {
+	store, err := NewJobStore(root)
 	if err != nil {
 		return nil, err
 	}
-	var jobs []babysitJob
-	for _, entry := range entries {
-		if !entry.IsDir() || !babysitIDPattern.MatchString(entry.Name()) {
-			continue
+	records, err := store.ListJobs()
+	if err != nil {
+		return nil, err
+	}
+	jobs := make([]monitorJob, 0, len(records))
+	for _, record := range records {
+		if record.Type == monitorJobType && record.Monitor != nil {
+			jobs = append(jobs, *record.Monitor)
 		}
-		job, err := readBabysitJob(filepath.Join(root, entry.Name()))
-		if err != nil {
-			continue
-		}
-		jobs = append(jobs, *job)
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
 	return jobs, nil
@@ -249,12 +232,12 @@ func runGH(ctx context.Context, args ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func readSnapshot(ctx context.Context, job *babysitJob) (*babysitSnapshot, string, error) {
+func readSnapshot(ctx context.Context, job *monitorJob) (*monitorSnapshot, string, error) {
 	data, err := runGH(ctx, "pr", "view", strconv.Itoa(job.PR), "--repo", job.Repo, "--json", "number,state,title,url,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,comments,statusCheckRollup")
 	if err != nil {
 		return nil, "", err
 	}
-	var s babysitSnapshot
+	var s monitorSnapshot
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, "", fmt.Errorf("invalid GitHub PR JSON: %w", err)
 	}
@@ -314,12 +297,12 @@ func processAlive(pid int) bool {
 	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
-func workerFresh(job babysitJob) bool {
+func workerFresh(job monitorJob) bool {
 	info, err := os.Stat(job.HeartbeatPath)
 	return err == nil && time.Since(info.ModTime()) < 2*time.Minute
 }
 
-func babysitID() (string, error) {
+func monitorID() (string, error) {
 	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
@@ -379,19 +362,19 @@ func readLockOwner(path string) (lockOwner, error) {
 	return owner, err
 }
 
-func acquireBabysitLock(root string) (func(), error) {
+func acquireMonitorLock(root string) (func(), error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
 	return acquireOwnedLock(filepath.Join(root, ".lock"))
 }
 
-// BabysitCommand implements monitor user-facing and internal worker commands.
-func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out, errOut io.Writer) error {
+// MonitorCommand implements monitor user-facing and internal worker commands.
+func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out, errOut io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory monitor <description> | list | get <id> [--details] | describe <id> [--details] | approve <id> | reject <id> | stop <id> | reset <id>")
+		return fmt.Errorf("usage: factory monitor <description> | list | get <id> [--details] | approve <id> | reject <id> | stop <id> | reset <id>")
 	}
-	root, err := babysitRoot(cfg)
+	root, err := monitorRoot(cfg)
 	if err != nil {
 		return err
 	}
@@ -399,7 +382,7 @@ func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		if len(args) != 2 {
 			return fmt.Errorf("invalid internal worker arguments")
 		}
-		if err := runBabysitWorker(args[1], root, cfg); err != nil {
+		if err := runMonitorWorker(args[1], root, cfg); err != nil {
 			return err
 		}
 		return nil
@@ -425,12 +408,12 @@ func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out
 			fmt.Fprintf(out, "%-29s %-20s %-28s #%d %s\n", j.ID, j.Status, j.Repo, j.PR, j.UpdatedAt.Format(time.RFC3339))
 		}
 		return nil
-	case "get", "describe":
+	case "get":
 		id, details, err := parseDetailsID("factory monitor get <id> [--details]", args[1:])
 		if err != nil {
 			return err
 		}
-		job, dir, err := findBabysitJob(root, id)
+		job, _, err := findMonitorJob(root, id)
 		if err != nil {
 			return err
 		}
@@ -443,61 +426,42 @@ func BabysitCommand(args []string, cfg Config, workdir string, in io.Reader, out
 			return err
 		}
 		fmt.Fprintf(out, "Details:\n%s\n", data)
-		for _, name := range []string{"actions.log", "proposal.txt", "agent.log"} {
-			path := filepath.Join(dir, name)
-			fmt.Fprintf(out, "%s path: %s\n", name, path)
-			data, err := os.ReadFile(path)
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if len(data) > 0 {
-				fmt.Fprintf(out, "%s:\n%s", name, data)
-				if data[len(data)-1] != '\n' {
-					fmt.Fprintln(out)
-				}
-			}
-		}
-		store, exists, err := existingMonitorJobStore(dir, job.ID)
+
+		store, err := NewJobStore(root)
 		if err != nil {
 			return err
 		}
-		if exists {
-			if record, err := store.GetJob(job.ID); err == nil {
-				return writeJobDetails(out, store, record)
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
+		record, err := store.GetJob(job.ID)
+		if err != nil {
+			return err
 		}
-		return nil
+		return writeJobDetails(out, store, record)
 	case "approve", "reject", "stop", "reset":
 		if len(args) != 2 {
 			return fmt.Errorf("%s requires a job id", args[0])
 		}
-		return babysitAction(args[0], root, args[1], cfg, in, out)
+		return monitorAction(args[0], root, args[1], cfg, in, out)
 	case "-h", "--help", "help":
-		fmt.Fprintln(out, "Usage: factory monitor <description>\n       factory monitor list\n       factory monitor get <id> [--details]\n       factory monitor describe <id> [--details] (compatibility alias)\n       factory monitor approve <id>\n       factory monitor reject <id>\n       factory monitor stop <id>\n       factory monitor reset <id>")
+		fmt.Fprintln(out, "Usage: factory monitor <description>\n       factory monitor list\n       factory monitor get <id> [--details]\n       factory monitor approve <id>\n       factory monitor reject <id>\n       factory monitor stop <id>\n       factory monitor reset <id>")
 		return nil
 	default:
-		return startBabysit(args, cfg, workdir, root, out)
+		return startMonitor(args, cfg, workdir, root, out)
 	}
 }
 
-func findBabysitJob(root, id string) (*babysitJob, string, error) {
-	dir, err := babysitJobDir(root, id)
+func findMonitorJob(root, id string) (*monitorJob, string, error) {
+	dir, err := monitorJobDir(root, id)
 	if err != nil {
 		return nil, "", err
 	}
-	job, err := readBabysitJob(dir)
+	job, err := readMonitorJob(dir)
 	if err != nil {
 		return nil, "", fmt.Errorf("job not found: %s", id)
 	}
 	return job, dir, nil
 }
 
-func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer) error {
+func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer) error {
 	description := strings.TrimSpace(strings.Join(args, " "))
 	if description == "" {
 		return fmt.Errorf("description cannot be empty")
@@ -505,10 +469,10 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	poll := os.Getenv("FACTORY_BABYSIT_POLL_INTERVAL")
+	poll := os.Getenv("FACTORY_MONITOR_POLL_INTERVAL")
 	if poll != "" {
 		if parsed, err := time.ParseDuration(poll); err != nil || parsed < time.Second {
-			return fmt.Errorf("FACTORY_BABYSIT_POLL_INTERVAL must be at least 1s")
+			return fmt.Errorf("FACTORY_MONITOR_POLL_INTERVAL must be at least 1s")
 		}
 	}
 	rootRepo, err := runGit(context.Background(), workdir, "rev-parse", "--show-toplevel")
@@ -524,7 +488,7 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 		return err
 	}
 	if isWithin(rootRepo, statePath) {
-		return fmt.Errorf("babysit state must be outside target repository")
+		return fmt.Errorf("monitor state must be outside target repository")
 	}
 	branch, err := runGit(context.Background(), rootRepo, "branch", "--show-current")
 	if err != nil || branch == "" {
@@ -545,7 +509,7 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 	if err != nil {
 		return fmt.Errorf("cannot identify current PR: %w", err)
 	}
-	var info babysitSnapshot
+	var info monitorSnapshot
 	if err := json.Unmarshal(data, &info); err != nil {
 		return err
 	}
@@ -579,95 +543,102 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 	if localHead != info.HeadRefOID {
 		return fmt.Errorf("local branch is not at validated PR head")
 	}
-	unlock, err := acquireBabysitLock(root)
+	unlock, err := acquireMonitorLock(root)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 	jobs, _ := loadJobs(root)
 	for _, j := range jobs {
-		if j.Repo == baseRepo && j.PR == info.Number && isBabysitActive(j.Status) && (j.Status == "starting" || workerFresh(j) && processAlive(j.PID)) {
-			return fmt.Errorf("an active babysitter already monitors %s#%d (%s)", j.Repo, j.PR, j.ID)
+		if j.Repo == baseRepo && j.PR == info.Number && isMonitorActive(j.Status) && (j.Status == "queued" || workerFresh(j) && processAlive(j.PID)) {
+			return fmt.Errorf("an active monitor already monitors %s#%d (%s)", j.Repo, j.PR, j.ID)
 		}
 	}
-	id, err := babysitID()
+	id, err := monitorID()
 	if err != nil {
 		return err
 	}
 	dir := filepath.Join(root, id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	store, err := NewJobStore(root)
+	if err != nil {
 		return err
 	}
-	workerBranch := "factory-babysit/" + id
+	if err := os.MkdirAll(filepath.Join(store.Root(), id), 0o700); err != nil {
+		return err
+	}
+	dir = filepath.Join(store.Root(), id)
+	workerBranch := "factory-monitor/" + id
 	worktree := filepath.Join(dir, "checkout")
 	if _, err := runGit(context.Background(), rootRepo, "worktree", "add", "-b", workerBranch, worktree, localHead); err != nil {
 		_ = os.RemoveAll(dir)
 		return fmt.Errorf("create isolated worker worktree: %w", err)
 	}
-	job := &babysitJob{ID: id, Description: description, RepoRoot: rootRepo, Repo: baseRepo, PR: info.Number, HeadRepo: headRepo, HeadBranch: branch, BaseRepo: baseRepo, BaseBranch: info.BaseRefName, BaseSHA: info.BaseRefOID, OriginURL: origin, HeadRepoURL: repoURL.URL, HeartbeatPath: filepath.Join(dir, "heartbeat"), BaselineHead: localHead, TargetBaseline: localHead, Worktree: worktree, WorkerBranch: workerBranch, Status: "starting", CreatedAt: time.Now().UTC()}
-	if err := saveBabysitJob(dir, job); err != nil {
+	job := &monitorJob{ID: id, Description: description, RepoRoot: rootRepo, Repo: baseRepo, PR: info.Number, HeadRepo: headRepo, HeadBranch: branch, BaseRepo: baseRepo, BaseBranch: info.BaseRefName, BaseSHA: info.BaseRefOID, OriginURL: origin, HeadRepoURL: repoURL.URL, HeartbeatPath: filepath.Join(dir, "heartbeat"), BaselineHead: localHead, TargetBaseline: localHead, Worktree: worktree, WorkerBranch: workerBranch, Status: "queued", CreatedAt: time.Now().UTC()}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TaskDescription: description, TargetPath: rootRepo, Status: "queued"}); err != nil {
 		_, _ = runGit(context.Background(), rootRepo, "worktree", "remove", "--force", worktree)
 		_ = os.RemoveAll(dir)
 		return err
 	}
-	if err := createMonitorJobRecord(cfg, job); err != nil {
+	if _, err := store.CreateSession(id, monitorSessionID, "queued"); err != nil {
 		_, _ = runGit(context.Background(), rootRepo, "worktree", "remove", "--force", worktree)
 		_ = os.RemoveAll(dir)
 		return err
 	}
-	_ = appendBabysitLog(dir, "Watcher metadata registered; starting detached monitor.")
-	pid, err := babysitWorkerLauncher(id, root)
+	if err := saveMonitorJob(dir, job); err != nil {
+		_, _ = runGit(context.Background(), rootRepo, "worktree", "remove", "--force", worktree)
+		_ = os.RemoveAll(dir)
+		return err
+	}
+	_ = appendMonitorLog(dir, "Watcher metadata registered; starting detached monitor.")
+	pid, err := monitorWorkerLauncher(id, root)
 	if err != nil {
 		job.Status = "failed"
-		_ = saveBabysitJob(dir, job)
-		_ = appendBabysitLog(dir, "Could not launch worker: "+err.Error())
+		_ = saveMonitorJob(dir, job)
+		_ = appendMonitorLog(dir, "Could not launch worker: "+err.Error())
 		return err
 	}
 	if err := registerMonitorWorkerIfMissing(job.ID, dir, pid); err != nil {
 		return err
 	}
-	registered, readErr := readBabysitJob(dir)
+	registered, readErr := readMonitorJob(dir)
 	if readErr != nil {
 		return readErr
 	}
 	if registered.PID == 0 {
 		registered.PID = pid
-		if err := saveBabysitJob(dir, registered); err != nil {
+		if err := saveMonitorJob(dir, registered); err != nil {
 			return err
 		}
 	}
-	fmt.Fprintf(out, "Started babysitter %s for %s#%d (%s).\n", id, job.Repo, job.PR, job.HeadBranch)
+	fmt.Fprintf(out, "Started monitor %s for %s#%d (%s).\n", id, job.Repo, job.PR, job.HeadBranch)
 	return nil
 }
 
-func isBabysitActive(status string) bool {
-	return status == "starting" || status == "running" || status == "awaiting_approval"
+func isMonitorActive(status string) bool {
+	return status == "queued" || status == "running"
 }
 
-func babysitAction(action, root, id string, cfg Config, in io.Reader, out io.Writer) error {
-	unlock, err := acquireBabysitLock(root)
+func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Writer) error {
+	unlock, err := acquireMonitorLock(root)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	job, dir, err := findBabysitJob(root, id)
+	job, dir, err := findMonitorJob(root, id)
 	if err != nil {
 		return err
 	}
 	switch action {
 	case "stop":
 		job.StopRequested = true
-		if store, exists, err := existingMonitorJobStore(dir, job.ID); err != nil {
-			return err
-		} else if exists {
-			if err := store.RequestStop(job.ID); err != nil {
-				return err
-			}
-		}
-		if err := os.WriteFile(filepath.Join(dir, "stop.requested"), []byte("stop\\n"), 0o600); err != nil {
+		store, err := NewJobStore(root)
+		if err != nil {
 			return err
 		}
-		if err := babysitEvent(dir, job, "Cooperative stop requested."); err != nil {
+		if err := store.RequestStop(job.ID); err != nil {
+			return err
+		}
+		if err := monitorEvent(dir, job, "Cooperative stop requested."); err != nil {
 			return err
 		}
 		fmt.Fprintf(out, "Stop requested for %s.\n", id)
@@ -685,36 +656,32 @@ func babysitAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 			_, _ = runGit(context.Background(), job.RepoRoot, "worktree", "remove", "--force", job.Worktree)
 			job.Worktree, job.WorkerBranch = "", ""
 		}
-		job.Status = "starting"
+		job.Status = "queued"
 		job.PID = 0
-		_ = os.Remove(filepath.Join(dir, "stop.requested"))
-		jobStateRoot, err := JobStateRoot(filepath.Dir(filepath.Dir(root)))
-		if err != nil {
-			return err
-		}
+		jobStateRoot := root
 		if err := resetMonitorJobRecord(job.ID, jobStateRoot); err != nil {
 			return err
 		}
-		if err := babysitEvent(dir, job, "Recoverable failure reset; detached worker restarting."); err != nil {
+		if err := monitorEvent(dir, job, "Recoverable failure reset; detached worker restarting."); err != nil {
 			return err
 		}
-		pid, err := babysitWorkerLauncher(job.ID, root)
+		pid, err := monitorWorkerLauncher(job.ID, root)
 		if err != nil {
 			job.Status = "recoverable_failure"
-			_ = saveBabysitJob(dir, job)
+			_ = saveMonitorJob(dir, job)
 			return err
 		}
 		if err := registerMonitorWorkerIfMissing(job.ID, dir, pid); err != nil {
 			return err
 		}
-		registered, readErr := readBabysitJob(dir)
+		registered, readErr := readMonitorJob(dir)
 		if readErr == nil && registered.PID == 0 {
 			registered.PID = pid
-			_ = saveBabysitJob(dir, registered)
+			_ = saveMonitorJob(dir, registered)
 		}
 		return nil
 	case "reject":
-		if job.Status != "awaiting_approval" {
+		if job.PendingSignature == "" || job.Proposal == "" {
 			return fmt.Errorf("job has no pending proposal")
 		}
 		job.RejectedSignature = job.PendingSignature
@@ -723,9 +690,9 @@ func babysitAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 		job.ApprovalScope = ""
 		job.ApprovalSignature = ""
 		job.Status = "running"
-		return babysitEvent(dir, job, "Proposal rejected; monitoring continues without repeating this action.")
+		return monitorEvent(dir, job, "Proposal rejected; monitoring continues without repeating this action.")
 	case "approve":
-		if job.Status != "awaiting_approval" || job.PendingSignature == "" || job.Proposal == "" {
+		if job.PendingSignature == "" || job.Proposal == "" {
 			return fmt.Errorf("job has no pending proposal")
 		}
 		fmt.Fprintf(out, "Approve proposal for %s? Type exact lowercase y: ", id)
@@ -747,33 +714,33 @@ func babysitAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 			job.ApprovalScope = ""
 			job.ApprovalSignature = ""
 			job.Status = "running"
-			_ = babysitEvent(dir, job, "Approval invalidated: live PR/check snapshot changed.")
+			_ = monitorEvent(dir, job, "Approval invalidated: live PR/check snapshot changed.")
 			return fmt.Errorf("proposal snapshot changed; watcher must reassess")
 		}
 		job.ApprovalScope = scope
 		job.ApprovalSignature = signature
 		job.RejectedSignature = ""
 		job.Status = "running"
-		return babysitEvent(dir, job, "Human approved a non-empty scope bound to the current PR/check snapshot.")
+		return monitorEvent(dir, job, "Human approved a non-empty scope bound to the current PR/check snapshot.")
 	}
 	return fmt.Errorf("unknown action")
 }
 
 func readPollInterval() time.Duration {
-	if value := os.Getenv("FACTORY_BABYSIT_POLL_INTERVAL"); value != "" {
+	if value := os.Getenv("FACTORY_MONITOR_POLL_INTERVAL"); value != "" {
 		if n, err := time.ParseDuration(value); err == nil && n >= time.Second {
 			return n
 		}
 	}
-	return babysitPollDefault
+	return monitorPollDefault
 }
 
-func runBabysitWorker(id, root string, cfg Config) error {
-	dir, err := babysitJobDir(root, id)
+func runMonitorWorker(id, root string, cfg Config) error {
+	dir, err := monitorJobDir(root, id)
 	if err != nil {
 		return err
 	}
-	job, err := readBabysitJob(dir)
+	job, err := readMonitorJob(dir)
 	if err != nil {
 		return err
 	}
@@ -785,7 +752,7 @@ func runBabysitWorker(id, root string, cfg Config) error {
 	defer unlockWorker()
 	if err := cfg.Validate(); err != nil {
 		job.Status = "failed"
-		_ = saveBabysitJob(dir, job)
+		_ = saveMonitorJob(dir, job)
 		return err
 	}
 	job.PID = os.Getpid()
@@ -797,7 +764,7 @@ func runBabysitWorker(id, root string, cfg Config) error {
 	if err := registerMonitorWorker(job.ID, dir, os.Getpid()); err != nil {
 		return err
 	}
-	if err := babysitEvent(dir, job, "Detached worker registered."); err != nil {
+	if err := monitorEvent(dir, job, "Detached worker registered."); err != nil {
 		return err
 	}
 	defer func() {
@@ -807,7 +774,7 @@ func runBabysitWorker(id, root string, cfg Config) error {
 	}()
 	defer func() {
 		job.PID = 0
-		_ = saveBabysitJob(dir, job)
+		_ = saveMonitorJob(dir, job)
 		_ = clearMonitorWorker(job.ID, dir)
 	}()
 	interval := readPollInterval()
@@ -837,7 +804,7 @@ func runBabysitWorker(id, root string, cfg Config) error {
 	attemptsBySignature := map[string]int{}
 	lastSignature := ""
 	for {
-		job, err = readBabysitJob(dir)
+		job, err = readMonitorJob(dir)
 		if err != nil {
 			return err
 		}
@@ -845,30 +812,30 @@ func runBabysitWorker(id, root string, cfg Config) error {
 			return stopErr
 		} else if stopped {
 			job.Status = "stopped"
-			return babysitEvent(dir, job, "Stopped at cooperative safe point.")
+			return monitorEvent(dir, job, "Stopped at cooperative safe point.")
 		}
 		if err := validateTarget(job); err != nil {
 			job.Status = "failed"
-			_ = babysitEvent(dir, job, "Target validation failed: "+err.Error())
+			_ = monitorEvent(dir, job, "Target validation failed: "+err.Error())
 			return err
 		}
 		if job.Worktree != "" {
 			workerTop, err := runGit(context.Background(), job.Worktree, "rev-parse", "--show-toplevel")
 			if err != nil {
 				job.Status = "failed"
-				_ = babysitEvent(dir, job, "Initial worktree unavailable.")
+				_ = monitorEvent(dir, job, "Initial worktree unavailable.")
 				return err
 			}
 			workerTop, err = canonicalPath(workerTop)
 			if err != nil || workerTop != job.Worktree {
 				job.Status = "failed"
-				_ = babysitEvent(dir, job, "Initial worktree identity validation failed.")
+				_ = monitorEvent(dir, job, "Initial worktree identity validation failed.")
 				return fmt.Errorf("invalid worker worktree")
 			}
 			workerBranch, err := runGit(context.Background(), job.Worktree, "branch", "--show-current")
 			if err != nil || workerBranch != job.WorkerBranch {
 				job.Status = "failed"
-				_ = babysitEvent(dir, job, "Initial worker branch validation failed.")
+				_ = monitorEvent(dir, job, "Initial worker branch validation failed.")
 				return fmt.Errorf("invalid worker branch")
 			}
 		}
@@ -878,43 +845,43 @@ func runBabysitWorker(id, root string, cfg Config) error {
 		if err != nil {
 			if workerCtx.Err() != nil {
 				job.Status = "stopped"
-				return babysitEvent(dir, job, "Stopped; active GitHub query or agent canceled.")
+				return monitorEvent(dir, job, "Stopped; active GitHub query or agent canceled.")
 			}
 			job.SnapshotFailures++
-			_ = appendBabysitLog(dir, fmt.Sprintf("Transient GitHub query failure (%d/%d): %v", job.SnapshotFailures, babysitSnapshotMaxRetries, err))
-			if saveErr := saveBabysitJob(dir, job); saveErr != nil {
+			_ = appendMonitorLog(dir, fmt.Sprintf("Transient GitHub query failure (%d/%d): %v", job.SnapshotFailures, monitorSnapshotMaxRetries, err))
+			if saveErr := saveMonitorJob(dir, job); saveErr != nil {
 				return saveErr
 			}
-			if job.SnapshotFailures >= babysitSnapshotMaxRetries {
+			if job.SnapshotFailures >= monitorSnapshotMaxRetries {
 				job.Status = "recoverable_failure"
-				if saveErr := babysitEvent(dir, job, "GitHub snapshot failed eight consecutive times; reset to retry."); saveErr != nil {
+				if saveErr := monitorEvent(dir, job, "GitHub snapshot failed eight consecutive times; reset to retry."); saveErr != nil {
 					return saveErr
 				}
 				return nil
 			}
-			if !sleepBabysitContext(workerCtx, dir, babysitRetryDelay(job.SnapshotFailures)) {
+			if !sleepMonitorContext(workerCtx, dir, monitorRetryDelay(job.SnapshotFailures)) {
 				job.Status = "stopped"
-				return babysitEvent(dir, job, "Stopped during GitHub retry backoff.")
+				return monitorEvent(dir, job, "Stopped during GitHub retry backoff.")
 			}
 			continue
 		}
 		if job.SnapshotFailures != 0 {
 			job.SnapshotFailures = 0
-			if err := saveBabysitJob(dir, job); err != nil {
+			if err := saveMonitorJob(dir, job); err != nil {
 				return err
 			}
 		}
 		if strings.EqualFold(snapshot.State, "MERGED") || strings.EqualFold(snapshot.State, "CLOSED") {
 			if strings.EqualFold(snapshot.State, "MERGED") {
-				job.Status = "completed"
+				job.Status = "complete"
 			} else {
 				job.Status = "closed"
 			}
-			return babysitEvent(dir, job, "PR is "+strings.ToLower(snapshot.State)+"; monitoring stopped.")
+			return monitorEvent(dir, job, "PR is "+strings.ToLower(snapshot.State)+"; monitoring stopped.")
 		}
 		if snapshot.HeadRefOID != job.BaselineHead {
 			job.Status = "failed"
-			_ = babysitEvent(dir, job, "PR head changed outside babysitter; refusing stale worktree.")
+			_ = monitorEvent(dir, job, "PR head changed outside monitor; refusing stale worktree.")
 			return fmt.Errorf("PR head changed")
 		}
 		initialSnapshot := job.Snapshot == ""
@@ -926,30 +893,30 @@ func runBabysitWorker(id, root string, cfg Config) error {
 				job.ApprovalScope = ""
 				job.ApprovalSignature = ""
 				job.Status = "running"
-				_ = babysitEvent(dir, job, "Pending approval invalidated because PR/check snapshot changed.")
+				_ = monitorEvent(dir, job, "Pending approval invalidated because PR/check snapshot changed.")
 			}
 			if job.ApprovalSignature != "" && job.ApprovalSignature != signature {
 				job.ApprovalSignature = ""
 				job.ApprovalScope = ""
-				_ = appendBabysitLog(dir, "Approval scope invalidated by snapshot change.")
+				_ = appendMonitorLog(dir, "Approval scope invalidated by snapshot change.")
 			}
 			job.Snapshot = signature
-			if err := babysitEvent(dir, job, "Observed PR/check snapshot "+signature+"."); err != nil {
+			if err := monitorEvent(dir, job, "Observed PR/check snapshot "+signature+"."); err != nil {
 				return err
 			}
 			lastSignature = signature
 		}
-		if job.Status == "awaiting_approval" {
-			if !sleepBabysitContext(workerCtx, dir, interval) {
+		if job.PendingSignature != "" && job.Proposal != "" {
+			if !sleepMonitorContext(workerCtx, dir, interval) {
 				job.Status = "stopped"
-				return babysitEvent(dir, job, "Stopped while waiting for approval.")
+				return monitorEvent(dir, job, "Stopped while waiting for approval.")
 			}
 			continue
 		}
 		if job.RejectedSignature != "" && signature == job.RejectedSignature {
-			if !sleepBabysitContext(workerCtx, dir, interval) {
+			if !sleepMonitorContext(workerCtx, dir, interval) {
 				job.Status = "stopped"
-				return babysitEvent(dir, job, "Stopped while waiting after rejection.")
+				return monitorEvent(dir, job, "Stopped while waiting after rejection.")
 			}
 			continue
 		}
@@ -958,9 +925,9 @@ func runBabysitWorker(id, root string, cfg Config) error {
 		}
 		failed := hasFailedCheck(snapshot.StatusCheckRollup)
 		if signature == job.ProcessedSignature && job.ApprovalSignature != signature && !failed {
-			if !sleepBabysitContext(workerCtx, dir, interval) {
+			if !sleepMonitorContext(workerCtx, dir, interval) {
 				job.Status = "stopped"
-				return babysitEvent(dir, job, "Stopped while waiting for a new PR event.")
+				return monitorEvent(dir, job, "Stopped while waiting for a new PR event.")
 			}
 			continue
 		}
@@ -969,15 +936,15 @@ func runBabysitWorker(id, root string, cfg Config) error {
 			actionable = true
 		}
 		if !actionable || (job.Attempts >= 3 && job.ApprovalSignature != signature) {
-			if job.Attempts >= 3 && job.Status != "awaiting_approval" {
-				job.Status = "awaiting_approval"
+			if job.Attempts >= 3 && (job.PendingSignature == "" || job.Proposal == "") {
+				job.Status = "running"
 				job.PendingSignature = signature
 				job.Proposal = "Automatic attempt cap (3) reached for unchanged PR/check snapshot."
-				_ = babysitEvent(dir, job, "Attempt cap reached; explicit approval required.")
+				_ = monitorEvent(dir, job, "Attempt cap reached; explicit approval required.")
 			}
-			if !sleepBabysitContext(workerCtx, dir, interval) {
+			if !sleepMonitorContext(workerCtx, dir, interval) {
 				job.Status = "stopped"
-				return babysitEvent(dir, job, "Stopped while waiting for an actionable PR event.")
+				return monitorEvent(dir, job, "Stopped while waiting for an actionable PR event.")
 			}
 			continue
 		}
@@ -992,28 +959,28 @@ func runBabysitWorker(id, root string, cfg Config) error {
 		job.Attempts++
 		job.ProcessedSignature = signature
 		job.PendingSignature, job.Proposal = "", ""
-		if err := saveBabysitJob(dir, job); err != nil {
+		if err := saveMonitorJob(dir, job); err != nil {
 			return err
 		}
-		if err := processBabysitEventContext(workerCtx, dir, job, cfg, snapshot, signature); err != nil {
-			_ = appendBabysitLog(dir, "Event processing failed safely: "+err.Error())
+		if err := processMonitorEventContext(workerCtx, dir, job, cfg, snapshot, signature); err != nil {
+			_ = appendMonitorLog(dir, "Event processing failed safely: "+err.Error())
 		}
 		if job.ApprovalSignature == signature {
 			job.ApprovalSignature, job.ApprovalScope = "", ""
-			_ = saveBabysitJob(dir, job)
+			_ = saveMonitorJob(dir, job)
 		}
-		if !sleepBabysitContext(workerCtx, dir, interval) {
+		if !sleepMonitorContext(workerCtx, dir, interval) {
 			job.Status = "stopped"
-			return babysitEvent(dir, job, "Stopped while waiting for the next PR poll.")
+			return monitorEvent(dir, job, "Stopped while waiting for the next PR poll.")
 		}
 	}
 }
 
-func sleepBabysit(dir string, interval time.Duration) {
-	_ = sleepBabysitContext(context.Background(), dir, interval)
+func sleepMonitor(dir string, interval time.Duration) {
+	_ = sleepMonitorContext(context.Background(), dir, interval)
 }
 
-func sleepBabysitContext(ctx context.Context, dir string, interval time.Duration) bool {
+func sleepMonitorContext(ctx context.Context, dir string, interval time.Duration) bool {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	timer := time.NewTimer(interval)
@@ -1042,7 +1009,7 @@ func snapshotRetryDelay(failures int) time.Duration {
 	return delay
 }
 
-func validateWorker(job *babysitJob) error {
+func validateWorker(job *monitorJob) error {
 	if job.Worktree == "" || job.WorkerBranch == "" {
 		return errors.New("worker worktree is not registered")
 	}
@@ -1069,7 +1036,7 @@ func validateWorker(job *babysitJob) error {
 	return nil
 }
 
-func validateTarget(job *babysitJob) error {
+func validateTarget(job *monitorJob) error {
 	root, err := runGit(context.Background(), job.RepoRoot, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return err
@@ -1132,18 +1099,18 @@ func hasNewCommentEvent(raw json.RawMessage) bool {
 	return len(raw) > 2 && string(raw) != "null" && string(raw) != "[]"
 }
 
-func processBabysitEvent(dir string, job *babysitJob, cfg Config, s *babysitSnapshot, signature string) error {
-	return processBabysitEventContext(context.Background(), dir, job, cfg, s, signature)
+func processMonitorEvent(dir string, job *monitorJob, cfg Config, s *monitorSnapshot, signature string) error {
+	return processMonitorEventContext(context.Background(), dir, job, cfg, s, signature)
 }
 
-func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob, cfg Config, s *babysitSnapshot, signature string) error {
+func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob, cfg Config, s *monitorSnapshot, signature string) error {
 	if job.Worktree != "" {
 		_, _ = runGit(context.Background(), job.RepoRoot, "worktree", "remove", "--force", job.Worktree)
 		job.Worktree = ""
 		job.WorkerBranch = ""
-		_ = saveBabysitJob(dir, job)
+		_ = saveMonitorJob(dir, job)
 	}
-	workerBranch := fmt.Sprintf("factory-babysit/%s-%s-a%d", job.ID, signature[:8], job.Attempts)
+	workerBranch := fmt.Sprintf("factory-monitor/%s-%s-a%d", job.ID, signature[:8], job.Attempts)
 	worktree := filepath.Join(dir, "events", signature[:16], "checkout")
 	if err := os.MkdirAll(filepath.Dir(worktree), 0o700); err != nil {
 		return err
@@ -1153,7 +1120,7 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	}
 	job.Worktree, job.WorkerBranch = worktree, workerBranch
 	job.Status = "running"
-	if err := saveBabysitJob(dir, job); err != nil {
+	if err := saveMonitorJob(dir, job); err != nil {
 		return err
 	}
 	task := fmt.Sprintf("Objective: %s\nRepository: %s\nPR #%d\nTarget branch: %s\nBase: %s\nSnapshot signature: %s\n\nPR title: %s\nPR URL: %s\nComments: %s\nChecks: %s\n", job.Description, job.Repo, job.PR, job.HeadBranch, job.BaseBranch, signature, s.Title, s.URL, string(s.Comments), string(s.StatusCheckRollup))
@@ -1173,8 +1140,8 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 	if err != nil {
 		return err
 	}
-	if agentTimeout > babysitAgentActionTimeout {
-		agentTimeout = babysitAgentActionTimeout
+	if agentTimeout > monitorAgentActionTimeout {
+		agentTimeout = monitorAgentActionTimeout
 	}
 	agentCtx, cancelAgent := context.WithTimeout(ctx, agentTimeout)
 	agentErr := (Runner{Config: cfg}).RunContext(agentCtx, "monitor", prompt, task, worktree, logPath)
@@ -1187,28 +1154,28 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 		return fmt.Errorf("append monitor agent log to session: %w", err)
 	}
 	if agentErr != nil {
-		_ = appendBabysitLog(dir, "Agent process failed: "+agentErr.Error())
+		_ = appendMonitorLog(dir, "Agent process failed: "+agentErr.Error())
 		return agentErr
 	}
 	if stopped, err := jobStopped(dir); err != nil {
 		return err
 	} else if stopped {
 		job.Status = "stopped"
-		return babysitEvent(dir, job, "Stopped after agent; no commit or push.")
+		return monitorEvent(dir, job, "Stopped after agent; no commit or push.")
 	}
 	protocol, proposal := agentProtocol(string(output))
 	switch protocol {
 	case "NO_ACTION":
-		_ = appendBabysitLog(dir, "Agent reported no action.")
+		_ = appendMonitorLog(dir, "Agent reported no action.")
 		return nil
 	case "APPROVAL_REQUIRED":
 		return pauseForApproval(dir, job, signature, proposal)
 	case "ERROR":
-		_ = appendBabysitLog(dir, "Agent reported an error.")
+		_ = appendMonitorLog(dir, "Agent reported an error.")
 		return nil
 	case "FIXED":
 	default:
-		_ = appendBabysitLog(dir, "Agent omitted valid final protocol; no commit or push.")
+		_ = appendMonitorLog(dir, "Agent omitted valid final protocol; no commit or push.")
 		return nil
 	}
 	changed, err := changedPaths(worktree)
@@ -1216,20 +1183,20 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 		return err
 	}
 	if len(changed) == 0 {
-		_ = appendBabysitLog(dir, "FIXED response had no changes; no commit or push.")
+		_ = appendMonitorLog(dir, "FIXED response had no changes; no commit or push.")
 		return nil
 	}
 	if stopped, err := jobStopped(dir); err != nil {
 		return err
 	} else if stopped {
 		job.Status = "stopped"
-		return babysitEvent(dir, job, "Stopped after agent; no commit or push.")
+		return monitorEvent(dir, job, "Stopped after agent; no commit or push.")
 	}
 	if err := guardedCommitPush(ctx, dir, job, signature, s, changed); err != nil {
-		_ = appendBabysitLog(dir, "Commit/push stopped safely: "+err.Error())
+		_ = appendMonitorLog(dir, "Commit/push stopped safely: "+err.Error())
 		if strings.Contains(err.Error(), "stop requested") {
 			job.Status = "stopped"
-			return babysitEvent(dir, job, err.Error())
+			return monitorEvent(dir, job, err.Error())
 		}
 		return nil
 	}
@@ -1237,26 +1204,11 @@ func processBabysitEventContext(ctx context.Context, dir string, job *babysitJob
 }
 
 func jobStopped(dir string) (bool, error) {
-	if _, err := os.Stat(filepath.Join(dir, "stop.requested")); err == nil {
-		return true, nil
-	} else if !os.IsNotExist(err) {
-		return false, err
-	}
-	id := filepath.Base(dir)
-	if babysitIDPattern.MatchString(id) {
-		store, exists, err := existingMonitorJobStore(dir, id)
-		if err != nil {
-			return false, err
-		}
-		if exists && store.StopRequested(id) {
-			return true, nil
-		}
-	}
-	job, err := readBabysitJob(dir)
+	store, err := NewJobStore(filepath.Dir(dir))
 	if err != nil {
 		return false, err
 	}
-	return job.StopRequested, nil
+	return store.StopRequested(filepath.Base(dir)), nil
 }
 
 func agentProtocol(output string) (string, string) {
@@ -1290,17 +1242,16 @@ func agentProtocol(output string) (string, string) {
 	return "", proposal
 }
 
-func pauseForApproval(dir string, job *babysitJob, signature, proposal string) error {
+func pauseForApproval(dir string, job *monitorJob, signature, proposal string) error {
 	if strings.TrimSpace(proposal) == "" {
 		proposal = "Agent requested explicit human review; inspect the logs before approval."
 	}
-	job.Status = "awaiting_approval"
+	job.Status = "running"
 	job.PendingSignature = signature
 	job.Proposal = proposal
 	job.ApprovalScope = ""
 	job.ApprovalSignature = ""
-	_ = os.WriteFile(filepath.Join(dir, "proposal.txt"), []byte(proposal+"\n"), 0o600)
-	return babysitEvent(dir, job, "Action paused for explicit human approval: "+proposal)
+	return monitorEvent(dir, job, "Action paused for explicit human approval: "+proposal)
 }
 
 func changedPaths(worktree string) ([]string, error) {
@@ -1360,7 +1311,7 @@ func validChangePath(path string) bool {
 	return true
 }
 
-func guardedCommitPush(ctx context.Context, dir string, job *babysitJob, signature string, snapshot *babysitSnapshot, files []string) error {
+func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signature string, snapshot *monitorSnapshot, files []string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("operation canceled before commit: %w", err)
 	}
@@ -1436,7 +1387,7 @@ func guardedCommitPush(ctx context.Context, dir string, job *babysitJob, signatu
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("operation canceled before commit: %w", err)
 	}
-	if _, err := runGit(context.Background(), job.Worktree, "commit", "-m", "fix: address PR feedback via factory babysit"); err != nil {
+	if _, err := runGit(context.Background(), job.Worktree, "commit", "-m", "fix: address PR feedback via factory monitor"); err != nil {
 		return err
 	}
 	if stopped, _ := jobStopped(dir); stopped {
@@ -1499,10 +1450,10 @@ func guardedCommitPush(ctx context.Context, dir string, job *babysitJob, signatu
 	job.Proposal = ""
 	job.Status = "running"
 	job.ApprovalScope, job.ApprovalSignature = "", ""
-	return babysitEvent(dir, job, "Validated changed paths; committed and pushed guarded changes to "+job.HeadBranch+".")
+	return monitorEvent(dir, job, "Validated changed paths; committed and pushed guarded changes to "+job.HeadBranch+".")
 }
 
-func validatedPushURL(worktree string, job *babysitJob) (string, error) {
+func validatedPushURL(worktree string, job *monitorJob) (string, error) {
 	config, err := runGit(context.Background(), worktree, "config", "--null", "--list")
 	if err != nil {
 		return "", fmt.Errorf("cannot inspect Git push configuration; refusing push: %w", err)

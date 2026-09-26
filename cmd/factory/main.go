@@ -27,6 +27,9 @@ func main() {
 
 func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	if len(args) > 0 {
+		if err := rejectRemovedAlias(args); err != nil {
+			return err
+		}
 		if commandHelpRequested(args) {
 			printCommandHelp(out, args)
 			return nil
@@ -42,9 +45,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if err != nil {
 				return err
 			}
-			return factory.BabysitCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
+			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "pipeline" && args[0] != "implement" && args[0] != "clean" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "--gate" {
+		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
@@ -86,8 +89,8 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if err != nil {
 				return fmt.Errorf("get current directory: %w", err)
 			}
-			return factory.BabysitCommand(args[1:], cfg, workdir, in, out, errOut)
-		case "pipeline", "implement":
+			return factory.MonitorCommand(args[1:], cfg, workdir, in, out, errOut)
+		case "implement":
 			gate, task, err := parseGate(args[1:])
 			if err != nil {
 				return err
@@ -95,7 +98,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			ctx, stop := foregroundContext()
 			defer stop()
 			return runPipelineContext(ctx, task, gate, in, out)
-		case "clean", "tidy":
+		case "tidy":
 			gate, task, err := parseGate(args[1:])
 			if err != nil {
 				return err
@@ -124,12 +127,33 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	return runPipelineContext(ctx, nil, false, in, out)
 }
 
+func rejectRemovedAlias(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	switch args[0] {
+	case "pipeline", "clean":
+		return fmt.Errorf("unknown command %q (try factory help)", args[0])
+	}
+	if len(args) > 1 {
+		if args[0] == "job" || args[0] == "run" {
+			if args[1] == "show" {
+				return fmt.Errorf("unknown %s subcommand %q (try factory %s help)", args[0], args[1], args[0])
+			}
+		}
+		if args[0] == "monitor" && args[1] == "describe" {
+			return fmt.Errorf("unknown monitor subcommand %q (try factory monitor help)", args[1])
+		}
+	}
+	return nil
+}
+
 func commandHelpRequested(args []string) bool {
 	if len(args) < 2 {
 		return false
 	}
 	switch args[0] {
-	case "implement", "pipeline", "tidy", "clean", "job", "run", "monitor":
+	case "implement", "tidy", "job", "run", "monitor":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -145,12 +169,6 @@ func printCommandHelp(out io.Writer, args []string) {
 		subcommand = args[1]
 	}
 	canonical := command
-	if command == "pipeline" {
-		canonical = "implement"
-	}
-	if command == "clean" {
-		canonical = "tidy"
-	}
 
 	var title string
 	var commands []helpCommand
@@ -160,13 +178,11 @@ func printCommandHelp(out io.Writer, args []string) {
 		title = "Implement workflow"
 		commands = []helpCommand{
 			{"factory implement [--gate] [description...]", "Start an implementation workflow; --gate runs in the foreground."},
-			{"factory pipeline [--gate] [description...]", "Alias for factory implement."},
 		}
 	case "tidy":
 		title = "Tidy workflow"
 		commands = []helpCommand{
 			{"factory tidy [--gate]", "Review, fix, document, and verify the repository."},
-			{"factory clean [--gate]", "Alias for factory tidy."},
 		}
 	case "job":
 		title = "Detached jobs"
@@ -207,7 +223,6 @@ func jobHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory job start monitor <description>", "Start a PR monitor."},
 		{"factory job list", "List detached jobs."},
 		{"factory job get <id> [--details]", "Show job status; --details includes metadata."},
-		{"factory job show <id> [--details]", "Alias for job get."},
 		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow logs."},
 		{"factory job attach <id>", "Follow worker output."},
 		{"factory job stop <id>", "Request cancellation."},
@@ -219,7 +234,6 @@ func runHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
 		{"factory run list", "List gated runs."},
 		{"factory run get <id> [--details]", "Show run status; --details includes metadata."},
-		{"factory run show <id> [--details]", "Alias for run get."},
 		{"factory run events <id> [--follow]", "Read or follow events."},
 		{"factory run stop <id>", "Request cancellation."},
 	}
@@ -231,7 +245,6 @@ func monitorHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory monitor <description>", "Start monitoring an open PR."},
 		{"factory monitor list", "List monitor jobs."},
 		{"factory monitor get <id> [--details]", "Show monitor status; --details includes proposals."},
-		{"factory monitor describe <id> [--details]", "Alias for monitor get."},
 		{"factory monitor approve <id>", "Approve a proposal with a scope."},
 		{"factory monitor reject <id>", "Reject a pending proposal."},
 		{"factory monitor stop <id>", "Stop monitoring."},
@@ -248,9 +261,6 @@ func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCom
 		return all, []string{example}
 	}
 	name := subcommand
-	if name == "show" || name == "describe" {
-		name = "get"
-	}
 	var selected []helpCommand
 	for _, command := range all {
 		fields := strings.Fields(command.usage)
@@ -359,7 +369,7 @@ func runCleanContext(ctx context.Context, gate bool, in io.Reader, out, errOut i
 	stdin, inputIsFile := inputFile(in)
 	terminal := inputIsFile && outputIsFile && isTerminal(stdin) && isTerminal(stdout)
 	if gate && !terminal {
-		return fmt.Errorf("factory clean --gate requires an interactive terminal for approvals")
+		return fmt.Errorf("factory tidy --gate requires an interactive terminal for approvals")
 	}
 	return (factory.CleanWorkflow{Agent: foregroundAgent{ctx: ctx, agent: factory.Runner{Config: cfg}}, Config: cfg, In: in, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: gate}).RunContext(ctx, "")
 }
@@ -519,8 +529,8 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 	}
 	fmt.Fprintln(out)
 	commands := []helpCommand{
-		{"factory implement [--gate] [description...]", "Start an implementation workflow (alias: pipeline)."},
-		{"factory tidy [--gate]", "Review, fix, document, and verify (alias: clean)."},
+		{"factory implement [--gate] [description...]", "Start an implementation workflow."},
+		{"factory tidy [--gate]", "Review, fix, document, and verify."},
 		{"factory monitor <description>", "Monitor an open pull request."},
 		{"factory job <command>", "Manage detached jobs."},
 		{"factory run <command>", "Manage gated runs."},

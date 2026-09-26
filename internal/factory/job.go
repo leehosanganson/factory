@@ -28,7 +28,7 @@ func JobCommand(args []string, cfg Config, target string, in io.Reader, out io.W
 // stops this observer; it never signals the detached worker.
 func JobCommandContext(ctx context.Context, args []string, cfg Config, target string, in io.Reader, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory job start <type> <description> | list | get <id> [--details] | show <id> [--details] | logs <id> [--session <id>] [--follow] | attach <id> | stop <id>")
+		return fmt.Errorf("usage: factory job start <type> <description> | list | get <id> [--details] | logs <id> [--session <id>] [--follow] | attach <id> | stop <id>")
 	}
 	root, err := JobStateRoot(cfg.StateDir)
 	if err != nil {
@@ -51,11 +51,7 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			if err := cfg.Validate(); err != nil {
 				return err
 			}
-			legacyRoot, err := babysitRoot(cfg)
-			if err != nil {
-				return err
-			}
-			return startBabysit([]string{description}, cfg, target, legacyRoot, out)
+			return startMonitor([]string{description}, cfg, target, root, out)
 		}
 		if args[1] != implementationJobType {
 			return fmt.Errorf("unsupported job type %q (supported: implementation, monitor)", args[1])
@@ -77,7 +73,7 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		}
 		writeJobTable(out, jobs)
 		return err
-	case "get", "show":
+	case "get":
 		id, details, err := parseDetailsID("factory job get <id> [--details]", args[1:])
 		if err != nil {
 			return err
@@ -121,9 +117,6 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			path, err = store.SessionLogPath(filtered[0], filtered[2])
 		} else if job.Type == monitorJobType {
 			path, err = store.SessionLogPath(filtered[0], monitorSessionID)
-			if err == nil {
-				path, err = monitorLegacyLogPath(store, filtered[0], path)
-			}
 		} else {
 			path, err = store.JobLogPath(filtered[0])
 		}
@@ -139,8 +132,7 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 				}
 				status = current.Status
 				if current.Type == monitorJobType && status == "recoverable_failure" {
-					stopped, err := monitorRecoverableFailureStopped(store, job.ID)
-					return stopped, err
+					return monitorRecoverableFailureStopped(store, job.ID)
 				}
 				return isTerminalStatus(status), nil
 			}, out)

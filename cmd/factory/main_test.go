@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -68,7 +69,7 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 				t.Errorf("root %v help missing %q: %s", args, want, out.String())
 			}
 		}
-		for _, omitted := range []string{"full command overview", "origin/<branch>", "dirty safe mode", "30-minute active", "optional placeholders", "approval requires exact", "isolated worktree", "factory job start implementation", "execution and safeguards", "configuration and limits"} {
+		for _, omitted := range []string{"full command overview", "origin/<branch>", "dirty safe mode", "30-minute active", "optional placeholders", "approval requires exact", "isolated worktree", "factory job start implementation", "execution and safeguards", "configuration and limits", "factory pipeline", "factory clean", "alias: pipeline", "alias: clean"} {
 			if strings.Contains(text, omitted) {
 				t.Errorf("root %v help includes full-overview detail %q: %s", args, omitted, out.String())
 			}
@@ -89,6 +90,13 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Implement workflow") || strings.Contains(out.String(), "Execution and safeguards") {
 		t.Fatalf("workflow help should remain concise: %s", out.String())
+	}
+	out.Reset()
+	if err := run([]string{"tidy", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "Tidy workflow") {
+		t.Fatalf("tidy help missing canonical workflow: %s", out.String())
 	}
 	out.Reset()
 	if err := run([]string{"job", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
@@ -128,16 +136,13 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		want []string
 		omit []string
 	}{
-		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}, omit: []string{"Examples:", "Ctrl-C", "interactive terminal"}},
-		{name: "pipeline alias", args: []string{"pipeline", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}},
-		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean"}, omit: []string{"Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
-		{name: "clean alias", args: []string{"clean", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean"}},
+		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
+		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
-		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "show remains an alias"}},
-		{name: "job show alias", args: []string{"job", "show", "--help"}, want: []string{"factory job get", "--details"}, omit: []string{"factory job start"}},
+		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "factory job show"}},
 		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"Gated runs", "factory run events"}, omit: []string{"factory job", "Monitor management", "Example:"}},
-		{name: "run show alias", args: []string{"run", "show", "--help"}, want: []string{"factory run get", "--details"}, omit: []string{"factory run events"}},
-		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "proposals"}, omit: []string{"describe remains an alias"}},
+		{name: "run get canonical", args: []string{"run", "get", "--help"}, want: []string{"factory run get", "--details", "metadata"}, omit: []string{"factory run show"}},
+		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "proposals"}, omit: []string{"factory monitor describe"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer
@@ -175,6 +180,62 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("inspect state after help: %v", err)
+	}
+}
+
+func TestRemovedAliasesFailBeforeHelpOrCommandDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "pipeline", args: []string{"pipeline", "do work"}, want: `unknown command "pipeline"`},
+		{name: "pipeline help flag", args: []string{"pipeline", "--help"}, want: `unknown command "pipeline"`},
+		{name: "pipeline help word", args: []string{"pipeline", "help"}, want: `unknown command "pipeline"`},
+		{name: "clean", args: []string{"clean"}, want: `unknown command "clean"`},
+		{name: "clean help flag", args: []string{"clean", "--help"}, want: `unknown command "clean"`},
+		{name: "clean help word", args: []string{"clean", "help"}, want: `unknown command "clean"`},
+		{name: "job show", args: []string{"job", "show", "job-id"}, want: `unknown job subcommand "show"`},
+		{name: "job show help flag", args: []string{"job", "show", "--help"}, want: `unknown job subcommand "show"`},
+		{name: "job show help word", args: []string{"job", "show", "help"}, want: `unknown job subcommand "show"`},
+		{name: "run show", args: []string{"run", "show", "run-id"}, want: `unknown run subcommand "show"`},
+		{name: "run show help flag", args: []string{"run", "show", "--help"}, want: `unknown run subcommand "show"`},
+		{name: "run show help word", args: []string{"run", "show", "help"}, want: `unknown run subcommand "show"`},
+		{name: "monitor describe", args: []string{"monitor", "describe", "job-id"}, want: `unknown monitor subcommand "describe"`},
+		{name: "monitor describe help flag", args: []string{"monitor", "describe", "--help"}, want: `unknown monitor subcommand "describe"`},
+		{name: "monitor describe help word", args: []string{"monitor", "describe", "help"}, want: `unknown monitor subcommand "describe"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			err := run(tc.args, strings.NewReader(""), &out, &errOut)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("run(%v) error = %v, want %q", tc.args, err, tc.want)
+			}
+			if out.Len() != 0 {
+				t.Fatalf("rejected alias printed help or output: %q", out.String())
+			}
+		})
+	}
+}
+
+func TestCanonicalManagementCommandsStillRoute(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"job", "list"}, want: "No jobs."},
+		{args: []string{"run", "list"}, want: "No gated runs."},
+		{args: []string{"monitor", "list"}, want: "No monitor jobs."},
+	} {
+		var out, errOut bytes.Buffer
+		if err := run(tc.args, strings.NewReader(""), &out, &errOut); err != nil {
+			t.Errorf("run(%v): %v", tc.args, err)
+			continue
+		}
+		if !strings.Contains(out.String(), tc.want) {
+			t.Errorf("run(%v) output = %q, want %q", tc.args, out.String(), tc.want)
+		}
 	}
 }
 
@@ -527,9 +588,14 @@ func TestGatedImplementRejectsNonInteractiveBeforeAgentOrRunState(t *testing.T) 
 	}
 }
 
-func TestNonInteractiveImplementPipelineAndBareAliasAreRejected(t *testing.T) {
+func TestRemovedPipelineAliasIsRejectedWhileBareInvocationStillRunsImplement(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if err := run([]string{"pipeline"}, strings.NewReader("task\n"), &out, &errOut); err == nil || !strings.Contains(err.Error(), `unknown command "pipeline"`) {
+		t.Fatalf("pipeline alias error = %v", err)
+	}
+
 	var errs []error
-	for _, args := range [][]string{{"implement"}, {"pipeline"}, nil} {
+	for _, args := range [][]string{{"implement"}, nil} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			var out, errOut bytes.Buffer
 			err := run(args, strings.NewReader("task\n"), &out, &errOut)
@@ -539,8 +605,8 @@ func TestNonInteractiveImplementPipelineAndBareAliasAreRejected(t *testing.T) {
 			errs = append(errs, err)
 		})
 	}
-	if len(errs) != 3 || errs[0].Error() != errs[1].Error() || errs[1].Error() != errs[2].Error() {
-		t.Fatalf("bare invocation, implement, and pipeline should use the same workflow: errors=%v", errs)
+	if len(errs) != 2 || errs[0].Error() != errs[1].Error() {
+		t.Fatalf("bare invocation and implement should use the same workflow: errors=%v", errs)
 	}
 }
 
@@ -565,9 +631,9 @@ func TestCLIParsesGateOptionAcrossSubcommands(t *testing.T) {
 		gate bool
 		task string
 	}{
-		{args: []string{"pipeline", "--gate", "do", "work"}, gate: true, task: "do work"},
+		{args: []string{"implement", "--gate", "do", "work"}, gate: true, task: "do work"},
 		{args: []string{"--gate", "do", "work"}, gate: true, task: "do work"},
-		{args: []string{"pipeline", "do", "work"}, gate: false, task: "do work"},
+		{args: []string{"implement", "do", "work"}, gate: false, task: "do work"},
 	} {
 		gotGate, gotTask, err := parseGate(tc.args[1:])
 		if tc.args[0] == "--gate" {
@@ -578,11 +644,11 @@ func TestCLIParsesGateOptionAcrossSubcommands(t *testing.T) {
 		}
 	}
 	if gate, task, err := parseGate([]string{"--gate"}); err != nil || !gate || len(task) != 0 {
-		t.Fatalf("clean gate parse = (%v, %v, %v)", gate, task, err)
+		t.Fatalf("tidy gate parse = (%v, %v, %v)", gate, task, err)
 	}
 }
 
-func TestGateParsingSupportsPipelineAndBareAliasForms(t *testing.T) {
+func TestGateParsingSupportsImplementAndBareForms(t *testing.T) {
 	for _, args := range [][]string{{"--gate", "a", "task"}, {"a", "--gate", "task"}} {
 		gate, task, err := parseGate(args)
 		if err != nil || !gate || strings.Join(task, " ") != "a task" {
@@ -594,7 +660,7 @@ func TestGateParsingSupportsPipelineAndBareAliasForms(t *testing.T) {
 	}
 }
 
-func TestImplementAndPipelineDefaultToAttachedImplementationJob(t *testing.T) {
+func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "fake-agent")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.1\ncase \"$2\" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -609,7 +675,7 @@ func TestImplementAndPipelineDefaultToAttachedImplementationJob(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build factory: %v\n%s", err, output)
 	}
-	for _, name := range []string{"implement", "pipeline"} {
+	for _, name := range []string{"implement"} {
 		t.Run(name, func(t *testing.T) {
 			state := t.TempDir()
 			target, err := filepath.EvalSymlinks(t.TempDir())
@@ -650,21 +716,11 @@ func TestImplementAndPipelineDefaultToAttachedImplementationJob(t *testing.T) {
 	}
 }
 
-func TestCleanAndTidyRejectTaskArgumentsIdentically(t *testing.T) {
-	var errors []string
-	for _, command := range []string{"tidy", "clean"} {
-		command := command
-		t.Run(command, func(t *testing.T) {
-			var out, errOut bytes.Buffer
-			err := run([]string{command, "unexpected"}, strings.NewReader(""), &out, &errOut)
-			if err == nil || err.Error() != "factory tidy accepts only --gate" {
-				t.Fatalf("%s argument error = %v", command, err)
-			}
-			errors = append(errors, err.Error())
-		})
-	}
-	if len(errors) != 2 || errors[0] != errors[1] {
-		t.Fatalf("tidy and clean should share routing and argument validation: %v", errors)
+func TestTidyRejectsTaskArguments(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := run([]string{"tidy", "unexpected"}, strings.NewReader(""), &out, &errOut)
+	if err == nil || err.Error() != "factory tidy accepts only --gate" {
+		t.Fatalf("tidy argument error = %v", err)
 	}
 }
 
@@ -691,21 +747,30 @@ func TestPipelineArgumentsBecomeTaskWithoutPrompt(t *testing.T) {
 	}
 }
 
-func TestMonitorListAndDescribePersistedMetadata(t *testing.T) {
+func TestMonitorListAndGetPersistedMetadata(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)
-	_ = factory.DefaultConfig()
-	jobRoot := filepath.Join(state, "factory", "jobs")
 	id := "20260518T120000-0123456789ab"
-	dir := filepath.Join(jobRoot, id)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	jobRoot, err := factory.JobStateRoot(state)
+	if err != nil {
 		t.Fatal(err)
 	}
-	metadata := `{"id":"` + id + `","description":"watch task","repo":"owner/repo","pr":12,"status":"running","created_at":"2026-05-18T12:00:00Z","updated_at":"2026-05-18T12:00:00Z"}`
-	if err := os.WriteFile(filepath.Join(dir, "job.json"), []byte(metadata), 0o600); err != nil {
+	store, err := factory.NewJobStore(jobRoot)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "actions.log"), []byte("[now] worker started\n"), 0o600); err != nil {
+	var job factory.JobRecord
+	metadata := `{"id":"` + id + `","type":"monitor","task_description":"watch task","status":"running","monitor":{"id":"` + id + `","description":"watch task","repo":"owner/repo","pr":12,"head_branch":"feature","status":"running","created_at":"2026-05-18T12:00:00Z","updated_at":"2026-05-18T12:00:00Z"}}`
+	if err := json.Unmarshal([]byte(metadata), &job); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, "monitor", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSessionLog(id, "monitor", []byte("[now] worker started\n")); err != nil {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
@@ -717,13 +782,13 @@ func TestMonitorListAndDescribePersistedMetadata(t *testing.T) {
 		t.Fatalf("list omitted persisted job: %s", monitorList)
 	}
 	out.Reset()
-	if err := run([]string{"monitor", "describe", id, "--details"}, strings.NewReader(""), &out, &errOut); err != nil {
+	if err := run([]string{"monitor", "get", id, "--details"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "watch task") || !strings.Contains(out.String(), "worker started") {
-		t.Fatalf("describe omitted metadata/log: %s", out.String())
+		t.Fatalf("get omitted metadata/log: %s", out.String())
 	}
-	if err := run([]string{"monitor", "describe", "../escape"}, strings.NewReader(""), &out, &errOut); err == nil {
+	if err := run([]string{"monitor", "get", "../escape"}, strings.NewReader(""), &out, &errOut); err == nil {
 		t.Fatal("unsafe job id accepted")
 	}
 }

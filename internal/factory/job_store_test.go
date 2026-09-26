@@ -26,7 +26,7 @@ func newTestJobStore(t *testing.T) *JobStore {
 
 func createTestJob(t *testing.T, store *JobStore, id string) {
 	t.Helper()
-	if err := store.CreateJob(JobRecord{ID: id, Kind: "test", Status: "queued"}); err != nil {
+	if err := store.CreateJob(JobRecord{ID: id, Type: "test", Status: "queued"}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -40,7 +40,7 @@ func TestJobStorePersistsVersionedJobSessionAndPrivateLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.Version != jobRecordVersion || job.Type != "implementation" || job.Kind != "implementation" || job.TaskDescription != "make a useful change" || !filepath.IsAbs(job.TargetPath) || job.Status != "queued" || job.CreatedAt.IsZero() || job.UpdatedAt.IsZero() {
+	if job.Version != jobRecordVersion || job.Type != "implementation" || job.TaskDescription != "make a useful change" || !filepath.IsAbs(job.TargetPath) || job.Status != "queued" || job.CreatedAt.IsZero() || job.UpdatedAt.IsZero() {
 		t.Fatalf("unexpected persisted job: %+v", job)
 	}
 	if _, err := store.UpdateJob(job.ID, func(job *JobRecord) error {
@@ -184,50 +184,19 @@ func TestSessionEventMaximumLineIsEnforcedOnAppendAndRead(t *testing.T) {
 	}
 }
 
-func TestJobStateRootPrefersExistingLegacyJobsWithoutCopyingState(t *testing.T) {
+func TestJobStateRootUsesCanonicalDetachedJobsRoot(t *testing.T) {
 	state := t.TempDir()
-	legacyRoot := filepath.Join(state, "factory", "jobs", "v2")
-	legacyStore, err := NewJobStore(legacyRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	target := t.TempDir()
-	if err := legacyStore.CreateJob(JobRecord{ID: "old-job", Type: implementationJobType, TargetPath: target, Status: "running"}); err != nil {
-		t.Fatal(err)
-	}
 	root, err := JobStateRoot(state)
-	if err != nil || root != legacyRoot {
-		t.Fatalf("JobStateRoot=%q err=%v, want legacy root %q", root, err, legacyRoot)
+	want := filepath.Join(state, "factory", "detached-jobs")
+	if err != nil || root != want {
+		t.Fatalf("JobStateRoot=%q err=%v, want canonical root %q", root, err, want)
 	}
-	opened, err := NewJobStore(root)
+	store, err := NewJobStore(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job, err := opened.GetJob("old-job"); err != nil || job.Status != "running" {
-		t.Fatalf("legacy job=%+v err=%v", job, err)
-	}
-	if _, err := os.Stat(filepath.Join(state, "factory", "detached-jobs")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("legacy compatibility created a second job root: %v", err)
-	}
-}
-
-func TestJobStateRootRejectsMixedStoresToPreserveTargetLockDomain(t *testing.T) {
-	state := t.TempDir()
-	for _, root := range []string{
-		filepath.Join(state, "factory", "jobs", "v2"),
-		filepath.Join(state, "factory", "detached-jobs"),
-	} {
-		store, err := NewJobStore(root)
-		if err != nil {
-			t.Fatal(err)
-		}
-		id := "job-" + filepath.Base(filepath.Dir(root))
-		if err := store.CreateJob(JobRecord{ID: id, Type: implementationJobType, TargetPath: t.TempDir(), Status: "running"}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if root, err := JobStateRoot(state); err == nil || root != "" || !strings.Contains(err.Error(), "refusing to split job state and target locks") {
-		t.Fatalf("JobStateRoot=%q err=%v, want mixed-store refusal", root, err)
+	if _, err := store.ListJobs(); err != nil {
+		t.Fatalf("canonical store should be usable: %v", err)
 	}
 }
 
@@ -304,7 +273,7 @@ func TestJobStoreRejectsUnsupportedRecordVersion(t *testing.T) {
 	store := newTestJobStore(t)
 	createTestJob(t, store, "versioned")
 	path := filepath.Join(store.Root(), "versioned", "job.json")
-	if err := os.WriteFile(path, []byte(`{"version":99,"id":"versioned","kind":"test","status":"queued"}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"version":99,"id":"versioned","status":"queued"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.GetJob("versioned"); err == nil {

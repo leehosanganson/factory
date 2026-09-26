@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -82,60 +81,6 @@ func followLog(ctx context.Context, path string, terminal func() (bool, error), 
 	}
 }
 
-func monitorLegacyLogPath(store *JobStore, id, fallback string) (string, error) {
-	job, err := store.GetJob(id)
-	if err != nil {
-		return "", err
-	}
-	if job.Type != monitorJobType {
-		return "", fmt.Errorf("job %s is not a monitor job", id)
-	}
-	legacyRoot := filepath.Join(filepath.Dir(store.Root()), "jobs")
-	legacyDir, err := babysitJobDir(legacyRoot, id)
-	if err != nil {
-		return "", err
-	}
-	legacyPath := filepath.Join(legacyDir, "actions.log")
-	if _, err := os.Lstat(legacyDir); errors.Is(err, os.ErrNotExist) {
-		return fallback, nil
-	} else if err != nil {
-		return "", err
-	}
-	if err := ensureRealDirectory(legacyRoot, legacyDir); err != nil {
-		return "", err
-	}
-	if err := ensureRegularIfExists(legacyPath); err != nil {
-		return "", err
-	}
-	if _, err := os.Lstat(legacyPath); errors.Is(err, os.ErrNotExist) {
-		return fallback, nil
-	} else if err != nil {
-		return "", err
-	}
-	if err := ensureRegularIfExists(filepath.Join(legacyDir, "job.json")); err != nil {
-		return "", err
-	}
-	legacy, err := readBabysitJob(legacyDir)
-	if err != nil {
-		return "", fmt.Errorf("read legacy monitor job: %w", err)
-	}
-	if !filepath.IsAbs(job.TargetPath) || !filepath.IsAbs(legacy.RepoRoot) {
-		return "", fmt.Errorf("legacy monitor job has an invalid target path")
-	}
-	detachedTarget, err := canonicalPath(job.TargetPath)
-	if err != nil {
-		return "", err
-	}
-	legacyTarget, err := canonicalPath(legacy.RepoRoot)
-	if err != nil {
-		return "", err
-	}
-	if legacy.ID != id || detachedTarget != legacyTarget {
-		return "", fmt.Errorf("legacy monitor job does not match detached job %s", id)
-	}
-	return legacyPath, nil
-}
-
 func monitorRecoverableFailureStopped(store *JobStore, id string) (bool, error) {
 	worker, err := store.ReadWorker(id)
 	if errors.Is(err, os.ErrNotExist) {
@@ -161,9 +106,6 @@ func AttachJob(ctx context.Context, store *JobStore, id string, out io.Writer) e
 	path, err := store.JobLogPath(id)
 	if job.Type == monitorJobType {
 		path, err = store.SessionLogPath(id, monitorSessionID)
-		if err == nil {
-			path, err = monitorLegacyLogPath(store, id, path)
-		}
 	}
 	if err != nil {
 		return err
@@ -187,7 +129,7 @@ func AttachJob(ctx context.Context, store *JobStore, id string, out io.Writer) e
 		return nil
 	}
 	switch status {
-	case "complete", "completed", "merged", "closed":
+	case "complete", "closed":
 		return nil
 	case "failed":
 		return fmt.Errorf("job %s failed; inspect with factory job logs %s", id, id)
