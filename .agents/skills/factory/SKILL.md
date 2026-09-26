@@ -4,8 +4,8 @@ description: >-
   Use Factory's implement workflow first for substantive engineering changes
   in this repository, or its detached monitor for routine, low-risk fixes on an
   existing open PR. Skip research, review-only work, and small isolated edits;
-  never start a nested workflow from an active Factory run. Pipeline approval
-  prompts are opt-in; use `--gate` when explicit approvals are wanted. Preserve
+  never start a nested workflow from an active Factory run. Approval prompts
+  are opt-in; use `--gate` when explicit approvals are wanted. Preserve
   bounded retries and user control; do not treat Factory as an autonomous
   engineering or security-sandbox system.
 ---
@@ -30,53 +30,44 @@ requested task is a repository-wide review/fix/document/verify pass.
 
 Before launching a workflow, determine whether this task is already running
 inside Factory. If so, continue within that workflow instead of starting
-`factory implement`, `factory pipeline`, a detached implementation job, or any
+`factory implement`, a detached implementation job, or any
 other Factory workflow recursively. If unsure, ask rather than starting another
 worker. Mention when recursion was avoided if it affects the chosen workflow.
 
-Choose the workflow that matches the work. `implement` is the canonical task
-workflow (`pipeline` remains an alias); `tidy` is the canonical clean workflow
-(`clean` remains an alias); `monitor` is the canonical detached PR monitor.
+Choose the workflow that matches the work. Use `implement` for task work,
+`tidy` for repository-wide review/fix/document/verify, and `monitor` for
+bounded detached PR maintenance.
 Preserve the user's authority over scope and decisions; honor any enabled
 approval gate and never present automation as a substitute for review.
 
 ## Detached implementation jobs
 
 `factory job` supports detached `implementation` and `monitor` types. Monitor
-jobs use the existing babysit engine and share its PR-specific duplicate guard;
-`factory monitor` uses the existing monitor engine. The removed `factory
-babysit` CLI command is not an alias; legacy babysit-named persisted metadata,
-configuration, and environment-variable identifiers remain for compatibility.
+jobs use the detached monitoring engine and its PR-specific duplicate guard.
 Current job commands are:
 
 ```text
 factory job start implementation <description>
 factory job start monitor <description>
 factory job list
-factory job show <id>
+factory job get <id> [--details]
 factory job logs <id> [--session workflow] [--follow]
 factory job attach <id>
 factory job stop <id>
 ```
 
-New jobs use `<state-base>/factory/detached-jobs`. For upgrades, when
-`<state-base>/factory/jobs/v2` contains jobs and the new directory does not,
-Factory keeps using the legacy directory in place so existing workers, CLI
-controls, and target locks remain in the same store; state is not copied or
-migrated. If both roots contain jobs, commands fail closed rather than split
-job discovery or target locking. A start returns after launching the worker,
-and stop requests cooperative cancellation through a durable file.
+Detached jobs are stored under `<state-base>/factory/detached-jobs`. A start
+returns after launching the worker, and stop requests cooperative cancellation
+through a durable file.
 Attach follows worker output; Ctrl-C detaches the observer without stopping the
 worker, which can be reattached later. The implementation workflow uses one
-job-level `workflow` session; monitor jobs use the babysit ID for the detached
-job and `monitor` session. Generic and legacy stop and reset operations
-interoperate. These commands are distinct from the supported
-`factory monitor list/describe/approve/reject/stop/reset` management commands
-below.
+job-level `workflow` session; monitor jobs use the monitor ID for the detached
+job and `monitor` session. Use `factory monitor list/get/approve/reject/stop/reset`
+for monitor management.
 
 ## Choose the right workflow
 
-- Use **implement** (legacy alias: **pipeline**) for deliberate feature work,
+- Use **implement** for deliberate feature work,
   engineering tasks, or work that needs requirements clarified before
   implementation. It proceeds through
   requirements, implementation, review, and documentation. A stage succeeds on
@@ -99,8 +90,7 @@ Run in the target repository:
 factory implement
 factory implement add a small feature
 factory implement --gate add a small feature
-factory pipeline add a small feature  # legacy alias
-factory                         # interactive alias for factory implement
+factory                         # starts the interactive implementation workflow
 ```
 
 By default, pipeline starts an implementation job and attaches to its output
@@ -109,9 +99,8 @@ until terminal state. Ctrl-C detaches without stopping the worker; use
 cooperative cancellation. `--gate` keeps the interactive foreground workflow,
 since detached workers cannot safely proxy approval input.
 
-With no description arguments, `factory implement` (or legacy `factory
-pipeline`) and bare `factory` prompt for
-task text and require an interactive terminal. Supplying description arguments
+With no description arguments, `factory implement` and bare `factory` prompt
+for task text and require an interactive terminal. Supplying description arguments
 skips only that task-entry prompt. Approval gates are off by default; add
 `--gate` to opt into them.
 
@@ -161,7 +150,7 @@ finding.
 
 ## Clean: pristine publishing and dirty safe mode
 
-Run `factory tidy` (legacy alias: `factory clean`) for review, fixes, documentation, then `make fmt`, `make test`,
+Run `factory tidy` for review, fixes, documentation, then `make fmt`, `make test`,
 and `make vet`. It has two distinct modes:
 
 - **Pristine mode** applies when the initial index, tracked worktree, and untracked
@@ -188,8 +177,7 @@ Each agent stage is invoked once; an agent error fails that stage. There is no
 independent evaluator. Each clean stage has a
 30-minute active agent-execution budget, which pauses during approvals, checks,
 and other non-agent work; it is not a whole-job deadline. Successful-stage approval
-prompts are skipped by default; `factory tidy --gate` (or legacy
-`factory clean --gate`) restores explicit gates.
+prompts are skipped by default; `factory tidy --gate` restores explicit gates.
 Pristine publication still requires an interactive terminal and exact lowercase
 `yes`, regardless of `--gate`. Neither mode is a security sandbox. This workflow
 is distinct from `make clean`, which removes local build artifacts.
@@ -203,7 +191,7 @@ factory monitor address the failing test and concrete review feedback
 ```
 
 Factory validates the PR/repository and baseline, then launches a detached
-worker in an isolated worktree and `factory-babysit/...` branch. The worker
+worker in an isolated worktree. The worker
 monitors the PR and checks; monitoring stops when the PR is merged or closed.
 A `FIXED` agent response with changes can proceed to commit/push only after
 Factory derives changed paths from Git and successfully revalidates the checkout,
@@ -227,14 +215,14 @@ Manage an existing job using the ID Factory reports:
 
 ```sh
 factory monitor list
-factory monitor describe <id>
+factory monitor get <id> [--details]
 factory monitor approve <id>
 factory monitor reject <id>
 factory monitor stop <id>
 factory monitor reset <id>
 ```
 
-`describe` includes job details and available logs/proposals. `approve` asks for
+`get <id> --details` includes job details and available logs/proposals. `approve` asks for
 exact lowercase `y` and non-empty task text defining the approved scope;
 approval is invalidated if the PR/check snapshot changes. `reject` declines the
 pending proposal and resumes monitoring without repeating that action. `stop`
@@ -284,10 +272,8 @@ change the separate two-minute GitHub PR/check snapshot timeout or clean
 verification commands. Foreground runs and monitor jobs/logs are persisted
 outside the target repository by default under
 `${XDG_STATE_HOME:-~/.local/state}/factory/`. New detached job records use
-`${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs`; legacy monitor
-metadata remains under `${XDG_STATE_HOME:-~/.local/state}/factory/jobs` for
-compatibility. Configured `state_dir` uses `<state_dir>/factory/detached-jobs`
-for new detached jobs and `<state_dir>/factory/jobs` for legacy monitor
-metadata. The upgrade compatibility behavior described above applies to
-`<state_dir>/factory/jobs/v2` as well. Do not infer additional resume, rollback,
-or control commands beyond those provided by the CLI.
+`${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs`. Configured
+`state_dir` uses `<state_dir>/factory/detached-jobs` for detached jobs. Monitor
+polling is controlled by `FACTORY_MONITOR_POLL_INTERVAL`. Do not infer
+additional resume, rollback, or control commands beyond those provided by the
+CLI.
