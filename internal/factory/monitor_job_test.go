@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func TestMonitorJobUsesBabysitStartGuardAndCreatesMatchingV2Session(t *testing.T) {
+func TestMonitorJobStartsForForkHeadAndCreatesMatchingV2Session(t *testing.T) {
 	base := t.TempDir()
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
@@ -27,7 +27,7 @@ func TestMonitorJobUsesBabysitStartGuardAndCreatesMatchingV2Session(t *testing.T
 	}
 	runTestCommand(t, repo, "git", "add", "tracked")
 	runTestCommand(t, repo, "git", "commit", "-m", "initial")
-	runTestCommand(t, repo, "git", "remote", "set-url", "origin", "https://github.com/team/repo.git")
+	runTestCommand(t, repo, "git", "remote", "set-url", "origin", "https://github.com/team/fork.git")
 	head, err := runGit(context.Background(), repo, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
@@ -35,14 +35,13 @@ func TestMonitorJobUsesBabysitStartGuardAndCreatesMatchingV2Session(t *testing.T
 	response := map[string]any{
 		"number": 7, "state": "OPEN", "title": "Fix", "url": "https://github.com/team/repo/pull/7",
 		"headRefName": "feature", "headRefOid": head,
-		"headRepository": map[string]string{"nameWithOwner": "team/repo", "url": "https://github.com/team/repo"},
+		"headRepository": map[string]string{"nameWithOwner": "team/fork", "url": "https://github.com/team/fork"},
 		"baseRefName":    "main", "baseRefOid": head,
-		"baseRepository": map[string]string{"nameWithOwner": "team/repo", "url": "https://github.com/team/repo"},
-		"comments":       []any{}, "statusCheckRollup": []any{},
+		"comments": []any{}, "statusCheckRollup": []any{},
 	}
 	responseJSON, _ := json.Marshal(response)
 	gh := filepath.Join(base, "gh")
-	ghScript := "#!/bin/sh\nif [ \"$1\" = repo ]; then echo '{\"url\":\"https://github.com/team/repo\",\"sshUrl\":\"git@github.com:team/repo.git\"}'; else printf '%s\\n' '" + strings.ReplaceAll(string(responseJSON), "'", "'\\''") + "'; fi\n"
+	ghScript := "#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\nif [ \"$1\" = repo ]; then echo '{\"url\":\"https://github.com/team/fork\",\"sshUrl\":\"git@github.com:team/fork.git\"}'; else printf '%s\\n' '" + strings.ReplaceAll(string(responseJSON), "'", "'\\''") + "'; fi\n"
 	if err := os.WriteFile(gh, []byte(ghScript), 0o700); err != nil {
 		t.Fatal(err)
 	}

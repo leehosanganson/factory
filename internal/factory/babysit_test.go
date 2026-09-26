@@ -216,14 +216,14 @@ func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
 		t.Fatal(err)
 	}
 	responsePath := filepath.Join(base, "snapshot.json")
-	closedResponse := `{"number":7,"state":"CLOSED","title":"Fix","url":"https://example.test/pr/7","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","baseRepository":{"nameWithOwner":"team/repo"},"comments":[],"statusCheckRollup":[]}`
+	closedResponse := `{"number":7,"state":"CLOSED","title":"Fix","url":"https://github.com/team/repo/pull/7","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","comments":[],"statusCheckRollup":[]}`
 	activeResponse := strings.Replace(closedResponse, `"state":"CLOSED"`, `"state":"OPEN"`, 1)
 	activeResponse = strings.Replace(activeResponse, `"statusCheckRollup":[]`, `"statusCheckRollup":[{"state":"FAILURE"}]`, 1)
 	if err := os.WriteFile(responsePath, []byte(activeResponse), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	gh := filepath.Join(base, "gh")
-	if err := os.WriteFile(gh, []byte("#!/bin/sh\n[ ! -f \"$GH_FAIL\" ] || exit 1\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\n[ ! -f \"$GH_FAIL\" ] || exit 1\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	failMarker := filepath.Join(base, "gh-fail")
@@ -376,11 +376,11 @@ func TestBabysitIDsAndAtomicMetadata(t *testing.T) {
 func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testing.T) {
 	base := t.TempDir()
 	gh := filepath.Join(base, "gh")
-	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	response := `{"number":7,"state":"OPEN","title":"Fix","url":"https://example.test/pr/7","headRefName":"feature","headRefOid":"head123","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"base123","baseRepository":{"nameWithOwner":"team/repo"},"comments":[],"statusCheckRollup":[]}`
+	response := `{"number":7,"state":"OPEN","title":"Fix","url":"https://github.com/team/repo/pull/7","headRefName":"feature","headRefOid":"head123","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"base123","comments":[],"statusCheckRollup":[]}`
 	file := filepath.Join(base, "response.json")
 	if err := os.WriteFile(file, []byte(response), 0o600); err != nil {
 		t.Fatal(err)
@@ -440,17 +440,17 @@ func TestBabysitApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testi
 func TestBabysitSnapshotValidationAndSignature(t *testing.T) {
 	root := t.TempDir()
 	gh := filepath.Join(root, "gh")
-	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
+	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", root+string(os.PathListSeparator)+os.Getenv("PATH"))
-	response := `{"number":7,"state":"OPEN","title":"Fix","url":"https://example.test/pr/7","headRefName":"feature","headRefOid":"abc123","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"base123","baseRepository":{"nameWithOwner":"team/repo"},"comments":[],"statusCheckRollup":[]}`
+	response := `{"number":7,"state":"OPEN","title":"Fix","url":"https://github.com/team/repo/pull/7","headRefName":"feature","headRefOid":"abc123","headRepository":{"nameWithOwner":"team/fork"},"baseRefName":"main","baseRefOid":"base123","comments":[],"statusCheckRollup":[]}`
 	file := filepath.Join(root, "response.json")
 	if err := os.WriteFile(file, []byte(response), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GH_RESPONSE", file)
-	job := &babysitJob{PR: 7, Repo: "team/repo", HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main"}
+	job := &babysitJob{PR: 7, Repo: "team/repo", HeadRepo: "team/fork", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", BaseSHA: "base123"}
 	first, sig, err := readSnapshot(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
@@ -459,12 +459,50 @@ func TestBabysitSnapshotValidationAndSignature(t *testing.T) {
 	if err != nil || sig != sig2 || first.HeadRefOID != second.HeadRefOID {
 		t.Fatalf("identical snapshot changed: %q %q %v", sig, sig2, err)
 	}
-	invalid := strings.Replace(response, `"headRefName":"feature"`, `"headRefName":"other"`, 1)
-	if err := os.WriteFile(file, []byte(invalid), 0o600); err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name, changed string
+	}{
+		{name: "head branch", changed: strings.Replace(response, `"headRefName":"feature"`, `"headRefName":"other"`, 1)},
+		{name: "PR number", changed: strings.Replace(response, `"number":7`, `"number":8`, 1)},
+		{name: "URL number", changed: strings.Replace(response, "/pull/7", "/pull/8", 1)},
+		{name: "base repository", changed: strings.Replace(response, "/team/repo/pull/7", "/attacker/repo/pull/7", 1)},
+		{name: "head repository", changed: strings.Replace(response, `"nameWithOwner":"team/fork"`, `"nameWithOwner":"attacker/repo"`, 1)},
+		{name: "base branch", changed: strings.Replace(response, `"baseRefName":"main"`, `"baseRefName":"other"`, 1)},
+		{name: "base SHA", changed: strings.Replace(response, `"baseRefOid":"base123"`, `"baseRefOid":"other123"`, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(file, []byte(tc.changed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := readSnapshot(context.Background(), job); err == nil {
+				t.Fatalf("changed %s was accepted", tc.name)
+			}
+		})
 	}
-	if _, _, err := readSnapshot(context.Background(), job); err == nil {
-		t.Fatal("changed PR branch was accepted")
+}
+
+func TestParsePRURL(t *testing.T) {
+	for _, tc := range []struct {
+		url      string
+		wantRepo string
+		wantNum  int
+		wantErr  bool
+	}{
+		{url: "https://github.com/team/repo/pull/17", wantRepo: "team/repo", wantNum: 17},
+		{url: "https://github.example.test/team/repo-name/pull/42/", wantRepo: "team/repo-name", wantNum: 42},
+		{url: "https://github.com/team/repo/pull/0", wantErr: true},
+		{url: "https://github.com/team/repo/issues/17", wantErr: true},
+		{url: "https://github.com/team/repo/pull/not-a-number", wantErr: true},
+		{url: "https://github.com/team/repo/pull/17?redirect=attacker", wantErr: true},
+		{url: "https://github.com/team%2Fattacker/repo/pull/17", wantErr: true},
+		{url: "http://github.com/team/repo/pull/17", wantErr: true},
+	} {
+		t.Run(tc.url, func(t *testing.T) {
+			gotRepo, gotNum, err := parsePRURL(tc.url)
+			if (err != nil) != tc.wantErr || gotRepo != tc.wantRepo || gotNum != tc.wantNum {
+				t.Fatalf("parsePRURL(%q) = %q, %d, %v", tc.url, gotRepo, gotNum, err)
+			}
+		})
 	}
 }
 
@@ -589,6 +627,7 @@ func TestBabysitFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
 	}
 	gh := filepath.Join(base, "gh")
 	ghScript := `#!/bin/sh
+case "$*" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$GH_SNAPSHOT"
   exit 0
@@ -599,7 +638,7 @@ exit 1
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	snapshotJSON := `{"number":17,"state":"OPEN","title":"Fix docs","url":"https://example.test/pr/17","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","baseRepository":{"nameWithOwner":"team/repo"},"comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
+	snapshotJSON := `{"number":17,"state":"OPEN","title":"Fix docs","url":"https://github.com/team/repo/pull/17","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
 	t.Setenv("GH_SNAPSHOT", snapshotJSON)
 	job := &babysitJob{ID: "20260518T120000-0123456789ab", Description: "Fix the documented typo", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
 	snap, sig, err := readSnapshot(context.Background(), job)

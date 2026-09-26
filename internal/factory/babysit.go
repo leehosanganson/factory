@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -83,7 +84,6 @@ type babysitSnapshot struct {
 	HeadRepository    *ghRepository   `json:"headRepository"`
 	BaseRefName       string          `json:"baseRefName"`
 	BaseRefOID        string          `json:"baseRefOid"`
-	BaseRepository    *ghRepository   `json:"baseRepository"`
 	Comments          json.RawMessage `json:"comments"`
 	StatusCheckRollup json.RawMessage `json:"statusCheckRollup"`
 }
@@ -250,7 +250,7 @@ func runGH(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func readSnapshot(ctx context.Context, job *babysitJob) (*babysitSnapshot, string, error) {
-	data, err := runGH(ctx, "pr", "view", strconv.Itoa(job.PR), "--repo", job.Repo, "--json", "number,state,title,url,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,baseRepository,comments,statusCheckRollup")
+	data, err := runGH(ctx, "pr", "view", strconv.Itoa(job.PR), "--repo", job.Repo, "--json", "number,state,title,url,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,comments,statusCheckRollup")
 	if err != nil {
 		return nil, "", err
 	}
@@ -258,7 +258,8 @@ func readSnapshot(ctx context.Context, job *babysitJob) (*babysitSnapshot, strin
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, "", fmt.Errorf("invalid GitHub PR JSON: %w", err)
 	}
-	if s.Number != job.PR || s.HeadRefName != job.HeadBranch || s.BaseRefName != job.BaseBranch || s.HeadRefOID == "" || s.BaseRefOID == "" || (job.BaseSHA != "" && s.BaseRefOID != job.BaseSHA) || s.HeadRepository == nil || s.HeadRepository.NameWithOwner != job.HeadRepo || s.BaseRepository == nil || s.BaseRepository.NameWithOwner != job.BaseRepo {
+	baseRepo, number, err := parsePRURL(s.URL)
+	if err != nil || number != s.Number || number != job.PR || baseRepo != job.BaseRepo || baseRepo != job.Repo || s.Number != job.PR || s.HeadRefName != job.HeadBranch || s.BaseRefName != job.BaseBranch || s.HeadRefOID == "" || s.BaseRefOID == "" || (job.BaseSHA != "" && s.BaseRefOID != job.BaseSHA) || s.HeadRepository == nil || s.HeadRepository.NameWithOwner != job.HeadRepo {
 		return nil, "", errors.New("PR identity changed or metadata is incomplete")
 	}
 	canonical, err := json.Marshal(s)
@@ -267,6 +268,38 @@ func readSnapshot(ctx context.Context, job *babysitJob) (*babysitSnapshot, strin
 	}
 	hash := sha256.Sum256(canonical)
 	return &s, hex.EncodeToString(hash[:]), nil
+}
+
+func parsePRURL(raw string) (string, int, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return "", 0, errors.New("invalid PR URL")
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) != 4 || parts[2] != "pull" {
+		return "", 0, errors.New("invalid PR URL path")
+	}
+	owner, err := url.PathUnescape(parts[0])
+	if err != nil || owner == "" || strings.ContainsAny(owner, "/\\") {
+		return "", 0, errors.New("invalid PR URL owner")
+	}
+	repo, err := url.PathUnescape(parts[1])
+	if err != nil || repo == "" || strings.ContainsAny(repo, "/\\") {
+		return "", 0, errors.New("invalid PR URL repository")
+	}
+	if parts[3] == "" {
+		return "", 0, errors.New("invalid PR URL number")
+	}
+	for _, digit := range parts[3] {
+		if digit < '0' || digit > '9' {
+			return "", 0, errors.New("invalid PR URL number")
+		}
+	}
+	number, err := strconv.Atoi(parts[3])
+	if err != nil || number <= 0 {
+		return "", 0, errors.New("invalid PR URL number")
+	}
+	return owner + "/" + repo, number, nil
 }
 
 func processAlive(pid int) bool {
@@ -476,7 +509,7 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 	if err != nil {
 		return fmt.Errorf("origin remote is required: %w", err)
 	}
-	data, err := runGH(context.Background(), "pr", "view", "--json", "number,state,headRefName,headRefOid,headRepository,baseRefName,baseRefOid,baseRepository")
+	data, err := runGH(context.Background(), "pr", "view", "--json", "number,state,url,headRefName,headRefOid,headRepository,baseRefName,baseRefOid")
 	if err != nil {
 		return fmt.Errorf("cannot identify current PR: %w", err)
 	}
@@ -484,7 +517,8 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 	if err := json.Unmarshal(data, &info); err != nil {
 		return err
 	}
-	if info.Number <= 0 || !strings.EqualFold(info.State, "OPEN") || info.HeadRefName != branch || info.HeadRefOID == "" || info.BaseRefOID == "" || info.HeadRepository == nil || info.BaseRepository == nil {
+	baseRepo, prNumber, err := parsePRURL(info.URL)
+	if info.Number <= 0 || prNumber != info.Number || !strings.EqualFold(info.State, "OPEN") || info.HeadRefName != branch || info.HeadRefOID == "" || info.BaseRefOID == "" || info.HeadRepository == nil || err != nil {
 		return fmt.Errorf("current PR metadata is incomplete or branch does not match")
 	}
 	headName, err := runGit(context.Background(), rootRepo, "config", "--get", "remote.origin.url")
@@ -520,7 +554,7 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 	defer unlock()
 	jobs, _ := loadJobs(root)
 	for _, j := range jobs {
-		if j.Repo == info.BaseRepository.NameWithOwner && j.PR == info.Number && isBabysitActive(j.Status) && (j.Status == "starting" || workerFresh(j) && processAlive(j.PID)) {
+		if j.Repo == baseRepo && j.PR == info.Number && isBabysitActive(j.Status) && (j.Status == "starting" || workerFresh(j) && processAlive(j.PID)) {
 			return fmt.Errorf("an active babysitter already monitors %s#%d (%s)", j.Repo, j.PR, j.ID)
 		}
 	}
@@ -538,7 +572,7 @@ func startBabysit(args []string, cfg Config, workdir, root string, out io.Writer
 		_ = os.RemoveAll(dir)
 		return fmt.Errorf("create isolated worker worktree: %w", err)
 	}
-	job := &babysitJob{ID: id, Description: description, RepoRoot: rootRepo, Repo: info.BaseRepository.NameWithOwner, PR: info.Number, HeadRepo: headRepo, HeadBranch: branch, BaseRepo: info.BaseRepository.NameWithOwner, BaseBranch: info.BaseRefName, BaseSHA: info.BaseRefOID, OriginURL: origin, HeadRepoURL: repoURL.URL, HeartbeatPath: filepath.Join(dir, "heartbeat"), BaselineHead: localHead, TargetBaseline: localHead, Worktree: worktree, WorkerBranch: workerBranch, Status: "starting", CreatedAt: time.Now().UTC()}
+	job := &babysitJob{ID: id, Description: description, RepoRoot: rootRepo, Repo: baseRepo, PR: info.Number, HeadRepo: headRepo, HeadBranch: branch, BaseRepo: baseRepo, BaseBranch: info.BaseRefName, BaseSHA: info.BaseRefOID, OriginURL: origin, HeadRepoURL: repoURL.URL, HeartbeatPath: filepath.Join(dir, "heartbeat"), BaselineHead: localHead, TargetBaseline: localHead, Worktree: worktree, WorkerBranch: workerBranch, Status: "starting", CreatedAt: time.Now().UTC()}
 	if err := saveBabysitJob(dir, job); err != nil {
 		_, _ = runGit(context.Background(), rootRepo, "worktree", "remove", "--force", worktree)
 		_ = os.RemoveAll(dir)
