@@ -9,5 +9,12 @@
   ],
   "prompt_dir": "",
   "state_dir": "",
-  "agent_timeout": "60m"
+  "agent_timeout": "60m",
+  "pipeline_checks": [
+    ["make", "test"]
+  ],
+  "parallel_implementation": {
+    "enabled": false,
+    "max_concurrency": 4
+  }
 }

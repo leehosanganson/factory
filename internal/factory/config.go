@@ -13,11 +13,13 @@ import (
 
 // Config describes the agent process and prompt overrides used for each run.
 type Config struct {
-	Command      string   `json:"command"`
-	Args         []string `json:"args"`
-	PromptDir    string   `json:"prompt_dir,omitempty"`
-	StateDir     string   `json:"state_dir,omitempty"`
-	AgentTimeout string   `json:"agent_timeout,omitempty"`
+	Command                string                        `json:"command"`
+	Args                   []string                      `json:"args"`
+	PipelineChecks         [][]string                    `json:"pipeline_checks,omitempty"`
+	ParallelImplementation *ParallelImplementationConfig `json:"parallel_implementation,omitempty"`
+	PromptDir              string                        `json:"prompt_dir,omitempty"`
+	StateDir               string                        `json:"state_dir,omitempty"`
+	AgentTimeout           string                        `json:"agent_timeout,omitempty"`
 }
 
 // DefaultConfig returns a copy of the built-in pi command adapter.
@@ -104,11 +106,36 @@ func (c Config) Validate() error {
 	if systemPromptCount != 1 {
 		return fmt.Errorf("command and arguments must contain {system_prompt} exactly once (found %d)", systemPromptCount)
 	}
+	if err := validatePipelineChecks(c.PipelineChecks); err != nil {
+		return err
+	}
+	if c.ParallelImplementation != nil {
+		if c.ParallelImplementation.MaxConcurrency < 0 || c.ParallelImplementation.MaxConcurrency > maxParallelSubtasks {
+			return fmt.Errorf("parallel_implementation.max_concurrency must be between 0 and %d", maxParallelSubtasks)
+		}
+	}
 	if c.PromptDir != "" && strings.ContainsRune(c.PromptDir, 0) {
 		return fmt.Errorf("prompt_dir contains NUL")
 	}
 	if c.StateDir != "" && !filepath.IsAbs(c.StateDir) {
 		return fmt.Errorf("state_dir must be absolute")
+	}
+	return nil
+}
+
+func validatePipelineChecks(checks [][]string) error {
+	for i, check := range checks {
+		if len(check) == 0 {
+			return fmt.Errorf("pipeline check %d must not be empty", i)
+		}
+		if strings.TrimSpace(check[0]) == "" {
+			return fmt.Errorf("pipeline check %d executable must not be empty", i)
+		}
+		for j, arg := range check {
+			if strings.ContainsRune(arg, 0) {
+				return fmt.Errorf("pipeline check %d argument %d contains NUL", i, j)
+			}
+		}
 	}
 	return nil
 }

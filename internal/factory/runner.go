@@ -14,9 +14,8 @@ import (
 )
 
 // Agent runs a stage in a fresh process. The log includes both stdout and stderr.
-// Workflow agents must implement RunWithContext; evaluators must also implement
-// RunWithOutputContext so stdout can be distinguished from the combined log. Agents
-// without the required context-aware workflow contract fail closed.
+// Workflow agents must implement RunWithContext. Agents without the required
+// context-aware workflow contract fail closed.
 type Agent interface {
 	Run(stage, systemPrompt, task, workdir, logPath string) error
 }
@@ -197,6 +196,15 @@ func readLog(path string) string {
 		data = data[newline+1:]
 	}
 	return marker + string(bytes.TrimRight(data, "\n"))
+}
+
+func stdoutFirstLinePasses(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) != "" {
+			return line == "PASS"
+		}
+	}
+	return false
 }
 
 func copyOutput(dst io.Writer, content string) {

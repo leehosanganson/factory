@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -12,20 +13,25 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
 // CleanWorkflow reviews and verifies a checkout, publishing only from pristine mode; dirty safe mode never stages, commits, or pushes.
 type CleanWorkflow struct {
-	Agent      Agent
-	Config     Config
-	In         io.Reader
-	Out        io.Writer
-	Workdir    string
-	Terminal   bool
-	Gate       bool
-	Git        func(string, ...string) ([]byte, error)
-	GitContext func(context.Context, string, ...string) ([]byte, error)
-	Make       func(string, ...string) error
+	Agent         Agent
+	Config        Config
+	In            io.Reader
+	Out           io.Writer
+	Workdir       string
+	Terminal      bool
+	Gate          bool
+	Observer      WorkflowObserver
+	Git           func(string, ...string) ([]byte, error)
+	GitContext    func(context.Context, string, ...string) ([]byte, error)
+	GitAt         func(context.Context, string, string, ...string) ([]byte, error)
+	Make          func(string, ...string) error
+	OpenCheckLog  func(string) (*os.File, error)
+	SetupWorktree func(context.Context, string, string) (string, func() error, error)
 }
 
 type cleanBaseline struct {
@@ -44,6 +50,8 @@ type cleanFileSnapshot struct {
 	content []byte
 }
 
+var cleanCheckCloseFile = func(file *os.File) error { return file.Close() }
+
 func (w CleanWorkflow) Run(task string) error {
 	return w.RunContext(context.Background(), task)
 }
@@ -56,13 +64,27 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if err != nil {
 		return fmt.Errorf("resolve target directory: %w", err)
 	}
-	git := func(name string, args ...string) ([]byte, error) {
+	originalRoot := root
+	stateRoot, stateErr := StateRoot(w.Config.StateDir)
+	if stateErr != nil {
+		return stateErr
+	}
+	stateRoot, stateErr = canonicalPath(stateRoot)
+	if stateErr != nil {
+		return fmt.Errorf("resolve clean state directory: %w", stateErr)
+	}
+	if isWithin(originalRoot, stateRoot) {
+		return fmt.Errorf("state directory %s must be outside target directory %s", stateRoot, originalRoot)
+	}
+	gitAt := func(workdir, name string, args ...string) ([]byte, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		var output []byte
 		var gitErr error
 		switch {
+		case w.GitAt != nil:
+			output, gitErr = w.GitAt(ctx, workdir, name, args...)
 		case w.GitContext != nil:
 			output, gitErr = w.GitContext(ctx, name, args...)
 		case w.Git != nil:
@@ -70,13 +92,33 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		default:
 			cmd := exec.CommandContext(ctx, name, args...)
 			configureProcessCancellation(cmd)
-			cmd.Dir = root
+			cmd.Dir = workdir
 			output, gitErr = cmd.Output()
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		return output, gitErr
+	}
+	git := func(name string, args ...string) ([]byte, error) { return gitAt(root, name, args...) }
+	originalGit := func(name string, args ...string) ([]byte, error) {
+		if w.GitAt != nil {
+			return gitAt(originalRoot, name, args...)
+		}
+		if w.Git != nil || w.GitContext != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			cmd := exec.CommandContext(ctx, name, args...)
+			configureProcessCancellation(cmd)
+			cmd.Dir = originalRoot
+			output, err := cmd.Output()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return output, err
+		}
+		return gitAt(originalRoot, name, args...)
 	}
 	baseline, err := inspectCleanBaseline(git)
 	if err != nil {
@@ -85,15 +127,42 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if baseline.dirty {
 		fmt.Fprintln(w.Out, "Warning: the initial worktree/index is dirty. Existing changes may be affected by agents or formatters; Factory will not commit or push anything in this run.")
 	}
-	makeTarget := w.Make
-	if makeTarget == nil {
-		makeTarget = func(target string, _ ...string) error {
-			cmd := exec.CommandContext(ctx, "make", target)
-			configureProcessCancellation(cmd)
-			cmd.Dir = root
-			cmd.Stdout, cmd.Stderr = w.Out, w.Out
-			return cmd.Run()
+	var cleanupWorktree func() error
+	isolatedWorktree := false
+	if !baseline.dirty {
+		if w.GitAt == nil && (w.Git != nil || w.GitContext != nil) {
+			return fmt.Errorf("pristine clean with injected Git requires GitAt to route commands by workdir")
 		}
+		setup := w.SetupWorktree
+		if setup == nil {
+			setup = createCleanWorktree
+		}
+		isolatedRoot, cleanup, setupErr := setup(ctx, originalRoot, baseline.head)
+		if setupErr != nil {
+			setupErr = fmt.Errorf("create pristine clean worktree: %w", setupErr)
+			if cleanup != nil {
+				return errors.Join(setupErr, cleanup())
+			}
+			return setupErr
+		}
+		if cleanup == nil {
+			return fmt.Errorf("create pristine clean worktree: cleanup function is required")
+		}
+		cleanupWorktree = cleanup
+		root, err = canonicalPath(isolatedRoot)
+		if err != nil {
+			return errors.Join(fmt.Errorf("resolve pristine worktree: %w", err), cleanupWorktree())
+		}
+		if root == originalRoot {
+			return errors.Join(fmt.Errorf("pristine clean worktree must be distinct from the target checkout"), cleanupWorktree())
+		}
+		if isWithin(originalRoot, root) || isWithin(stateRoot, root) {
+			return errors.Join(fmt.Errorf("pristine worktree must be outside target checkout and state directory"), cleanupWorktree())
+		}
+		if err := validateCleanWorktree(ctx, originalRoot, root, baseline.head); err != nil {
+			return errors.Join(err, cleanupWorktree())
+		}
+		isolatedWorktree = true
 	}
 	if strings.TrimSpace(task) == "" {
 		task = "Review the current repository and work performed in this clean run. Fix every issue found, then document the changes. Preserve the user's intent and avoid unrelated changes."
@@ -103,12 +172,16 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		finalApproval = "verify and complete without committing or pushing changes"
 	}
 	runOutput := &cleanRunOutput{out: w.Out}
-	workflow := Workflow{Agent: w.Agent, Config: w.Config, In: w.In, Out: runOutput, Workdir: root, Terminal: w.Terminal, Gate: w.Gate, RequireComplete: true, Stages: []string{"review", "fix", "document"}, FinalApproval: finalApproval}
-	if err := workflow.RunContext(ctx, task); err != nil {
-		return err
+	workflowInput := w.In
+	if workflowInput == nil {
+		workflowInput = strings.NewReader("")
 	}
+	if _, ok := workflowInput.(ContextLineReader); !ok {
+		workflowInput = bufio.NewReader(workflowInput)
+	}
+	workflow := Workflow{Agent: w.Agent, Config: w.Config, In: workflowInput, Out: runOutput, Workdir: root, Terminal: w.Terminal, Gate: w.Gate, RequireComplete: true, DeferCompletion: true, Observer: w.Observer, Stages: []string{"review", "fix", "document"}, FinalApproval: finalApproval, RunCreated: runOutput.setRun}
 	defer func() {
-		if runErr == nil || runOutput.runDir == "" {
+		if runOutput.runDir == "" {
 			return
 		}
 		data, readErr := os.ReadFile(filepath.Join(runOutput.runDir, "state.json"))
@@ -116,25 +189,171 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 			return
 		}
 		var state State
-		if json.Unmarshal(data, &state) != nil || state.Status != "complete" {
+		if json.Unmarshal(data, &state) != nil {
 			return
 		}
-		state.Status = "failed"
-		if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
-			state.Status = "interrupted"
+		if state.Status != "running" && state.Status != "interrupted" {
+			return
 		}
-		_ = writeState(runOutput.runDir, &state)
+		status := "complete"
+		message := "complete"
+		if state.Status == "interrupted" {
+			status = "interrupted"
+			message = status
+			if runErr != nil {
+				message = runErr.Error()
+			}
+			if cleanHasTransition(runOutput.runDir, state.ID, status) {
+				return
+			}
+		} else if runErr != nil {
+			status = "failed"
+			message = runErr.Error()
+			if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+				status = "interrupted"
+			}
+		}
+		state.Status = status
+		if err := writeState(runOutput.runDir, &state); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+		terminalEvent := WorkflowEvent{RunID: state.ID, Type: "workflow.transition", Stage: state.Stage, Message: message}
+		if err := persistWorkflowEvent(runOutput.runDir, terminalEvent); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+		if err := w.observeClean(terminalEvent); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
 	}()
-	for _, target := range []string{"fmt", "test", "vet"} {
+	if isolatedWorktree {
+		defer func() {
+			if cleanupWorktree != nil {
+				runErr = errors.Join(runErr, cleanupWorktree())
+			}
+		}()
+	}
+	if err := workflow.RunContext(ctx, task); err != nil {
+		return err
+	}
+	var pathsAfterFormat []string
+	var snapshotAfterFormat map[string]cleanFileSnapshot
+	for i, target := range []string{"fmt", "test", "vet"} {
 		if err := cleanVerificationInterrupted(ctx, runOutput.runDir); err != nil {
 			return err
 		}
+		startedAt := time.Now().UTC()
+		logName := fmt.Sprintf("clean-check-%02d-%s.log", i+1, target)
+		openCheckLog := w.OpenCheckLog
+		if openCheckLog == nil {
+			openCheckLog = func(path string) (*os.File, error) {
+				return os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+			}
+		}
+		logPath := filepath.Join(runOutput.runDir, logName)
+		checkCommand := []string{"make", target}
+		startedEvent := WorkflowEvent{
+			RunID: runOutput.runID, Type: "check.started", Stage: "make " + target,
+			Command: checkCommand, Transcript: logName, StartedAt: startedAt,
+		}
+		if err := persistWorkflowEvent(runOutput.runDir, startedEvent); err != nil {
+			return fmt.Errorf("persist clean check start: %w", err)
+		}
+		if err := w.observeClean(startedEvent); err != nil {
+			return err
+		}
+		logFile, err := openCheckLog(logPath)
+		if err != nil {
+			endedAt := time.Now().UTC()
+			exitCode := -1
+			checkResult := CheckResult{Command: checkCommand, Log: logName, ExitCode: exitCode, StartedAt: startedAt, EndedAt: endedAt}
+			if persistErr := persistCleanCheck(runOutput.runDir, checkResult); persistErr != nil {
+				err = errors.Join(err, persistErr)
+			}
+			completedEvent := WorkflowEvent{RunID: runOutput.runID, Type: "check.completed", Stage: "make " + target, Command: checkCommand, Transcript: logName, Outcome: "failure", ExitCode: &exitCode, StartedAt: startedAt, EndedAt: endedAt}
+			if eventErr := persistWorkflowEvent(runOutput.runDir, completedEvent); eventErr != nil {
+				err = errors.Join(err, eventErr)
+			}
+			if observerErr := w.observeClean(completedEvent); observerErr != nil {
+				err = errors.Join(err, observerErr)
+			}
+			return fmt.Errorf("create clean check log %s: %w", logName, err)
+		}
 		fmt.Fprintf(w.Out, "Running make %s\n", target)
-		if err := makeTarget(target); err != nil {
+		var checkOutput bytes.Buffer
+		checkWriter := io.MultiWriter(w.Out, &checkOutput, logFile)
+		var checkErr error
+		if w.Make != nil {
+			checkErr = w.Make(target)
+		} else {
+			cmd := exec.CommandContext(ctx, "make", target)
+			configureProcessCancellation(cmd)
+			cmd.Dir = root
+			cmd.Stdout, cmd.Stderr = checkWriter, checkWriter
+			checkErr = cmd.Run()
+		}
+		closeErr := cleanCheckCloseFile(logFile)
+		endedAt := time.Now().UTC()
+		checkResult := CheckResult{Command: checkCommand, Log: logName, ExitCode: 0, StartedAt: startedAt, EndedAt: endedAt}
+		if checkErr != nil || closeErr != nil || ctx.Err() != nil {
+			checkResult.ExitCode = -1
+			var exitErr *exec.ExitError
+			if errors.As(checkErr, &exitErr) {
+				checkResult.ExitCode = exitErr.ExitCode()
+			}
+		}
+		if err := persistCleanCheck(runOutput.runDir, checkResult); err != nil {
+			return err
+		}
+		outcome := "success"
+		if checkErr != nil || closeErr != nil {
+			outcome = "failure"
+		}
+		if closeErr == nil && (ctx.Err() != nil || errors.Is(checkErr, context.Canceled) || errors.Is(checkErr, context.DeadlineExceeded)) {
+			outcome = "canceled"
+		}
+		exitCode := checkResult.ExitCode
+		completedEvent := WorkflowEvent{
+			RunID: runOutput.runID, Type: "check.completed", Stage: "make " + target,
+			Command: checkCommand, Transcript: logName, Outcome: outcome,
+			ExitCode: &exitCode, StartedAt: startedAt, EndedAt: endedAt,
+		}
+		if err := persistWorkflowEvent(runOutput.runDir, completedEvent); err != nil {
+			return err
+		}
+		if err := w.observeClean(completedEvent); err != nil {
+			return err
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close clean check log %s: %w", logName, closeErr)
+		}
+		if checkErr != nil {
 			if interrupted := cleanVerificationInterrupted(ctx, runOutput.runDir); interrupted != nil {
 				return interrupted
 			}
-			return fmt.Errorf("make %s: %w", target, err)
+			return fmt.Errorf("make %s: %w", target, checkErr)
+		}
+		if err := cleanVerificationInterrupted(ctx, runOutput.runDir); err != nil {
+			return err
+		}
+		if !baseline.dirty {
+			pathsAfterCheck, pathErr := cleanChangedPaths(git)
+			if pathErr != nil {
+				return pathErr
+			}
+			if target == "fmt" {
+				pathsAfterFormat = pathsAfterCheck
+				snapshotAfterFormat, pathErr = snapshotCleanPaths(git, root, pathsAfterFormat)
+				if pathErr != nil {
+					return fmt.Errorf("snapshot clean outputs after formatting: %w", pathErr)
+				}
+			} else {
+				if !samePaths(pathsAfterCheck, pathsAfterFormat) {
+					return fmt.Errorf("unexpected worktree paths appeared during clean verification; refusing to publish")
+				}
+				if pathErr = verifyCleanSnapshot(git, root, pathsAfterFormat, snapshotAfterFormat); pathErr != nil {
+					return fmt.Errorf("clean outputs changed during verification; refusing to publish: %w", pathErr)
+				}
+			}
 		}
 		if err := cleanVerificationInterrupted(ctx, runOutput.runDir); err != nil {
 			return err
@@ -151,6 +370,30 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if err != nil {
 		return err
 	}
+	if !samePaths(paths, pathsAfterFormat) {
+		return fmt.Errorf("unexpected worktree paths appeared after clean verification; refusing to publish")
+	}
+	if err := verifyCleanSnapshot(git, root, paths, snapshotAfterFormat); err != nil {
+		return fmt.Errorf("clean outputs changed after verification; refusing to publish: %w", err)
+	}
+	if isolatedWorktree {
+		if err := revalidateClean(originalGit, baseline, nil, nil); err != nil {
+			return fmt.Errorf("original checkout changed during pristine clean; refusing to publish: %w", err)
+		}
+	}
+	candidateSnapshot, err := snapshotCleanPaths(git, root, paths)
+	if err != nil {
+		return fmt.Errorf("snapshot isolated clean changes: %w", err)
+	}
+	if len(paths) != 0 && isolatedWorktree {
+		if err := revalidateClean(originalGit, baseline, nil, nil); err != nil {
+			return fmt.Errorf("original checkout changed during pristine clean; refusing to publish: %w", err)
+		}
+		if err := transferCleanPaths(originalRoot, root, paths, candidateSnapshot); err != nil {
+			return fmt.Errorf("apply isolated clean changes: %w", err)
+		}
+	}
+	root = originalRoot
 	if len(paths) == 0 {
 		if err := revalidateClean(git, baseline, nil, nil); err != nil {
 			return err
@@ -158,6 +401,9 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		if baseline.upstream != "" && baseline.head == baseline.upstreamHead {
 			fmt.Fprintln(w.Out, "Clean completed with no changes; branch is already synced.")
 			return nil
+		}
+		if err := w.approveCleanPublication(ctx, workflowInput, runOutput.runDir); err != nil {
+			return err
 		}
 		if err := validateBeforePush(git, baseline, baseline.head); err != nil {
 			return err
@@ -171,10 +417,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 		fmt.Fprintf(w.Out, "Existing branch commits pushed (%s).\n", baseline.head)
 		return nil
 	}
-	snapshot, err := snapshotCleanPaths(git, root, paths)
-	if err != nil {
-		return fmt.Errorf("snapshot clean changes: %w", err)
-	}
+	snapshot := candidateSnapshot
 	if err := revalidateClean(git, baseline, paths, nil); err != nil {
 		return err
 	}
@@ -217,6 +460,9 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if err := verifyCleanSnapshot(git, root, paths, snapshot); err != nil {
 		return fmt.Errorf("clean outputs changed before commit; refusing commit: %w", err)
 	}
+	if err := w.approveCleanPublication(ctx, workflowInput, runOutput.runDir); err != nil {
+		return err
+	}
 	if err := cleanContextCheck(ctx); err != nil {
 		return err
 	}
@@ -258,29 +504,222 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	return nil
 }
 
+func (w CleanWorkflow) approveCleanPublication(ctx context.Context, reader io.Reader, runDir string) error {
+	if !w.Terminal {
+		return fmt.Errorf("clean publication approval requires an interactive terminal; rerun from a terminal to commit and push")
+	}
+	approved, err := askApproval(ctx, reader, w.Out, "Checks passed. Approve to commit and push pristine clean changes? Type exactly yes: ")
+	if err != nil {
+		return fmt.Errorf("read clean publication approval: %w", err)
+	}
+	if !approved {
+		return fmt.Errorf("clean publication was not approved")
+	}
+	if err := cleanVerificationInterrupted(ctx, runDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCleanWorktree(ctx context.Context, originalRoot, root, expectedHead string) error {
+	runGit := func(workdir string, args ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, "git", args...)
+		configureProcessCancellation(cmd)
+		cmd.Dir = workdir
+		return cmd.Output()
+	}
+	registered, err := runGit(originalRoot, "worktree", "list", "--porcelain")
+	if err != nil {
+		return fmt.Errorf("verify pristine worktree registration: %w", err)
+	}
+	rootEntry := "worktree " + root
+	registeredRoot := false
+	for _, line := range strings.Split(string(registered), "\n") {
+		if line == rootEntry {
+			registeredRoot = true
+			break
+		}
+	}
+	if !registeredRoot {
+		return fmt.Errorf("pristine checkout %s is not a registered Git worktree of %s", root, originalRoot)
+	}
+	head, err := runGit(root, "rev-parse", "HEAD")
+	if err != nil || strings.TrimSpace(string(head)) != expectedHead {
+		if err != nil {
+			return fmt.Errorf("inspect pristine worktree HEAD: %w", err)
+		}
+		return fmt.Errorf("pristine worktree HEAD %s does not match baseline %s", strings.TrimSpace(string(head)), expectedHead)
+	}
+	status, err := runGit(root, "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all")
+	if err != nil {
+		return fmt.Errorf("inspect pristine worktree status: %w", err)
+	}
+	if len(status) != 0 {
+		return fmt.Errorf("pristine worktree is not clean before agent start")
+	}
+	return nil
+}
+
+func createCleanWorktree(ctx context.Context, target, head string) (string, func() error, error) {
+	path, err := os.MkdirTemp(os.TempDir(), "factory-clean-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create temporary worktree directory: %w", err)
+	}
+	if isWithin(target, path) {
+		_ = os.Remove(path)
+		return "", nil, fmt.Errorf("temporary worktree must be outside target checkout")
+	}
+	cmd := exec.CommandContext(ctx, "git", "-C", target, "worktree", "add", "--detach", path, head)
+	configureProcessCancellation(cmd)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		_ = os.RemoveAll(path)
+		return "", nil, fmt.Errorf("register detached worktree: %w: %s", err, output)
+	}
+	cleanup := func() error {
+		cmd := exec.Command("git", "-C", target, "worktree", "remove", "--force", path)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("remove temporary Git worktree: %w: %s", err, output)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove temporary worktree directory: %w", err)
+		}
+		return nil
+	}
+	return path, cleanup, nil
+}
+
+func transferCleanPaths(target, source string, paths []string, expected map[string]cleanFileSnapshot) error {
+	patchCmd := exec.Command("git", "-C", source, "diff", "--binary", "HEAD", "--")
+	patch, err := patchCmd.Output()
+	if err != nil {
+		return fmt.Errorf("create isolated tracked-change patch: %w", err)
+	}
+	if len(patch) != 0 {
+		apply := exec.Command("git", "-C", target, "apply", "--binary", "-")
+		apply.Stdin = bytes.NewReader(patch)
+		if output, err := apply.CombinedOutput(); err != nil {
+			return fmt.Errorf("apply isolated tracked changes: %w: %s", err, output)
+		}
+	}
+	untrackedCmd := exec.Command("git", "-C", source, "ls-files", "--others", "--exclude-standard", "-z")
+	untrackedData, err := untrackedCmd.Output()
+	if err != nil {
+		return fmt.Errorf("inspect isolated untracked paths: %w", err)
+	}
+	for _, path := range nulPaths(untrackedData) {
+		if !samePaths([]string{path}, []string{filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))}) || filepath.IsAbs(path) || path == ".." || strings.HasPrefix(path, "../") {
+			return fmt.Errorf("unsafe isolated path %q", path)
+		}
+		entry := expected[path]
+		if entry.mode == "" {
+			return fmt.Errorf("missing isolated snapshot for %q", path)
+		}
+		destination := filepath.Join(target, filepath.FromSlash(path))
+		parent := target
+		for _, component := range strings.Split(filepath.Dir(filepath.FromSlash(path)), string(filepath.Separator)) {
+			if component == "." || component == "" {
+				continue
+			}
+			parent = filepath.Join(parent, component)
+			info, err := os.Lstat(parent)
+			if os.IsNotExist(err) {
+				if err := os.Mkdir(parent, 0o755); err != nil {
+					return fmt.Errorf("create parent for %q: %w", path, err)
+				}
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("inspect parent for %q: %w", path, err)
+			}
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("unsafe parent directory for isolated path %q", path)
+			}
+		}
+		if entry.mode == "120000" {
+			if err := os.Symlink(string(entry.content), destination); err != nil {
+				return fmt.Errorf("create isolated symlink %q without replacing existing content: %w", path, err)
+			}
+			continue
+		}
+		if entry.mode != "100644" && entry.mode != "100755" {
+			return fmt.Errorf("unsupported isolated addition type %q for %q", entry.mode, path)
+		}
+		file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("create isolated file %q without replacing existing content: %w", path, err)
+		}
+		_, writeErr := file.Write(entry.content)
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return fmt.Errorf("write isolated file %q: %w", path, err)
+		}
+		mode := os.FileMode(0o644)
+		if entry.mode == "100755" {
+			mode = 0o755
+		}
+		if err := os.Chmod(destination, mode); err != nil {
+			return fmt.Errorf("set mode for isolated file %q: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func persistCleanCheck(runDir string, result CheckResult) error {
+	path := filepath.Join(runDir, "state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read clean run state: %w", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		return fmt.Errorf("decode clean run state: %w", err)
+	}
+	state.Checks = append(state.Checks, result)
+	if err := writeState(runDir, &state); err != nil {
+		return fmt.Errorf("persist clean check result: %w", err)
+	}
+	return nil
+}
+
+func cleanHasTransition(runDir, runID, status string) bool {
+	file, err := os.Open(filepath.Join(runDir, "workflow-events.jsonl"))
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var event workflowEventRecord
+		if json.Unmarshal(scanner.Bytes(), &event) != nil {
+			return false
+		}
+		if event.RunID == runID && event.Type == "workflow.transition" && event.Message == status {
+			return true
+		}
+	}
+	return false
+}
+
+func (w CleanWorkflow) observeClean(event WorkflowEvent) error {
+	if w.Observer == nil {
+		return nil
+	}
+	return w.Observer.ObserveWorkflowEvent(event)
+}
+
 type cleanRunOutput struct {
 	out    io.Writer
 	runDir string
-	line   bytes.Buffer
+	runID  string
+}
+
+func (w *cleanRunOutput) setRun(runDir, runID string) {
+	w.runDir = runDir
+	w.runID = runID
 }
 
 func (w *cleanRunOutput) Write(data []byte) (int, error) {
-	written, err := w.out.Write(data)
-	if err != nil {
-		return written, err
-	}
-	for _, b := range data[:written] {
-		if b == '\n' {
-			line := w.line.String()
-			w.line.Reset()
-			if strings.HasPrefix(line, "Run: ") {
-				w.runDir = strings.TrimPrefix(line, "Run: ")
-			}
-		} else {
-			w.line.WriteByte(b)
-		}
-	}
-	return written, nil
+	return w.out.Write(data)
 }
 
 func cleanVerificationInterrupted(ctx context.Context, runDir string) error {
@@ -290,8 +729,10 @@ func cleanVerificationInterrupted(ctx context.Context, runDir string) error {
 			if readErr == nil {
 				var state State
 				if json.Unmarshal(data, &state) == nil {
-					state.Status = "interrupted"
-					_ = writeState(runDir, &state)
+					if state.Status != "interrupted" {
+						state.Status = "interrupted"
+						_ = writeState(runDir, &state)
+					}
 				}
 			}
 		}

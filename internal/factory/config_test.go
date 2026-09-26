@@ -14,7 +14,7 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" {
+	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 {
 		t.Fatalf("unexpected default config: %#v", cfg)
 	}
 	if timeout, err := cfg.agentTimeout(); err != nil || timeout != 60*time.Minute {
@@ -27,6 +27,10 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 		`{"command":"pi","args":["{task}","{system_prompt}"],"unexpected":true}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"]} {}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"],"state_dir":"relative"}`,
+		`{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[[]]}`,
+		`{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[["", "arg"]]}`,
+		`{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[["make", "bad\u0000arg"]]}`,
+		`{"command":"pi","args":["{task}","{system_prompt}"],"parallel_implementation":{"enabled":true,"max_concurrency":9}}`,
 	} {
 		t.Run(content, func(t *testing.T) {
 			file := filepath.Join(t.TempDir(), "config.json")
@@ -37,6 +41,48 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 				t.Fatal("expected invalid config to be rejected")
 			}
 		})
+	}
+}
+
+func TestLoadConfigPreservesPipelineCheckArgumentVectors(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "config.json")
+	content := `{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[["make","test"],["go","test","./..."]]}`
+	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"make", "test"}, {"go", "test", "./..."}}
+	if len(cfg.PipelineChecks) != len(want) {
+		t.Fatalf("pipeline_checks = %#v, want %#v", cfg.PipelineChecks, want)
+	}
+	for i := range want {
+		if strings.Join(cfg.PipelineChecks[i], "\x00") != strings.Join(want[i], "\x00") {
+			t.Fatalf("pipeline_checks[%d] = %#v, want %#v", i, cfg.PipelineChecks[i], want[i])
+		}
+	}
+}
+
+func TestLoadConfigParallelImplementationIsExplicitlyOptIn(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(file, []byte(`{"command":"pi","args":["{task}","{system_prompt}"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ParallelImplementation != nil || (Config{ParallelImplementation: &ParallelImplementationConfig{Enabled: false}}).ParallelImplementation.Enabled {
+		t.Fatal("parallel implementation must remain disabled unless explicitly enabled")
+	}
+	if err := os.WriteFile(file, []byte(`{"command":"pi","args":["{task}","{system_prompt}"],"parallel_implementation":{"enabled":true,"max_concurrency":2}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig(file)
+	if err != nil || cfg.ParallelImplementation == nil || !cfg.ParallelImplementation.Enabled || cfg.ParallelImplementation.MaxConcurrency != 2 {
+		t.Fatalf("enabled parallel config = %+v, %v", cfg.ParallelImplementation, err)
 	}
 }
 
@@ -126,7 +172,7 @@ func TestConfigPathHonorsXDGAndRequiresAbsolute(t *testing.T) {
 func TestLoadBabysitPromptExternalOverrideAndEmbeddedFallback(t *testing.T) {
 	dir := t.TempDir()
 	prompt, err := LoadPrompt(dir, "babysit")
-	if err != nil || !strings.Contains(prompt, "FACTORY_STATUS=FIXED") || !strings.Contains(prompt, "independent") {
+	if err != nil || !strings.Contains(prompt, "FACTORY_STATUS=FIXED") || !strings.Contains(prompt, "re-derives and validates") || !strings.Contains(prompt, "snapshot guards") {
 		t.Fatalf("embedded babysit prompt = %q, %v", prompt, err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "babysit.md"), []byte(" custom babysit prompt "), 0o600); err != nil {
@@ -150,5 +196,8 @@ func TestLoadPromptExternalOverrideAndEmbeddedFallback(t *testing.T) {
 	}
 	if _, err := LoadPrompt(dir, "../../bad"); err == nil {
 		t.Fatal("unknown stage must not be used as a path")
+	}
+	if _, err := LoadPrompt(dir, "evaluate"); err == nil || !strings.Contains(err.Error(), `unknown prompt stage "evaluate"`) {
+		t.Fatalf("obsolete evaluate override error = %v, want unknown stage", err)
 	}
 }

@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -15,7 +14,7 @@ import (
 const (
 	progressTailBytes       = 16 * 1024
 	progressLogLineLimit    = 180
-	progressLogLines        = 3
+	progressLogLines        = 20
 	progressDefaultWidth    = 80
 	progressDefaultRows     = 24
 	progressMaxWidth        = 500
@@ -27,7 +26,6 @@ const (
 type stageProgress struct {
 	out         io.Writer
 	stage       string
-	attempt     int
 	logPath     string
 	started     time.Time
 	terminal    bool
@@ -40,24 +38,24 @@ type stageProgress struct {
 	sizeQuery   func(uintptr) (int, int, error)
 }
 
-func startProgress(out io.Writer, terminal bool, stage string, attempt int, logPath string) *stageProgress {
-	return startProgressWithIntervals(out, terminal, stage, attempt, logPath, progressHeartbeatPeriod, progressAnimationPeriod)
+func startProgress(out io.Writer, terminal bool, stage, logPath string) *stageProgress {
+	return startProgressWithIntervals(out, terminal, stage, logPath, progressHeartbeatPeriod, progressAnimationPeriod)
 }
 
-func startProgressWithIntervals(out io.Writer, terminal bool, stage string, attempt int, logPath string, heartbeat, animation time.Duration) *stageProgress {
-	return startProgressWithSizeQuery(out, terminal, stage, attempt, logPath, heartbeat, animation, queryTerminalSize)
+func startProgressWithIntervals(out io.Writer, terminal bool, stage, logPath string, heartbeat, animation time.Duration) *stageProgress {
+	return startProgressWithSizeQuery(out, terminal, stage, logPath, heartbeat, animation, queryTerminalSize)
 }
 
 // startProgressWithWidthQuery is retained as a narrow test seam for callers that only
 // have a width query. Production rendering always queries both terminal dimensions.
-func startProgressWithWidthQuery(out io.Writer, terminal bool, stage string, attempt int, logPath string, heartbeat, animation time.Duration, query func(uintptr) (int, error)) *stageProgress {
-	return startProgressWithSizeQuery(out, terminal, stage, attempt, logPath, heartbeat, animation, func(fd uintptr) (int, int, error) {
+func startProgressWithWidthQuery(out io.Writer, terminal bool, stage, logPath string, heartbeat, animation time.Duration, query func(uintptr) (int, error)) *stageProgress {
+	return startProgressWithSizeQuery(out, terminal, stage, logPath, heartbeat, animation, func(fd uintptr) (int, int, error) {
 		width, err := query(fd)
 		return width, progressDimensionsFromEnv().rows, err
 	})
 }
 
-func startProgressWithSizeQuery(out io.Writer, terminal bool, stage string, attempt int, logPath string, heartbeat, animation time.Duration, query func(uintptr) (int, int, error)) *stageProgress {
+func startProgressWithSizeQuery(out io.Writer, terminal bool, stage, logPath string, heartbeat, animation time.Duration, query func(uintptr) (int, int, error)) *stageProgress {
 	terminal = terminal && strings.TrimSpace(os.Getenv("TERM")) != "dumb"
 	dimensions := progressDimensionsFromEnv()
 	width, rows := dimensions.width, dimensions.rows
@@ -65,7 +63,7 @@ func startProgressWithSizeQuery(out io.Writer, terminal bool, stage string, atte
 		width, rows = resolveProgressSize(out, query, os.Getenv("COLUMNS"), os.Getenv("LINES"))
 		terminal = width >= 40 && rows >= 6
 	}
-	p := &stageProgress{out: out, stage: stage, attempt: attempt, logPath: logPath, started: time.Now(), terminal: terminal, width: width, rows: rows, sizeQuery: query}
+	p := &stageProgress{out: out, stage: stage, logPath: logPath, started: time.Now(), terminal: terminal, width: width, rows: rows, sizeQuery: query}
 	if terminal {
 		p.stop = make(chan struct{})
 		p.done = make(chan struct{})
@@ -75,7 +73,7 @@ func startProgressWithSizeQuery(out io.Writer, terminal bool, stage string, atte
 		return p
 	}
 
-	fmt.Fprintf(out, "Stage: %s\nAttempt: %d/4\nElapsed: 0s\nLatest: waiting for agent output\nLog: %s\n", stage, attempt, safeProgressPath(logPath, max(1, width-10)))
+	fmt.Fprintf(out, "Stage: %s\nElapsed: 0s\nLatest: waiting for agent output\nLog: %s\n", stage, styledLogPath(safeProgressPath(logPath, max(1, width-10)), os.Getenv("NO_COLOR") == ""))
 	p.stop = make(chan struct{})
 	p.done = make(chan struct{})
 	go p.run(heartbeat)
@@ -124,7 +122,7 @@ func (p *stageProgress) finish(err error) {
 	if p.terminal {
 		pathWidth = max(1, p.width-32)
 	}
-	summary := fmt.Sprintf("%s attempt %d/4 %s in %s; log: %s", p.stage, p.attempt, result, elapsed, safeProgressPath(p.logPath, pathWidth))
+	summary := fmt.Sprintf("%s %s in %s; log: %s", p.stage, result, elapsed, styledLogPath(safeProgressPath(p.logPath, pathWidth), os.Getenv("NO_COLOR") == ""))
 	fmt.Fprintln(p.out, truncateProgressText(summary, p.width+1))
 }
 
@@ -134,7 +132,7 @@ func (p *stageProgress) renderHeartbeat() {
 	if len(lines) > 0 {
 		activity = lines[len(lines)-1]
 	}
-	fmt.Fprintf(p.out, "Progress update\nStage: %s\nAttempt: %d/4\nElapsed: %s\nLatest: %s\nLog: %s\n", p.stage, p.attempt, time.Since(p.started).Round(time.Second), activity, safeProgressPath(p.logPath, max(1, p.width-10)))
+	fmt.Fprintf(p.out, "Progress update\nStage: %s\nElapsed: %s\nLatest: %s\nLog: %s\n", p.stage, time.Since(p.started).Round(time.Second), activity, styledLogPath(safeProgressPath(p.logPath, max(1, p.width-10)), os.Getenv("NO_COLOR") == ""))
 }
 
 func (p *stageProgress) render(animated bool, status string, frame ...int) {
@@ -149,7 +147,7 @@ func (p *stageProgress) render(animated bool, status string, frame ...int) {
 			}
 		}
 	}
-	lines := renderProgressScreen(width, rows, p.stage, p.attempt, p.logPath, time.Since(p.started), status, animated, frame...)
+	lines := renderProgressScreen(width, rows, p.stage, p.logPath, time.Since(p.started), status, animated, frame...)
 	if !p.hasRendered || resized {
 		fmt.Fprint(p.out, "\033[2J")
 	}
@@ -168,7 +166,7 @@ func (p *stageProgress) render(animated bool, status string, frame ...int) {
 	p.hasRendered = true
 }
 
-func renderProgressScreen(width, rows int, stage string, attempt int, logPath string, elapsed time.Duration, status string, animated bool, frame ...int) []string {
+func renderProgressScreen(width, rows int, stage, logPath string, elapsed time.Duration, status string, animated bool, frame ...int) []string {
 	width, rows = boundedProgressWidth(width), boundedProgressRows(rows)
 	noColor := os.Getenv("NO_COLOR") != ""
 	spinner := "✓"
@@ -186,22 +184,56 @@ func renderProgressScreen(width, rows int, stage string, attempt int, logPath st
 	if status != "ACTIVE" {
 		state = status
 	}
+	statusText := func(text string) string { return styledProgressText(text, progressStatusColor(status), noColor) }
+	logLine := func() string {
+		path := shortProgressPath(terminalSafeProgressPath(logPath), max(1, width-5))
+		return "LOG  " + styledLogPath(path, !noColor)
+	}
 
-	if rows <= 5 {
-		stageLine := styledProgressText(spinner+" "+strings.ToUpper(stage)+" · "+state, progressStatusColor(status), noColor)
-		attemptLine := fmt.Sprintf("Attempt: %d/4", attempt)
-		logLine := "LOG  " + shortProgressPath(terminalSafeProgressPath(logPath), max(1, width-5))
-		lines := []string{stageLine, attemptLine, logLine}
-		if rows == 5 {
-			lines = []string{styledProgressText("FACTORY  "+state, progressStatusColor(status), noColor), strings.Repeat("─", max(0, width-1)), stageLine, attemptLine, logLine}
+	if rows < 12 {
+		stageLine := statusText(spinner + " " + strings.ToUpper(stage) + " · " + state)
+		lines := []string{stageLine, fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
+		if rows == 3 {
+			lines[1] = "RECENT  " + readProgressActivity(logPath)
+		}
+		if rows >= 8 {
+			activity := readProgressLog(logPath)
+			if len(activity) == 0 {
+				activity = []string{"waiting for agent output"}
+			}
+			lines = []string{statusText("FACTORY  " + state), strings.Repeat("─", max(0, width-1)), "CURRENT OPERATION", stageLine, fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), strings.Repeat("─", max(0, width-1)), "RECENT ACTIVITY"}
+			activitySlots := rows - 8
+			var wrapped []string
+			for _, item := range activity {
+				wrapped = append(wrapped, wrapProgressText(item, max(1, width-4))...)
+			}
+			if len(wrapped) > activitySlots {
+				wrapped = wrapped[len(wrapped)-activitySlots:]
+			}
+			for _, item := range wrapped {
+				lines = append(lines, "  "+item)
+			}
+			for len(lines) < rows-1 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, logLine())
+		} else if rows == 7 {
+			lines = []string{statusText("FACTORY  " + state), strings.Repeat("─", max(0, width-1)), stageLine, "RECENT ACTIVITY", readProgressActivity(logPath), fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
+		} else if rows == 6 {
+			lines = []string{statusText("FACTORY  " + state), stageLine, "RECENT ACTIVITY", readProgressActivity(logPath), fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
+		} else if rows == 5 {
+			lines = []string{statusText("FACTORY  " + state), strings.Repeat("─", max(0, width-1)), stageLine, fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
 		} else if rows == 4 {
-			lines = []string{styledProgressText("FACTORY  "+state, progressStatusColor(status), noColor), stageLine, attemptLine, logLine}
+			lines = []string{statusText("FACTORY  " + state), stageLine, fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)), logLine()}
 		} else if rows == 2 {
-			lines = []string{stageLine + " · " + attemptLine, logLine}
+			lines = []string{stageLine, logLine()}
 		} else if rows == 1 {
-			prefix := stageLine + fmt.Sprintf(" · %d/4 · LOG ", attempt)
+			prefix := stageLine + " · LOG "
 			pathWidth := max(1, width-progressTextWidth(prefix))
-			lines = []string{prefix + shortProgressPath(terminalSafeProgressPath(logPath), pathWidth)}
+			lines = []string{prefix + styledLogPath(shortProgressPath(terminalSafeProgressPath(logPath), pathWidth), !noColor)}
+		}
+		for len(lines) < rows {
+			lines = append(lines, "")
 		}
 		for i := range lines {
 			lines[i] = truncateProgressText(lines[i], width+1)
@@ -209,59 +241,43 @@ func renderProgressScreen(width, rows int, stage string, attempt int, logPath st
 		return lines
 	}
 
-	content := make([]string, 0, rows)
-	fullLayout := rows >= 12
-	content = append(content,
-		styledProgressText("FACTORY", "\033[1;36m", noColor)+"  "+styledProgressText(state, progressStatusColor(status), noColor),
-		strings.Repeat("─", max(0, width-1)),
-	)
-	if fullLayout {
-		content = append(content, "", "CURRENT OPERATION", styledProgressText(spinner+" "+strings.ToUpper(stage), progressStatusColor(status), noColor))
-		content = append(content,
-			fmt.Sprintf("ATTEMPT  %s  %s", progressAttemptMeter(attempt), fmt.Sprintf("%d / 4", min(max(attempt, 0), 4))),
-			fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)),
-			"",
-			"RECENT ACTIVITY",
-		)
-	} else {
-		content = append(content, styledProgressText(spinner+" "+strings.ToUpper(stage), progressStatusColor(status), noColor), fmt.Sprintf("Attempt: %d/4  ·  %s", attempt, elapsed.Round(time.Second)))
-		if rows >= 7 {
-			content = append(content, "LATEST ACTIVITY")
-		}
-	}
-
 	activityLines := readProgressLog(logPath)
 	if len(activityLines) == 0 {
 		activityLines = []string{"waiting for agent output"}
 	}
-	activityWidth := max(1, width-2)
-	var wrapped []string
-	if fullLayout {
-		for _, activity := range activityLines {
-			wrapped = append(wrapped, wrapProgressText(activity, activityWidth)...)
-		}
-	} else {
-		content = append(content, activityLines[len(activityLines)-1])
+	content := []string{
+		styledProgressText("FACTORY", "\033[1;36m", noColor) + "  " + statusText(state),
+		strings.Repeat("─", max(0, width-1)),
+		"CURRENT OPERATION",
+		statusText(spinner + " " + strings.ToUpper(stage)),
+		fmt.Sprintf("ELAPSED  %s", elapsed.Round(time.Second)),
+		strings.Repeat("─", max(0, width-1)),
+		"RECENT ACTIVITY",
 	}
-	footerRows := 2
-	if !fullLayout {
-		footerRows = 1
+	footerRows := 1
+	if rows >= 12 {
+		footerRows = 2
+		content = append(content, strings.Repeat("─", max(0, width-1)))
+	} else if len(content) >= 2 {
+		content = append(content[:5], content[6:]...)
 	}
 	activitySlots := max(0, rows-len(content)-footerRows)
-	if activitySlots > 0 {
-		if len(wrapped) > activitySlots {
-			wrapped = wrapped[len(wrapped)-activitySlots:]
-		}
-		for _, line := range wrapped {
-			content = append(content, "  "+line)
-		}
+	var wrapped []string
+	for _, activity := range activityLines {
+		wrapped = append(wrapped, wrapProgressText(activity, max(1, width-4))...)
 	}
-	footer := []string{"", "LOG  " + shortProgressPath(terminalSafeProgressPath(logPath), max(1, width-5))}
-	if !fullLayout {
-		footer = []string{"LOG  " + shortProgressPath(terminalSafeProgressPath(logPath), max(1, width-5))}
+	if len(wrapped) > activitySlots {
+		wrapped = wrapped[len(wrapped)-activitySlots:]
 	}
-	for len(content)+len(footer) < rows {
+	for len(content)+len(wrapped) < rows-footerRows {
 		content = append(content, "")
+	}
+	for _, line := range wrapped {
+		content = append(content, "  "+line)
+	}
+	footer := []string{logLine()}
+	if footerRows == 2 {
+		footer = []string{"", logLine()}
 	}
 	content = append(content, footer...)
 	if len(content) > rows {
@@ -271,6 +287,21 @@ func renderProgressScreen(width, rows int, stage string, attempt int, logPath st
 		content[i] = truncateProgressText(content[i], width+1)
 	}
 	return content
+}
+
+func readProgressActivity(path string) string {
+	lines := readProgressLog(path)
+	if len(lines) == 0 {
+		return "waiting for agent output"
+	}
+	return lines[len(lines)-1]
+}
+
+func styledLogPath(path string, enabled bool) string {
+	if !enabled || path == "" {
+		return path
+	}
+	return "\033[2m" + path + "\033[0m"
 }
 
 func styledProgressText(text, color string, noColor bool) string {
@@ -340,11 +371,6 @@ func progressEnvDimension(name string, fallback, maximum int) int {
 
 func boundedProgressWidth(width int) int { return min(max(width, 1), progressMaxWidth) }
 func boundedProgressRows(rows int) int   { return min(max(rows, 1), progressMaxRows) }
-
-func progressAttemptMeter(attempt int) string {
-	attempt = min(max(attempt, 0), 4)
-	return "[" + strings.Repeat("■", attempt) + strings.Repeat("□", 4-attempt) + "]"
-}
 
 func wrapProgressText(text string, width int) []string {
 	if width <= 0 {
@@ -517,14 +543,21 @@ func readProgressLog(path string) []string {
 	n, _ := io.ReadFull(file, data)
 	data = data[:n]
 	if offset > 0 {
-		if newline := bytes.IndexByte(data, '\n'); newline >= 0 {
-			data = data[newline+1:]
+		for i, b := range data {
+			if b == '\r' || b == '\n' {
+				if b == '\r' && i+1 < len(data) && data[i+1] == '\n' {
+					data = data[i+2:]
+				} else {
+					data = data[i+1:]
+				}
+				break
+			}
 		}
 	}
-	parts := strings.Split(string(data), "\n")
+	parts := splitProgressRecords(data)
 	lines := make([]string, 0, progressLogLines)
 	for _, part := range parts {
-		clean := sanitizeProgressLine(strings.TrimSuffix(part, "\r"))
+		clean := sanitizeProgressLine(part)
 		if clean == "" {
 			continue
 		}
@@ -534,6 +567,25 @@ func readProgressLog(path string) []string {
 		lines = lines[len(lines)-progressLogLines:]
 	}
 	return lines
+}
+
+func splitProgressRecords(data []byte) []string {
+	var records []string
+	start := 0
+	for i := 0; i < len(data); i++ {
+		if data[i] != '\r' && data[i] != '\n' {
+			continue
+		}
+		records = append(records, string(data[start:i]))
+		if data[i] == '\r' && i+1 < len(data) && data[i+1] == '\n' {
+			i++
+		}
+		start = i + 1
+	}
+	if start < len(data) {
+		records = append(records, string(data[start:]))
+	}
+	return records
 }
 
 func sanitizeProgressLine(line string) string {

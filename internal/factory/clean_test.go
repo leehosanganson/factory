@@ -3,6 +3,7 @@ package factory
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,367 @@ import (
 	"testing"
 	"time"
 )
+
+func TestCleanPristineUsesIsolatedWorktreeAndPublishesOnlyItsChanges(t *testing.T) {
+	repo := newCleanRepo(t)
+	record := filepath.Join(t.TempDir(), "check-workdirs")
+	writeCleanFile(t, repo.work, ".gitignore", "check-workdirs\n")
+	writeCleanFile(t, repo.work, "Makefile", "fmt test vet:\n\t@printf '%s\\n' \"$$PWD\" >> \""+record+"\"\n")
+	gitClean(t, repo.work, "add", ".gitignore", "Makefile")
+	gitClean(t, repo.work, "commit", "-m", "add test checks")
+	gitClean(t, repo.work, "push")
+	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+	agent := &cleanIsolatedWorkspaceAgent{target: repo.work}
+	workflow := cleanTestWorkflow(repo.work, agent)
+	workflow.SetupWorktree = nil
+	workflow.Git = nil
+	workflow.GitContext = nil
+	workflow.Make = nil
+	if err := workflow.Run(""); err != nil {
+		t.Fatalf("isolated pristine clean failed: %v", err)
+	}
+	if agent.workdir == "" || agent.workdir == repo.work || isWithin(repo.work, agent.workdir) {
+		t.Fatalf("agent ran outside an external isolated worktree: target=%q agent=%q", repo.work, agent.workdir)
+	}
+	if _, err := os.Stat(agent.workdir); !os.IsNotExist(err) {
+		t.Fatalf("temporary worktree was not removed after run: %v", err)
+	}
+	lines, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, workdir := range strings.Fields(string(lines)) {
+		if workdir != agent.workdir {
+			t.Errorf("check ran in %q, want isolated worktree %q", workdir, agent.workdir)
+		}
+	}
+	if len(strings.Fields(string(lines))) != 3 {
+		t.Fatalf("checks ran %d times, want fmt/test/vet: %q", len(strings.Fields(string(lines))), lines)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "show", "--format=", "--name-only", "HEAD"))); got != "README.md\nfix.txt" {
+		t.Fatalf("published paths = %q, want only isolated agent changes", got)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD^"))); got != initial {
+		t.Fatalf("published commit parent = %q, want baseline %q", got, initial)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo.work, "fix.txt")); err != nil || string(got) != "created in isolated workspace\n" {
+		t.Fatalf("isolated addition not transferred: %q, %v", got, err)
+	}
+}
+
+func TestCleanPristineTransfersTrackedDeletionsRenamesAndUntrackedAdditions(t *testing.T) {
+	repo := newCleanRepo(t)
+	writeCleanFile(t, repo.work, "remove.txt", "delete me\n")
+	writeCleanFile(t, repo.work, "old.txt", "rename me\n")
+	gitClean(t, repo.work, "add", "remove.txt", "old.txt")
+	gitClean(t, repo.work, "commit", "-m", "add transfer fixture")
+	gitClean(t, repo.work, "push")
+	workflow := cleanTestWorkflow(repo.work, &cleanPristineTransferAgent{})
+	workflow.SetupWorktree = nil
+	workflow.Git = nil
+	workflow.GitContext = nil
+	if err := workflow.Run(""); err != nil {
+		t.Fatalf("isolated changes failed to transfer and publish: %v", err)
+	}
+	paths := strings.TrimSpace(string(gitClean(t, repo.work, "diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "HEAD")))
+	if paths != "README.md\nnew.txt\nold.txt\nremove.txt" {
+		t.Fatalf("commit paths = %q; want modified, added, renamed source/destination, and deleted paths", paths)
+	}
+	if _, err := os.Stat(filepath.Join(repo.work, "remove.txt")); !os.IsNotExist(err) {
+		t.Fatalf("deleted path remains after transfer: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo.work, "new.txt")); err != nil || string(got) != "renamed content\n" {
+		t.Fatalf("renamed destination content = %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(repo.work, "old.txt")); !os.IsNotExist(err) {
+		t.Fatalf("renamed source remains after transfer: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(repo.work, "README.md")); err != nil || string(got) != "modified in isolated worktree\n" {
+		t.Fatalf("tracked modification content = %q, %v", got, err)
+	}
+}
+
+func TestCleanPristineRejectsExternalChangesWithoutPublishingThem(t *testing.T) {
+	for _, mode := range []string{"added", "modified"} {
+		t.Run(mode, func(t *testing.T) {
+			repo := newCleanRepo(t)
+			agent := &cleanIsolatedWorkspaceAgent{target: repo.work, externalChange: mode}
+			workflow := cleanTestWorkflow(repo.work, agent)
+			workflow.SetupWorktree = nil
+			workflow.Git = nil
+			workflow.GitContext = nil
+			initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+			err := workflow.Run("")
+			if err == nil || !strings.Contains(err.Error(), "original checkout changed") {
+				t.Fatalf("external mutation error = %v, want publish refusal", err)
+			}
+			if agent.workdir == "" || agent.workdir == repo.work || isWithin(repo.work, agent.workdir) {
+				t.Fatalf("agent did not receive isolated worktree: target=%q agent=%q", repo.work, agent.workdir)
+			}
+			if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {
+				t.Fatalf("external mutation was committed: got %s want %s", got, initial)
+			}
+			if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initial {
+				t.Fatalf("external mutation was pushed: got %s want %s", got, initial)
+			}
+			if mode == "added" {
+				if got, err := os.ReadFile(filepath.Join(repo.work, "external.txt")); err != nil || string(got) != "user addition\n" {
+					t.Fatalf("user addition was not preserved: %q, %v", got, err)
+				}
+			} else if got, err := os.ReadFile(filepath.Join(repo.work, "README.md")); err != nil || string(got) != "user modification\n" {
+				t.Fatalf("user modification was not preserved: %q, %v", got, err)
+			}
+			if _, err := os.Stat(filepath.Join(repo.work, "fix.txt")); !os.IsNotExist(err) {
+				t.Fatalf("isolated candidate leaked into checkout despite external-change refusal: %v", err)
+			}
+		})
+	}
+}
+
+func TestCleanLegacyGitInjectionWithoutGitAtRefusesPristineBeforeAgents(t *testing.T) {
+	for _, injection := range []string{"Git", "GitContext"} {
+		t.Run(injection, func(t *testing.T) {
+			repo := newCleanRepo(t)
+			agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+			workflow := cleanTestWorkflow(repo.work, agent)
+			workflow.SetupWorktree = nil
+			callback := func(name string, args ...string) ([]byte, error) {
+				cmd := exec.Command(name, args...)
+				cmd.Dir = repo.work
+				return cmd.Output()
+			}
+			if injection == "Git" {
+				workflow.Git = callback
+			} else {
+				workflow.GitContext = func(_ context.Context, name string, args ...string) ([]byte, error) {
+					return callback(name, args...)
+				}
+			}
+
+			err := workflow.Run("")
+			if err == nil || !strings.Contains(err.Error(), "requires GitAt") {
+				t.Fatalf("legacy %s pristine error = %v, want workdir-aware GitAt refusal", injection, err)
+			}
+			if len(agent.calls) != 0 {
+				t.Fatalf("agent ran before missing worktree setup refusal: %v", agent.calls)
+			}
+		})
+	}
+}
+
+func TestCleanRejectsCustomSetupCheckoutThatIsNotAWorktreeAndCleansIt(t *testing.T) {
+	repo := newCleanRepo(t)
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+	cleanupCalled := false
+	workflow := cleanTestWorkflow(repo.work, agent)
+	workflow.SetupWorktree = func(_ context.Context, target, _ string) (string, func() error, error) {
+		path := filepath.Join(t.TempDir(), "ordinary-clone")
+		if output, err := exec.Command("git", "clone", "--no-hardlinks", target, path).CombinedOutput(); err != nil {
+			return "", nil, fmt.Errorf("clone test checkout: %w: %s", err, output)
+		}
+		return path, func() error {
+			cleanupCalled = true
+			return os.RemoveAll(path)
+		}, nil
+	}
+
+	err := workflow.Run("")
+	if err == nil || !strings.Contains(err.Error(), "is not a registered Git worktree") {
+		t.Fatalf("ordinary-clone setup error = %v, want real-worktree rejection", err)
+	}
+	if !cleanupCalled {
+		t.Fatal("ordinary-clone setup cleanup was not executed")
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("agent ran before ordinary-clone refusal: %v", agent.calls)
+	}
+}
+
+func TestCleanRejectsCustomSetupWorktreeAtWrongHeadAndCleansIt(t *testing.T) {
+	repo := newCleanRepo(t)
+	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+	cleanupCalled := false
+	workflow := cleanTestWorkflow(repo.work, agent)
+	workflow.SetupWorktree = func(ctx context.Context, target, _ string) (string, func() error, error) {
+		path, cleanup, err := createCleanWorktree(ctx, target, initial)
+		if err != nil {
+			return "", nil, err
+		}
+		writeCleanFilePathRaw(path, "wrong.txt", "different HEAD\n")
+		gitClean(t, path, "add", "wrong.txt")
+		gitClean(t, path, "commit", "-m", "wrong HEAD")
+		return path, func() error {
+			cleanupCalled = true
+			return cleanup()
+		}, nil
+	}
+
+	err := workflow.Run("")
+	if err == nil || !strings.Contains(err.Error(), "does not match baseline") {
+		t.Fatalf("wrong-HEAD setup error = %v, want baseline rejection", err)
+	}
+	if !cleanupCalled {
+		t.Fatal("wrong-HEAD setup cleanup was not executed")
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("agent ran before wrong-HEAD worktree refusal: %v", agent.calls)
+	}
+}
+
+func TestCleanRejectsCustomSetupWorktreeWithDirtyStatusAndCleansIt(t *testing.T) {
+	repo := newCleanRepo(t)
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+	cleanupCalled := false
+	workflow := cleanTestWorkflow(repo.work, agent)
+	workflow.SetupWorktree = func(ctx context.Context, target, head string) (string, func() error, error) {
+		path, cleanup, err := createCleanWorktree(ctx, target, head)
+		if err != nil {
+			return "", nil, err
+		}
+		writeCleanFilePathRaw(path, "dirty.txt", "untracked\n")
+		return path, func() error {
+			cleanupCalled = true
+			return cleanup()
+		}, nil
+	}
+
+	err := workflow.Run("")
+	if err == nil || !strings.Contains(err.Error(), "not clean before agent start") {
+		t.Fatalf("dirty-worktree setup error = %v, want clean-status rejection", err)
+	}
+	if !cleanupCalled {
+		t.Fatal("dirty-worktree setup cleanup was not executed")
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("agent ran before dirty-worktree refusal: %v", agent.calls)
+	}
+}
+
+func TestCleanGitAtReceivesOriginalAndIsolatedWorkdirs(t *testing.T) {
+	repo := newCleanRepo(t)
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	var workdirs []string
+	workflow.GitAt = func(ctx context.Context, workdir, name string, args ...string) ([]byte, error) {
+		workdirs = append(workdirs, filepath.Clean(workdir))
+		cmd := exec.CommandContext(ctx, name, args...)
+		cmd.Dir = workdir
+		return cmd.Output()
+	}
+	if err := workflow.Run(""); err != nil {
+		t.Fatalf("GitAt pristine run failed: %v", err)
+	}
+	seenOriginal, seenIsolated := false, false
+	for _, workdir := range workdirs {
+		seenOriginal = seenOriginal || workdir == filepath.Clean(repo.work)
+		seenIsolated = seenIsolated || workdir != filepath.Clean(repo.work)
+	}
+	if !seenOriginal || !seenIsolated {
+		t.Fatalf("GitAt workdirs = %v, want original %q and isolated checkout", workdirs, repo.work)
+	}
+}
+
+func TestCleanFinalizesStateAfterWorktreeCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cleanupErr error
+		wantStatus string
+	}{
+		{name: "cleanup failure", cleanupErr: errors.New("worktree cleanup failed"), wantStatus: "failed"},
+		{name: "cleanup success", wantStatus: "complete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newCleanRepo(t)
+			stateDir := filepath.Join(filepath.Dir(repo.work), "state")
+			workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+			workflow.Config.StateDir = stateDir
+			workflow.SetupWorktree = func(ctx context.Context, target, head string) (string, func() error, error) {
+				path, cleanup, err := createCleanWorktree(ctx, target, head)
+				if err != nil {
+					return "", nil, err
+				}
+				return path, func() error {
+					if err := cleanup(); err != nil {
+						return err
+					}
+					return tc.cleanupErr
+				}, nil
+			}
+			var terminalEvent WorkflowEvent
+			workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+				if event.Type == "workflow.transition" {
+					terminalEvent = event
+				}
+				return nil
+			})
+
+			err := workflow.Run("")
+			if tc.cleanupErr != nil {
+				if !errors.Is(err, tc.cleanupErr) {
+					t.Fatalf("clean error = %v, want cleanup error %v", err, tc.cleanupErr)
+				}
+			} else if err != nil {
+				t.Fatalf("successful clean returned error: %v", err)
+			}
+			state, _ := readCleanState(t, stateDir)
+			if state.Status != tc.wantStatus {
+				t.Fatalf("persisted status = %q, want %q", state.Status, tc.wantStatus)
+			}
+			if terminalEvent.Type != "workflow.transition" || !strings.Contains(terminalEvent.Message, tc.wantStatus) {
+				t.Fatalf("terminal event = %+v, want status %q", terminalEvent, tc.wantStatus)
+			}
+			if tc.cleanupErr != nil && !strings.Contains(terminalEvent.Message, tc.cleanupErr.Error()) {
+				t.Fatalf("failed terminal event = %+v, want cleanup failure", terminalEvent)
+			}
+		})
+	}
+}
+
+func TestCleanSetupErrorRunsAndJoinsCleanupError(t *testing.T) {
+	repo := newCleanRepo(t)
+	setupErr := errors.New("worktree setup failed")
+	cleanupErr := errors.New("worktree cleanup failed")
+	cleanupCalled := false
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.SetupWorktree = func(context.Context, string, string) (string, func() error, error) {
+		return "", func() error {
+			cleanupCalled = true
+			return cleanupErr
+		}, setupErr
+	}
+
+	err := workflow.Run("")
+	if !errors.Is(err, setupErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("setup error = %v, want setup and cleanup errors joined", err)
+	}
+	if !cleanupCalled {
+		t.Fatal("setup cleanup callback was not executed")
+	}
+}
+
+func TestCleanRejectsSetupReturningOriginalRootBeforeAgents(t *testing.T) {
+	repo := newCleanRepo(t)
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
+	workflow := cleanTestWorkflow(repo.work, agent)
+	cleanupCalled := false
+	workflow.SetupWorktree = func(_ context.Context, target, _ string) (string, func() error, error) {
+		return target, func() error {
+			cleanupCalled = true
+			return nil
+		}, nil
+	}
+
+	err := workflow.Run("")
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("same-root setup error = %v, want distinct-root refusal", err)
+	}
+	if !cleanupCalled {
+		t.Fatal("same-root setup cleanup callback was not executed")
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("agent ran before same-root setup refusal: %v", agent.calls)
+	}
+}
 
 func TestCleanDirtyWorktreeRunsSafeModeWithoutPublishing(t *testing.T) {
 	repo := newCleanRepo(t)
@@ -36,6 +398,8 @@ func TestCleanDirtyWorktreeRunsSafeModeWithoutPublishing(t *testing.T) {
 	workflow.In = strings.NewReader("yes\nyes\nyes\n")
 	var makeTargets []string
 	workflow.Make = func(target string, _ ...string) error {
+		scope := cleanTestGitScope(repo.work, nil)
+		defer scope()
 		makeTargets = append(makeTargets, target)
 		if !strings.Contains(strings.ToLower(output.String()), "dirty") || !strings.Contains(strings.ToLower(output.String()), "may") {
 			t.Fatalf("dirty-worktree warning was not shown before make %s: %q", target, output.String())
@@ -43,7 +407,9 @@ func TestCleanDirtyWorktreeRunsSafeModeWithoutPublishing(t *testing.T) {
 		return nil
 	}
 	addCalls, pushCalls, commitCalls := 0, 0, 0
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 {
 			switch args[0] {
 			case "add":
@@ -55,14 +421,14 @@ func TestCleanDirtyWorktreeRunsSafeModeWithoutPublishing(t *testing.T) {
 			}
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 
 	if err := workflow.Run(""); err != nil {
 		t.Fatalf("dirty safe mode failed: %v", err)
 	}
-	if got, want := strings.Join(agent.calls, ","), "review,evaluate,fix,evaluate,document,evaluate"; got != want {
+	if got, want := strings.Join(agent.calls, ","), "review,fix,document"; got != want {
 		t.Fatalf("workflow stages = %s, want %s", got, want)
 	}
 	if got, want := strings.Join(makeTargets, ","), "fmt,test,vet"; got != want {
@@ -141,12 +507,14 @@ func TestCleanRefusesMultipleConfiguredMergeRefsBeforeAgentsOrPublication(t *tes
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 	workflow := cleanTestWorkflow(repo.work, agent)
 	pushCalls := 0
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "push" {
 			pushCalls++
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 
@@ -199,6 +567,8 @@ func TestCleanRevalidatesUpstreamConfiguration(t *testing.T) {
 			workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
 			pushCalls := 0
 			workflow.Make = func(target string, _ ...string) error {
+				scope := cleanTestGitScope(repo.work, nil)
+				defer scope()
 				if target == "fmt" {
 					if mode == "upstream-appears" {
 						gitClean(t, repo.work, "branch", "--set-upstream-to=origin/main")
@@ -208,12 +578,14 @@ func TestCleanRevalidatesUpstreamConfiguration(t *testing.T) {
 				}
 				return nil
 			}
-			workflow.Git = func(name string, args ...string) ([]byte, error) {
+			workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+				scope := cleanTestGitScope(repo.work, args)
+				defer scope()
 				if name == "git" && len(args) > 0 && args[0] == "push" {
 					pushCalls++
 				}
 				cmd := exec.Command(name, args...)
-				cmd.Dir = repo.work
+				cmd.Dir = workdir
 				return cmd.Output()
 			}
 			if err := workflow.Run(""); err == nil {
@@ -338,22 +710,29 @@ func TestCleanWithoutUpstreamRefusesDestinationCreatedDuringRun(t *testing.T) {
 				agent = &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 			}
 			workflow := cleanTestWorkflow(repo.work, agent)
-			pushArgs := []string(nil)
-			workflow.Git = func(name string, args ...string) ([]byte, error) {
-				if name == "git" && len(args) > 0 && args[0] == "push" {
-					pushArgs = append([]string(nil), args...)
+			workflow.Make = func(target string, _ ...string) error {
+				if target == "fmt" {
 					gitClean(t, competing, "push", "origin", "HEAD:refs/heads/clean-topic")
 				}
+				return nil
+			}
+			pushArgs := []string(nil)
+			workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+				scope := cleanTestGitScope(repo.work, args)
+				defer scope()
+				if name == "git" && len(args) > 0 && args[0] == "push" {
+					pushArgs = append([]string(nil), args...)
+				}
 				cmd := exec.Command(name, args...)
-				cmd.Dir = repo.work
+				cmd.Dir = workdir
 				return cmd.Output()
 			}
 
 			err := workflow.Run("")
-			if err == nil || !strings.Contains(err.Error(), "push clean") {
-				t.Fatalf("push-boundary race error = %v, want push failure", err)
+			if err == nil || (!strings.Contains(err.Error(), "push clean") && !strings.Contains(err.Error(), "upstream appeared") && !strings.Contains(err.Error(), "push destination changed") && !strings.Contains(err.Error(), "already exists")) {
+				t.Fatalf("push-boundary race error = %v, want destination revalidation or push failure", err)
 			}
-			if !hasCleanPushLease(pushArgs, "refs/heads/clean-topic") {
+			if len(pushArgs) != 0 && !hasCleanPushLease(pushArgs, "refs/heads/clean-topic") {
 				t.Fatalf("fallback push lacks empty expected-value lease: %v", pushArgs)
 			}
 			if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/clean-topic"))); got != competingHead {
@@ -368,12 +747,14 @@ func TestCleanCommitDoesNotIncludeChangesOutsideApprovedPaths(t *testing.T) {
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 	workflow := cleanTestWorkflow(repo.work, agent)
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "commit" {
-			writeCleanFilePath(repo.work, "README.md", "concurrent edit outside commit\n")
+			writeCleanFilePathRaw(repo.work, "README.md", "concurrent edit outside commit\n")
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err == nil {
@@ -396,10 +777,12 @@ func TestCleanRefusesCommitWithIndexMutationAndNeverPushes(t *testing.T) {
 	repo := newCleanRepo(t)
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "commit" {
 			cmd := exec.Command("git", "hash-object", "-w", "--stdin")
-			cmd.Dir = repo.work
+			cmd.Dir = workdir
 			cmd.Stdin = strings.NewReader("altered staged content\n")
 			blob, err := cmd.Output()
 			if err != nil {
@@ -408,7 +791,7 @@ func TestCleanRefusesCommitWithIndexMutationAndNeverPushes(t *testing.T) {
 			gitClean(t, repo.work, "update-index", "--cacheinfo", "100644,"+strings.TrimSpace(string(blob))+",fix.txt")
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "committed clean outputs differ from inventory") {
@@ -426,7 +809,9 @@ func TestCleanRefusesMergeCommitWithInitialHeadAsFirstParent(t *testing.T) {
 	repo := newCleanRepo(t)
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "commit" {
 			mergeTree := strings.TrimSpace(string(gitClean(t, repo.work, "write-tree")))
 			secondParent := strings.TrimSpace(string(gitClean(t, repo.work, "commit-tree", initial+"^{tree}", "-p", initial, "-m", "second parent")))
@@ -435,7 +820,7 @@ func TestCleanRefusesMergeCommitWithInitialHeadAsFirstParent(t *testing.T) {
 			return nil, nil
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "exactly one parent") {
@@ -457,7 +842,9 @@ func TestCleanPushUsesCapturedURLWhenRemoteConfigChangesAtPush(t *testing.T) {
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
 	pushCalls := 0
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "push" {
 			pushCalls++
 			if args[2] != repo.bare || args[3] != strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))+":refs/heads/main" {
@@ -466,7 +853,7 @@ func TestCleanPushUsesCapturedURLWhenRemoteConfigChangesAtPush(t *testing.T) {
 			gitClean(t, repo.work, "remote", "set-url", "origin", redirect)
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err != nil {
@@ -487,12 +874,14 @@ func TestCleanFailsClosedWhenRawRemoteURLsCannotBeInspected(t *testing.T) {
 	repo := newCleanRepo(t)
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 	workflow := cleanTestWorkflow(repo.work, agent)
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) == 4 && args[0] == "config" && args[1] == "--null" && args[2] == "--get-all" && strings.HasPrefix(args[3], "remote.origin.") {
 			return nil, fmt.Errorf("simulated config inspection failure")
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 
@@ -559,7 +948,9 @@ func TestCleanRefusesMatchingURLRewriteAtPushBoundary(t *testing.T) {
 			workflow := cleanTestWorkflow(repo.work, agent)
 			pushCalls := 0
 			rewriteAdded := false
-			workflow.Git = func(name string, args ...string) ([]byte, error) {
+			workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+				scope := cleanTestGitScope(repo.work, args)
+				defer scope()
 				if name == "git" && len(args) == 3 && args[0] == "config" && args[1] == "--null" && args[2] == "--list" && !rewriteAdded {
 					rewriteAdded = true
 					if mode == "config-unavailable" {
@@ -571,7 +962,7 @@ func TestCleanRefusesMatchingURLRewriteAtPushBoundary(t *testing.T) {
 					pushCalls++
 				}
 				cmd := exec.Command(name, args...)
-				cmd.Dir = repo.work
+				cmd.Dir = workdir
 				return cmd.Output()
 			}
 			err := workflow.Run("")
@@ -602,12 +993,14 @@ func TestCleanRefusesUpstreamChangeAfterCommit(t *testing.T) {
 	repo := newCleanRepo(t)
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "commit" {
 			gitClean(t, repo.work, "config", "branch.main.remote", "redirect")
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "upstream changed after commit") {
@@ -649,12 +1042,14 @@ func TestCleanDetectsSamePathMutationDuringStagingAndNeverPushes(t *testing.T) {
 	repo := newCleanRepo(t)
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "add" {
 			writeCleanFilePath(repo.work, "fix.txt", "concurrent same-path edit\n")
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "changed during staging") {
@@ -693,10 +1088,12 @@ func TestCleanFormatterEffectsAreIncludedWithinRunScope(t *testing.T) {
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 	workflow := cleanTestWorkflow(repo.work, agent)
 	workflow.Make = func(target string, _ ...string) error {
+		scope := cleanTestGitScope(repo.work, nil)
+		defer scope()
 		if target != "fmt" {
 			return nil
 		}
-		path := filepath.Join(repo.work, "fix.go")
+		path := filepath.Join(agent.work, "fix.go")
 		if err := os.WriteFile(path, []byte("package sample\nfunc value() {\nprintln(\"ok\")\nprintln(\"done\")\n}\n"), 0o644); err != nil {
 			return err
 		}
@@ -754,10 +1151,23 @@ func TestCleanVerificationCancellationInterruptsWithoutPublishing(t *testing.T) 
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
 	workflow.Config.StateDir = stateDir
 	workflow.Out = &output
+	var checkEvents []WorkflowEvent
+	var terminalEvents []WorkflowEvent
+	workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+		if event.Type == "check.started" || event.Type == "check.completed" {
+			checkEvents = append(checkEvents, event)
+		}
+		if event.Type == "workflow.transition" && strings.Contains(event.Message, "interrupted") {
+			terminalEvents = append(terminalEvents, event)
+		}
+		return nil
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var makeTargets []string
 	workflow.Make = func(target string, _ ...string) error {
+		scope := cleanTestGitScope(repo.work, nil)
+		defer scope()
 		makeTargets = append(makeTargets, target)
 		if target == "fmt" {
 			cancel()
@@ -765,7 +1175,9 @@ func TestCleanVerificationCancellationInterruptsWithoutPublishing(t *testing.T) 
 		return nil
 	}
 	publishCalls := 0
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 {
 			switch args[0] {
 			case "add", "commit", "push":
@@ -773,7 +1185,7 @@ func TestCleanVerificationCancellationInterruptsWithoutPublishing(t *testing.T) 
 			}
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 
@@ -789,6 +1201,23 @@ func TestCleanVerificationCancellationInterruptsWithoutPublishing(t *testing.T) 
 	}
 	if publishCalls != 0 {
 		t.Fatalf("canceled verification staged or published work: git add/commit/push calls=%d", publishCalls)
+	}
+	if len(checkEvents) != 2 || checkEvents[0].Type != "check.started" || checkEvents[1].Type != "check.completed" || checkEvents[1].Outcome != "canceled" || checkEvents[1].ExitCode == nil || !checkEvents[0].StartedAt.Equal(checkEvents[1].StartedAt) || !checkEvents[1].StartedAt.Before(checkEvents[1].EndedAt) {
+		t.Fatalf("canceled clean check lifecycle = %+v, want started and canceled completion", checkEvents)
+	}
+	_, runDir := readCleanState(t, stateDir)
+	assertPipelineCheckEvents(t, runDir, []workflowEventRecord{
+		{Type: "check.started", Command: []string{"make", "fmt"}, Transcript: "clean-check-01-fmt.log"},
+		{Type: "check.completed", Outcome: "canceled", ExitCode: intPointer(-1), Command: []string{"make", "fmt"}, Transcript: "clean-check-01-fmt.log"},
+	})
+	var localInterrupted []workflowEventRecord
+	for _, event := range readPipelineCheckEvents(t, runDir) {
+		if event.Type == "workflow.transition" && strings.Contains(event.Message, "interrupted") {
+			localInterrupted = append(localInterrupted, event)
+		}
+	}
+	if len(localInterrupted) != 1 || len(terminalEvents) != 1 || terminalEvents[0].RunID != localInterrupted[0].RunID {
+		t.Fatalf("interrupted terminal transition count local=%d observer=%+v; want exactly one matching event", len(localInterrupted), terminalEvents)
 	}
 	if strings.Contains(output.String(), "Clean verification succeeded") || strings.Contains(output.String(), "Clean changes committed") || strings.Contains(output.String(), "Clean completed") {
 		t.Fatalf("canceled verification emitted a success line: %q", output.String())
@@ -807,7 +1236,9 @@ func TestCleanCancellationDuringGitCheckStopsBeforePublishing(t *testing.T) {
 	var startedOnce sync.Once
 	var mu sync.Mutex
 	var publishCalls []string
-	workflow.GitContext = func(ctx context.Context, name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(ctx context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 {
 			if args[0] == "diff" && len(args) == 5 && args[1] == "--name-only" && args[4] == "HEAD" {
 				startedOnce.Do(func() { close(gitStarted) })
@@ -824,7 +1255,7 @@ func TestCleanCancellationDuringGitCheckStopsBeforePublishing(t *testing.T) {
 			}
 		}
 		cmd := exec.CommandContext(ctx, name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 
@@ -866,7 +1297,7 @@ func TestCleanTerminalProgressUsesSpinnerAndClearsLine(t *testing.T) {
 	if err := workflow.Run(""); err != nil {
 		t.Fatal(err)
 	}
-	if got := output.String(); !strings.Contains(got, "⠋ REVIEW\033[0m") || !strings.Contains(got, "ATTEMPT") || !strings.Contains(got, "\r\033[2K") {
+	if got := output.String(); !strings.Contains(got, "⠋ REVIEW\033[0m") || !strings.Contains(got, "RECENT ACTIVITY") || !strings.Contains(got, "\r\033[2K") {
 		t.Fatalf("terminal progress spinner or cleanup missing from output: %q", got)
 	}
 }
@@ -920,6 +1351,8 @@ func TestCleanVerificationFailureDoesNotPushExistingAheadCommits(t *testing.T) {
 	localHead := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
 	workflow.Make = func(target string, _ ...string) error {
+		scope := cleanTestGitScope(repo.work, nil)
+		defer scope()
 		if target == "test" {
 			return fmt.Errorf("intentional test failure")
 		}
@@ -941,12 +1374,14 @@ func TestCleanSyncedNoopDoesNotCreateCommitOrPush(t *testing.T) {
 	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
 	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
 	pushCalls := 0
-	workflow.Git = func(name string, args ...string) ([]byte, error) {
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
 		if name == "git" && len(args) > 0 && args[0] == "push" {
 			pushCalls++
 		}
 		cmd := exec.Command(name, args...)
-		cmd.Dir = repo.work
+		cmd.Dir = workdir
 		return cmd.Output()
 	}
 	if err := workflow.Run(""); err != nil {
@@ -963,6 +1398,22 @@ func TestCleanSyncedNoopDoesNotCreateCommitOrPush(t *testing.T) {
 	}
 }
 
+func TestCleanSuccessfulAgentStagesDoNotRequireEvaluatorProtocol(t *testing.T) {
+	repo := newCleanRepo(t)
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{
+		"review":   {"no evaluator verdict"},
+		"fix":      {"no evaluator verdict"},
+		"document": {"no evaluator verdict"},
+	}}
+	workflow := cleanTestWorkflow(repo.work, agent)
+	if err := workflow.Run(""); err != nil {
+		t.Fatalf("successful agent stages should proceed without evaluator output: %v", err)
+	}
+	if got, want := strings.Join(agent.calls, ","), "review,fix,document"; got != want {
+		t.Fatalf("clean pipeline calls = %s, want %s", got, want)
+	}
+}
+
 func TestCleanCommitsAndPushesOnlyRunChanges(t *testing.T) {
 	repo := newCleanRepo(t)
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
@@ -970,7 +1421,7 @@ func TestCleanCommitsAndPushesOnlyRunChanges(t *testing.T) {
 	if err := workflow.Run(""); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := strings.Join(agent.calls, ","), "review,evaluate,fix,evaluate,document,evaluate"; got != want {
+	if got, want := strings.Join(agent.calls, ","), "review,fix,document"; got != want {
 		t.Fatalf("clean pipeline calls = %s, want %s", got, want)
 	}
 	if got := strings.TrimSpace(string(gitClean(t, repo.work, "show", "--format=", "--name-only", "HEAD"))); got != "README.md\nfix.txt" {
@@ -984,19 +1435,378 @@ func TestCleanCommitsAndPushesOnlyRunChanges(t *testing.T) {
 	}
 }
 
-func TestCleanGatePromptsOnRetriesAndApprovals(t *testing.T) {
+func TestCleanGateDoesNotRetryFailedStageOrPromptForRetry(t *testing.T) {
 	repo := newCleanRepo(t)
-	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{"evaluate": {"FAIL\nreview incomplete", "PASS\n", "PASS\n", "PASS\n"}}}
+	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{"review": {"ERROR: unavailable", "must not execute"}}}
 	var output bytes.Buffer
 	workflow := cleanTestWorkflow(repo.work, agent)
 	workflow.Gate = true
-	workflow.In = strings.NewReader("yes\nyes\nyes\nyes\nyes\nyes\nyes\n")
+	workflow.In = strings.NewReader(strings.Repeat("yes\n", 8))
 	workflow.Out = &output
+	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "review agent failed") {
+		t.Fatalf("failed clean review should end workflow: %v", err)
+	}
+	if len(agent.calls) != 1 || agent.calls[0] != "review" {
+		t.Fatalf("clean agent calls = %v, want one review invocation", agent.calls)
+	}
+	if strings.Contains(output.String(), "Type exactly yes") || strings.Contains(output.String(), "Retry this stage?") {
+		t.Fatalf("failed stage emitted retry/approval prompt: %s", output.String())
+	}
+}
+
+func TestCleanOwnsTerminalStateUntilChecksAndReportsCheckOutput(t *testing.T) {
+	repo := newCleanRepo(t)
+	writeCleanFile(t, repo.work, "dirty.txt", "preserve safe mode\n")
+	stateDir := filepath.Join(filepath.Dir(repo.work), "state")
+	makefile := "fmt test vet:\n\t@printf 'check-output-%s\\n' \"$@\"\n"
+	writeCleanFile(t, repo.work, "Makefile", makefile)
+	store, err := NewJobStore(filepath.Join(filepath.Dir(repo.work), "jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: "clean-job", Type: "clean", Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession("clean-job", "clean-session", "running"); err != nil {
+		t.Fatal(err)
+	}
+	observer := JobSessionObserver{Store: store, JobID: "clean-job", SessionID: "clean-session"}
+	var output bytes.Buffer
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.Config.StateDir = stateDir
+	workflow.Out = &output
+	workflow.Make = nil
+	var observedChecks []WorkflowEvent
+	workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+		if event.Type == "check.started" || event.Type == "check.completed" {
+			observedChecks = append(observedChecks, event)
+			if status := workflowRunStatus(t, stateDir); status != "running" {
+				t.Errorf("run status at %s = %q, want running until checks finish", event.Stage, status)
+			}
+			if event.Message != "" || event.Transcript == "" || len(event.Command) != 2 || event.Command[0] != "make" || event.StartedAt.IsZero() {
+				t.Errorf("check event lacks structured metadata or includes output: %+v", event)
+			}
+			if event.Type == "check.started" {
+				if event.Outcome != "" || event.ExitCode != nil || !event.EndedAt.IsZero() {
+					t.Errorf("check start contains completion fields: %+v", event)
+				}
+			} else if event.Outcome != "success" || event.ExitCode == nil || *event.ExitCode != 0 || !event.StartedAt.Before(event.EndedAt) {
+				t.Errorf("check completion metadata = %+v", event)
+			}
+		}
+		return observer.ObserveWorkflowEvent(event)
+	})
 	if err := workflow.Run(""); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(output.String(), "Type exactly yes") != 4 {
-		t.Fatalf("expected approvals for retry and all passing stages; output=%s", output.String())
+	if status := workflowRunStatus(t, stateDir); status != "complete" {
+		t.Fatalf("clean status after checks = %q, want complete", status)
+	}
+	events, err := store.SessionEvents("clean-job", "clean-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var checkCompletions []SessionEvent
+	for _, event := range events {
+		if event.Type == "check.completed" {
+			checkCompletions = append(checkCompletions, event)
+		}
+	}
+	if len(checkCompletions) != 3 {
+		t.Fatalf("check completion events = %d, want three: %+v", len(checkCompletions), events)
+	}
+	for i, target := range []string{"fmt", "test", "vet"} {
+		if strings.Contains(checkCompletions[i].Message, "check-output-") {
+			t.Errorf("make %s observer event leaked output: %+v", target, checkCompletions[i])
+		}
+		if checkCompletions[i].Type != "check.completed" {
+			t.Errorf("make %s event has type %q", target, checkCompletions[i].Type)
+		}
+	}
+	state, runDir := readCleanState(t, stateDir)
+	if len(state.Checks) != 3 {
+		t.Fatalf("persisted checks = %d, want three", len(state.Checks))
+	}
+	var localEvents []workflowEventRecord
+	for _, event := range readPipelineCheckEvents(t, runDir) {
+		if event.Type == "check.started" || event.Type == "check.completed" {
+			localEvents = append(localEvents, event)
+		}
+	}
+	if len(localEvents) != 6 {
+		t.Fatalf("local check lifecycle events = %d, want six: %+v", len(localEvents), localEvents)
+	}
+	if len(observedChecks) != 6 {
+		t.Fatalf("observer check lifecycle events = %d, want six: %+v", len(observedChecks), observedChecks)
+	}
+	for index, target := range []string{"fmt", "test", "vet"} {
+		started, completed := localEvents[index*2], localEvents[index*2+1]
+		check := state.Checks[index]
+		logName := fmt.Sprintf("clean-check-%02d-%s.log", index+1, target)
+		observedStarted, observedCompleted := observedChecks[index*2], observedChecks[index*2+1]
+		if started.Type != "check.started" || completed.Type != "check.completed" || started.Command[1] != target || completed.Command[1] != target || started.Transcript != logName || completed.Transcript != logName || started.Message != "" || completed.Message != "" || completed.Outcome != "success" || completed.ExitCode == nil || *completed.ExitCode != 0 || started.StartedAt == nil || completed.StartedAt == nil || completed.EndedAt == nil || !started.StartedAt.Equal(check.StartedAt) || !completed.EndedAt.Equal(check.EndedAt) {
+			t.Errorf("local check lifecycle %s mismatch: started=%+v completed=%+v result=%+v", target, started, completed, check)
+		}
+		if observedStarted.Type != started.Type || observedCompleted.Type != completed.Type || strings.Join(observedStarted.Command, "\x00") != strings.Join(started.Command, "\x00") || observedCompleted.Outcome != completed.Outcome || observedCompleted.ExitCode == nil || *observedCompleted.ExitCode != 0 || observedStarted.Transcript != started.Transcript || observedCompleted.Transcript != completed.Transcript || observedStarted.Message != "" || observedCompleted.Message != "" {
+			t.Errorf("observer check lifecycle %s differs from structured local events: %+v / %+v", target, observedStarted, observedCompleted)
+		}
+	}
+	localData, err := os.ReadFile(filepath.Join(runDir, "workflow-events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(localData), "check-output-") {
+		t.Fatalf("local workflow events leaked command output: %s", localData)
+	}
+}
+
+func TestCleanRejectsUnrelatedMutationDuringChecks(t *testing.T) {
+	repo := newCleanRepo(t)
+	initial := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main")))
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.Make = func(target string, _ ...string) error {
+		scope := cleanTestGitScope(repo.work, nil)
+		defer scope()
+		if target == "test" {
+			writeCleanFilePath(repo.work, "external-work.txt", "must not be published\n")
+		}
+		return nil
+	}
+	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "unexpected worktree paths") {
+		t.Fatalf("clean error = %v, want fail-closed rejection for an unrelated mutation", err)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initial {
+		t.Fatalf("external work was published: initial=%s remote=%s", initial, got)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {
+		t.Fatalf("external work was committed: initial=%s local=%s", initial, got)
+	}
+}
+
+func TestCleanRequiresTerminalForPublicationApproval(t *testing.T) {
+	repo := newCleanRepo(t)
+	initial := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD")))
+	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
+	workflow.Terminal = false
+	workflow.In = strings.NewReader("yes\n")
+	gitOperations := []string(nil)
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
+		if name == "git" && len(args) > 0 && (args[0] == "commit" || args[0] == "push") {
+			gitOperations = append(gitOperations, args[0])
+		}
+		cmd := exec.Command(name, args...)
+		cmd.Dir = workdir
+		return cmd.Output()
+	}
+
+	err := workflow.Run("")
+	if err == nil || !strings.Contains(err.Error(), "requires an interactive terminal") {
+		t.Fatalf("clean error = %v, want actionable terminal requirement", err)
+	}
+	if len(gitOperations) != 0 {
+		t.Fatalf("non-terminal yes attempted publication operations: %v", gitOperations)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {
+		t.Fatalf("non-terminal approval created a commit: got %s want %s", got, initial)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initial {
+		t.Fatalf("non-terminal approval pushed changes: got %s want %s", got, initial)
+	}
+}
+
+func TestCleanRequiresApprovalBeforePublishingAndRejectsWithoutCommit(t *testing.T) {
+	repo := newCleanRepo(t)
+	initial := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main")))
+	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
+	workflow.In = strings.NewReader("no\n")
+	var output bytes.Buffer
+	workflow.Out = &output
+	if err := workflow.Run(""); err == nil || !strings.Contains(err.Error(), "not approved") {
+		t.Fatalf("clean error = %v, want publication rejection", err)
+	}
+	if !strings.Contains(output.String(), "Approve to commit and push pristine clean changes") {
+		t.Fatalf("mandatory approval prompt missing: %q", output.String())
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main"))); got != initial {
+		t.Fatalf("rejected clean advanced remote: initial=%s remote=%s", initial, got)
+	}
+	if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {
+		t.Fatalf("rejected clean created a commit: initial=%s local=%s", initial, got)
+	}
+}
+
+func TestCleanPersistsCompleteCheckLogsAndStaysRunningThroughPublication(t *testing.T) {
+	repo := newCleanRepo(t)
+	stateDir := filepath.Join(filepath.Dir(repo.work), "state")
+	writeCleanFile(t, repo.work, "Makefile", "fmt test vet:\n\t@i=0; while [ $$i -lt 1200 ]; do printf 'large-check-transcript\\n'; i=$$((i+1)); done\n")
+	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})
+	workflow.Config.StateDir = stateDir
+	workflow.In = strings.NewReader("yes\n")
+	var output bytes.Buffer
+	workflow.Out = &output
+	workflow.Make = nil
+	workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+		if event.Type == "check.started" || event.Type == "check.completed" {
+			if status := workflowRunStatus(t, stateDir); status != "running" {
+				t.Errorf("run status at %s = %q, want running", event.Type, status)
+			}
+		}
+		return nil
+	})
+	workflow.GitAt = func(_ context.Context, workdir, name string, args ...string) ([]byte, error) {
+		scope := cleanTestGitScope(repo.work, args)
+		defer scope()
+		if name == "git" && len(args) > 0 && args[0] == "push" {
+			if status := workflowRunStatus(t, stateDir); status != "running" {
+				t.Errorf("run status before push = %q, want running", status)
+			}
+		}
+		cmd := exec.Command(name, args...)
+		cmd.Dir = workdir
+		return cmd.Output()
+	}
+	if err := workflow.Run(""); err != nil {
+		t.Fatal(err)
+	}
+	state, runDir := readCleanState(t, stateDir)
+	if state.Status != "complete" || len(state.Checks) != 3 {
+		t.Fatalf("final state = status %q, checks %d; want complete and three results", state.Status, len(state.Checks))
+	}
+	for _, check := range state.Checks {
+		data, err := os.ReadFile(filepath.Join(runDir, check.Log))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) <= evaluatorOutputLimit || !strings.Contains(string(data), "large-check-transcript") {
+			t.Errorf("make %s log length/content = %d bytes, want full transcript over %d bytes", check.Command[len(check.Command)-1], len(data), evaluatorOutputLimit)
+		}
+	}
+}
+
+func TestCleanCheckOpenFailurePersistsFailureLifecycle(t *testing.T) {
+	repo := newCleanRepo(t)
+	writeCleanFile(t, repo.work, "dirty.txt", "safe mode\n")
+	stateDir := filepath.Join(filepath.Dir(repo.work), "state")
+	openErr := errors.New("clean transcript unavailable")
+	var observed []WorkflowEvent
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.Config.StateDir = stateDir
+	workflow.OpenCheckLog = func(string) (*os.File, error) { return nil, openErr }
+	workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+		if strings.HasPrefix(event.Type, "check.") {
+			observed = append(observed, event)
+		}
+		return nil
+	})
+
+	err := workflow.Run("")
+	if !errors.Is(err, openErr) {
+		t.Fatalf("clean error = %v, want transcript open failure", err)
+	}
+	state, runDir := readCleanState(t, stateDir)
+	if state.Status != "failed" || len(state.Checks) != 1 || state.Checks[0].ExitCode == 0 || state.Checks[0].ExitCode != -1 {
+		t.Fatalf("clean state = %+v, want failed check with nonzero result", state)
+	}
+	wantEvents := []workflowEventRecord{
+		{Type: "check.started", Command: []string{"make", "fmt"}, Transcript: "clean-check-01-fmt.log", StartedAt: timePointer(state.Checks[0].StartedAt)},
+		{Type: "check.completed", Outcome: "failure", ExitCode: intPointer(-1), Command: []string{"make", "fmt"}, Transcript: "clean-check-01-fmt.log", StartedAt: timePointer(state.Checks[0].StartedAt), EndedAt: timePointer(state.Checks[0].EndedAt)},
+	}
+	assertPipelineCheckEvents(t, runDir, wantEvents)
+	if len(observed) != 2 || observed[0].Type != "check.started" || observed[1].Type != "check.completed" || observed[1].Outcome != "failure" || observed[1].ExitCode == nil || *observed[1].ExitCode != -1 {
+		t.Fatalf("observer check lifecycle = %+v, want started and failed completion", observed)
+	}
+}
+
+func TestCleanRunOutputUsesExactRunPathWhenDisplayedPathIsTruncated(t *testing.T) {
+	repo := newCleanRepo(t)
+	writeCleanFile(t, repo.work, "dirty.txt", "safe mode\n")
+	stateRoot := filepath.Join(filepath.Dir(repo.work), strings.Repeat("state-dir-", 8), strings.Repeat("nested-", 8), "state")
+	if err := os.MkdirAll(stateRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.Config.StateDir = stateRoot
+	workflow.Out = &output
+	if err := workflow.Run(""); err != nil {
+		t.Fatalf("clean with long run directory failed: %v", err)
+	}
+	state, runDir := readCleanState(t, stateRoot)
+	if len(state.Checks) != 3 {
+		t.Fatalf("persisted checks = %d, want all checks", len(state.Checks))
+	}
+	for _, check := range state.Checks {
+		if _, err := os.Stat(filepath.Join(runDir, check.Log)); err != nil {
+			t.Errorf("check transcript missing at exact run path %q: %v", filepath.Join(runDir, check.Log), err)
+		}
+	}
+	var displayedRun string
+	for _, line := range strings.Split(output.String(), "\n") {
+		if strings.HasPrefix(line, "Run: ") {
+			displayedRun = strings.TrimPrefix(line, "Run: ")
+			break
+		}
+	}
+	if displayedRun == "" || displayedRun == runDir || len([]rune(displayedRun)) >= len([]rune(runDir)) || len([]rune(displayedRun)) > progressLogLineLimit {
+		t.Fatalf("long run path was not safely truncated in progress output: got %q for %q", displayedRun, runDir)
+	}
+}
+
+func TestCleanCheckCloseFailurePersistsFailureAndTerminalEvent(t *testing.T) {
+	repo := newCleanRepo(t)
+	writeCleanFile(t, repo.work, "dirty.txt", "safe mode\n")
+	stateDir := filepath.Join(filepath.Dir(repo.work), "state")
+	closeErr := errors.New("clean transcript close failed")
+	oldClose := cleanCheckCloseFile
+	cleanCheckCloseFile = func(file *os.File) error {
+		if err := file.Close(); err != nil {
+			return err
+		}
+		return closeErr
+	}
+	t.Cleanup(func() { cleanCheckCloseFile = oldClose })
+	var observed []WorkflowEvent
+	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
+	workflow.Config.StateDir = stateDir
+	workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+		observed = append(observed, event)
+		return nil
+	})
+
+	err := workflow.Run("")
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("clean error = %v, want transcript close failure", err)
+	}
+	state, runDir := readCleanState(t, stateDir)
+	if state.Status != "failed" || len(state.Checks) != 1 || state.Checks[0].ExitCode != -1 {
+		t.Fatalf("clean state = %+v, want persisted failed check", state)
+	}
+	var checkEvents []workflowEventRecord
+	var localTerminalEvent bool
+	for _, event := range readPipelineCheckEvents(t, runDir) {
+		if strings.HasPrefix(event.Type, "check.") {
+			checkEvents = append(checkEvents, event)
+		}
+		if event.Type == "workflow.transition" && strings.Contains(event.Message, closeErr.Error()) {
+			localTerminalEvent = true
+		}
+	}
+	if len(checkEvents) != 2 || checkEvents[0].Type != "check.started" || checkEvents[1].Type != "check.completed" || checkEvents[1].Outcome != "failure" || checkEvents[1].ExitCode == nil || *checkEvents[1].ExitCode != -1 {
+		t.Fatalf("local check lifecycle = %+v, want failed completion", checkEvents)
+	}
+	var observerCompletion, terminalEvent bool
+	for _, event := range observed {
+		if event.Type == "check.completed" && event.Outcome == "failure" && event.ExitCode != nil && *event.ExitCode == -1 {
+			observerCompletion = true
+		}
+		if event.Type == "workflow.transition" && strings.Contains(event.Message, closeErr.Error()) {
+			terminalEvent = true
+		}
+	}
+	if !observerCompletion || !terminalEvent || !localTerminalEvent {
+		t.Fatalf("missing observer/local check failure or failed terminal transition: observed=%+v localTerminal=%t", observed, localTerminalEvent)
 	}
 }
 
@@ -1007,7 +1817,16 @@ func TestCleanVerificationFailureNeverPushes(t *testing.T) {
 	agent := &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}}
 	workflow := cleanTestWorkflow(repo.work, agent)
 	workflow.Config.StateDir = stateDir
+	var checkEvents []WorkflowEvent
+	workflow.Observer = WorkflowObserverFunc(func(event WorkflowEvent) error {
+		if event.Type == "check.started" || event.Type == "check.completed" {
+			checkEvents = append(checkEvents, event)
+		}
+		return nil
+	})
 	workflow.Make = func(target string, _ ...string) error {
+		scope := cleanTestGitScope(repo.work, nil)
+		defer scope()
 		if target == "test" {
 			return fmt.Errorf("intentional test failure")
 		}
@@ -1019,6 +1838,16 @@ func TestCleanVerificationFailureNeverPushes(t *testing.T) {
 	if status := workflowRunStatus(t, stateDir); status != "failed" {
 		t.Fatalf("failed clean verification status = %q, want failed", status)
 	}
+	if len(checkEvents) != 4 || checkEvents[0].Type != "check.started" || checkEvents[1].Type != "check.completed" || checkEvents[1].Outcome != "success" || checkEvents[2].Type != "check.started" || checkEvents[3].Type != "check.completed" || checkEvents[3].Outcome != "failure" || checkEvents[3].ExitCode == nil || *checkEvents[3].ExitCode != -1 || checkEvents[3].Transcript != "clean-check-02-test.log" {
+		t.Fatalf("clean success/failure observer lifecycle = %+v", checkEvents)
+	}
+	_, runDir := readCleanState(t, stateDir)
+	assertPipelineCheckEvents(t, runDir, []workflowEventRecord{
+		{Type: "check.started", Command: []string{"make", "fmt"}, Transcript: "clean-check-01-fmt.log"},
+		{Type: "check.completed", Outcome: "success", ExitCode: intPointer(0), Command: []string{"make", "fmt"}, Transcript: "clean-check-01-fmt.log"},
+		{Type: "check.started", Command: []string{"make", "test"}, Transcript: "clean-check-02-test.log"},
+		{Type: "check.completed", Outcome: "failure", ExitCode: intPointer(-1), Command: []string{"make", "test"}, Transcript: "clean-check-02-test.log"},
+	})
 	remote := strings.TrimSpace(string(gitClean(t, repo.bare, "rev-parse", "refs/heads/main")))
 	if remote != initial {
 		t.Fatalf("verification failure pushed changes: initial=%s remote=%s", initial, remote)
@@ -1046,6 +1875,77 @@ func TestCleanNormalPushRejectsRemoteDivergence(t *testing.T) {
 	if remotePaths != "remote.txt" {
 		t.Fatalf("failed push changed remote contents: head=%s paths=%q", remoteHead, remotePaths)
 	}
+}
+
+type cleanPristineTransferAgent struct{}
+
+func (*cleanPristineTransferAgent) Run(stage, _, _, workdir, log string) error {
+	if stage == "fix" {
+		if err := os.Rename(filepath.Join(workdir, "old.txt"), filepath.Join(workdir, "new.txt")); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(workdir, "remove.txt")); err != nil {
+			return err
+		}
+		writeCleanFilePath(workdir, "new.txt", "renamed content\n")
+	}
+	if stage == "document" {
+		writeCleanFilePath(workdir, "README.md", "modified in isolated worktree\n")
+	}
+	return os.WriteFile(log, []byte("PASS\n"), 0o600)
+}
+
+func (*cleanPristineTransferAgent) RunWithContext(ctx context.Context, stage, prompt, task, workdir, log string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return (&cleanPristineTransferAgent{}).Run(stage, prompt, task, workdir, log)
+}
+
+func (*cleanPristineTransferAgent) RunWithOutputContext(ctx context.Context, stage, prompt, task, workdir, log string) (string, error) {
+	if err := (&cleanPristineTransferAgent{}).RunWithContext(ctx, stage, prompt, task, workdir, log); err != nil {
+		return "", err
+	}
+	return "PASS\n", nil
+}
+
+type cleanIsolatedWorkspaceAgent struct {
+	target         string
+	externalChange string
+	workdir        string
+}
+
+func (a *cleanIsolatedWorkspaceAgent) Run(stage, _, _, workdir, log string) error {
+	a.workdir = workdir
+	if stage == "review" {
+		switch a.externalChange {
+		case "added":
+			writeCleanFilePathRaw(a.target, "external.txt", "user addition\n")
+		case "modified":
+			writeCleanFilePathRaw(a.target, "README.md", "user modification\n")
+		}
+	}
+	if stage == "fix" {
+		writeCleanFilePath(workdir, "fix.txt", "created in isolated workspace\n")
+	}
+	if stage == "document" {
+		writeCleanFilePath(workdir, "README.md", "updated by isolated clean\n")
+	}
+	return os.WriteFile(log, []byte("PASS\n"), 0o600)
+}
+
+func (a *cleanIsolatedWorkspaceAgent) RunWithContext(ctx context.Context, stage, prompt, task, workdir, log string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return a.Run(stage, prompt, task, workdir, log)
+}
+
+func (a *cleanIsolatedWorkspaceAgent) RunWithOutputContext(ctx context.Context, stage, prompt, task, workdir, log string) (string, error) {
+	if err := a.RunWithContext(ctx, stage, prompt, task, workdir, log); err != nil {
+		return "", err
+	}
+	return "PASS\n", nil
 }
 
 type cleanRepo struct {
@@ -1078,6 +1978,24 @@ func cloneCleanRepo(t *testing.T, bare string) string {
 	return work
 }
 
+func readCleanState(t *testing.T, stateDir string) (State, string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Join(stateDir, "runs"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("clean run entries = %v, %v; want one", entries, err)
+	}
+	runDir := filepath.Join(stateDir, "runs", entries[0].Name())
+	data, err := os.ReadFile(filepath.Join(runDir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatal(err)
+	}
+	return state, runDir
+}
+
 func hasCleanPushLease(args []string, ref string) bool {
 	for _, arg := range args {
 		if arg == "--force-with-lease="+ref+":" {
@@ -1090,9 +2008,71 @@ func hasCleanPushLease(args []string, ref string) bool {
 func cleanTestWorkflow(work string, agent Agent) CleanWorkflow {
 	return CleanWorkflow{
 		Agent: stdoutProtocolTestAgent{Agent: agent}, Config: Config{StateDir: filepath.Join(filepath.Dir(work), "state")},
-		In: strings.NewReader(""), Out: io.Discard, Workdir: work,
+		In: strings.NewReader("yes\n"), Out: io.Discard, Workdir: work, Terminal: true,
 		Make: func(string, ...string) error { return nil },
+		SetupWorktree: func(ctx context.Context, target, head string) (string, func() error, error) {
+			path, cleanup, err := createCleanWorktree(ctx, target, head)
+			if err != nil {
+				return "", nil, err
+			}
+			cleanTestWorkdirs.Store(filepath.Clean(target), path)
+
+			wrappedCleanup := func() error {
+				defer cleanTestWorkdirs.Delete(filepath.Clean(target))
+				defer cleanTestPublishing.Delete(filepath.Clean(target))
+				return cleanup()
+			}
+			switch a := agent.(type) {
+			case *cleanWriterAgent:
+				a.work = path
+			case *cleanRenameOnlyAgent:
+				a.work = path
+			case *cleanDestinationRaceAgent:
+				a.work = path
+				a.target = target
+			}
+			return path, wrappedCleanup, nil
+		},
 	}
+}
+
+var cleanTestWorkdirs sync.Map
+var cleanTestWorkdirScopes sync.Map
+var cleanTestPublishing sync.Map
+
+func cleanTestGitScope(target string, args []string) func() {
+	key := filepath.Clean(target)
+	if _, ok := cleanTestWorkdirs.Load(key); !ok {
+		return func() {}
+	}
+	if len(args) > 0 && args[0] == "add" {
+		cleanTestPublishing.Store(key, true)
+		return func() {}
+	}
+	if _, publishing := cleanTestPublishing.Load(key); publishing {
+		return func() {}
+	}
+	path, _ := cleanTestWorkdirs.Load(key)
+	previous, hadPrevious := cleanTestWorkdirScopes.Load(key)
+	cleanTestWorkdirScopes.Store(key, path)
+	return func() {
+		if hadPrevious {
+			cleanTestWorkdirScopes.Store(key, previous)
+		} else {
+			cleanTestWorkdirScopes.Delete(key)
+		}
+	}
+}
+
+func cleanTestWorkdir(target string) string {
+	key := filepath.Clean(target)
+	if _, publishing := cleanTestPublishing.Load(key); publishing {
+		return target
+	}
+	if path, active := cleanTestWorkdirScopes.Load(key); active {
+		return path.(string)
+	}
+	return target
 }
 
 type stdoutProtocolTestAgent struct {
@@ -1127,15 +2107,16 @@ func (a *cleanRecordingAgent) Run(stage, _, _, _, log string) error {
 }
 
 type cleanDestinationRaceAgent struct {
-	work  string
-	calls []string
+	work   string
+	target string
+	calls  []string
 }
 
 func (a *cleanDestinationRaceAgent) Run(stage, _, _, _, log string) error {
 	a.calls = append(a.calls, stage)
 	if stage == "review" {
 		cmd := exec.Command("git", "push", "origin", "HEAD:refs/heads/clean-topic")
-		cmd.Dir = a.work
+		cmd.Dir = a.target
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("create competing destination: %w: %s", err, out)
 		}
@@ -1205,6 +2186,9 @@ func (a *cleanWriterAgent) Run(stage, _, _, _, log string) error {
 		output = queued[0]
 		a.outputs[stage] = queued[1:]
 	}
+	if strings.HasPrefix(output, "ERROR:") {
+		return errors.New(strings.TrimPrefix(output, "ERROR:"))
+	}
 	return os.WriteFile(log, []byte(output), 0o600)
 }
 
@@ -1228,6 +2212,10 @@ func writeCleanFile(t *testing.T, dir, name, content string) {
 }
 
 func writeCleanFilePath(dir, name, content string) {
+	writeCleanFilePathRaw(cleanTestWorkdir(dir), name, content)
+}
+
+func writeCleanFilePathRaw(dir, name, content string) {
 	path := filepath.Join(dir, name)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		panic(fmt.Sprintf("create test file directory: %v", err))

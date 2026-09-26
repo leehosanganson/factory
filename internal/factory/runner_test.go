@@ -83,7 +83,7 @@ func TestRunnerReturnsStdoutProtocolAndLogsBothStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	logPath := filepath.Join(dir, "agent.log")
-	stdout, err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunWithOutputContext(context.Background(), "evaluate", "prompt", "task", dir, logPath)
+	stdout, err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunWithOutputContext(context.Background(), "implement", "prompt", "task", dir, logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,14 +125,14 @@ func TestRunnerBoundsProtocolCaptureAndPreservesFirstNonemptyLine(t *testing.T) 
 				t.Fatal(err)
 			}
 			logPath := filepath.Join(dir, "agent.log")
-			stdout, err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunWithOutputContext(context.Background(), "evaluate", "prompt", "task", dir, logPath)
+			stdout, err := (Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}}).RunWithOutputContext(context.Background(), "implement", "prompt", "task", dir, logPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if len(stdout) > stdoutProtocolCaptureLimit {
 				t.Fatalf("protocol capture length=%d exceeds limit %d", len(stdout), stdoutProtocolCaptureLimit)
 			}
-			if got := evaluatorPassed(stdout); got != tc.wantPass {
+			if got := stdoutFirstLinePasses(stdout); got != tc.wantPass {
 				t.Fatalf("captured protocol passed=%v, want %v; output length=%d", got, tc.wantPass, len(stdout))
 			}
 			if tc.want != "" && stdout != tc.want {

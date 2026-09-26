@@ -11,12 +11,36 @@ import (
 
 // State records progress without placing workflow data in the target repository.
 type State struct {
-	ID        string    `json:"id"`
-	Task      string    `json:"task"`
-	Workdir   string    `json:"workdir"`
-	Stage     string    `json:"stage,omitempty"`
+	ID                  string          `json:"id"`
+	Task                string          `json:"task"`
+	Workdir             string          `json:"workdir"`
+	Stage               string          `json:"stage,omitempty"`
+	Status              string          `json:"status"`
+	Managed             bool            `json:"managed,omitempty"`
+	StageHistoryVersion int             `json:"stage_history_version"`
+	Stages              []StageRecord   `json:"stages"`
+	Checks              []CheckResult   `json:"checks,omitempty"`
+	Subtasks            []SubtaskRecord `json:"subtasks,omitempty"`
+	SubtaskPlanStatus   string          `json:"subtask_plan_status,omitempty"`
+	SubtaskPlanLog      string          `json:"subtask_plan_log,omitempty"`
+	UpdatedAt           time.Time       `json:"updated_at"`
+}
+
+// StageRecord records one stage in the order it ran.
+type StageRecord struct {
+	Name      string    `json:"name"`
 	Status    string    `json:"status"`
-	UpdatedAt time.Time `json:"updated_at"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at,omitempty"`
+}
+
+// CheckResult records one configured pipeline check and its durable log.
+type CheckResult struct {
+	Command   []string  `json:"command"`
+	Log       string    `json:"log"`
+	ExitCode  int       `json:"exit_code"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at"`
 }
 
 // StateRoot returns the state directory that contains run records.
@@ -83,7 +107,10 @@ func createRun(root, workdir, task string) (string, *State, error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("create run directory: %w", err)
 	}
-	state := &State{ID: filepath.Base(dir), Task: task, Workdir: workdir, Status: "running", UpdatedAt: time.Now().UTC()}
+	state := &State{
+		ID: filepath.Base(dir), Task: task, Workdir: workdir, Status: "running",
+		StageHistoryVersion: 1, Stages: []StageRecord{}, UpdatedAt: time.Now().UTC(),
+	}
 	if err := writeState(dir, state); err != nil {
 		return "", nil, err
 	}

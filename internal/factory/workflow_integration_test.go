@@ -45,7 +45,7 @@ func TestWorkflowIntegrationHelper(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if call.Stage == "evaluate" && strings.Contains(call.Task, "Stage completed: requirements") {
+	if call.Stage == "requirements" {
 		countPath := os.Getenv("FACTORY_INTEGRATION_RETRY_COUNT")
 		count := 0
 		data, err := os.ReadFile(countPath)
@@ -61,16 +61,12 @@ func TestWorkflowIntegrationHelper(t *testing.T) {
 			t.Fatal(err)
 		}
 		if count == 1 {
-			fmt.Println("FAIL\nintegration evaluator finding: requirements incomplete")
-			return
+			t.Fatalf("first stage invocation should fail workflow")
 		}
-	}
-	if call.Stage == "evaluate" {
-		fmt.Println("PASS")
 	}
 }
 
-func TestWorkflowIntegrationUsesRunnerRetriesAndKeepsArtifactsOutsideTarget(t *testing.T) {
+func TestWorkflowIntegrationFailsAfterOneRunnerInvocationAndKeepsArtifactsOutsideTarget(t *testing.T) {
 	base := t.TempDir()
 	target := filepath.Join(base, "target")
 	state := filepath.Join(base, "state")
@@ -78,7 +74,7 @@ func TestWorkflowIntegrationUsesRunnerRetriesAndKeepsArtifactsOutsideTarget(t *t
 		t.Fatal(err)
 	}
 	trace := filepath.Join(base, "processes.jsonl")
-	counter := filepath.Join(base, "retry-count")
+	counter := filepath.Join(base, "invocation-count")
 	t.Setenv("FACTORY_INTEGRATION_HELPER", "1")
 	t.Setenv("FACTORY_INTEGRATION_TRACE", trace)
 	t.Setenv("FACTORY_INTEGRATION_RETRY_COUNT", counter)
@@ -98,51 +94,33 @@ func TestWorkflowIntegrationUsesRunnerRetriesAndKeepsArtifactsOutsideTarget(t *t
 		Workdir: target,
 		Gate:    true,
 	}
-	if err := workflow.Run(task); err != nil {
-		t.Fatal(err)
+	if err := workflow.Run(task); err == nil || !strings.Contains(err.Error(), "requirements agent failed") {
+		t.Fatalf("failed stage invocation should end workflow: %v", err)
 	}
 
 	calls := readIntegrationCalls(t, trace)
-	wantStages := []string{"requirements", "evaluate", "requirements", "evaluate", "implement", "evaluate", "review", "evaluate", "document", "evaluate"}
-	if len(calls) != len(wantStages) {
-		t.Fatalf("process calls = %d, want %d; calls=%+v", len(calls), len(wantStages), calls)
-	}
-	for i, call := range calls {
-		if call.Stage != wantStages[i] {
-			t.Fatalf("process call %d stage = %q, want %q", i, call.Stage, wantStages[i])
-		}
-		if !strings.Contains(call.Task, task) {
-			t.Errorf("task placeholder was not preserved for %s: %q", call.Stage, call.Task)
-		}
+	if len(calls) != 1 || calls[0].Stage != "requirements" {
+		t.Fatalf("process calls = %+v, want one requirements invocation and no follow-up stages", calls)
 	}
 	if !strings.Contains(calls[0].Task, "Target repository: "+target) || !strings.Contains(calls[0].Task, task) {
 		t.Errorf("requirements did not receive target context and original task: %q", calls[0].Task)
 	}
-	if !strings.Contains(calls[2].Task, task) || !strings.Contains(calls[2].Task, "integration evaluator finding: requirements incomplete") || !strings.Contains(calls[2].Task, "Evaluator output/findings:") {
-		t.Errorf("second requirements attempt did not receive original task and first evaluator feedback: %q", calls[2].Task)
-	}
 	if calls[0].Workdir == target || !isWithin(state, calls[0].Workdir) {
 		t.Errorf("requirements workdir = %q, want a run directory under external state %q", calls[0].Workdir, state)
 	}
-	for i, call := range calls[1:] {
-		wantWorkdir := target
-		if call.Stage == "requirements" {
-			wantWorkdir = calls[0].Workdir
-		}
-		if call.Workdir != wantWorkdir {
-			t.Errorf("process call %d (%s) workdir = %q, want %q", i+1, call.Stage, call.Workdir, wantWorkdir)
-		}
-	}
-	if count, err := os.ReadFile(counter); err != nil || strings.TrimSpace(string(count)) != "2" {
-		t.Errorf("requirements evaluator retry count = %q, err=%v", count, err)
+	if count, err := os.ReadFile(counter); err != nil || strings.TrimSpace(string(count)) != "1" {
+		t.Errorf("requirements agent invocation count = %q, err=%v", count, err)
 	}
 	stateEntries, err := os.ReadDir(filepath.Join(state, "runs"))
 	if err != nil || len(stateEntries) != 1 {
 		t.Fatalf("expected persisted run outside target: entries=%v err=%v", stateEntries, err)
 	}
 	runDir := filepath.Join(state, "runs", stateEntries[0].Name())
-	if _, err := os.Stat(filepath.Join(runDir, "02-evaluate-requirements.log")); err != nil {
-		t.Errorf("retry evaluator log missing from external state: %v", err)
+	if _, err := os.Stat(filepath.Join(runDir, "01-requirements.log")); err != nil {
+		t.Errorf("single stage log missing from external state: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "02-requirements.log")); !os.IsNotExist(err) {
+		t.Errorf("unexpected retry log exists: %v", err)
 	}
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Errorf("task text was interpreted as shell syntax: marker stat error=%v", err)

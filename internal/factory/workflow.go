@@ -3,11 +3,15 @@ package factory
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -16,23 +20,73 @@ var workflowStages = []string{"requirements", "implement", "review", "document"}
 
 const evaluatorOutputLimit = 8 * 1024
 
+var pipelineCheckOpenFile = func(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+}
+var pipelineCheckCloseFile = func(file *os.File) error { return file.Close() }
+
 // ContextLineReader reads one line and can stop waiting when its context is canceled.
 type ContextLineReader interface {
 	ReadLineContext(context.Context) (string, error)
 }
 
+// WorkflowEvent describes one observable workflow lifecycle transition.
+type WorkflowEvent struct {
+	RunID      string
+	Type       string
+	Stage      string
+	Message    string
+	Command    []string
+	Transcript string
+	Outcome    string
+	ExitCode   *int
+	StartedAt  time.Time
+	EndedAt    time.Time
+}
+
+type workflowEventRecord struct {
+	Version    int        `json:"version"`
+	Timestamp  time.Time  `json:"timestamp"`
+	RunID      string     `json:"runID"`
+	Type       string     `json:"type"`
+	Stage      string     `json:"stage,omitempty"`
+	Message    string     `json:"message,omitempty"`
+	Command    []string   `json:"command,omitempty"`
+	Transcript string     `json:"transcript,omitempty"`
+	Outcome    string     `json:"outcome,omitempty"`
+	ExitCode   *int       `json:"exit_code,omitempty"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	EndedAt    *time.Time `json:"ended_at,omitempty"`
+}
+
+// WorkflowObserver receives durable-session lifecycle events. Implementations
+// should return an error when an event could not be recorded.
+type WorkflowObserver interface {
+	ObserveWorkflowEvent(WorkflowEvent) error
+}
+
+// WorkflowObserverFunc adapts a function to WorkflowObserver.
+type WorkflowObserverFunc func(WorkflowEvent) error
+
+func (f WorkflowObserverFunc) ObserveWorkflowEvent(event WorkflowEvent) error { return f(event) }
+
 // Workflow coordinates fresh agent processes and human approval gates.
 type Workflow struct {
-	Agent           Agent
-	Config          Config
-	In              io.Reader
-	Out             io.Writer
-	Workdir         string
-	Terminal        bool
-	Gate            bool
-	RequireComplete bool
-	Stages          []string
-	FinalApproval   string
+	Agent            Agent
+	Config           Config
+	In               io.Reader
+	Out              io.Writer
+	Workdir          string
+	Terminal         bool
+	Gate             bool
+	RequireComplete  bool
+	Stages           []string
+	FinalApproval    string
+	Observer         WorkflowObserver
+	DeferCompletion  bool
+	Managed          bool
+	RunCreated       func(runDir, runID string)
+	stageBudgetLimit time.Duration
 }
 
 // Run starts a persisted run and executes the complete human-gated workflow.
@@ -42,6 +96,12 @@ func (w Workflow) Run(task string) error {
 
 // RunContext starts a persisted run and executes the workflow until completion or cancellation.
 func (w Workflow) RunContext(ctx context.Context, task string) error {
+	if w.Managed && !w.Gate {
+		return fmt.Errorf("managed run controls are reserved for gated foreground workflows")
+	}
+	if err := validatePipelineChecks(w.Config.PipelineChecks); err != nil {
+		return err
+	}
 	target, err := canonicalPath(w.Workdir)
 	if err != nil {
 		return fmt.Errorf("resolve target directory: %w", err)
@@ -62,7 +122,63 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	if err != nil {
 		return err
 	}
+	if w.RunCreated != nil {
+		w.RunCreated(runDir, state.ID)
+	}
+	state.Managed = w.Managed
+	if err := writeState(runDir, state); err != nil {
+		return err
+	}
+	var managed *managedRun
+	if w.Managed {
+		managed, err = startManagedRun(ctx, runDir)
+		if err != nil {
+			return err
+		}
+		defer managed.close()
+		ctx = managed.ctx
+	}
 	fmt.Fprintf(w.Out, "Run: %s\n", safeProgressPath(runDir, progressLogLineLimit-5))
+	observe := func(event WorkflowEvent) error {
+		if err := persistWorkflowEvent(runDir, event); err != nil {
+			return err
+		}
+		if w.Observer != nil {
+			return w.Observer.ObserveWorkflowEvent(event)
+		}
+		return nil
+	}
+	transition := func(status string) error {
+		state.Status = status
+		writeErr := writeState(runDir, state)
+		eventErr := observe(WorkflowEvent{RunID: state.ID, Type: "workflow.transition", Stage: state.Stage, Message: status})
+		if writeErr != nil {
+			return writeErr
+		}
+		return eventErr
+	}
+	initialEvent := WorkflowEvent{RunID: state.ID, Type: "workflow.transition", Message: state.Status}
+	if err := observe(initialEvent); err != nil {
+		state.Status = "failed"
+		writeErr := writeState(runDir, state)
+		failedEvent := initialEvent
+		failedEvent.Message = state.Status
+		eventErr := persistWorkflowEvent(runDir, failedEvent)
+		return errors.Join(err, writeErr, eventErr)
+	}
+	fail := func(err error) error {
+		status := "failed"
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			status = "interrupted"
+		}
+		if w.Managed && managedStopRequested(runDir) {
+			status = "stopped"
+		}
+		if transitionErr := transition(status); transitionErr != nil {
+			return errors.Join(err, transitionErr)
+		}
+		return err
+	}
 	var reader io.Reader = bufio.NewReader(w.In)
 	if _, ok := w.In.(ContextLineReader); ok {
 		reader = w.In
@@ -73,177 +189,275 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	}
 	for _, stage := range stages {
 		if ctx.Err() != nil {
-			state.Status = "interrupted"
-			_ = writeState(runDir, state)
-			return fmt.Errorf("workflow interrupted: %w", ctx.Err())
+			return fail(fmt.Errorf("workflow interrupted: %w", ctx.Err()))
 		}
 		state.Stage = stage
+		state.Stages = append(state.Stages, StageRecord{
+			Name: stage, Status: "running", StartedAt: time.Now().UTC(),
+		})
+		stageRecord := &state.Stages[len(state.Stages)-1]
 		if err := writeState(runDir, state); err != nil {
-			state.Status = "failed"
-			_ = writeState(runDir, state)
-			return err
+			return fail(err)
 		}
-		passed, err := w.runStage(ctx, reader, runDir, task, stage)
+		passed, err := w.runStage(ctx, reader, runDir, task, stage, state, observe)
 		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				state.Status = "interrupted"
-				_ = writeState(runDir, state)
-				return fmt.Errorf("workflow interrupted: %w", err)
+			stageRecord.Status = "failed"
+			if (ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && !errors.Is(err, errStageExecutionBudgetExhausted) {
+				stageRecord.Status = "interrupted"
 			}
-			state.Status = "failed"
-			_ = writeState(runDir, state)
-			return err
+			stageRecord.EndedAt = time.Now().UTC()
+			if writeErr := writeState(runDir, state); writeErr != nil {
+				err = errors.Join(err, writeErr)
+			}
+			if (ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && !errors.Is(err, errStageExecutionBudgetExhausted) {
+				return fail(fmt.Errorf("workflow interrupted: %w", err))
+			}
+			return fail(err)
 		}
 		if err := ctx.Err(); err != nil {
-			state.Status = "interrupted"
-			_ = writeState(runDir, state)
-			return fmt.Errorf("workflow interrupted: %w", err)
+			if stageRecord.Status != "failed" {
+				stageRecord.Status = "interrupted"
+				stageRecord.EndedAt = time.Now().UTC()
+			}
+			if writeErr := writeState(runDir, state); writeErr != nil {
+				err = errors.Join(err, writeErr)
+			}
+			return fail(fmt.Errorf("workflow interrupted: %w", err))
 		}
 		if !passed {
-			state.Status = "stopped"
-			_ = writeState(runDir, state)
+			stageRecord.Status = "stopped"
+			stageRecord.EndedAt = time.Now().UTC()
+			if err := writeState(runDir, state); err != nil {
+				return fail(err)
+			}
+			if err := transition("stopped"); err != nil {
+				return err
+			}
 			if w.RequireComplete {
 				return fmt.Errorf("workflow stopped before completion")
 			}
 			return nil
 		}
+		stageRecord.Status = "passed"
+		stageRecord.EndedAt = time.Now().UTC()
+		if err := writeState(runDir, state); err != nil {
+			return fail(err)
+		}
 	}
 	if ctx.Err() != nil {
-		state.Status = "interrupted"
-		_ = writeState(runDir, state)
-		return fmt.Errorf("workflow interrupted: %w", ctx.Err())
+		return fail(fmt.Errorf("workflow interrupted: %w", ctx.Err()))
 	}
-	state.Status = "complete"
-	if err := writeState(runDir, state); err != nil {
-		state.Status = "failed"
-		_ = writeState(runDir, state)
-		return err
+	if !w.DeferCompletion {
+		if err := runPipelineChecks(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe); err != nil {
+			return fail(err)
+		}
+	}
+	if w.DeferCompletion {
+		return nil
+	}
+	if err := transition("complete"); err != nil {
+		return fail(err)
 	}
 	return nil
 }
 
-func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, stage string) (bool, error) {
-	var retryFeedback string
-	for attempt := 1; attempt <= 4; attempt++ {
+func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error) error {
+	for i, args := range checks {
 		if err := ctx.Err(); err != nil {
-			return false, err
+			return fmt.Errorf("pipeline check interrupted: %w", err)
 		}
-		prompt, err := LoadPrompt(w.Config.PromptDir, stage)
+		started := time.Now().UTC()
+		logName := fmt.Sprintf("pipeline-check-%02d.log", i+1)
+		logPath := filepath.Join(runDir, logName)
+		startedEvent := WorkflowEvent{
+			RunID: state.ID, Type: "check.started", Stage: args[0],
+			Command: append([]string(nil), args...), Transcript: logName, StartedAt: started,
+		}
+		if err := observe(startedEvent); err != nil {
+			return fmt.Errorf("persist pipeline check start: %w", err)
+		}
+		log, err := pipelineCheckOpenFile(logPath)
 		if err != nil {
-			return false, err
+			ended := time.Now().UTC()
+			exitCode := -1
+			state.Checks = append(state.Checks, CheckResult{
+				Command: append([]string(nil), args...), Log: logName, ExitCode: exitCode,
+				StartedAt: started, EndedAt: ended,
+			})
+			stateErr := writeState(runDir, state)
+			completedEvent := WorkflowEvent{
+				RunID: state.ID, Type: "check.completed", Stage: args[0],
+				Command: append([]string(nil), args...), Transcript: logName, Outcome: "failure",
+				ExitCode: &exitCode, StartedAt: started, EndedAt: ended,
+			}
+			eventErr := observe(completedEvent)
+			return errors.Join(fmt.Errorf("create pipeline check log %s: %w", logName, err), stateErr, eventErr)
 		}
-		stageLog := filepath.Join(runDir, fmt.Sprintf("%02d-%s.log", attempt, stage))
-		stageTask := task
-		stageWorkdir := w.Workdir
-		if stage == "requirements" {
-			stageTask = fmt.Sprintf("Target repository: %s\n\nOriginal task:\n%s", w.Workdir, task)
-			stageWorkdir = runDir
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		configureProcessCancellation(cmd)
+		cmd.Dir = workdir
+		cmd.Stdout = log
+		cmd.Stderr = log
+		runErr := cmd.Run()
+		closeErr := pipelineCheckCloseFile(log)
+		ended := time.Now().UTC()
+		exitCode := 0
+		if runErr != nil {
+			exitCode = -1
+			var exitErr *exec.ExitError
+			if errors.As(runErr, &exitErr) {
+				exitCode = exitErr.ExitCode()
+			}
 		}
-		if retryFeedback != "" {
-			stageTask += "\n\nFeedback from the previous attempt:\n" + retryFeedback
+		if closeErr != nil && runErr == nil {
+			exitCode = -1
 		}
-		progress := startProgress(w.Out, w.Terminal, stage, attempt, stageLog)
-		runErr := runWithProgress(progress, func() error {
-			return runAgentWithContext(ctx, w.Agent, stage, prompt, stageTask, stageWorkdir, stageLog)
+		state.Checks = append(state.Checks, CheckResult{
+			Command: append([]string(nil), args...), Log: logName, ExitCode: exitCode,
+			StartedAt: started, EndedAt: ended,
 		})
-		if ctx.Err() != nil {
-			return false, ctx.Err()
+		if writeErr := writeState(runDir, state); writeErr != nil {
+			return errors.Join(runErr, closeErr, fmt.Errorf("persist pipeline check result: %w", writeErr))
+		}
+		outcome := "success"
+		if runErr != nil || closeErr != nil {
+			outcome = "failure"
+			if closeErr == nil && (ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded)) {
+				outcome = "canceled"
+			}
+		}
+		completedEvent := WorkflowEvent{
+			RunID: state.ID, Type: "check.completed", Stage: args[0],
+			Command: append([]string(nil), args...), Transcript: logName, Outcome: outcome,
+			ExitCode: &exitCode, StartedAt: started, EndedAt: ended,
+		}
+		if err := observe(completedEvent); err != nil {
+			return errors.Join(runErr, closeErr, fmt.Errorf("persist pipeline check completion: %w", err))
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close pipeline check transcript %s: %w", logPath, closeErr)
 		}
 		if runErr != nil {
-			stageOutput := readLog(stageLog)
-			fmt.Fprintf(w.Out, "%s\n", boundedOutput(stageOutput, evaluatorOutputLimit))
-			fmt.Fprintf(w.Out, "Agent failed: %s\n", boundedOutput(runErr.Error(), evaluatorOutputLimit))
-			if attempt == 4 {
-				return false, fmt.Errorf("%s agent failed after attempt %d/4: %s", stage, attempt, boundedOutput(runErr.Error(), evaluatorOutputLimit))
+			if ctx.Err() != nil {
+				return fmt.Errorf("pipeline check %q interrupted (transcript: %s): %w", args[0], logPath, ctx.Err())
 			}
-			if w.Gate {
-				retry, err := askRetry(ctx, reader, w.Out, stage, attempt)
-				if err != nil {
-					return false, err
-				}
-				if !retry {
-					return false, nil
-				}
-			}
-			fmt.Fprintf(w.Out, "Retrying %s: agent invocation failed (%s); starting attempt %d/4 (maximum 4 attempts).\n", stage, boundedOutput(runErr.Error(), evaluatorOutputLimit), attempt+1)
-			retryFeedback = fmt.Sprintf("Previous stage attempt failed.\nStage output/error log:\n%s\nAgent error: %s", boundedOutput(stageOutput, evaluatorOutputLimit), boundedOutput(runErr.Error(), evaluatorOutputLimit))
-			continue
+			return fmt.Errorf("pipeline check %q failed (exit code %d; transcript: %s): %w", args[0], exitCode, logPath, runErr)
 		}
+	}
+	return nil
+}
 
-		evaluatorTask := fmt.Sprintf("Original task:\n%s\n\nStage completed: %s\nStage output log: %s\n\nThe stage agent already exited successfully; otherwise this evaluator would not run. The workflow state remains status=running during evaluation by design, until evaluator acceptance is recorded. The evaluator process being active is expected. Do not count status=running or this evaluator being active alone as failure or incompleteness. Verify the requested work and stage output on substance against the original task and workflow requirements; keep those content and quality checks strict. Do not perform the stage. Report findings, then put PASS as the first non-empty stdout line only if the stage succeeded and materially satisfies its requirements; otherwise put FAIL first.", task, stage, stageLog)
-		evaluatorPrompt, err := LoadPrompt(w.Config.PromptDir, "evaluate")
+func optionalTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	return &value
+}
+
+func persistWorkflowEvent(runDir string, event WorkflowEvent) error {
+	record := workflowEventRecord{
+		Version: 1, Timestamp: time.Now().UTC(), RunID: event.RunID,
+		Type: event.Type, Stage: event.Stage, Message: event.Message,
+		Command: event.Command, Transcript: event.Transcript, Outcome: event.Outcome,
+		ExitCode: event.ExitCode, StartedAt: optionalTime(event.StartedAt), EndedAt: optionalTime(event.EndedAt),
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("marshal workflow event: %w", err)
+	}
+	file, err := os.OpenFile(filepath.Join(runDir, "workflow-events.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open workflow event log: %w", err)
+	}
+	_, writeErr := file.Write(append(data, '\n'))
+	closeErr := file.Close()
+	if writeErr != nil {
+		return fmt.Errorf("write workflow event: %w", writeErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close workflow event log: %w", closeErr)
+	}
+	return nil
+}
+
+func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, stage string, state *State, observe func(WorkflowEvent) error) (bool, error) {
+	budget := newStageExecutionBudget(w.stageBudgetLimit)
+	agentTimeout, err := w.Config.agentTimeout()
+	if err != nil {
+		return false, err
+	}
+	stageAgent := budgetedAgent{agent: w.Agent, budget: budget, timeout: agentTimeout}
+	prompt, err := LoadPrompt(w.Config.PromptDir, stage)
+	if err != nil {
+		return false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if budget.isExhausted() {
+		return false, fmt.Errorf("%s exceeded its cumulative agent execution budget: %w", stage, errStageExecutionBudgetExhausted)
+	}
+	stageLog := filepath.Join(runDir, fmt.Sprintf("%02d-%s.log", len(state.Stages), stage))
+	stageTask := task
+	stageWorkdir := w.Workdir
+	if stage == "requirements" {
+		stageTask = fmt.Sprintf("Target repository: %s\n\nOriginal task:\n%s", w.Workdir, task)
+		stageWorkdir = runDir
+	}
+	if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.started", Stage: stage, Message: stageLog}); err != nil {
+		return false, err
+	}
+	progress := startProgress(w.Out, w.Terminal, stage, stageLog)
+	runErr := runWithProgress(progress, func() error {
+		if stage == "implement" {
+			parallelWorkflow := w
+			parallelWorkflow.Agent = stageAgent
+			used, err := parallelWorkflow.runParallelImplementation(ctx, stageTask, stageLog, runDir, state, observe)
+			if used || err != nil {
+				return err
+			}
+		}
+		return runAgentWithContext(ctx, stageAgent, stage, prompt, stageTask, stageWorkdir, stageLog)
+	})
+	if runErr != nil {
+		if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.failed", Stage: stage, Message: boundedOutput(runErr.Error()+"\n"+stageLog, evaluatorOutputLimit)}); err != nil {
+			return false, err
+		}
+	} else if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.completed", Stage: stage, Message: stageLog}); err != nil {
+		return false, err
+	}
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if runErr != nil {
+		if errors.Is(runErr, errStageExecutionBudgetExhausted) {
+			return false, fmt.Errorf("%s exceeded its cumulative agent execution budget: %w", stage, runErr)
+		}
+		stageOutput := readLog(stageLog)
+		fmt.Fprintf(w.Out, "%s\n", boundedOutput(stageOutput, evaluatorOutputLimit))
+		fmt.Fprintf(w.Out, "Agent failed: %s\n", boundedOutput(runErr.Error(), evaluatorOutputLimit))
+		return false, fmt.Errorf("%s agent failed: %s", stage, boundedOutput(runErr.Error(), evaluatorOutputLimit))
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if w.Gate {
+		next := "the next stage"
+		if stage == "document" {
+			next = "complete the workflow"
+			if w.FinalApproval != "" {
+				next = w.FinalApproval
+			}
+		}
+		approved, err := askApproval(ctx, reader, w.Out, fmt.Sprintf("Agent completed %s. Approve to %s? Type exactly yes: ", stage, next))
 		if err != nil {
 			return false, err
 		}
-		evaluatorLog := filepath.Join(runDir, fmt.Sprintf("%02d-evaluate-%s.log", attempt, stage))
-		progress = startProgress(w.Out, w.Terminal, "evaluate "+stage, attempt, evaluatorLog)
-		var protocolOutput []byte
-		evalErr := runWithProgress(progress, func() error {
-			var err error
-			protocolOutput, err = runEvaluatorWithContext(ctx, w.Agent, evaluatorPrompt, evaluatorTask, w.Workdir, evaluatorLog)
-			return err
-		})
-		if ctx.Err() != nil {
-			return false, ctx.Err()
+		if !approved {
+			return false, nil
 		}
-		output := readLog(evaluatorLog)
-		passed := protocolOutput != nil && evaluatorPassed(string(protocolOutput))
-		if evalErr == nil && passed {
-			fmt.Fprintf(w.Out, "Evaluation: PASS — %s; log: %s\n", stage, safeProgressPath(evaluatorLog, evaluatorOutputLimit-64))
-		} else {
-			if evalErr != nil {
-				fmt.Fprintf(w.Out, "Evaluation: ERROR — %s: %s\n", stage, boundedOutput(evalErr.Error(), evaluatorOutputLimit))
-			} else {
-				fmt.Fprintf(w.Out, "Evaluation: FAIL — %s; first non-empty stdout line was not exactly PASS.\n", stage)
-			}
-			fmt.Fprintf(w.Out, "Evaluator findings/output:\n%s\nEvaluator log: %s\n", boundedOutput(output, evaluatorOutputLimit), safeProgressPath(evaluatorLog, evaluatorOutputLimit-20))
-		}
-		if evalErr != nil || !passed {
-			if attempt == 4 {
-				if evalErr != nil {
-					return false, fmt.Errorf("%s evaluator failed after attempt %d/4: %s", stage, attempt, boundedOutput(evalErr.Error(), evaluatorOutputLimit))
-				}
-				return false, fmt.Errorf("%s evaluator rejected the stage after attempt %d/4", stage, attempt)
-			}
-			if w.Gate {
-				retry, err := askRetry(ctx, reader, w.Out, stage, attempt)
-				if err != nil {
-					return false, err
-				}
-				if !retry {
-					return false, nil
-				}
-			}
-			reason := "evaluator rejected the stage"
-			if evalErr != nil {
-				reason = fmt.Sprintf("evaluator invocation failed (%s)", boundedOutput(evalErr.Error(), evaluatorOutputLimit))
-			}
-			fmt.Fprintf(w.Out, "Retrying %s: %s; starting attempt %d/4 (maximum 4 attempts).\n", stage, reason, attempt+1)
-			retryFeedback = fmt.Sprintf("Evaluator rejected the previous attempt.\nStage output log:\n%s\nEvaluator output/findings:\n%s", boundedOutput(readLog(stageLog), evaluatorOutputLimit), boundedOutput(output, evaluatorOutputLimit))
-			if evalErr != nil {
-				retryFeedback += fmt.Sprintf("\nEvaluator error: %s", boundedOutput(evalErr.Error(), evaluatorOutputLimit))
-			}
-			continue
-		}
-		if w.Gate {
-			next := "the next stage"
-			if stage == "document" {
-				next = "complete the workflow"
-				if w.FinalApproval != "" {
-					next = w.FinalApproval
-				}
-			}
-			approved, err := askApproval(ctx, reader, w.Out, fmt.Sprintf("Evaluator passed for %s. Approve to %s? Type exactly yes: ", stage, next))
-			if err != nil {
-				return false, err
-			}
-			if !approved {
-				return false, nil
-			}
-		}
-		return true, nil
 	}
-	return false, nil
+	return true, nil
 }
 
 func runWithProgress(progress *stageProgress, run func() error) (err error) {
@@ -265,12 +479,11 @@ type outputContextAgent interface {
 	RunWithOutputContext(context.Context, string, string, string, string, string) (string, error)
 }
 
-func runEvaluatorWithContext(ctx context.Context, agent Agent, prompt, task, workdir, logPath string) ([]byte, error) {
+func runAgentWithOutputContext(ctx context.Context, agent Agent, stage, prompt, task, workdir, logPath string) (string, error) {
 	if contextual, ok := agent.(outputContextAgent); ok {
-		output, err := contextual.RunWithOutputContext(ctx, "evaluate", prompt, task, workdir, logPath)
-		return []byte(output), err
+		return contextual.RunWithOutputContext(ctx, stage, prompt, task, workdir, logPath)
 	}
-	return nil, fmt.Errorf("evaluator agent does not provide stdout protocol output")
+	return "", fmt.Errorf("agent does not provide stdout protocol output")
 }
 
 func runAgentWithContext(ctx context.Context, agent Agent, stage, prompt, task, workdir, logPath string) error {
@@ -278,15 +491,6 @@ func runAgentWithContext(ctx context.Context, agent Agent, stage, prompt, task, 
 		return contextual.RunWithContext(ctx, stage, prompt, task, workdir, logPath)
 	}
 	return fmt.Errorf("agent does not support context-aware execution")
-}
-
-func askRetry(ctx context.Context, reader io.Reader, out io.Writer, stage string, attempt int) (bool, error) {
-	fmt.Fprintf(out, "%s attempt %d/4 did not pass. Retry this stage? Type exactly yes to retry; any other response stops the workflow: ", stage, attempt)
-	answer, err := readPromptLine(ctx, reader)
-	if err != nil && err != io.EOF {
-		return false, err
-	}
-	return answer == "yes\n" || answer == "yes\r\n", nil
 }
 
 func askApproval(ctx context.Context, reader io.Reader, out io.Writer, question string) (bool, error) {
@@ -350,13 +554,4 @@ func terminalSafeText(text string) string {
 		}
 	}
 	return clean.String()
-}
-
-func evaluatorPassed(output string) bool {
-	for _, line := range strings.Split(output, "\n") {
-		if strings.TrimSpace(line) != "" {
-			return line == "PASS"
-		}
-	}
-	return false
 }

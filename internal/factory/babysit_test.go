@@ -75,19 +75,25 @@ func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) 
 
 func TestBabysitAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		ctx        func() (context.Context, context.CancelFunc)
-		timeout    string
-		hangAt     string
-		maxElapsed time.Duration
+		name        string
+		ctx         func() (context.Context, context.CancelFunc)
+		timeout     string
+		actionLimit time.Duration
+		hangAt      string
+		maxElapsed  time.Duration
 	}{
 		{name: "configured agent timeout", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "100ms", hangAt: "babysit", maxElapsed: 3 * time.Second},
-		{name: "configured evaluator timeout", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "100ms", hangAt: "evaluate", maxElapsed: 3 * time.Second},
+		{name: "monitor action ceiling", ctx: func() (context.Context, context.CancelFunc) { return context.Background(), func() {} }, timeout: "3s", actionLimit: 100 * time.Millisecond, hangAt: "babysit", maxElapsed: time.Second},
 		{name: "parent cancellation", ctx: func() (context.Context, context.CancelFunc) {
 			return context.WithTimeout(context.Background(), 100*time.Millisecond)
 		}, timeout: "3s", hangAt: "babysit", maxElapsed: time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			previousActionLimit := babysitAgentActionTimeout
+			if tc.actionLimit > 0 {
+				babysitAgentActionTimeout = tc.actionLimit
+			}
+			t.Cleanup(func() { babysitAgentActionTimeout = previousActionLimit })
 			base := t.TempDir()
 			bare := filepath.Join(base, "remote.git")
 			repo := filepath.Join(base, "repo")
@@ -112,13 +118,10 @@ func TestBabysitAgentUsesConfiguredTimeoutAndParentCancellation(t *testing.T) {
 			}
 			script := filepath.Join(base, "agent")
 			scriptBody := `#!/bin/sh
-if [ "$1" = babysit ]; then
-  if [ "$HANG_AT" = babysit ]; then exec sleep 30; fi
-  printf changed > tracked
-  printf 'FACTORY_STATUS=FIXED\n'
-  exit 0
-fi
-exec sleep 30
+if [ "$HANG_AT" = babysit ]; then exec sleep 30; fi
+printf changed > tracked
+printf 'FACTORY_STATUS=FIXED\n'
+exit 0
 `
 			if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 				t.Fatal(err)
@@ -465,32 +468,16 @@ func TestBabysitSnapshotValidationAndSignature(t *testing.T) {
 	}
 }
 
-func TestBabysitProtocolAndEvaluatorRequireExactFirstVerdict(t *testing.T) {
+func TestBabysitProtocolRequiresOneExactFinalStatus(t *testing.T) {
 	for _, tc := range []struct{ out, want string }{{"tests ok\nFACTORY_STATUS=FIXED\n", "FIXED"}, {"FACTORY_STATUS=FIXED\n", "FIXED"}, {"FACTORY_STATUS=FIXED\nFACTORY_STATUS=APPROVAL_REQUIRED\n", ""}, {"FACTORY_STATUS=FIXED extra\n", ""}} {
 		got, _ := agentProtocol(tc.out)
 		if got != tc.want {
 			t.Errorf("protocol(%q)=%q want %q", tc.out, got, tc.want)
 		}
 	}
-	if got, _ := parseEvaluation("PASS\nFACTORY_FILES=[\"main.go\"]\n"); got != "PASS" {
-		t.Fatalf("exact verdict rejected: %s", got)
-	}
-	for _, out := range []string{" \t\n\t\nPASS\nFACTORY_FILES=[]\n", "\n  \r\nPASS\nFACTORY_FILES=[]\n"} {
-		if got, _ := parseEvaluation(out); got != "PASS" {
-			t.Errorf("verdict after whitespace-only lines rejected: %q => %q", out, got)
-		}
-	}
-	for _, out := range []string{" PASS\nFACTORY_FILES=[]\n", "prefix\nPASS\nFACTORY_FILES=[]\n", "PASS extra\nFACTORY_FILES=[]\n", " \t\nPASS \t\nFACTORY_FILES=[]\n"} {
-		if got, _ := parseEvaluation(out); got == "PASS" {
-			t.Errorf("non-exact verdict accepted: %q", out)
-		}
-	}
-	if got, files := parseEvaluation("PASS\nFACTORY_FILES=[\"a.go\"]\n"); got != "PASS" || len(files) != 1 || files[0] != "a.go" {
-		t.Fatalf("evaluator path protocol parsed as %q %v", got, files)
-	}
 }
 
-func TestBabysitChangedPathsIncludeStagedAndUntrackedAndRejectUnsafeNames(t *testing.T) {
+func TestBabysitChangedPathsIncludeStagedUntrackedAndNoRenameEndpoints(t *testing.T) {
 	repo := newBabysitRepo(t)
 	if err := os.WriteFile(filepath.Join(repo, "tracked.go"), []byte("package test\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -510,6 +497,16 @@ func TestBabysitChangedPathsIncludeStagedAndUntrackedAndRejectUnsafeNames(t *tes
 	if !sameStringSet(paths, []string{"new file.txt", "tracked.go"}) {
 		t.Fatalf("changed paths = %q", paths)
 	}
+	if err := os.Rename(filepath.Join(repo, "tracked.go"), filepath.Join(repo, "renamed.go")); err != nil {
+		t.Fatal(err)
+	}
+	paths, err = changedPaths(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameStringSet(paths, []string{"new file.txt", "renamed.go", "tracked.go"}) {
+		t.Fatalf("rename endpoints missing from changed paths: %q", paths)
+	}
 	for _, path := range []string{"../escape", "/tmp/x", ".git/config", "a/../b"} {
 		if validChangePath(path) {
 			t.Errorf("unsafe path %q accepted", path)
@@ -520,7 +517,53 @@ func TestBabysitChangedPathsIncludeStagedAndUntrackedAndRejectUnsafeNames(t *tes
 	}
 }
 
-func TestBabysitIndependentEvaluationCommitsAndPushesOnlyAuthorizedPaths(t *testing.T) {
+func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
+	base := t.TempDir()
+	bare := filepath.Join(base, "remote.git")
+	repo := filepath.Join(base, "repo")
+	runTestCommand(t, base, "git", "init", "--bare", bare)
+	runTestCommand(t, base, "git", "clone", bare, repo)
+	runTestCommand(t, repo, "git", "checkout", "-b", "feature")
+	runTestCommand(t, repo, "git", "config", "user.name", "Factory Test")
+	runTestCommand(t, repo, "git", "config", "user.email", "factory@example.test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("before\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runTestCommand(t, repo, "git", "add", "README.md")
+	runTestCommand(t, repo, "git", "commit", "-m", "initial")
+	runTestCommand(t, repo, "git", "push", "-u", "origin", "feature")
+	head := runTestCommand(t, repo, "git", "rev-parse", "HEAD")
+	jobDir := filepath.Join(base, "20260518T120000-0123456789ab")
+	if err := os.MkdirAll(jobDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	job := &babysitJob{ID: "20260518T120000-0123456789ab", Description: "Fix docs", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
+	if err := saveBabysitJob(jobDir, job); err != nil {
+		t.Fatal(err)
+	}
+	worktree := filepath.Join(base, "worker")
+	runTestCommand(t, repo, "git", "worktree", "add", "-b", "worker", worktree, head)
+	job.Worktree, job.WorkerBranch = worktree, "worker"
+	script := filepath.Join(base, "agent")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+printf changed > README.md
+printf 'FACTORY_PROPOSAL=Need human review\n'
+printf 'FACTORY_STATUS=APPROVAL_REQUIRED\n'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := processBabysitEvent(jobDir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}}, &babysitSnapshot{HeadRefOID: head}, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "awaiting_approval" || job.Proposal != "Need human review" {
+		t.Fatalf("approval state = %q, proposal %q; want awaiting approval", job.Status, job.Proposal)
+	}
+	if got := runTestCommand(t, bare, "git", "rev-parse", "refs/heads/feature"); got != head {
+		t.Fatalf("approval-required action changed remote: got %s, want %s", got, head)
+	}
+}
+
+func TestBabysitFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
 	base := t.TempDir()
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
@@ -575,11 +618,6 @@ if [ "$stage" = "babysit" ]; then
   printf 'FACTORY_STATUS=FIXED\n'
   exit 0
 fi
-if [ "$stage" = "evaluate" ]; then
-  printf '%s\\n' '[pi-web-access] Dynamic tool activation requires Pi 0.86.1 or newer; web tools remain eagerly available.' >&2
-  printf 'PASS\\nFACTORY_FILES=["README.md"]\\n'
-  exit 0
-fi
 exit 9
 `
 	script = strings.ReplaceAll(script, `\\n`, `\n`)
@@ -597,8 +635,10 @@ exit 9
 	if remoteHead == head {
 		log, _ := os.ReadFile(filepath.Join(jobDir, "actions.log"))
 		agentLog, _ := os.ReadFile(filepath.Join(jobDir, "agent.log"))
-		evalLog, _ := os.ReadFile(filepath.Join(jobDir, "evaluation.log"))
-		t.Fatalf("independently evaluated fix was not pushed; actions=%s agent=%s evaluation=%s", log, agentLog, evalLog)
+		t.Fatalf("FIXED changes were not pushed; actions=%s agent=%s", log, agentLog)
+	}
+	if _, err := os.Stat(filepath.Join(jobDir, "evaluation.log")); !os.IsNotExist(err) {
+		t.Fatalf("runtime evaluator transcript exists: %v", err)
 	}
 	message, err := runGit(context.Background(), repo, "show", "-s", "--format=%s", remoteHead)
 	if err != nil {
