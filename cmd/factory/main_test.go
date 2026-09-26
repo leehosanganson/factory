@@ -27,6 +27,33 @@ func TestPrivateJobWorkerInvocationRequiresStoreRoot(t *testing.T) {
 	}
 }
 
+func TestVersionCommandReportsLinkedVersion(t *testing.T) {
+	originalVersion := version
+	t.Cleanup(func() { version = originalVersion })
+
+	for _, tc := range []struct {
+		name    string
+		version string
+	}{
+		{name: "development default", version: "dev"},
+		{name: "release linker value", version: "v1.2.3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			version = tc.version
+			var out, errOut bytes.Buffer
+			if err := run([]string{"version"}, strings.NewReader(""), &out, &errOut); err != nil {
+				t.Fatal(err)
+			}
+			if out.String() != tc.version+"\n" {
+				t.Fatalf("version output = %q, want %q", out.String(), tc.version+"\n")
+			}
+			if errOut.Len() != 0 {
+				t.Fatalf("version wrote unexpected stderr: %q", errOut.String())
+			}
+		})
+	}
+}
+
 func TestHelpAndMonitorUsage(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if err := run([]string{"-h"}, strings.NewReader(""), &out, &errOut); err != nil {
@@ -34,7 +61,7 @@ func TestHelpAndMonitorUsage(t *testing.T) {
 	}
 	help := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
 	for _, want := range []string{
-		"factory implement", "factory tidy", "factory monitor", "factory pipeline", "factory clean", "factory babysit",
+		"factory version", "build version", "defaults to dev", "factory implement", "factory tidy", "factory monitor", "factory pipeline", "factory clean", "factory babysit",
 		"factory run list", "factory run stop", "factory job start implementation", "factory job start monitor",
 		"factory monitor list", "factory babysit", "factory run events", "factory job attach", "-h, --help",
 		"babysit", "make clean", "origin/<branch>", "only if that remote branch does not already exist",
@@ -384,6 +411,63 @@ func (cancelAwareTestAgent) Run(string, string, string, string, string) error {
 
 func (cancelAwareTestAgent) RunWithContext(ctx context.Context, _, _, _, _, _ string) error {
 	return ctx.Err()
+}
+
+func TestGatedImplementRejectsNonInteractiveBeforeAgentOrRunState(t *testing.T) {
+	stateDir := t.TempDir()
+	configDir := filepath.Join(t.TempDir(), "config")
+	factoryConfigDir := filepath.Join(configDir, "factory")
+	if err := os.MkdirAll(factoryConfigDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "agent-invoked")
+	agent := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\ntouch \"$AGENT_MARKER\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q}`, agent, stateDir)
+	if err := os.WriteFile(filepath.Join(factoryConfigDir, "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	t.Setenv("AGENT_MARKER", marker)
+
+	tests := []struct {
+		name           string
+		stdinTerminal  bool
+		stdoutTerminal bool
+	}{
+		{name: "stdin is not a terminal", stdoutTerminal: true},
+		{name: "stdout is not a terminal", stdinTerminal: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			readEnd, writeEnd, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { readEnd.Close(); writeEnd.Close() })
+			terminalCheck := func(file *os.File) bool {
+				if file == readEnd {
+					return tc.stdinTerminal
+				}
+				if file == os.Stdout {
+					return tc.stdoutTerminal
+				}
+				return false
+			}
+			err = runPipelineContextWithTerminalCheck(context.Background(), []string{"do the work"}, true, readEnd, os.Stdout, terminalCheck)
+			if err == nil || !strings.Contains(err.Error(), "factory implement --gate requires an interactive terminal for approvals") {
+				t.Fatalf("gated implementation error = %v", err)
+			}
+			if _, err := os.Stat(marker); !os.IsNotExist(err) {
+				t.Fatalf("agent invoked before terminal check: stat marker error=%v", err)
+			}
+			if _, err := os.Stat(filepath.Join(stateDir, "runs")); !os.IsNotExist(err) {
+				t.Fatalf("gated implementation created run state before terminal check: stat error=%v", err)
+			}
+		})
+	}
 }
 
 func TestNonInteractiveImplementPipelineAndBareAliasAreRejected(t *testing.T) {

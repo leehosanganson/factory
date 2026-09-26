@@ -1,0 +1,32 @@
+version: 2
+project_name: factory
+
+builds:
+  - id: factory
+    main: ./cmd/factory
+    binary: factory
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }}
+
+archives:
+  - id: factory
+    ids: [factory]
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256

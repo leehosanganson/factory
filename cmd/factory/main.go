@@ -16,6 +16,8 @@ import (
 	"github.com/leehosanganson/factory/internal/factory"
 )
 
+var version = "dev"
+
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "factory:", err)
@@ -35,6 +37,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
+		case "version":
+			fmt.Fprintln(out, version)
+			return nil
 		case "help", "-h", "--help":
 			printHelp(out)
 			return nil
@@ -132,8 +137,18 @@ func runPipeline(args []string, gate bool, in io.Reader, out io.Writer) error {
 }
 
 func runPipelineContext(ctx context.Context, args []string, gate bool, in io.Reader, out io.Writer) error {
+	return runPipelineContextWithTerminalCheck(ctx, args, gate, in, out, isTerminal)
+}
+
+func runPipelineContextWithTerminalCheck(ctx context.Context, args []string, gate bool, in io.Reader, out io.Writer, terminalCheck func(*os.File) bool) error {
 	if file, ok := in.(*os.File); ok {
 		in = &contextStdin{file: file, ctx: ctx}
+	}
+	stdout, outputIsFile := out.(*os.File)
+	stdin, inputIsFile := inputFile(in)
+	terminal := inputIsFile && outputIsFile && terminalCheck(stdin) && terminalCheck(stdout)
+	if gate && !terminal {
+		return fmt.Errorf("factory implement --gate requires an interactive terminal for approvals")
 	}
 	return runPipelineTask(args, in, out, func(task string, workflowIn io.Reader) error {
 		cfg, err := factory.LoadConfig("")
@@ -144,9 +159,6 @@ func runPipelineContext(ctx context.Context, args []string, gate bool, in io.Rea
 		if err != nil {
 			return fmt.Errorf("get target repository directory: %w", err)
 		}
-		stdout, outputIsFile := out.(*os.File)
-		stdin, inputIsFile := inputFile(in)
-		terminal := inputIsFile && outputIsFile && isTerminal(stdin) && isTerminal(stdout)
 		if gate {
 			workflow := factory.Workflow{Agent: factory.Runner{Config: cfg}, Config: cfg, In: workflowIn, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: true, Managed: true}
 			return workflow.RunContext(ctx, task)
@@ -376,6 +388,7 @@ func printHelpWithOptions(out io.Writer, width int, terminal, noColor bool) {
 	}
 	sections := []helpSection{
 		{title: "Workflows", commands: []helpCommand{
+			{"factory version", "Print the build version (defaults to dev)."},
 			{"factory implement [--gate] [description...]", "Start an implementation job and attach to its output (alias: factory pipeline)."},
 			{"factory tidy [--gate]", "Review, fix, document, and verify (alias: factory clean)."},
 			{"factory monitor <description>", "Start detached monitoring for a routine fix on an open PR (alias: factory babysit)."},
@@ -383,6 +396,7 @@ func printHelpWithOptions(out io.Writer, width int, terminal, noColor bool) {
 			{"factory help, -h, --help", "Show this help."},
 		}, paragraphs: []string{
 			"Legacy command forms: factory pipeline -> factory implement; factory clean -> factory tidy; factory babysit -> factory monitor.",
+			"Build version is set by the release tag at link time; development builds report dev.",
 		}},
 
 		{title: "Detached jobs", commands: []helpCommand{

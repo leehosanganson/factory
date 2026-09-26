@@ -29,15 +29,24 @@ factory job stop <id>
 - `git` and GitHub CLI (`gh`) for `factory monitor`
 - A configured agent executable; the default adapter uses `pi`
 
-## Build and test
+## Build, version, and release
+
+Development builds report `dev`. The `factory version` command prints the version embedded in the binary; release builds set it from the Git tag with a linker flag.
 
 ```sh
 make build
+./bin/factory version
 make test
 make vet
 ```
 
-The binary is written to `./bin/factory`.
+The binary is written to `./bin/factory`. Build a versioned local binary with:
+
+```sh
+go build -ldflags "-X main.version=v1.2.3" -o bin/factory ./cmd/factory
+```
+
+CI runs on pull requests targeting `main` and pushes to `main`. Releases are separate: pushing a stable `vMAJOR.MINOR.PATCH` tag (for example, `v1.2.3`) runs tests and builds Linux and macOS archives for amd64 and arm64, with SHA-256 checksums, then publishes a GitHub release. Prerelease and build-metadata tags are rejected. Merging to `main` does not create a release; release tags must be created explicitly.
 
 ## Interactive task workflow
 
