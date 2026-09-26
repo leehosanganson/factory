@@ -40,7 +40,7 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build factory: %v\n%s", err, output)
 	}
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,10 +142,52 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	}
 }
 
+func TestJobCommandsControlJobsPersistedInLegacyStateRoot(t *testing.T) {
+	state := t.TempDir()
+	target := t.TempDir()
+	legacyRoot := filepath.Join(state, "factory", "jobs", "v2")
+	legacyStore, err := NewJobStore(legacyRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyStore.CreateJob(JobRecord{ID: "legacy-active", Type: implementationJobType, TaskDescription: "pre-upgrade work", TargetPath: target, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacyStore.CreateSession("legacy-active", "workflow", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := legacyStore.CreateJobLog("legacy-active"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := JobCommand([]string{"list"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err != nil || !strings.Contains(out.String(), "legacy-active") {
+		t.Fatalf("legacy job list=%q err=%v", out.String(), err)
+	}
+	out.Reset()
+	if err := JobCommand([]string{"start", "implementation", "must not overlap"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err == nil || !strings.Contains(err.Error(), "already targets") {
+		t.Fatalf("legacy active job did not block duplicate target admission: %v", err)
+	}
+	out.Reset()
+	if err := JobCommand([]string{"get", "legacy-active"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err != nil || !strings.Contains(out.String(), "Status: running") {
+		t.Fatalf("legacy job get=%q err=%v", out.String(), err)
+	}
+	out.Reset()
+	if err := JobCommand([]string{"stop", "legacy-active"}, Config{StateDir: state}, target, strings.NewReader(""), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !legacyStore.StopRequested("legacy-active") {
+		t.Fatal("stop request was not written beside the existing worker's legacy job")
+	}
+	if _, err := os.Stat(filepath.Join(state, "factory", "detached-jobs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("CLI controls split the existing worker into a new root: %v", err)
+	}
+}
+
 func TestDetachedJobStopAndSameTargetAdmission(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +232,7 @@ func TestDifferentTargetsCanAcquireIndependentJobLocks(t *testing.T) {
 func TestDuplicateJobWorkerCannotRerunOrReplaceWorkerIdentity(t *testing.T) {
 	stateDir := t.TempDir()
 	target := t.TempDir()
-	store, err := NewJobStore(filepath.Join(stateDir, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(stateDir, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +329,7 @@ func TestRunJobWorkerRequiresCanonicalPrivateRoot(t *testing.T) {
 func TestAdmissionRecoversOrphanQueueButNeverStealsActiveWorker(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +386,7 @@ func TestAdmissionRecoversOrphanQueueButNeverStealsActiveWorker(t *testing.T) {
 
 func TestJobListPrintsReadableJobsAlongsideReconciliationErrors(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +457,7 @@ func TestJobListSaysNoJobsWhenStoreIsEmpty(t *testing.T) {
 
 func TestJobListReconcilesEveryStaleJobWithoutStealingLiveTargets(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +502,7 @@ func TestJobListReconcilesEveryStaleJobWithoutStealingLiveTargets(t *testing.T) 
 
 func TestJobShowReconcilesOnlyRequestedStaleJob(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +531,7 @@ func TestJobShowReconcilesOnlyRequestedStaleJob(t *testing.T) {
 
 func TestJobStopReconcilesStaleJobAndRejectsTerminalStop(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,7 +559,7 @@ func TestJobStopReconcilesStaleJobAndRejectsTerminalStop(t *testing.T) {
 
 func TestJobStopLiveTargetOnlyRequestsCancellation(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,7 +586,7 @@ func TestJobStopLiveTargetOnlyRequestsCancellation(t *testing.T) {
 func TestRunJobWorkerStopRequestCancelsWorkflow(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -565,7 +607,7 @@ func TestRunJobWorkerStopRequestCancelsWorkflow(t *testing.T) {
 	}
 	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
 	t.Setenv("XDG_STATE_HOME", stateDir)
-	workerStore, err := NewJobStore(filepath.Join(stateDir, "factory", "jobs", "v2"))
+	workerStore, err := NewJobStore(filepath.Join(stateDir, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-func TestMonitorJobStartsForForkHeadAndCreatesMatchingV2Session(t *testing.T) {
+func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing.T) {
 	base := t.TempDir()
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
@@ -56,20 +56,27 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingV2Session(t *testing.T) {
 		t.Fatalf("monitor start failed: %v", err)
 	}
 	id := strings.Fields(output.String())[2]
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	job, err := store.GetJob(id)
 	if err != nil || job.ID != id || job.Type != monitorJobType || job.TaskDescription != "monitor this PR" || job.Status != "queued" {
-		t.Fatalf("v2 monitor record = %+v, err=%v", job, err)
+		t.Fatalf("detached monitor record = %+v, err=%v", job, err)
+	}
+	legacyMetadata := filepath.Join(state, "factory", "jobs", id, "job.json")
+	if _, err := os.Stat(legacyMetadata); err != nil {
+		t.Fatalf("legacy monitor metadata missing from factory/jobs: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "factory", "detached-jobs", id, "job.json")); err != nil {
+		t.Fatalf("detached monitor record missing from factory/detached-jobs: %v", err)
 	}
 	session, err := store.GetSession(id, monitorSessionID)
 	if err != nil || session.JobID != id || session.Status != "queued" {
 		t.Fatalf("monitor session = %+v, err=%v", session, err)
 	}
 	if err := JobCommand([]string{"start", "monitor", "duplicate"}, cfg, repo, strings.NewReader(""), &output); err == nil || !strings.Contains(err.Error(), "active babysitter already monitors") {
-		t.Fatalf("second v2 monitor did not use babysit duplicate guard: %v", err)
+		t.Fatalf("second detached job monitor did not use babysit duplicate guard: %v", err)
 	}
 }
 
@@ -142,7 +149,7 @@ func TestMonitorGetAliasesKeepProposalsAndLogsOutOfConciseOutput(t *testing.T) {
 	}
 }
 
-func TestMonitorLegacyLifecycleAndResetSynchronizeV2Record(t *testing.T) {
+func TestMonitorLegacyLifecycleAndResetSynchronizeDetachedRecord(t *testing.T) {
 	state := t.TempDir()
 	legacyRoot := filepath.Join(state, "factory", "jobs")
 	id := "20260518T120010-0123456789ab"
@@ -161,7 +168,7 @@ func TestMonitorLegacyLifecycleAndResetSynchronizeV2Record(t *testing.T) {
 	if err := registerMonitorWorker(id, dir, os.Getpid()); err != nil {
 		t.Fatal(err)
 	}
-	store, _ := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, _ := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	workerBefore, err := store.ReadWorker(id)
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +191,7 @@ func TestMonitorLegacyLifecycleAndResetSynchronizeV2Record(t *testing.T) {
 	}
 	record, err := store.GetJob(id)
 	if err != nil || record.Status != "recoverable_failure" {
-		t.Fatalf("recoverable v2 job = %+v, err=%v", record, err)
+		t.Fatalf("recoverable detached job = %+v, err=%v", record, err)
 	}
 	if err := JobCommand([]string{"stop", id}, cfg, job.RepoRoot, strings.NewReader(""), io.Discard); err != nil {
 		t.Fatal(err)
@@ -224,7 +231,7 @@ func TestMonitorLegacyLifecycleAndResetSynchronizeV2Record(t *testing.T) {
 	}
 	record, err = store.GetJob(id)
 	if err != nil || record.Status != "queued" || store.StopRequested(id) {
-		t.Fatalf("reset did not resume same v2 job: record=%+v stop=%v err=%v", record, store.StopRequested(id), err)
+		t.Fatalf("reset did not resume detached job: record=%+v stop=%v err=%v", record, store.StopRequested(id), err)
 	}
 	session, err := store.GetSession(id, monitorSessionID)
 	if err != nil || session.Status != "queued" {
@@ -247,7 +254,7 @@ func TestMonitorLegacyLifecycleAndResetSynchronizeV2Record(t *testing.T) {
 	}
 	record, err = store.GetJob(id)
 	if err != nil || record.Status != "closed" || !isTerminalStatus(record.Status) {
-		t.Fatalf("closed PR did not become terminal v2 state: %+v err=%v", record, err)
+		t.Fatalf("closed PR did not become terminal detached job state: %+v err=%v", record, err)
 	}
 	session, err = store.GetSession(id, monitorSessionID)
 	if err != nil || session.Status != "closed" {
@@ -268,7 +275,7 @@ func TestReconcileStaleMonitorUpdatesMonitorSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyDir := filepath.Join(filepath.Dir(store.Root()), job.ID)
+	legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", job.ID)
 	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -317,7 +324,7 @@ func TestReconcileStaleMonitorDoesNotMutateMismatchedLegacyJob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacyDir := filepath.Join(filepath.Dir(store.Root()), job.ID)
+	legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", job.ID)
 	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -345,11 +352,11 @@ func TestReconcileStaleMonitorDoesNotMutateMismatchedLegacyJob(t *testing.T) {
 	}
 	job, err = store.GetJob(job.ID)
 	if err != nil || job.Status != "running" {
-		t.Fatalf("v2 monitor job=%+v err=%v, want unchanged running status", job, err)
+		t.Fatalf("detached monitor job=%+v err=%v, want unchanged running status", job, err)
 	}
 	session, err := store.GetSession(job.ID, monitorSessionID)
 	if err != nil || session.Status != "running" {
-		t.Fatalf("v2 monitor session=%+v err=%v, want unchanged running status", session, err)
+		t.Fatalf("detached monitor session=%+v err=%v, want unchanged running status", session, err)
 	}
 }
 

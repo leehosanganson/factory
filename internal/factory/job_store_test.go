@@ -17,7 +17,7 @@ import (
 
 func newTestJobStore(t *testing.T) *JobStore {
 	t.Helper()
-	store, err := NewJobStore(filepath.Join(t.TempDir(), "factory", "jobs"))
+	store, err := NewJobStore(filepath.Join(t.TempDir(), "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,10 +184,57 @@ func TestSessionEventMaximumLineIsEnforcedOnAppendAndRead(t *testing.T) {
 	}
 }
 
-func TestJobStateRootUsesV2AndTargetLocksCanonicalizeAliases(t *testing.T) {
+func TestJobStateRootPrefersExistingLegacyJobsWithoutCopyingState(t *testing.T) {
+	state := t.TempDir()
+	legacyRoot := filepath.Join(state, "factory", "jobs", "v2")
+	legacyStore, err := NewJobStore(legacyRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if err := legacyStore.CreateJob(JobRecord{ID: "old-job", Type: implementationJobType, TargetPath: target, Status: "running"}); err != nil {
+		t.Fatal(err)
+	}
+	root, err := JobStateRoot(state)
+	if err != nil || root != legacyRoot {
+		t.Fatalf("JobStateRoot=%q err=%v, want legacy root %q", root, err, legacyRoot)
+	}
+	opened, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job, err := opened.GetJob("old-job"); err != nil || job.Status != "running" {
+		t.Fatalf("legacy job=%+v err=%v", job, err)
+	}
+	if _, err := os.Stat(filepath.Join(state, "factory", "detached-jobs")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy compatibility created a second job root: %v", err)
+	}
+}
+
+func TestJobStateRootRejectsMixedStoresToPreserveTargetLockDomain(t *testing.T) {
+	state := t.TempDir()
+	for _, root := range []string{
+		filepath.Join(state, "factory", "jobs", "v2"),
+		filepath.Join(state, "factory", "detached-jobs"),
+	} {
+		store, err := NewJobStore(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := "job-" + filepath.Base(filepath.Dir(root))
+		if err := store.CreateJob(JobRecord{ID: id, Type: implementationJobType, TargetPath: t.TempDir(), Status: "running"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if root, err := JobStateRoot(state); err == nil || root != "" || !strings.Contains(err.Error(), "refusing to split job state and target locks") {
+		t.Fatalf("JobStateRoot=%q err=%v, want mixed-store refusal", root, err)
+	}
+}
+
+func TestJobStateRootUsesDetachedJobsAndTargetLocksCanonicalizeAliases(t *testing.T) {
 	state := t.TempDir()
 	root, err := JobStateRoot(state)
-	if err != nil || root != filepath.Join(state, "factory", "jobs", "v2") {
+	if err != nil || root != filepath.Join(state, "factory", "detached-jobs") {
 		t.Fatalf("JobStateRoot=%q err=%v", root, err)
 	}
 	store, err := NewJobStore(root)

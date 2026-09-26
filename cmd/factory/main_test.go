@@ -54,31 +54,48 @@ func TestVersionCommandReportsLinkedVersion(t *testing.T) {
 	}
 }
 
-func TestHelpAndMonitorUsage(t *testing.T) {
+func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 	var out, errOut bytes.Buffer
-	if err := run([]string{"-h"}, strings.NewReader(""), &out, &errOut); err != nil {
+	var rootHelp string
+	for _, args := range [][]string{{"-h"}, {"--help"}, {"help"}} {
+		out.Reset()
+		if err := run(args, strings.NewReader(""), &out, &errOut); err != nil {
+			t.Fatal(err)
+		}
+		text := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
+		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory job", "factory run", "--gate", "factory version"} {
+			if !strings.Contains(text, want) {
+				t.Errorf("root %v help missing %q: %s", args, want, out.String())
+			}
+		}
+		for _, omitted := range []string{"full command overview", "origin/<branch>", "dirty safe mode", "30-minute active", "optional placeholders", "approval requires exact", "isolated worktree", "factory job start implementation", "execution and safeguards", "configuration and limits"} {
+			if strings.Contains(text, omitted) {
+				t.Errorf("root %v help includes full-overview detail %q: %s", args, omitted, out.String())
+			}
+		}
+		if rootHelp != "" && text != rootHelp {
+			t.Errorf("root help aliases differ:\n%q\n%q", rootHelp, text)
+		}
+		rootHelp = text
+	}
+	out.Reset()
+	printRootHelpWithOptions(&out, 80, false, false)
+	if !strings.Contains(out.String(), "Usage:") || strings.Contains(out.String(), "full command overview") {
+		t.Fatalf("concise root help rendering is incorrect: %s", out.String())
+	}
+	out.Reset()
+	if err := run([]string{"implement", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
-	help := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
-	for _, want := range []string{
-		"factory version", "build version", "defaults to dev", "factory implement", "factory tidy", "factory monitor", "factory pipeline", "factory clean",
-		"factory run list", "factory run stop", "factory job start implementation", "factory job start monitor",
-		"factory monitor list", "factory run events", "factory job attach", "-h, --help",
-		"make clean", "origin/<branch>", "only if that remote branch does not already exist",
-		"pristine mode", "dirty safe mode", "does not stage, commit, or push", "does not require an upstream or origin",
-		"not an independent correctness evaluation", "each agent stage runs once", "30-minute active agent-execution budget",
-		"no overall job deadline", "agent_timeout (default 60m)", "exact lowercase yes", "optional placeholders: {workdir} and {stage}",
-		"approval requires exact lowercase y", "three automatic actions", "isolated worktree", "does not merge the pr", "not forcibly killed", "recoverable failure",
-	} {
-		if !strings.Contains(help, want) {
-			t.Errorf("help missing %q: %s", want, out.String())
-		}
+	if !strings.Contains(out.String(), "Implement workflow") || strings.Contains(out.String(), "Execution and safeguards") {
+		t.Fatalf("workflow help should remain concise: %s", out.String())
 	}
-	if strings.Contains(help, "factory babysit") {
-		t.Fatalf("public help must not advertise the removed babysit alias: %s", out.String())
+	out.Reset()
+	if err := run([]string{"job", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(help, "retry") {
-		t.Fatalf("help must not make retry claims: %s", out.String())
+	if !strings.Contains(out.String(), "factory job start implementation") || strings.Contains(out.String(), "full command overview") {
+		t.Fatalf("command-specific help should remain concise: %s", out.String())
 	}
 	if err := run([]string{"job", "start", "clean", "unsupported"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "unsupported job type") {
 		t.Fatalf("clean job type should remain unsupported: err=%v", err)
@@ -111,16 +128,16 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		want []string
 		omit []string
 	}{
-		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}},
+		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}, omit: []string{"Examples:", "Ctrl-C", "interactive terminal"}},
 		{name: "pipeline alias", args: []string{"pipeline", "--help"}, want: []string{"Implement workflow", "factory implement", "factory pipeline"}},
-		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean", "Dirty safe mode"}, omit: []string{"Detached jobs", "factory job", "Monitor management"}},
+		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean"}, omit: []string{"Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "clean alias", args: []string{"clean", "--help"}, want: []string{"Tidy workflow", "factory tidy", "factory clean"}},
-		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"factory job start implementation", "factory job start monitor"}, omit: []string{"factory run", "Monitor management"}},
-		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "show remains an alias"}, omit: []string{"factory job start", "factory run"}},
-		{name: "job show alias", args: []string{"job", "show", "--help"}, want: []string{"factory job get", "--details", "show remains an alias"}},
-		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"factory run events"}, omit: []string{"factory job", "Monitor management"}},
-		{name: "run show alias", args: []string{"run", "show", "--help"}, want: []string{"factory run get", "--details", "show remains an alias"}},
-		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "describe remains an alias"}},
+		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
+		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "show remains an alias"}},
+		{name: "job show alias", args: []string{"job", "show", "--help"}, want: []string{"factory job get", "--details"}, omit: []string{"factory job start"}},
+		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"Gated runs", "factory run events"}, omit: []string{"factory job", "Monitor management", "Example:"}},
+		{name: "run show alias", args: []string{"run", "show", "--help"}, want: []string{"factory run get", "--details"}, omit: []string{"factory run events"}},
+		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "proposals"}, omit: []string{"describe remains an alias"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errOut bytes.Buffer
@@ -161,64 +178,31 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}
 }
 
-func TestHelpFormattingWrapsAndAlignsAtRequestedWidth(t *testing.T) {
+func TestRootHelpFormattingWrapsAtRequestedWidth(t *testing.T) {
 	var out bytes.Buffer
-	printHelpWithOptions(&out, 48, false, false)
+	for _, width := range []int{48, 24} {
+		out.Reset()
+		printRootHelpWithOptions(&out, width, false, false)
+		text := out.String()
+		if strings.Contains(text, "\033[") {
+			t.Fatal("buffer help must never contain ANSI styling")
+		}
+		for i, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
+			if helpTextWidth(line) > width {
+				t.Errorf("line %d exceeds configured width (%d): %q", i+1, width, line)
+			}
+		}
+	}
 	text := out.String()
-	if strings.Contains(text, "\033[") {
-		t.Fatal("buffer help must never contain ANSI styling")
-	}
-	for i, line := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
-		if len([]rune(line)) > 48 {
-			t.Errorf("line %d exceeds configured width (%d): %q", i+1, len([]rune(line)), line)
+	for _, want := range []string{"Usage:", "factory implement", "factory tidy", "factory help"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("concise help omitted %q: %s", want, text)
 		}
 	}
-	if !strings.Contains(text, "factory implement") || !strings.Contains(text, "factory tidy") {
-		t.Fatalf("help omitted canonical commands: %s", text)
-	}
-	var descriptionColumns []int
-	for _, line := range strings.Split(text, "\n") {
-		if strings.HasPrefix(line, "  factory ") && strings.Contains(line, "Show this help.") {
-			descriptionColumns = append(descriptionColumns, strings.Index(line, "Show this help."))
+	for _, omitted := range []string{"factory implement add a small feature", "Dirty safe mode", "Execution and safeguards"} {
+		if strings.Contains(text, omitted) {
+			t.Errorf("concise help unexpectedly includes %q: %s", omitted, text)
 		}
-	}
-	if len(descriptionColumns) != 1 || descriptionColumns[0] < 20 {
-		t.Fatalf("help command row is not aligned into usage and description columns: %s", text)
-	}
-	if !strings.Contains(text, "factory implement add a small feature") || !strings.Contains(text, "Dirty safe mode") {
-		t.Fatalf("help missing examples or safety detail: %s", text)
-	}
-}
-
-func TestHelpLongUsageStacksDescriptionAtDefaultWidth(t *testing.T) {
-	for _, command := range []helpCommand{
-		{
-			usage: "factory implement [--gate] [description...]",
-			desc:  "Start an implementation job and attach to its output (alias: factory pipeline).",
-		},
-		{
-			usage: "factory job start implementation <description>",
-			desc:  "Start a detached implementation job.",
-		},
-	} {
-		t.Run(command.usage, func(t *testing.T) {
-			var output bytes.Buffer
-			printHelpCommands(&output, []helpCommand{command}, 80)
-			got := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
-
-			usageLines := wrapHelpText(command.usage, 40)
-			descLines := wrapHelpText(command.desc, 36)
-			want := make([]string, 0, len(usageLines)+len(descLines))
-			for _, line := range usageLines {
-				want = append(want, "  "+line)
-			}
-			for _, line := range descLines {
-				want = append(want, "    "+line)
-			}
-			if strings.Join(got, "\n") != strings.Join(want, "\n") {
-				t.Fatalf("long usage and description should be stacked at width 80:\n got: %q\nwant: %q", got, want)
-			}
-		})
 	}
 }
 
@@ -226,14 +210,14 @@ func TestHelpOutputFitsNarrowWidths(t *testing.T) {
 	for _, width := range []int{24, 39} {
 		t.Run(fmt.Sprintf("width-%d", width), func(t *testing.T) {
 			var out bytes.Buffer
-			printHelpWithOptions(&out, width, false, false)
+			printRootHelpWithOptions(&out, width, false, false)
 			for lineNumber, line := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
 				if cells := helpTextWidth(line); cells > width {
 					t.Errorf("line %d has %d terminal cells, exceeding width %d: %q", lineNumber+1, cells, width, line)
 				}
 			}
-			if !strings.Contains(out.String(), "    Show this help.") {
-				t.Errorf("width %d command descriptions did not stack below usage", width)
+			if !strings.Contains(out.String(), "Usage:") || !strings.Contains(out.String(), "factory implement") {
+				t.Errorf("width %d concise help omitted usage or workflow", width)
 			}
 		})
 	}
@@ -303,7 +287,7 @@ func TestHelpStylingRequiresTTYColorAndWideEnoughTerminal(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			printHelpWithOptions(&out, tc.width, tc.terminal, tc.noColor)
+			printRootHelpWithOptions(&out, tc.width, tc.terminal, tc.noColor)
 			got := strings.Contains(out.String(), "\033[")
 			if got != tc.wantANSI {
 				t.Fatalf("ANSI present=%t, want %t", got, tc.wantANSI)

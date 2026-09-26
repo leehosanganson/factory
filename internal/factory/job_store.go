@@ -139,7 +139,7 @@ func NewJobStore(root string) (*JobStore, error) {
 	return &JobStore{root: root}, nil
 }
 
-// JobStateRoot returns the shared jobs directory associated with factory state.
+// JobStateRoot returns the detached-jobs directory associated with factory state.
 func JobStateRoot(override string) (string, error) {
 	base := override
 	if base == "" {
@@ -155,7 +155,58 @@ func JobStateRoot(override string) (string, error) {
 	if !filepath.IsAbs(base) {
 		return "", fmt.Errorf("state directory must be absolute")
 	}
-	return filepath.Join(base, "factory", "jobs", "v2"), nil
+	root := filepath.Join(base, "factory", "detached-jobs")
+	legacyRoot := filepath.Join(base, "factory", "jobs", "v2")
+	legacyHasJobs, err := hasJobRecords(legacyRoot)
+	if err != nil {
+		return "", err
+	}
+	currentHasJobs, err := hasJobRecords(root)
+	if err != nil {
+		return "", err
+	}
+	if legacyHasJobs && currentHasJobs {
+		return "", fmt.Errorf("job records exist in both %s and %s; refusing to split job state and target locks", legacyRoot, root)
+	}
+	if legacyHasJobs {
+		return legacyRoot, nil
+	}
+	return root, nil
+}
+
+func hasJobRecords(root string) (bool, error) {
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect job state root %s: %w", root, err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("job state root %s must be a real directory", root)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false, fmt.Errorf("read job state root %s: %w", root, err)
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || validateStoredID(entry.Name()) != nil {
+			continue
+		}
+		jobPath := filepath.Join(root, entry.Name(), "job.json")
+		jobInfo, err := os.Lstat(jobPath)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("inspect job record %s: %w", jobPath, err)
+		}
+		if !jobInfo.Mode().IsRegular() {
+			return false, fmt.Errorf("job record %s must be a regular file", jobPath)
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // Root returns the canonical filesystem path backing this store.
@@ -343,7 +394,11 @@ func (s *JobStore) reconcileMonitorOrphan(job JobRecord) (bool, error) {
 		return false, nil
 	}
 
-	legacyDir := filepath.Join(filepath.Dir(s.root), current.ID)
+	legacyRoot := filepath.Dir(s.root)
+	if filepath.Base(s.root) != "v2" {
+		legacyRoot = filepath.Join(legacyRoot, "jobs")
+	}
+	legacyDir := filepath.Join(legacyRoot, current.ID)
 	legacyPath := filepath.Join(legacyDir, "job.json")
 	legacy, err := func() (*babysitJob, error) {
 		if _, err := os.Lstat(legacyDir); errors.Is(err, os.ErrNotExist) {
@@ -351,7 +406,7 @@ func (s *JobStore) reconcileMonitorOrphan(job JobRecord) (bool, error) {
 		} else if err != nil {
 			return nil, err
 		}
-		if err := ensureRealDirectory(filepath.Dir(s.root), legacyDir); err != nil {
+		if err := ensureRealDirectory(legacyRoot, legacyDir); err != nil {
 			return nil, err
 		}
 		if err := ensureRegularIfExists(legacyPath); err != nil {
@@ -377,7 +432,7 @@ func (s *JobStore) reconcileMonitorOrphan(job JobRecord) (bool, error) {
 			return false, fmt.Errorf("resolve legacy monitor target path: %w", err)
 		}
 		if legacy.ID != current.ID || legacyTarget != canonicalTarget {
-			return false, fmt.Errorf("legacy monitor job does not match v2 job %s", current.ID)
+			return false, fmt.Errorf("legacy monitor job does not match detached job %s", current.ID)
 		}
 	}
 

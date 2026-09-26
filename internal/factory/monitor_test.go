@@ -575,7 +575,7 @@ func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
 	runTestCommand(t, repo, "git", "commit", "-m", "initial")
 	runTestCommand(t, repo, "git", "push", "-u", "origin", "feature")
 	head := runTestCommand(t, repo, "git", "rev-parse", "HEAD")
-	jobDir := filepath.Join(base, "20260518T120000-0123456789ab")
+	jobDir := filepath.Join(base, "state", "factory", "jobs", "20260518T120000-0123456789ab")
 	if err := os.MkdirAll(jobDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -583,7 +583,7 @@ func TestBabysitApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
 	if err := saveBabysitJob(jobDir, job); err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewJobStore(filepath.Join(base, "v2"))
+	store, err := NewJobStore(filepath.Join(base, "state", "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +663,7 @@ exit 1
 	if err := saveBabysitJob(jobDir, job); err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewJobStore(filepath.Join(root, "v2"))
+	store, err := NewJobStore(filepath.Join(base, "state", "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -726,10 +726,10 @@ exit 9
 		t.Fatal(err)
 	}
 	if !bytes.HasPrefix(sessionBytes, agentBytes) || bytes.Count(sessionBytes, agentBytes) != 1 {
-		t.Fatalf("v2 monitor session log = %q, want raw agent log exactly once at the start", sessionBytes)
+		t.Fatalf("detached job monitor session log = %q, want raw agent log exactly once at the start", sessionBytes)
 	}
 	if !bytes.Equal(sessionBytes[:len(agentBytes)], agentBytes) {
-		t.Fatalf("v2 monitor session log did not preserve exact agent bytes: got prefix %q want %q", sessionBytes[:len(agentBytes)], agentBytes)
+		t.Fatalf("detached job monitor session log did not preserve exact agent bytes: got prefix %q want %q", sessionBytes[:len(agentBytes)], agentBytes)
 	}
 	if _, err := os.Stat(filepath.Join(repo, "README.md")); err != nil {
 		t.Fatal(err)
@@ -944,7 +944,7 @@ func newMonitorPushFixture(t *testing.T) monitorPushFixture {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
-	dir := filepath.Join(base, "jobs", "20260518T120003-0123456789ab")
+	dir := filepath.Join(base, "state", "factory", "jobs", "20260518T120003-0123456789ab")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1011,7 +1011,7 @@ func TestGuardedCommitPushCancellationAbortsSnapshotCheckpoint(t *testing.T) {
 
 func TestMonitorAgentSessionAppendFailureFailsAction(t *testing.T) {
 	fixture := newMonitorPushFixture(t)
-	storeRoot := filepath.Join(filepath.Dir(fixture.dir), "v2")
+	storeRoot := filepath.Join(filepath.Dir(filepath.Dir(fixture.dir)), "factory", "detached-jobs")
 	store, err := NewJobStore(storeRoot)
 	if err != nil {
 		t.Fatal(err)

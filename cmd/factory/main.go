@@ -51,8 +51,11 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 		case "version":
 			fmt.Fprintln(out, version)
 			return nil
-		case "help", "-h", "--help":
-			printHelp(out)
+		case "help":
+			printRootHelp(out)
+			return nil
+		case "-h", "--help":
+			printRootHelp(out)
 			return nil
 		case "run":
 			cfg, err := factory.LoadConfig("")
@@ -156,17 +159,15 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "implement":
 		title = "Implement workflow"
 		commands = []helpCommand{
-			{"factory implement [--gate] [description...]", "Start an implementation workflow; default mode starts a job and attaches to output."},
-			{"factory pipeline [--gate] [description...]", "Legacy alias for factory implement."},
+			{"factory implement [--gate] [description...]", "Start an implementation workflow; --gate runs in the foreground."},
+			{"factory pipeline [--gate] [description...]", "Alias for factory implement."},
 		}
-		paragraphs = []string{"Examples: factory implement add a small feature; factory implement --gate add a small feature.", "With no description, task entry requires an interactive terminal. Ctrl-C detaches from the default job; --gate runs the workflow in the foreground for approvals."}
 	case "tidy":
 		title = "Tidy workflow"
 		commands = []helpCommand{
 			{"factory tidy [--gate]", "Review, fix, document, and verify the repository."},
-			{"factory clean [--gate]", "Legacy alias for factory tidy."},
+			{"factory clean [--gate]", "Alias for factory tidy."},
 		}
-		paragraphs = []string{"Example: factory tidy --gate.", "Pristine mode requires an interactive terminal and exact lowercase yes before publication. Dirty safe mode warns that existing work may be affected but does not stage, commit, or push files. This differs from make clean."}
 	case "job":
 		title = "Detached jobs"
 		commands, paragraphs = jobHelp(subcommand)
@@ -202,46 +203,48 @@ func printCommandHelp(out io.Writer, args []string) {
 
 func jobHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
-		{"factory job start implementation <description>", "Start a detached implementation job."},
-		{"factory job start monitor <description>", "Start a detached PR monitor."},
+		{"factory job start implementation <description>", "Start an implementation job."},
+		{"factory job start monitor <description>", "Start a PR monitor."},
 		{"factory job list", "List detached jobs."},
-		{"factory job get <id> [--details]", "Get job status; --details adds metadata and sessions (show remains an alias)."},
-		{"factory job show <id> [--details]", "Compatibility alias for job get."},
-		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow worker/session logs."},
-		{"factory job attach <id>", "Follow worker output; Ctrl-C detaches."},
-		{"factory job stop <id>", "Request cooperative cancellation."},
+		{"factory job get <id> [--details]", "Show job status; --details includes metadata."},
+		{"factory job show <id> [--details]", "Alias for job get."},
+		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow logs."},
+		{"factory job attach <id>", "Follow worker output."},
+		{"factory job stop <id>", "Request cancellation."},
 	}
-	return selectCommandHelp(all, subcommand, "Example: factory job start implementation update the parser.")
+	return selectCommandHelp(all, subcommand, "")
 }
 
 func runHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
-		{"factory run list", "List gated foreground runs."},
-		{"factory run get <id> [--details]", "Get run status; --details adds liveness and metadata (show remains an alias)."},
-		{"factory run show <id> [--details]", "Compatibility alias for run get."},
-		{"factory run events <id> [--follow]", "Read or follow workflow events."},
-		{"factory run stop <id>", "Request cooperative cancellation."},
+		{"factory run list", "List gated runs."},
+		{"factory run get <id> [--details]", "Show run status; --details includes metadata."},
+		{"factory run show <id> [--details]", "Alias for run get."},
+		{"factory run events <id> [--follow]", "Read or follow events."},
+		{"factory run stop <id>", "Request cancellation."},
 	}
-	return selectCommandHelp(all, subcommand, "Example: factory run events <id> --follow.")
+	return selectCommandHelp(all, subcommand, "")
 }
 
 func monitorHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
-		{"factory monitor <description>", "Start detached monitoring for a routine fix on an open PR."},
-		{"factory monitor list", "List active and recent jobs."},
-		{"factory monitor get <id> [--details]", "Get monitor status; --details adds proposals and actions (describe remains an alias)."},
-		{"factory monitor describe <id> [--details]", "Compatibility alias for monitor get."},
-		{"factory monitor approve <id>", "Approve a proposal with an exact, non-empty scope."},
+		{"factory monitor <description>", "Start monitoring an open PR."},
+		{"factory monitor list", "List monitor jobs."},
+		{"factory monitor get <id> [--details]", "Show monitor status; --details includes proposals."},
+		{"factory monitor describe <id> [--details]", "Alias for monitor get."},
+		{"factory monitor approve <id>", "Approve a proposal with a scope."},
 		{"factory monitor reject <id>", "Reject a pending proposal."},
-		{"factory monitor stop <id>", "Request a stop and cancel active agent processes."},
-		{"factory monitor reset <id>", "Restart a recoverable-failure job after its worker exits."},
+		{"factory monitor stop <id>", "Stop monitoring."},
+		{"factory monitor reset <id>", "Reset a recoverable failure."},
 	}
-	commands, _ := selectCommandHelp(all, subcommand, "Example: factory monitor address a failing check on this PR.")
-	return commands, []string{"Example: factory monitor address a failing check on this PR.", "Monitoring is for narrow, routine fixes on an existing open PR; it may publish a guarded fix but does not merge the PR."}
+	return selectCommandHelp(all, subcommand, "")
 }
 
 func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCommand, []string) {
 	if subcommand == "" || subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
+		if example == "" {
+			return all, nil
+		}
 		return all, []string{example}
 	}
 	name := subcommand
@@ -251,11 +254,14 @@ func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCom
 	var selected []helpCommand
 	for _, command := range all {
 		fields := strings.Fields(command.usage)
-		if len(fields) >= 3 && (fields[2] == name || fields[2] == "get" && (subcommand == "show" || subcommand == "describe")) {
+		if len(fields) >= 3 && fields[2] == name {
 			selected = append(selected, command)
 		}
 	}
 	if len(selected) == 0 {
+		if example == "" {
+			return all, nil
+		}
 		return all, []string{example}
 	}
 	return selected, nil
@@ -485,9 +491,43 @@ func readTask(reader *bufio.Reader, out io.Writer) (string, error) {
 	}
 }
 
-func printHelp(out io.Writer) {
+func printRootHelp(out io.Writer) {
 	_, noColor := os.LookupEnv("NO_COLOR")
-	printHelpWithOptions(out, detectHelpWidth(out), helpOutputIsTerminal(out), noColor)
+	printRootHelpWithOptions(out, detectHelpWidth(out), helpOutputIsTerminal(out), noColor)
+}
+
+func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) {
+	if width <= 0 {
+		width = 80
+	}
+	color := terminal && !noColor && width >= 40
+	style := func(text string) string {
+		if color {
+			return "\033[1;36m" + text + "\033[0m"
+		}
+		return text
+	}
+	for _, line := range wrapHelpText("factory - software factory workflows", width) {
+		fmt.Fprintln(out, style(line))
+	}
+	fmt.Fprintln(out)
+	for _, line := range wrapHelpText("Usage: factory [--gate] [description...]", width) {
+		fmt.Fprintln(out, line)
+	}
+	for _, line := range wrapHelpText("       factory <command> [options]", width) {
+		fmt.Fprintln(out, line)
+	}
+	fmt.Fprintln(out)
+	commands := []helpCommand{
+		{"factory implement [--gate] [description...]", "Start an implementation workflow (alias: pipeline)."},
+		{"factory tidy [--gate]", "Review, fix, document, and verify (alias: clean)."},
+		{"factory monitor <description>", "Monitor an open pull request."},
+		{"factory job <command>", "Manage detached jobs."},
+		{"factory run <command>", "Manage gated runs."},
+		{"factory version", "Print the build version."},
+		{"factory help, -h, --help", "Show this concise help."},
+	}
+	printHelpCommands(out, commands, width)
 }
 
 func detectHelpWidth(out io.Writer) int {
@@ -518,107 +558,6 @@ func helpOutputIsTerminal(out io.Writer) bool {
 type helpCommand struct {
 	usage string
 	desc  string
-}
-
-type helpSection struct {
-	title      string
-	commands   []helpCommand
-	paragraphs []string
-}
-
-func printHelpWithOptions(out io.Writer, width int, terminal, noColor bool) {
-	if width <= 0 {
-		width = 80
-	}
-	color := terminal && !noColor && width >= 40
-	style := func(text, code string) string {
-		if !color {
-			return text
-		}
-		return "\033[" + code + "m" + text + "\033[0m"
-	}
-	sections := []helpSection{
-		{title: "Workflows", commands: []helpCommand{
-			{"factory version", "Print the build version (defaults to dev)."},
-			{"factory implement [--gate] [description...]", "Start an implementation job and attach to its output (alias: factory pipeline)."},
-			{"factory tidy [--gate]", "Review, fix, document, and verify (alias: factory clean)."},
-			{"factory monitor <description>", "Start detached monitoring for a routine fix on an open PR."},
-			{"factory [--gate] [description...]", "Interactive alias for factory implement."},
-			{"factory help, -h, --help", "Show this help."},
-		}, paragraphs: []string{
-			"Legacy command forms: factory pipeline -> factory implement; factory clean -> factory tidy.",
-			"Build version is set by the release tag at link time; development builds report dev.",
-		}},
-
-		{title: "Detached jobs", commands: []helpCommand{
-			{"factory job start implementation <description>", "Start a detached implementation job."},
-			{"factory job start monitor <description>", "Start a detached PR monitor."},
-			{"factory job list", "List detached jobs."},
-			{"factory job get <id> [--details]", "Get job status; --details adds metadata and sessions (show remains an alias)."},
-			{"factory job logs <id> [--session <id>] [--follow]", "Read or follow worker/session logs."},
-			{"factory job attach <id>", "Follow worker output; Ctrl-C detaches."},
-			{"factory job stop <id>", "Request cooperative cancellation."},
-		}},
-		{title: "Gated runs", commands: []helpCommand{
-			{"factory run list", "List gated foreground runs."},
-			{"factory run get <id> [--details]", "Get run status; --details adds liveness and metadata (show remains an alias)."},
-			{"factory run events <id> [--follow]", "Read or follow workflow events."},
-			{"factory run stop <id>", "Request cooperative cancellation."},
-		}},
-		{title: "Monitor management", commands: []helpCommand{
-			{"factory monitor list", "List active and recent jobs."},
-			{"factory monitor get <id> [--details]", "Get monitor status; --details adds proposals and actions (describe remains an alias)."},
-			{"factory monitor approve <id>", "Approve a proposal with an exact, non-empty scope."},
-			{"factory monitor reject <id>", "Reject a pending proposal."},
-			{"factory monitor stop <id>", "Request a stop and cancel active agent processes."},
-			{"factory monitor reset <id>", "Restart a recoverable-failure job after its worker exits."},
-		}, paragraphs: []string{
-			"Approval requires exact lowercase y and scoped task text; it is invalidated if the PR/check snapshot changes. After three automatic actions against an unchanged snapshot, the monitor pauses for approval.",
-			"Monitoring runs in an isolated worktree and stops when the PR closes or merges. Before publishing, Factory revalidates the checkout, branch, safe paths, and live PR/check snapshot. It may push a guarded routine fix, but does not merge the PR.",
-		}},
-		{title: "Examples", paragraphs: []string{
-			"factory implement add a small feature",
-			"factory implement --gate add a small feature",
-			"factory job start implementation update the parser",
-			"factory monitor address a failing check on this PR",
-			"factory monitor list",
-		}},
-		{title: "Execution and safeguards", paragraphs: []string{
-			"Implement starts a detached job and attaches to it by default. Ctrl-C detaches without stopping the worker; use factory job stop to request cancellation. --gate keeps the workflow in the foreground for approvals. With no description, task entry requires an interactive terminal.",
-			"Each agent stage runs once; invocation errors fail the workflow. Successful agent exit is not an independent correctness evaluation. Pipeline/clean stages and monitor actions have a 30-minute active agent-execution budget. The configured agent_timeout (default 60m) is a per-process limit; budgets pause during approvals and other non-agent work. There is no overall job deadline.",
-			"Monitor is for narrow, routine fixes on an existing open PR—not general autonomous engineering, high-impact decisions, or a security sandbox. Stop requests are cooperative; the active agent process is canceled, but the detached worker is not forcibly killed. Inspect changes and logs.",
-		}},
-		{title: "Tidy safety", paragraphs: []string{
-			"Pristine mode requires a non-detached branch and an interactive terminal with exact lowercase yes before publication. It uses a configured upstream when available; otherwise it targets origin/<branch> only if that remote branch does not already exist. Upstream-ahead or diverged branches are refused; a synced no-op creates no commit.",
-			"Dirty safe mode warns that agents and formatters may affect existing work. It does not stage, commit, or push files and does not require an upstream or origin. Back up important local changes first. Neither mode is a sandbox. This differs from `make clean`, which removes local build artifacts.",
-		}},
-		{title: "Configuration and limits", paragraphs: []string{
-			"Config: ${XDG_CONFIG_HOME:-~/.config}/factory/config.json",
-			"Run state: ${XDG_STATE_HOME:-~/.local/state}/factory/runs; detached jobs: ${XDG_STATE_HOME:-~/.local/state}/factory/jobs/v2",
-			"Monitor polling: FACTORY_BABYSIT_POLL_INTERVAL (default 30s). GitHub snapshot timeout: 2m. Eight consecutive snapshot failures move the job to recoverable failure; reset clears the failure count but does not fix the underlying cause. Clean verification commands are outside the agent timeout/budget.",
-			"Default agent: pi -p --no-session --append-system-prompt {system_prompt} {task}",
-			"Optional placeholders: {workdir} and {stage}.",
-		}},
-	}
-
-	for _, line := range wrapHelpText("factory - software factory workflows", width) {
-		fmt.Fprintln(out, style(line, "1;36"))
-	}
-	fmt.Fprintln(out)
-	for _, section := range sections {
-		for _, line := range wrapHelpText(section.title, width) {
-			fmt.Fprintln(out, style(line, "1;34"))
-		}
-		if len(section.commands) > 0 {
-			printHelpCommands(out, section.commands, width)
-		}
-		for _, paragraph := range section.paragraphs {
-			for _, line := range wrapHelpText(paragraph, width) {
-				fmt.Fprintln(out, line)
-			}
-		}
-		fmt.Fprintln(out)
-	}
 }
 
 func printHelpCommands(out io.Writer, commands []helpCommand, width int) {

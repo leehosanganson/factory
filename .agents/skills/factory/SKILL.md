@@ -59,13 +59,18 @@ factory job attach <id>
 factory job stop <id>
 ```
 
-Jobs use a separate `jobs/v2` state root. A start returns after launching the
-worker, and stop requests cooperative cancellation through a durable file.
+New jobs use `<state-base>/factory/detached-jobs`. For upgrades, when
+`<state-base>/factory/jobs/v2` contains jobs and the new directory does not,
+Factory keeps using the legacy directory in place so existing workers, CLI
+controls, and target locks remain in the same store; state is not copied or
+migrated. If both roots contain jobs, commands fail closed rather than split
+job discovery or target locking. A start returns after launching the worker,
+and stop requests cooperative cancellation through a durable file.
 Attach follows worker output; Ctrl-C detaches the observer without stopping the
 worker, which can be reattached later. The implementation workflow uses one
-job-level `workflow` session; monitor jobs use
-the babysit ID for the v2 job and `monitor` session. Generic and legacy stop and
-reset operations interoperate. These commands are distinct from the supported
+job-level `workflow` session; monitor jobs use the babysit ID for the detached
+job and `monitor` session. Generic and legacy stop and reset operations
+interoperate. These commands are distinct from the supported
 `factory monitor list/describe/approve/reject/stop/reset` management commands
 below.
 
@@ -278,5 +283,11 @@ non-agent work; there is no overall job deadline. `agent_timeout` does not
 change the separate two-minute GitHub PR/check snapshot timeout or clean
 verification commands. Foreground runs and monitor jobs/logs are persisted
 outside the target repository by default under
-`${XDG_STATE_HOME:-~/.local/state}/factory/`. Do not infer additional resume,
-rollback, or control commands beyond those provided by the CLI.
+`${XDG_STATE_HOME:-~/.local/state}/factory/`. New detached job records use
+`${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs`; legacy monitor
+metadata remains under `${XDG_STATE_HOME:-~/.local/state}/factory/jobs` for
+compatibility. Configured `state_dir` uses `<state_dir>/factory/detached-jobs`
+for new detached jobs and `<state_dir>/factory/jobs` for legacy monitor
+metadata. The upgrade compatibility behavior described above applies to
+`<state_dir>/factory/jobs/v2` as well. Do not infer additional resume, rollback,
+or control commands beyond those provided by the CLI.

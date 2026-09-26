@@ -688,7 +688,11 @@ func babysitAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 		job.Status = "starting"
 		job.PID = 0
 		_ = os.Remove(filepath.Join(dir, "stop.requested"))
-		if err := resetMonitorJobRecord(job.ID, filepath.Join(root, "v2")); err != nil {
+		jobStateRoot, err := JobStateRoot(filepath.Dir(filepath.Dir(root)))
+		if err != nil {
+			return err
+		}
+		if err := resetMonitorJobRecord(job.ID, jobStateRoot); err != nil {
 			return err
 		}
 		if err := babysitEvent(dir, job, "Recoverable failure reset; detached worker restarting."); err != nil {

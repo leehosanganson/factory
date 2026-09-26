@@ -14,15 +14,19 @@ func appendMonitorAgentLog(dir, id string, data []byte) error {
 		return err
 	}
 	if !exists {
-		return fmt.Errorf("v2 monitor job %s does not exist", id)
+		return fmt.Errorf("detached monitor job %s does not exist", id)
 	}
 	return store.AppendSessionLog(id, monitorSessionID, data)
 }
 
 func existingMonitorJobStore(dir, id string) (*JobStore, bool, error) {
-	root := filepath.Join(filepath.Dir(dir), "v2")
+	factoryRoot := filepath.Dir(filepath.Dir(dir))
+	root, err := JobStateRoot(filepath.Dir(factoryRoot))
+	if err != nil {
+		return nil, false, err
+	}
 	path := filepath.Join(root, id, "job.json")
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
 	} else if err != nil {
 		return nil, false, err

@@ -6,7 +6,7 @@ Factory’s primary value is managing a durable workflow through sequential stag
 
 ## Detached implementation jobs
 
-`factory job` supports detached `implementation` and `monitor` types. Jobs persist under the separate jobs/v2 state root. Implementation jobs serialize work against other Factory jobs for the same canonical target; monitor jobs use the detached monitoring engine and its PR-specific duplicate guard.
+`factory job` supports detached `implementation` and `monitor` types. New job state uses `<state-base>/factory/detached-jobs`. For upgrades, if `<state-base>/factory/jobs/v2` contains persisted jobs and the new directory does not, Factory continues using the legacy directory in place so existing workers, job controls, and target locks share one store; it does not copy or migrate live state. If both directories contain jobs, commands fail closed rather than split job discovery or target locking. Implementation jobs serialize work against other Factory jobs for the same canonical target; monitor jobs use the detached monitoring engine and its PR-specific duplicate guard.
 
 ```sh
 factory job start implementation <description>
@@ -20,7 +20,7 @@ factory job attach <id>
 factory job stop <id>
 ```
 
-`start` returns after launching the worker. Workflow events and worker output are retained in job/session logs. `attach` follows worker output to terminal state; Ctrl-C detaches only the observer, and the worker continues. Reattach later with the same command or use `job logs --follow`. `stop` writes a durable cooperative cancellation request; the worker polls it and cancels active work. Implementation sessions use one job-level `workflow` session. Monitor jobs use the monitor ID for both the v2 job and its `monitor` session; `factory monitor stop/reset` operate on that same v2 record and session.
+`start` returns after launching the worker. Workflow events and worker output are retained in job/session logs. `attach` follows worker output to terminal state; Ctrl-C detaches only the observer, and the worker continues. Reattach later with the same command or use `job logs --follow`. `stop` writes a durable cooperative cancellation request; the worker polls it and cancels active work. Implementation sessions use one job-level `workflow` session. Monitor jobs use the monitor ID for both the detached job and its `monitor` session; `factory monitor stop/reset` operate on that same job and session.
 
 Use `factory job get <id> [--details]` as the canonical inspection command; `factory job show <id>` remains a compatibility alias. The same interface applies to `factory run get <id> [--details]` (`run show` alias) and `factory monitor get <id> [--details]` (`monitor describe` alias). The agreed default is concise, tabulated output; `--details` exposes long descriptions, records, proposals, and logs. Current list output is tabulated and individual `get` output is concise labeled fields; tabulating those individual summaries remains outstanding.
 
@@ -127,9 +127,9 @@ pi -p --no-session --append-system-prompt {system_prompt} {task}
 
 Embedded prompts can be overridden by stage-name files in `prompt_dir`, including `requirements.md`, `implement.md`, `review.md`, `document.md`, and the canonical `monitor.md`. For compatibility, if `monitor.md` is absent, `babysit.md` is also accepted as a monitor prompt override.
 
-By default, foreground run state is stored under `${XDG_STATE_HOME:-~/.local/state}/factory/runs`; legacy babysit-named monitor metadata remains under `${XDG_STATE_HOME:-~/.local/state}/factory/jobs`, and v2 implementation/monitor records use `${XDG_STATE_HOME:-~/.local/state}/factory/jobs/v2`. When `state_dir` is configured, foreground runs use `<state_dir>/runs`, legacy monitor metadata uses `<state_dir>/factory/jobs`, and v2 records use `<state_dir>/factory/jobs/v2`. The legacy metadata directory name is for persisted-state compatibility, not a CLI alias. State directories must resolve outside the target repository. Monitor polling can be changed with the legacy environment variable `FACTORY_BABYSIT_POLL_INTERVAL`.
+By default, foreground run state is stored under `${XDG_STATE_HOME:-~/.local/state}/factory/runs`; new detached job records use `${XDG_STATE_HOME:-~/.local/state}/factory/detached-jobs`. When `state_dir` is configured, foreground runs use `<state_dir>/runs` and new detached job records use `<state_dir>/factory/detached-jobs`. If the prior `<state-base>/factory/jobs/v2` directory contains jobs and the new directory has none, Factory continues to use the prior directory as the single job store, keeping pre-upgrade records and live workers controllable without moving state or splitting target locks. If both roots contain jobs, job commands refuse to proceed until the conflict is resolved; Factory does not guess which store or lock domain is authoritative. Legacy babysit-named monitor metadata remains under `${XDG_STATE_HOME:-~/.local/state}/factory/jobs` (or `<state_dir>/factory/jobs` when configured) for persisted-state compatibility, not as a CLI alias. State directories must resolve outside the target repository. Monitor polling can be changed with the legacy environment variable `FACTORY_BABYSIT_POLL_INTERVAL`.
 
-Use `factory help` (or `factory -h`) for the CLI usage summary. `factory monitor help` lists monitor-specific commands, including recovery with `reset`.
+Use `factory help` (or `factory -h` / `factory --help`) for concise CLI help. Command-specific help (for example, `factory monitor help`) lists that command's options and aliases.
 
 ## Go package layout
 

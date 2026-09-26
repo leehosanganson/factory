@@ -90,7 +90,7 @@ func monitorLegacyLogPath(store *JobStore, id, fallback string) (string, error) 
 	if job.Type != monitorJobType {
 		return "", fmt.Errorf("job %s is not a monitor job", id)
 	}
-	legacyRoot := filepath.Dir(store.Root())
+	legacyRoot := filepath.Join(filepath.Dir(store.Root()), "jobs")
 	legacyDir, err := babysitJobDir(legacyRoot, id)
 	if err != nil {
 		return "", err
@@ -122,7 +122,7 @@ func monitorLegacyLogPath(store *JobStore, id, fallback string) (string, error) 
 	if !filepath.IsAbs(job.TargetPath) || !filepath.IsAbs(legacy.RepoRoot) {
 		return "", fmt.Errorf("legacy monitor job has an invalid target path")
 	}
-	v2Target, err := canonicalPath(job.TargetPath)
+	detachedTarget, err := canonicalPath(job.TargetPath)
 	if err != nil {
 		return "", err
 	}
@@ -130,8 +130,8 @@ func monitorLegacyLogPath(store *JobStore, id, fallback string) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if legacy.ID != id || v2Target != legacyTarget {
-		return "", fmt.Errorf("legacy monitor job does not match v2 job %s", id)
+	if legacy.ID != id || detachedTarget != legacyTarget {
+		return "", fmt.Errorf("legacy monitor job does not match detached job %s", id)
 	}
 	return legacyPath, nil
 }

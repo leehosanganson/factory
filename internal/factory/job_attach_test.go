@@ -17,7 +17,7 @@ import (
 func TestAttachCancellationDetachesAndWorkerCanBeReattached(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestAttachSurfacesFailedAndStoppedLifecycle(t *testing.T) {
 	}
 }
 
-func TestBabysitEventAppendFailurePreventsLegacyAndV2Updates(t *testing.T) {
+func TestBabysitEventAppendFailurePreventsLegacyAndDetachedUpdates(t *testing.T) {
 	state := t.TempDir()
 	legacyDir := filepath.Join(state, "factory", "jobs", "20260518T120016-0123456789ab")
 	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
@@ -160,7 +160,7 @@ func TestBabysitEventAppendFailurePreventsLegacyAndV2Updates(t *testing.T) {
 	if err := createMonitorJobRecord(cfg, legacy); err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,17 +179,17 @@ func TestBabysitEventAppendFailurePreventsLegacyAndV2Updates(t *testing.T) {
 	if err != nil || persisted.Status != "running" || persisted.LastEvent != "previous event" {
 		t.Fatalf("legacy state changed after log append failure: %+v err=%v", persisted, err)
 	}
-	v2, err := store.GetJob(id)
-	if err != nil || v2.Status != "queued" {
-		t.Fatalf("v2 status changed after log append failure: %+v err=%v", v2, err)
+	detachedJob, err := store.GetJob(id)
+	if err != nil || detachedJob.Status != "queued" {
+		t.Fatalf("detached job status changed after log append failure: %+v err=%v", detachedJob, err)
 	}
 	session, err := store.GetSession(id, monitorSessionID)
 	if err != nil || session.Status != "queued" {
-		t.Fatalf("v2 session changed after log append failure: %+v err=%v", session, err)
+		t.Fatalf("detached job session changed after log append failure: %+v err=%v", session, err)
 	}
 	events, err := store.SessionEvents(id, monitorSessionID)
 	if err != nil || len(events) != 0 {
-		t.Fatalf("v2 event persisted after append failure: %+v err=%v", events, err)
+		t.Fatalf("detached job event persisted after append failure: %+v err=%v", events, err)
 	}
 }
 
@@ -211,7 +211,7 @@ func TestAttachMonitorDrainsTerminalLegacyEventBeforeStatusTransition(t *testing
 	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
 		t.Fatal(err)
 	}
-	legacyDir := filepath.Join(filepath.Dir(store.Root()), id)
+	legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", id)
 	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -253,7 +253,7 @@ func TestAttachMonitorDrainsTerminalLegacyEventBeforeStatusTransition(t *testing
 
 func TestAttachMonitorUsesMonitorSessionLog(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,8 +271,8 @@ func TestAttachMonitorUsesMonitorSessionLog(t *testing.T) {
 	if err := store.AppendSessionLog(id, monitorSessionID, []byte("monitor transcript\n")); err != nil {
 		t.Fatal(err)
 	}
-	legacyDir := filepath.Join(filepath.Dir(store.Root()), id)
-	if err := os.Mkdir(legacyDir, 0o700); err != nil {
+	legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", id)
+	if err := os.MkdirAll(legacyDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	legacy := &babysitJob{ID: id, RepoRoot: target, Status: "completed"}
@@ -320,12 +320,12 @@ func TestAttachMonitorFallsBackAndRejectsUnsafeLegacyActionLog(t *testing.T) {
 	}{
 		{name: "missing legacy directory", wantFallback: true},
 		{name: "missing actions log", setup: func(t *testing.T, dir string) {
-			if err := os.Mkdir(dir, 0o700); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 		}, wantFallback: true},
 		{name: "symlink actions log", setup: func(t *testing.T, dir string) {
-			if err := os.Mkdir(dir, 0o700); err != nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			outside := filepath.Join(t.TempDir(), "outside.log")
@@ -347,10 +347,10 @@ func TestAttachMonitorFallsBackAndRejectsUnsafeLegacyActionLog(t *testing.T) {
 			if _, err := store.CreateSession(id, monitorSessionID, "complete"); err != nil {
 				t.Fatal(err)
 			}
-			if err := store.AppendSessionLog(id, monitorSessionID, []byte("v2 session fallback\n")); err != nil {
+			if err := store.AppendSessionLog(id, monitorSessionID, []byte("detached job session fallback\n")); err != nil {
 				t.Fatal(err)
 			}
-			legacyDir := filepath.Join(filepath.Dir(store.Root()), id)
+			legacyDir := filepath.Join(filepath.Dir(store.Root()), "jobs", id)
 			if test.setup != nil {
 				test.setup(t, legacyDir)
 			}
@@ -365,14 +365,14 @@ func TestAttachMonitorFallsBackAndRejectsUnsafeLegacyActionLog(t *testing.T) {
 			}
 			err := AttachJob(context.Background(), store, id, &out)
 			if test.wantFallback {
-				if err != nil || out.String() != "v2 session fallback\n" {
+				if err != nil || out.String() != "detached job session fallback\n" {
 					t.Fatalf("attach fallback output=%q err=%v", out.String(), err)
 				}
 			} else if err == nil {
 				t.Fatalf("attach with unsafe legacy log succeeded: %q", out.String())
 			} else {
 				out.Reset()
-				state := filepath.Dir(filepath.Dir(filepath.Dir(store.Root())))
+				state := filepath.Dir(filepath.Dir(store.Root()))
 				if err := JobCommand([]string{"logs", id}, Config{StateDir: state}, t.TempDir(), nil, &out); err == nil {
 					t.Fatalf("logs command accepted unsafe legacy log: %q", out.String())
 				}
@@ -406,7 +406,7 @@ func TestAttachRecoverableFailureReturnsWhenMonitorWorkerExited(t *testing.T) {
 
 func TestJobLogsFollowRecoverableFailureReturnsResetGuidance(t *testing.T) {
 	state := t.TempDir()
-	store, err := NewJobStore(filepath.Join(state, "factory", "jobs", "v2"))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
 	}
