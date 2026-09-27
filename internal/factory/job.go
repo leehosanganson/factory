@@ -371,7 +371,7 @@ func startWorkflowJob(store *JobStore, target, description, jobType string) (str
 		if err != nil {
 			return "", err
 		}
-		worktree, workBranch, err = createImplementationWorktree(store.Root(), repository, canonicalTarget, targetHead, id)
+		worktree, workBranch, err = createImplementationWorktree(store.Root(), repository, canonicalTarget, targetHead, description, id)
 		if err != nil {
 			return "", err
 		}

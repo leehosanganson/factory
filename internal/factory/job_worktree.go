@@ -14,13 +14,39 @@ func repositoryOrTarget(repository, target string) string {
 	return target
 }
 
-func createImplementationWorktree(stateRoot, repository, target, head, id string) (string, string, error) {
-	branch := "factory-job/" + id
-	worktree := filepath.Join(stateRoot, id, "worktree")
+func createImplementationWorktree(stateRoot, repository, target, head, description, id string) (string, string, error) {
+	name := implementationJobName(description, id)
+	branch := "factory-job-" + name
+	worktree := filepath.Join(stateRoot, name)
 	if _, err := runGit(context.Background(), repository, "worktree", "add", "-b", branch, worktree, head); err != nil {
 		return "", "", fmt.Errorf("create isolated implementation worktree: %w", err)
 	}
 	return worktree, branch, nil
+}
+
+func implementationJobName(description, id string) string {
+	return implementationJobSlug(description) + "-" + id
+}
+
+func implementationJobSlug(description string) string {
+	var builder strings.Builder
+	lastDash := false
+	for _, char := range strings.ToLower(description) {
+		if char >= 'a' && char <= 'z' || char >= '0' && char <= '9' {
+			builder.WriteRune(char)
+			lastDash = false
+		} else if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+		if builder.Len() >= 48 {
+			break
+		}
+	}
+	if slug := strings.Trim(builder.String(), "-"); slug != "" {
+		return slug
+	}
+	return "task"
 }
 
 func defaultBranch(repository string) (string, error) {
