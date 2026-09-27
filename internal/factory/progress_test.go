@@ -171,6 +171,35 @@ func TestTTYAnimationUpdatesRowsWithoutClearingViewport(t *testing.T) {
 	}
 }
 
+func TestImplementationProgressShowsPersistedStageAndSafeStatusOnly(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "01-implement.log")
+	if err := os.WriteFile(logPath, []byte("SECRET raw agent output\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeEvent := func(event WorkflowEvent) {
+		t.Helper()
+		if err := persistWorkflowEvent(dir, event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeEvent(WorkflowEvent{Type: "stage.started", Stage: "implement", Message: logPath})
+	output := newProgressTestWriter()
+	progress := startProgressWithEvents(output, false, "implement", logPath, filepath.Join(dir, "workflow-events.jsonl"), time.Hour, time.Hour, queryTerminalSize)
+	defer progress.finish(nil)
+	progress.renderHeartbeat()
+	if got := output.String(); !strings.Contains(got, "Latest: Activity: implement in progress") {
+		t.Fatalf("initial foreground progress = %q, want current implementation stage", got)
+	}
+	writeEvent(WorkflowEvent{Type: "stage.status", Stage: "implement", Message: "2026-01-02T03:04:05Z checking focused tests\x1b[31m"})
+	progress.renderHeartbeat()
+	got := output.String()
+	if !strings.Contains(got, "Latest: Activity: implement · checking focused tests") || strings.Contains(got, "SECRET") || strings.ContainsAny(got, "\x1b\r") {
+		t.Fatalf("foreground progress did not show only safe persisted stage status: %q", got)
+	}
+}
+
 func TestProgressRedrawShowsNewestLogRecord(t *testing.T) {
 	t.Setenv("NO_COLOR", "1")
 	path := filepath.Join(t.TempDir(), "activity.log")

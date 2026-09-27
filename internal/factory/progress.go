@@ -26,20 +26,21 @@ const (
 )
 
 type stageProgress struct {
-	out          io.Writer
-	stage        string
-	logPath      string
-	started      time.Time
-	terminal     bool
-	width        int
-	rows         int
-	lastLines    []string
-	hasRendered  bool
-	stop         chan struct{}
-	done         chan struct{}
-	sizeQuery    func(uintptr) (int, int, error)
-	statusMu     sync.RWMutex
-	latestStatus string
+	out                io.Writer
+	stage              string
+	logPath            string
+	started            time.Time
+	terminal           bool
+	width              int
+	rows               int
+	lastLines          []string
+	hasRendered        bool
+	stop               chan struct{}
+	done               chan struct{}
+	sizeQuery          func(uintptr) (int, int, error)
+	statusMu           sync.RWMutex
+	latestStatus       string
+	workflowEventsPath string
 }
 
 func startProgress(out io.Writer, terminal bool, stage, logPath string) *stageProgress {
@@ -48,6 +49,10 @@ func startProgress(out io.Writer, terminal bool, stage, logPath string) *stagePr
 
 func startProgressWithIntervals(out io.Writer, terminal bool, stage, logPath string, heartbeat, animation time.Duration) *stageProgress {
 	return startProgressWithSizeQuery(out, terminal, stage, logPath, heartbeat, animation, queryTerminalSize)
+}
+
+func startWorkflowProgress(out io.Writer, terminal bool, stage, logPath, runDir string) *stageProgress {
+	return startProgressWithEvents(out, terminal, stage, logPath, filepath.Join(runDir, "workflow-events.jsonl"), progressHeartbeatPeriod, progressAnimationPeriod, queryTerminalSize)
 }
 
 // startProgressWithWidthQuery is retained as a narrow test seam for callers that only
@@ -60,6 +65,10 @@ func startProgressWithWidthQuery(out io.Writer, terminal bool, stage, logPath st
 }
 
 func startProgressWithSizeQuery(out io.Writer, terminal bool, stage, logPath string, heartbeat, animation time.Duration, query func(uintptr) (int, int, error)) *stageProgress {
+	return startProgressWithEvents(out, terminal, stage, logPath, "", heartbeat, animation, query)
+}
+
+func startProgressWithEvents(out io.Writer, terminal bool, stage, logPath, eventsPath string, heartbeat, animation time.Duration, query func(uintptr) (int, int, error)) *stageProgress {
 	terminal = terminal && strings.TrimSpace(os.Getenv("TERM")) != "dumb"
 	dimensions := progressDimensionsFromEnv()
 	width, rows := dimensions.width, dimensions.rows
@@ -67,7 +76,7 @@ func startProgressWithSizeQuery(out io.Writer, terminal bool, stage, logPath str
 		width, rows = resolveProgressSize(out, query, os.Getenv("COLUMNS"), os.Getenv("LINES"))
 		terminal = width >= 40 && rows >= 6
 	}
-	p := &stageProgress{out: out, stage: stage, logPath: logPath, started: time.Now(), terminal: terminal, width: width, rows: rows, sizeQuery: query}
+	p := &stageProgress{out: out, stage: stage, logPath: logPath, started: time.Now(), terminal: terminal, width: width, rows: rows, sizeQuery: query, workflowEventsPath: eventsPath}
 	if terminal {
 		p.stop = make(chan struct{})
 		p.done = make(chan struct{})
@@ -143,6 +152,13 @@ func (p *stageProgress) setStatus(status string) {
 }
 
 func (p *stageProgress) activity() []string {
+	if p.workflowEventsPath != "" {
+		activity := latestWorkflowProgress(p.workflowEventsPath, p.stage)
+		if activity == "" {
+			activity = "Stage started"
+		}
+		return []string{"Activity: " + activity}
+	}
 	lines := readProgressLog(p.logPath)
 	p.statusMu.RLock()
 	status := p.latestStatus

@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing.T) {
@@ -64,6 +66,10 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing
 	}
 	if job.Monitor == nil || job.Monitor.ID != id || job.Monitor.Repo != "team/fork" {
 		t.Fatalf("canonical monitor state missing from job record: %+v", job.Monitor)
+	}
+	wantParent := filepath.Join(filepath.Dir(repo), filepath.Base(repo)+".worktrees")
+	if job.Monitor.WorktreeParent != wantParent {
+		t.Fatalf("registered monitor worktree parent = %q, want %q", job.Monitor.WorktreeParent, wantParent)
 	}
 	session, err := store.GetSession(id, monitorSessionID)
 	if err != nil || session.JobID != id || session.Status != "queued" {
@@ -147,6 +153,150 @@ func TestMonitorDetailsReadCanonicalRecordAndSession(t *testing.T) {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("details missing %q: %s", want, out.String())
 		}
+	}
+}
+
+func TestMonitorEventHistoryPersistsBoundedPhaseTransitions(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "20260518T120010-0123456789ab"
+	monitor := &monitorJob{ID: id, Status: "running", Phase: "polling"}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(root, id)
+	for i := 0; i < monitorRecentEventLimit+3; i++ {
+		monitor.Phase = fmt.Sprintf("phase-%d", i)
+		if err := monitorEvent(dir, monitor, fmt.Sprintf("transition %d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	persisted, err := readMonitorJob(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.RecentEvents) != monitorRecentEventLimit {
+		t.Fatalf("recent event count = %d, want bounded limit %d", len(persisted.RecentEvents), monitorRecentEventLimit)
+	}
+	first := persisted.RecentEvents[0]
+	last := persisted.RecentEvents[len(persisted.RecentEvents)-1]
+	if first.Message != "transition 3" || first.Phase != "phase-3" || last.Message != "transition 14" || last.Phase != "phase-14" {
+		t.Fatalf("persisted recent phase transitions = first %+v, last %+v", first, last)
+	}
+}
+
+func TestMonitorStatusExposesPhaseCheckFreshnessApprovalAndBoundedEvents(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "20260518T120010-0123456789ab"
+	checkedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	monitor := &monitorJob{
+		ID: id, Repo: "team/repo", PR: 7, HeadBranch: "feature", Status: "running",
+		Phase: "agent_work", LatestCheckAt: checkedAt, LatestCheckResult: "2 passed, 1 failed, 0 pending",
+		PendingSignature: "snapshot", Proposal: "Needs human judgment",
+	}
+	for i := 0; i < monitorRecentEventLimit+3; i++ {
+		monitor.RecentEvents = append(monitor.RecentEvents, monitorTraceEvent{At: checkedAt.Add(time.Duration(i) * time.Second), Phase: "polling", Message: fmt.Sprintf("transition %d", i)})
+	}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := MonitorCommand([]string{"get", id}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"Phase: approval_pending", "Latest successful PR/check query:", checkedAt.Format(time.RFC3339), "2 passed, 1 failed, 0 pending", "Approval pending: Needs human judgment", "Recent monitor events:"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("monitor status missing %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "transition 0") || strings.Contains(text, "transition 2") || !strings.Contains(text, "transition 3") {
+		t.Fatalf("monitor status did not retain only bounded recent events: %s", text)
+	}
+}
+
+func TestMonitorGetReturnsRecentEventWriterErrors(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "20260518T120010-0123456789ab"
+	monitor := &monitorJob{ID: id, Status: "running", Phase: "polling", RecentEvents: []monitorTraceEvent{{Phase: "polling", Message: "query completed"}}}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	writer := &failingMonitorWriter{failAfter: 4}
+	if err := MonitorCommand([]string{"get", id}, Config{StateDir: state}, t.TempDir(), nil, writer, io.Discard); err == nil {
+		t.Fatal("monitor get swallowed recent-event output error")
+	}
+	if writer.writes != 5 {
+		t.Fatalf("writer received %d writes before error; want failure while writing a recent event", writer.writes)
+	}
+}
+
+type failingMonitorWriter struct {
+	writes    int
+	failAfter int
+}
+
+func (w *failingMonitorWriter) Write(data []byte) (int, error) {
+	w.writes++
+	if w.writes > w.failAfter {
+		return 0, fmt.Errorf("output failed")
+	}
+	return len(data), nil
+}
+
+func TestMonitorDisplayPhasePrefersTerminalStatusToStalePhase(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		phase  string
+		want   string
+	}{
+		{status: "complete", phase: "stopping", want: "complete"},
+		{status: "closed", phase: "polling", want: "closed"},
+		{status: "stopped", phase: "agent_work", want: "stopped"},
+		{status: "recoverable_failure", phase: "retrying_snapshot", want: "recoverable_failure"},
+	} {
+		job := &monitorJob{Status: tc.status, Phase: tc.phase}
+		if got := monitorDisplayPhase(job); got != tc.want {
+			t.Errorf("monitorDisplayPhase(%s, %s) = %q, want %q", tc.status, tc.phase, got, tc.want)
+		}
+	}
+}
+
+func TestMonitorCheckSummarySeparatesNeutralAndSkippedResults(t *testing.T) {
+	raw := json.RawMessage(`[{"conclusion":"SUCCESS"},{"state":"FAILURE"},{"conclusion":"NEUTRAL"},{"conclusion":"SKIPPED"},{"state":"QUEUED"}]`)
+	got := monitorCheckSummary(raw)
+	want := "1 passed, 1 failed, 1 pending, 2 neutral/skipped"
+	if got != want {
+		t.Fatalf("monitorCheckSummary() = %q, want %q", got, want)
 	}
 }
 

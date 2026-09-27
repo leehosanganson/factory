@@ -69,14 +69,22 @@ func TestJobWatchRefreshesStatusAndActivityWithoutPrintingLogs(t *testing.T) {
 	if err := os.WriteFile(sessionPath, []byte("SECRET_SESSION_LOG_CONTENT\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.AppendSessionEventDetails("changing", "workflow", SessionEvent{Type: "stage.started", Message: "stage=implement /private/01-implement.log", At: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSessionEventDetails("changing", "workflow", SessionEvent{Type: "stage.status", Message: "stage=implement 2026-01-02T03:04:05Z checking focused tests\x1b[31m", At: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
 
 	var out safeWatchBuffer
 	done := make(chan error, 1)
 	go func() {
 		done <- watchJobs(context.Background(), store, []string{"changing"}, &out, false, 5*time.Millisecond)
 	}()
-	waitFor(t, time.Second, func() bool { return strings.Contains(out.String(), "Status: running") })
-	if err := store.AppendSessionEventDetails("changing", "workflow", SessionEvent{Type: "stage.completed", Message: "new latest activity", At: time.Now().UTC()}); err != nil {
+	waitFor(t, time.Second, func() bool {
+		return strings.Contains(out.String(), "Status: running") && strings.Contains(out.String(), "implement · checking focused tests")
+	})
+	if err := store.AppendSessionEventDetails("changing", "workflow", SessionEvent{Type: "stage.status", Message: "stage=implement 2026-01-02T03:04:06Z running focused verifications", At: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.UpdateJob("changing", func(job *JobRecord) error { job.Status = "complete"; return nil }); err != nil {
@@ -91,8 +99,11 @@ func TestJobWatchRefreshesStatusAndActivityWithoutPrintingLogs(t *testing.T) {
 		t.Fatal("watch did not stop after observing terminal status")
 	}
 	text := out.String()
-	if !strings.Contains(text, "Status: complete") || !strings.Contains(text, "stage.completed: new latest activity") {
-		t.Fatalf("watch did not refresh selected job status/activity: %q", text)
+	if !strings.Contains(text, "Status: complete") || !strings.Contains(text, "implement · running focused verifications") {
+		t.Fatalf("watch did not show current stage and safe persisted progress: %q", text)
+	}
+	if strings.Contains(text, "01-implement.log") || strings.Contains(text, "2026-01-02") || strings.Contains(text, "stage.status") || strings.ContainsAny(text, "\x1b\r") {
+		t.Fatalf("watch exposed event internals or unsafe data: %q", text)
 	}
 	if strings.Contains(text, "SECRET_WORKER_LOG_CONTENT") || strings.Contains(text, "SECRET_SESSION_LOG_CONTENT") {
 		t.Fatalf("watch leaked worker/session logs: %q", text)
@@ -128,6 +139,44 @@ func TestJobWatchCancellationDoesNotStopWorker(t *testing.T) {
 	}
 }
 
+func TestJobWatchIncludesMonitorPhaseFreshnessAndBoundedEvents(t *testing.T) {
+	store := newWatchTestStore(t)
+	checkedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	monitor := &monitorJob{
+		ID: "monitor", Status: "running", Phase: "approval_pending", LatestCheckAt: checkedAt,
+		LatestCheckResult: "1 passed, 0 failed, 1 pending",
+		RecentEvents:      []monitorTraceEvent{{At: checkedAt, Phase: "approval_pending", Message: "Agent requested approval"}},
+	}
+	if err := store.CreateJob(JobRecord{ID: "monitor", Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession("monitor", monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var out safeWatchBuffer
+	done := make(chan error, 1)
+	go func() { done <- watchJobs(ctx, store, []string{"monitor"}, &out, false, time.Millisecond) }()
+	waitFor(t, time.Second, func() bool { return strings.Contains(out.String(), "Agent requested approval") })
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for _, want := range []string{"Monitor phase: approval_pending", "Latest successful PR/check query:", checkedAt.Format(time.RFC3339), "1 passed, 0 failed, 1 pending", "Recent monitor events:", "Agent requested approval"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("watch output missing %q: %s", want, text)
+		}
+	}
+}
+
+func TestJobWatchMonitorRecentEventWriterErrorIsReturned(t *testing.T) {
+	job := watchedJob{ID: "monitor", Status: "running", Phase: "polling", RecentEvents: []monitorTraceEvent{{Phase: "polling", Message: "query complete"}}}
+	if err := writeJobWatchSnapshot(&failingMonitorWriter{}, []watchedJob{job}, false); err == nil {
+		t.Fatal("job watch swallowed recent-event output error")
+	}
+}
+
 func TestJobWatchPlainAndTerminalSnapshots(t *testing.T) {
 	jobs := []watchedJob{{ID: "job-1", Status: "running", Activity: "stage.started: work"}}
 	for _, tc := range []struct {
@@ -160,6 +209,12 @@ func (b *safeWatchBuffer) Write(data []byte) (int, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.Buffer.Write(data)
+}
+
+func (b *safeWatchBuffer) WriteString(s string) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.WriteString(s)
 }
 
 func (b *safeWatchBuffer) String() string {

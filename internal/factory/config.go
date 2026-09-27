@@ -19,6 +19,7 @@ type Config struct {
 	ParallelImplementation *ParallelImplementationConfig `json:"parallel_implementation,omitempty"`
 	PromptDir              string                        `json:"prompt_dir,omitempty"`
 	StateDir               string                        `json:"state_dir,omitempty"`
+	WorktreeParent         string                        `json:"worktree_parent,omitempty"`
 	AgentTimeout           string                        `json:"agent_timeout,omitempty"`
 	MonitorTimeout         string                        `json:"monitor_timeout,omitempty"`
 }
@@ -26,9 +27,10 @@ type Config struct {
 // DefaultConfig returns a copy of the built-in pi command adapter.
 func DefaultConfig() Config {
 	return Config{
-		Command:      "pi",
-		Args:         []string{"-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"},
-		AgentTimeout: "60m",
+		Command:        "pi",
+		Args:           []string{"-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"},
+		AgentTimeout:   "60m",
+		WorktreeParent: defaultWorktreeParent,
 	}
 }
 
@@ -123,6 +125,12 @@ func (c Config) Validate() error {
 	}
 	if c.StateDir != "" && !filepath.IsAbs(c.StateDir) {
 		return fmt.Errorf("state_dir must be absolute")
+	}
+	if strings.ContainsRune(c.WorktreeParent, 0) {
+		return fmt.Errorf("worktree_parent contains NUL")
+	}
+	if c.WorktreeParent != "" && strings.TrimSpace(c.WorktreeParent) == "" {
+		return fmt.Errorf("worktree_parent must not be empty or whitespace")
 	}
 	return nil
 }

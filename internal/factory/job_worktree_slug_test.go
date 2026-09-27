@@ -59,7 +59,8 @@ func TestStartImplementationJobProposesSlugBeforeWorktreeCreation(t *testing.T) 
 else
   printf 'PASS\\n'
 fi`, repo, marker))
-	cfg := Config{Command: script, Args: []string{"{stage}", "{system_prompt}", "{task}"}}
+	worktreeParent := filepath.Join(t.TempDir(), "configured", "{repo}-worktrees")
+	cfg := Config{Command: script, Args: []string{"{stage}", "{system_prompt}", "{task}"}, WorktreeParent: worktreeParent}
 	id, err := startWorkflowJob(store, cfg, repo, "Task description that differs", implementationJobType)
 	if err != nil {
 		t.Fatalf("start implementation: %v", err)
@@ -68,8 +69,11 @@ fi`, repo, marker))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := filepath.Base(job.Worktree), "proposed-readable-name-"+id; got != want {
+	if got, want := filepath.Base(job.Worktree), id[:4]+"-proposed-readable-name"; got != want {
 		t.Fatalf("worktree name = %q, want %q", got, want)
+	}
+	if got, want := filepath.Dir(job.Worktree), filepath.Join(filepath.Dir(worktreeParent), filepath.Base(repo)+"-worktrees"); got != want {
+		t.Fatalf("worktree parent = %q, want configured parent %q", got, want)
 	}
 	if got, want := job.WorkBranch, "factory-job-proposed-readable-name-"+id; got != want {
 		t.Fatalf("work branch = %q, want %q", got, want)

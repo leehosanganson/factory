@@ -62,6 +62,11 @@ func summarizeJobTrace(store *JobStore, job JobRecord) jobTraceSummary {
 		}
 	}
 	summary.StatusCalls = len(statusInvocations)
+	if job.Type == implementationJobType {
+		if activity := jobWorkflowProgress(events); activity != "" {
+			summary.Activity = activity
+		}
+	}
 	return summary
 }
 

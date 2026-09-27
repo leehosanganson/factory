@@ -215,7 +215,22 @@ func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	job := &monitorJob{ID: id, Description: description, RepoRoot: primary, Repo: baseRepo, PR: info.Number, HeadRepo: headRepo, HeadBranch: info.HeadRefName, BaseRepo: baseRepo, BaseBranch: info.BaseRefName, BaseSHA: info.BaseRefOID, OriginURL: origin, HeadRepoURL: repoURL.URL, HeartbeatPath: filepath.Join(dir, "heartbeat"), BaselineHead: baseline, TargetBaseline: targetHead, TargetBranch: targetBranch, Status: "queued", CreatedAt: time.Now().UTC()}
+	worktreeParent, err := resolveWorktreeParent(cfg.WorktreeParent, primary)
+	if err != nil {
+		return err
+	}
+	worktreeParent, err = validateWorktreeParent(worktreeParent, primary, repository)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(worktreeParent, 0o700); err != nil {
+		return err
+	}
+	worktreeParent, err = validateWorktreeParent(worktreeParent, primary, repository)
+	if err != nil {
+		return err
+	}
+	job := &monitorJob{ID: id, Description: description, RepoRoot: primary, Repo: baseRepo, PR: info.Number, HeadRepo: headRepo, HeadBranch: info.HeadRefName, BaseRepo: baseRepo, BaseBranch: info.BaseRefName, BaseSHA: info.BaseRefOID, OriginURL: origin, HeadRepoURL: repoURL.URL, HeartbeatPath: filepath.Join(dir, "heartbeat"), BaselineHead: baseline, TargetBaseline: targetHead, TargetBranch: targetBranch, WorktreeParent: worktreeParent, Status: "queued", CreatedAt: time.Now().UTC()}
 	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TaskDescription: description, TargetPath: primary, RepositoryPath: commonRepository, Status: "queued", Monitor: job}); err != nil {
 		return err
 	}
@@ -327,6 +342,18 @@ func monitorPRWorktreePath(root, repositoryIdentityValue, branch string, pr int,
 	return filepath.Join(root, "monitor-pr", safeBranchPathComponent(branch)+"-"+hex.EncodeToString(sum[:]), id, "checkout")
 }
 
+func monitorWorktreePathAtParent(parent, branch, id string, registeredPath ...string) (string, error) {
+	registered := ""
+	if len(registeredPath) > 0 {
+		registered = registeredPath[0]
+	}
+	name, err := availableJobWorktreeName(parent, safeBranchPathComponent(branch), id, registered)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, name), nil
+}
+
 func safeBranchPathComponent(branch string) string {
 	var builder strings.Builder
 	lastDash := false
@@ -363,8 +390,21 @@ func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
 		return err
 	}
 	expected := monitorPRWorktreePath(root, identity, job.HeadBranch, job.PR, job.ID)
+	legacyCheckout := filepath.Join(root, job.ID, "checkout")
+	if job.WorktreeParent != "" {
+		parent, parentErr := canonicalPath(job.WorktreeParent)
+		primary, primaryErr := primaryWorktree(job.RepoRoot)
+		if parentErr != nil || primaryErr != nil || parent != job.WorktreeParent || isWithin(job.RepoRoot, parent) || isWithin(primary, parent) || !isWithin(parent, job.Worktree) {
+			return errors.New("monitor worktree parent is not the registered isolated parent")
+		}
+		expected, err = monitorWorktreePathAtParent(parent, job.HeadBranch, job.ID, job.Worktree)
+		if err != nil {
+			return err
+		}
+	}
 	worktree, err := canonicalPath(job.Worktree)
-	if err != nil || worktree != job.Worktree || worktree != expected || !isWithin(root, worktree) || isWithin(job.RepoRoot, worktree) {
+	matchesRegisteredPath := worktree == expected || job.WorktreeParent == "" && worktree == legacyCheckout
+	if err != nil || worktree != job.Worktree || !matchesRegisteredPath || !isWithin(root, worktree) && job.WorktreeParent == "" || isWithin(job.RepoRoot, worktree) {
 		return errors.New("monitor worktree is not the expected isolated Factory checkout")
 	}
 	top, err := runGit(context.Background(), worktree, "rev-parse", "--show-toplevel")
@@ -383,6 +423,10 @@ func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
 }
 
 func setupExistingPRWorktree(store *JobStore, repository, branch, head string, pr int, id string) (string, string, error) {
+	return setupExistingPRWorktreeAtParent(store, repository, branch, head, pr, id, "")
+}
+
+func setupExistingPRWorktreeAtParent(store *JobStore, repository, branch, head string, pr int, id, configuredParent string) (string, string, error) {
 	if !monitorIDPattern.MatchString(id) {
 		return "", "", errors.New("invalid monitor id for isolated worktree")
 	}
@@ -404,7 +448,28 @@ func setupExistingPRWorktree(store *JobStore, repository, branch, head string, p
 	if err != nil {
 		return "", "", err
 	}
+	primary, err := primaryWorktree(repository)
+	if err != nil {
+		return "", "", err
+	}
 	path := monitorPRWorktreePath(store.Root(), identity, branch, pr, id)
+	if configuredParent != "" {
+		configuredParent, err = validateWorktreeParent(configuredParent, primary, repository)
+		if err != nil {
+			return "", "", err
+		}
+		if err := os.MkdirAll(configuredParent, 0o700); err != nil {
+			return "", "", fmt.Errorf("create monitor worktree parent: %w", err)
+		}
+		configuredParent, err = validateWorktreeParent(configuredParent, primary, repository)
+		if err != nil {
+			return "", "", err
+		}
+		path, err = monitorWorktreePathAtParent(configuredParent, branch, id)
+		if err != nil {
+			return "", "", err
+		}
+	}
 	canonicalRoot, err := canonicalPath(store.Root())
 	if err != nil {
 		return "", "", err
@@ -413,8 +478,8 @@ func setupExistingPRWorktree(store *JobStore, repository, branch, head string, p
 	if err != nil {
 		return "", "", err
 	}
-	if !isWithin(canonicalRoot, canonicalParent) {
-		return "", "", fmt.Errorf("monitor worktree path escapes job state root")
+	if configuredParent == "" && !isWithin(canonicalRoot, canonicalParent) || configuredParent != "" && (canonicalParent != configuredParent || isWithin(repository, canonicalParent)) {
+		return "", "", fmt.Errorf("monitor worktree path escapes its isolated parent")
 	}
 	if _, err := os.Lstat(path); err == nil {
 		return "", "", errors.New("Factory monitor worktree path already exists; refusing to reuse an unverified checkout")
@@ -423,6 +488,13 @@ func setupExistingPRWorktree(store *JobStore, repository, branch, head string, p
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", "", err
+	}
+	if configuredParent != "" {
+		if _, err := os.Lstat(path); err == nil {
+			return "", "", errors.New("Factory monitor worktree path already exists; refusing to reuse an unverified checkout")
+		} else if !os.IsNotExist(err) {
+			return "", "", err
+		}
 	}
 	workerBranch := "factory-monitor/" + id
 	if _, err := runGit(context.Background(), repository, "worktree", "add", "-b", workerBranch, path, head); err != nil {

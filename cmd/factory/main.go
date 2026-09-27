@@ -249,7 +249,8 @@ func jobHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow logs."},
 		{"factory job attach <id>", "Follow worker output."},
 		{"factory job stop <id>", "Request cancellation."},
-		{"factory job watch <id>...", "Refresh selected job status and latest activity."},
+		{"factory job watch <id>...", "Refresh selected job status and latest activity, with monitor phase, check freshness, and recent events."},
+		{"Configuration: worktree_parent", "Parent path template for implementation and monitor worktrees; {repo} is the primary checkout name."},
 	}
 	return selectCommandHelp(all, subcommand, "")
 }
@@ -268,7 +269,7 @@ func monitorHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
 		{"factory monitor <description>", "Start monitoring an open PR."},
 		{"factory monitor list", "List monitor jobs."},
-		{"factory monitor get <id> [--details]", "Show monitor status; --details includes proposals."},
+		{"factory monitor get <id> [--details]", "Show phase, latest PR check, recent events; --details includes proposals."},
 		{"factory monitor approve <id>", "Approve a proposal with a scope."},
 		{"factory monitor reject <id>", "Reject a pending proposal."},
 		{"factory monitor stop <id>", "Stop monitoring."},

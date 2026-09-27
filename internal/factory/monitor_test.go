@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -194,11 +195,17 @@ printf '%s\n' '` + response + `'
 			if err != nil || got.Status != tc.wantStatus || !got.DeadlineAt.Equal(deadline) {
 				t.Fatalf("reset extended deadline or produced wrong status: status=%q deadline=%s err=%v; want %q and %s", got.Status, got.DeadlineAt, err, tc.wantStatus, deadline)
 			}
+			if tc.wantStatus == "closed" && got.Phase != "closed" {
+				t.Fatalf("terminal PR status retained phase %q; want closed", got.Phase)
+			}
 			logData, err := os.ReadFile(filepath.Join(fixture.dir, "sessions", monitorSessionID, "session.log"))
 			if err != nil || strings.Contains(string(logData), "Monitor lifetime timeout reached") != tc.wantTimeout {
 				t.Fatalf("timeout event presence=%v err=%v; want %v; log=%s", strings.Contains(string(logData), "Monitor lifetime timeout reached"), err, tc.wantTimeout, logData)
 			}
 			if tc.wantTimeout {
+				if got.Phase != "stopped" {
+					t.Fatalf("timed out monitor retained nonterminal phase %q", got.Phase)
+				}
 				store, err := NewJobStore(filepath.Dir(fixture.dir))
 				if err != nil {
 					t.Fatal(err)
@@ -762,8 +769,16 @@ printf 'FACTORY_STATUS=APPROVAL_REQUIRED\n'
 	if err := processMonitorEvent(jobDir, job, Config{Command: script, Args: []string{"{stage}", "{task}", "{system_prompt}"}}, &monitorSnapshot{HeadRefOID: head}, strings.Repeat("a", 64)); err != nil {
 		t.Fatal(err)
 	}
-	if job.Status != "running" || job.Proposal != "Need human review" {
-		t.Fatalf("approval state = %q, proposal %q; want awaiting approval", job.Status, job.Proposal)
+	if job.Status != "running" || job.Proposal != "Need human review" || job.Phase != "approval_pending" {
+		t.Fatalf("approval state = %q, phase %q, proposal %q; want visible approval pending", job.Status, job.Phase, job.Proposal)
+	}
+	seenAgentWork, seenApprovalPending := false, false
+	for _, event := range job.RecentEvents {
+		seenAgentWork = seenAgentWork || event.Phase == "agent_work"
+		seenApprovalPending = seenApprovalPending || event.Phase == "approval_pending"
+	}
+	if !seenAgentWork || !seenApprovalPending || job.RecentEvents[len(job.RecentEvents)-1].Phase != "approval_pending" {
+		t.Fatalf("observable agent/approval phase transitions were not persisted: %+v", job.RecentEvents)
 	}
 	if got := runTestCommand(t, bare, "git", "rev-parse", "refs/heads/feature"); got != head {
 		t.Fatalf("approval-required action changed remote: got %s, want %s", got, head)
@@ -1314,7 +1329,7 @@ func TestMonitorLifetimeTimeoutMarksQueuedJobAfterWorkerLockWait(t *testing.T) {
 	if err := saveMonitorJob(fixture.dir, fixture.job); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Command: "/bin/true", Args: []string{"{stage}", "{task}", "{system_prompt}"}, MonitorTimeout: "150ms"}
+	cfg := Config{Command: "/bin/true", Args: []string{"{stage}", "{task}", "{system_prompt}"}, StateDir: filepath.Join(fixture.base, "state"), MonitorTimeout: "150ms"}
 	lockDeadline := time.Now().Add(150 * time.Millisecond)
 	previousAcquire := monitorAcquireWorkerLock
 	monitorAcquireWorkerLock = func(path string) (func(), error) {
@@ -1350,6 +1365,13 @@ func TestMonitorLifetimeTimeoutMarksQueuedJobAfterWorkerLockWait(t *testing.T) {
 	events, err := store.SessionEvents(fixture.job.ID, monitorSessionID)
 	if err != nil || len(events) == 0 || events[len(events)-1].Type != "monitor.status" || !strings.Contains(events[len(events)-1].Message, "Monitor lifetime timeout reached") {
 		t.Fatalf("queued worker-lock timeout lifecycle event missing: events=%+v err=%v", events, err)
+	}
+	var output bytes.Buffer
+	if err := MonitorCommand([]string{"get", fixture.job.ID}, cfg, fixture.repo, nil, &output, io.Discard); err != nil {
+		t.Fatalf("monitor get after worker-lock timeout: %v", err)
+	}
+	if !strings.Contains(output.String(), "Monitor lifetime timeout reached") {
+		t.Fatalf("monitor get omitted worker-lock timeout from recent events: %s", output.String())
 	}
 }
 
