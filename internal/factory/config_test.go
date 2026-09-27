@@ -14,7 +14,7 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 {
+	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 || cfg.MonitorTimeout != "" {
 		t.Fatalf("unexpected default config: %#v", cfg)
 	}
 	if timeout, err := cfg.agentTimeout(); err != nil || timeout != 60*time.Minute {
@@ -119,6 +119,44 @@ func TestLoadConfigAgentTimeout(t *testing.T) {
 			got, err := cfg.agentTimeout()
 			if err != nil || got != tc.want {
 				t.Fatalf("agent timeout = %s, %v; want %s", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigMonitorTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		field   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{name: "omitted indefinite", want: 0},
+		{name: "empty indefinite", field: `,"monitor_timeout":""`, want: 0},
+		{name: "configured duration", field: `,"monitor_timeout":"250ms"`, want: 250 * time.Millisecond},
+		{name: "invalid duration", field: `,"monitor_timeout":"soon"`, wantErr: true},
+		{name: "zero duration", field: `,"monitor_timeout":"0s"`, wantErr: true},
+		{name: "negative duration", field: `,"monitor_timeout":"-1s"`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			file := filepath.Join(t.TempDir(), "config.json")
+			content := `{"command":"pi","args":["{task}","{system_prompt}"]` + tc.field + `}`
+			if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(file)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid monitor_timeout was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := cfg.monitorTimeout()
+			if err != nil || got != tc.want {
+				t.Fatalf("monitor timeout = %s, %v; want %s", got, err, tc.want)
 			}
 		})
 	}

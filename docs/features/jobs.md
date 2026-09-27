@@ -15,4 +15,15 @@ factory job stop <id>
 
 A start returns after launching a worker. Implementation and tidy workers serialize against other Factory jobs for the same canonical target. Attach follows worker output; Ctrl-C detaches the observer without stopping the worker. `stop` records a cooperative cancellation request, which the worker checks; it is not a promise of immediate forced termination. Logs and workflow events are retained. Job list/get include latest activity and best-effort status-call and direct Pi subprocess counts.
 
+Implementation jobs in a Git repository run in an isolated worktree and retain their output there; Factory does not automatically integrate or remove that output. Use `factory job get <id> --details` to find the persisted `Worktree` path and `Work branch`, then inspect the worker's changes, for example:
+
+```sh
+factory job get <id> --details
+factory job logs <id> --session workflow
+git -C <worktree-path> status --short
+git -C <worktree-path> diff
+```
+
+Review and preserve any changes you want before cleanup. Only remove a completed or otherwise terminal job's worktree after confirming its path and branch from the job details. From the repository that owns the worktree, run `git worktree remove <worktree-path>`; Git refuses removal when there are uncommitted changes, so do not force removal unless you intentionally want to discard them. Once the worktree is removed, remove its branch if no longer needed with `git branch -d <work-branch>`. Job records, logs, and other persisted results are in `<state-dir>/factory/detached-jobs/<id>` (`<state-dir>` defaults to `${XDG_STATE_HOME:-~/.local/state}`). After verifying the job is terminal and saving anything needed, remove only that job's directory manually if desired, for example `rm -rf -- <state-dir>/factory/detached-jobs/<id>`. Removing the job data does not remove its Git worktree or branch, and removing the worktree does not remove the stored job logs/results.
+
 Detached tidy never commits or pushes. The monitor job uses the PR-specific monitoring engine and its duplicate guard; see [PR monitor](monitor.md). Current detached types are not a generic arbitrary command runner, and jobs cannot be chained together.

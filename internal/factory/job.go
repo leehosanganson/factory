@@ -207,6 +207,12 @@ func writeJobSummary(out io.Writer, store *JobStore, job JobRecord, details bool
 		return
 	}
 	fmt.Fprintf(out, "Target: %s\nCreated: %s\nUpdated: %s\n", job.TargetPath, job.CreatedAt.Format(time.RFC3339), job.UpdatedAt.Format(time.RFC3339))
+	if job.Worktree != "" {
+		fmt.Fprintf(out, "Worktree: %s\n", job.Worktree)
+	}
+	if job.WorkBranch != "" {
+		fmt.Fprintf(out, "Work branch: %s\n", job.WorkBranch)
+	}
 	if !job.StartedAt.IsZero() {
 		fmt.Fprintf(out, "Started: %s\n", job.StartedAt.Format(time.RFC3339))
 	}

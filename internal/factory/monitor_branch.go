@@ -322,9 +322,9 @@ func worktreeBranchOwner(repository, branch string) (string, bool, error) {
 	return "", false, nil
 }
 
-func monitorPRWorktreePath(root, repositoryIdentityValue, branch string, pr int) string {
+func monitorPRWorktreePath(root, repositoryIdentityValue, branch string, pr int, id string) string {
 	sum := sha256.Sum256([]byte(repositoryIdentityValue + "\x00" + strconv.Itoa(pr)))
-	return filepath.Join(root, "monitor-pr", safeBranchPathComponent(branch)+"-"+hex.EncodeToString(sum[:]), "checkout")
+	return filepath.Join(root, "monitor-pr", safeBranchPathComponent(branch)+"-"+hex.EncodeToString(sum[:]), id, "checkout")
 }
 
 func safeBranchPathComponent(branch string) string {
@@ -350,35 +350,41 @@ func safeBranchPathComponent(branch string) string {
 	return value
 }
 
-func setupExistingPRWorktree(store *JobStore, repository, primary, branch, head string, pr int, createIfAbsent bool) (string, string, error) {
-	local, localErr := runGit(context.Background(), repository, "rev-parse", "refs/heads/"+branch)
-	if localErr != nil {
-		if !createIfAbsent {
-			return "", "", nil
-		}
-		remote, err := runGit(context.Background(), repository, "remote", "get-url", "origin")
-		if err != nil {
-			return "", "", err
-		}
-		if _, err := runGit(context.Background(), repository, "fetch", "--no-tags", remote, "refs/heads/"+branch); err != nil {
-			return "", "", fmt.Errorf("fetch PR branch after actionable event: %w", err)
-		}
-		fetched, err := runGit(context.Background(), repository, "rev-parse", "FETCH_HEAD")
-		if err != nil {
-			return "", "", err
-		}
-		if fetched != head {
-			return "", "", errors.New("remote PR head does not match validated GitHub head")
-		}
-		if _, err := runGit(context.Background(), repository, "branch", branch, head); err != nil {
-			return "", "", fmt.Errorf("create local PR branch: %w", err)
-		}
-		local = head
+func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
+	if !job.OwnWorktree || job.Worktree == "" || job.WorkerBranch != "factory-monitor/"+job.ID {
+		return errors.New("monitor worker is not using a registered Factory-owned worktree")
 	}
-	if local != head {
-		if _, err := runGit(context.Background(), repository, "merge-base", "--is-ancestor", local, head); err != nil {
-			return "", "", fmt.Errorf("local PR branch %q is ahead of or divergent from validated PR head; refusing stale branch", branch)
-		}
+	root, err := canonicalPath(stateRoot)
+	if err != nil {
+		return err
+	}
+	identity, err := repositoryIdentity(job.RepoRoot)
+	if err != nil {
+		return err
+	}
+	expected := monitorPRWorktreePath(root, identity, job.HeadBranch, job.PR, job.ID)
+	worktree, err := canonicalPath(job.Worktree)
+	if err != nil || worktree != job.Worktree || worktree != expected || !isWithin(root, worktree) || isWithin(job.RepoRoot, worktree) {
+		return errors.New("monitor worktree is not the expected isolated Factory checkout")
+	}
+	top, err := runGit(context.Background(), worktree, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return err
+	}
+	top, err = canonicalPath(top)
+	if err != nil || top != worktree {
+		return errors.New("monitor worktree identity validation failed")
+	}
+	branch, err := runGit(context.Background(), worktree, "branch", "--show-current")
+	if err != nil || branch != job.WorkerBranch {
+		return errors.New("monitor worker branch validation failed")
+	}
+	return nil
+}
+
+func setupExistingPRWorktree(store *JobStore, repository, branch, head string, pr int, id string) (string, string, error) {
+	if !monitorIDPattern.MatchString(id) {
+		return "", "", errors.New("invalid monitor id for isolated worktree")
 	}
 	remote, err := runGit(context.Background(), repository, "remote", "get-url", "origin")
 	if err != nil {
@@ -394,39 +400,11 @@ func setupExistingPRWorktree(store *JobStore, repository, primary, branch, head 
 	if fetched != head {
 		return "", "", errors.New("remote PR head does not match the validated GitHub head; refusing stale branch")
 	}
-	owner, exists, err := worktreeBranchOwner(repository, branch)
-	if err != nil {
-		return "", "", err
-	}
-	if exists {
-		status, err := runGit(context.Background(), owner, "status", "--porcelain")
-		if err != nil {
-			return "", "", err
-		}
-		if status != "" {
-			return "", "", fmt.Errorf("worktree %s owning PR branch %q is dirty", owner, branch)
-		}
-		current, err := runGit(context.Background(), owner, "rev-parse", "HEAD")
-		if err != nil {
-			return "", "", err
-		}
-		if current != head {
-			if _, err := runGit(context.Background(), owner, "merge", "--ff-only", head); err != nil {
-				return "", "", fmt.Errorf("fast-forward PR worktree: %w", err)
-			}
-		}
-		return owner, head, nil
-	}
-	if local != head && !exists {
-		if _, err := runGit(context.Background(), repository, "update-ref", "refs/heads/"+branch, head, local); err != nil {
-			return "", "", fmt.Errorf("fast-forward local PR branch: %w", err)
-		}
-	}
 	identity, err := repositoryIdentity(repository)
 	if err != nil {
 		return "", "", err
 	}
-	path := monitorPRWorktreePath(store.Root(), identity, branch, pr)
+	path := monitorPRWorktreePath(store.Root(), identity, branch, pr, id)
 	canonicalRoot, err := canonicalPath(store.Root())
 	if err != nil {
 		return "", "", err
@@ -438,11 +416,17 @@ func setupExistingPRWorktree(store *JobStore, repository, primary, branch, head 
 	if !isWithin(canonicalRoot, canonicalParent) {
 		return "", "", fmt.Errorf("monitor worktree path escapes job state root")
 	}
+	if _, err := os.Lstat(path); err == nil {
+		return "", "", errors.New("Factory monitor worktree path already exists; refusing to reuse an unverified checkout")
+	} else if !os.IsNotExist(err) {
+		return "", "", err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", "", err
 	}
-	if _, err := runGit(context.Background(), repository, "worktree", "add", path, branch); err != nil {
-		return "", "", fmt.Errorf("create linked worktree for PR branch: %w", err)
+	workerBranch := "factory-monitor/" + id
+	if _, err := runGit(context.Background(), repository, "worktree", "add", "-b", workerBranch, path, head); err != nil {
+		return "", "", fmt.Errorf("create isolated monitor worktree: %w", err)
 	}
 	return path, head, nil
 }

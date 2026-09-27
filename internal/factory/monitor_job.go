@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -163,6 +164,180 @@ func clearMonitorWorker(id, dir string) error {
 		return err
 	}
 	return store.ClearWorker(id)
+}
+
+func finishMonitorWorkerLockTimeout(root, id string) (bool, error) {
+	dir, err := monitorJobDir(root, id)
+	if err != nil {
+		return false, err
+	}
+	unlockWorker, err := monitorAcquireWorkerLock(filepath.Join(dir, "worker.lock"))
+	if err != nil {
+		return false, nil
+	}
+	defer unlockWorker()
+
+	store, err := NewJobStore(root)
+	if err != nil {
+		return false, err
+	}
+	unlockJob, err := store.LockJob(id)
+	if err != nil {
+		return false, err
+	}
+	defer unlockJob()
+
+	job, err := store.GetJob(id)
+	if err != nil {
+		return false, err
+	}
+	if job.Type != monitorJobType || job.Monitor == nil {
+		return false, fmt.Errorf("invalid canonical monitor job record")
+	}
+	monitor := job.Monitor
+	if monitor.StopRequested || (monitor.Status != "queued" && monitor.Status != "recoverable_failure") {
+		return false, nil
+	}
+	if monitor.DeadlineAt.IsZero() || time.Now().Before(monitor.DeadlineAt) {
+		return false, nil
+	}
+	// PID and worker registration are published before normal startup changes
+	// queued to running. Their presence means the contended lock belongs to a
+	// real startup/active owner, not an orphaned queued record.
+	if monitor.PID > 0 && processAlive(monitor.PID) {
+		return false, nil
+	}
+	worker, workerErr := store.ReadWorker(id)
+	if workerErr == nil && processAlive(worker.PID) {
+		return false, nil
+	}
+	if workerErr != nil && !errors.Is(workerErr, os.ErrNotExist) {
+		return false, workerErr
+	}
+
+	message := "Monitor lifetime timeout reached; monitoring stopped."
+	now := time.Now().UTC()
+	setLifecycleTimes(job.Status, "stopped", &job.StartedAt, &job.EndedAt)
+	job.Status, job.UpdatedAt = "stopped", now
+	monitor.Status, monitor.LastEvent, monitor.UpdatedAt = "stopped", message, now
+	session, err := store.GetSession(id, monitorSessionID)
+	if err != nil {
+		return false, err
+	}
+	setLifecycleTimes(session.Status, "stopped", &session.StartedAt, &session.EndedAt)
+	session.Status, session.UpdatedAt = "stopped", now
+	for i := range job.Sessions {
+		if job.Sessions[i].ID == monitorSessionID {
+			job.Sessions[i] = sessionMetadata(session)
+			break
+		}
+	}
+
+	sessionDir, err := store.sessionDir(id, monitorSessionID, false)
+	if err != nil {
+		return false, err
+	}
+	if err := appendLockedMonitorEvent(sessionDir, message, now); err != nil {
+		return false, err
+	}
+	if err := appendLockedMonitorLog(sessionDir, message, now); err != nil {
+		return false, err
+	}
+	if err := writeJSONAtomic(sessionDir, "session.json", session); err != nil {
+		return false, err
+	}
+	jobDir, err := store.jobDir(id, false)
+	if err != nil {
+		return false, err
+	}
+	if err := writeJSONAtomic(jobDir, "job.json", job); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func appendLockedMonitorEvent(sessionDir, message string, at time.Time) error {
+	path := filepath.Join(sessionDir, "events.jsonl")
+	if err := ensureRegularIfExists(path); err != nil {
+		return err
+	}
+	line, err := json.Marshal(SessionEvent{At: at, Type: "monitor.status", Message: message})
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(append(line, '\n')); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func appendLockedMonitorLog(sessionDir, message string, at time.Time) error {
+	path := filepath.Join(sessionDir, "session.log")
+	if err := ensureRegularIfExists(path); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(file, "[%s] %s\n", at.Format(time.RFC3339), message); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func persistMonitorDeadline(root, id string, timeout time.Duration, deadline time.Time) (*monitorJob, error) {
+	store, err := NewJobStore(root)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := store.LockJob(id)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	job, err := store.GetJob(id)
+	if err != nil {
+		return nil, err
+	}
+	if job.Type != monitorJobType || job.Monitor == nil {
+		return nil, fmt.Errorf("invalid canonical monitor job record")
+	}
+	if job.Monitor.DeadlineAt.IsZero() {
+		startedAt := job.StartedAt
+		if !startedAt.IsZero() {
+			// Older records lack an absolute deadline. Anchor migration to
+			// their recorded lifecycle timestamp, not to this restart.
+			job.Monitor.DeadlineAt = startedAt.Add(timeout)
+		} else {
+			job.Monitor.DeadlineAt = deadline
+		}
+		job.UpdatedAt = time.Now().UTC()
+		job.Monitor.UpdatedAt = job.UpdatedAt
+		dir, err := store.jobDir(id, false)
+		if err != nil {
+			return nil, err
+		}
+		if err := writeJSONAtomic(dir, "job.json", job); err != nil {
+			return nil, err
+		}
+	}
+	copy := *job.Monitor
+	return &copy, nil
 }
 
 func resetMonitorJobRecord(id, root string) error {

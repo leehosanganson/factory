@@ -144,6 +144,40 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	}
 }
 
+func TestJobDetailsExposePersistedImplementationWorktree(t *testing.T) {
+	state := t.TempDir()
+	target := canonicalTestPath(t, t.TempDir())
+	worktree := filepath.Join(state, "factory", "detached-jobs", "job-id", "worktree")
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{
+		ID: "job-id", Type: implementationJobType, Status: "complete", TargetPath: target,
+		Worktree: worktree, WorkBranch: "factory-job/job-id",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := JobCommand([]string{"get", "job-id", "--details"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("job get details: %v", err)
+	}
+	for _, want := range []string{"Worktree: " + worktree, "Work branch: factory-job/job-id"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("job details omitted %q: %s", want, output.String())
+		}
+	}
+
+	output.Reset()
+	if err := JobCommand([]string{"get", "job-id"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("job get summary: %v", err)
+	}
+	if strings.Contains(output.String(), worktree) || strings.Contains(output.String(), "factory-job/job-id") {
+		t.Errorf("concise job output unexpectedly includes worktree details: %s", output.String())
+	}
+}
+
 func TestDetachedTidyJobRunsNonpublishingAndIsListed(t *testing.T) {
 	state := t.TempDir()
 	repo := newCleanRepo(t)

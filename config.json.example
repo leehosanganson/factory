@@ -10,6 +10,7 @@
   "prompt_dir": "",
   "state_dir": "",
   "agent_timeout": "60m",
+  "monitor_timeout": "",
   "pipeline_checks": [
     ["make", "test"]
   ],

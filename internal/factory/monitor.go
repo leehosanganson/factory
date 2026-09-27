@@ -27,11 +27,14 @@ const (
 	monitorSnapshotMaxRetries = 8
 )
 
+type monitorBranchLockContextKey struct{}
+
 var (
-	monitorWorkerLauncher   = launchMonitorWorker
-	monitorRetryDelay       = snapshotRetryDelay
-	monitorLogOpenFile      = os.OpenFile
-	monitorSessionLogAppend = func(store *JobStore, id string, data []byte) error {
+	monitorWorkerLauncher    = launchMonitorWorker
+	monitorAcquireWorkerLock = acquireOwnedLock
+	monitorRetryDelay        = snapshotRetryDelay
+	monitorLogOpenFile       = os.OpenFile
+	monitorSessionLogAppend  = func(store *JobStore, id string, data []byte) error {
 		return store.AppendSessionLog(id, monitorSessionID, data)
 	}
 	monitorAgentActionTimeout = 30 * time.Minute
@@ -76,6 +79,7 @@ type monitorJob struct {
 	Heartbeat          time.Time `json:"heartbeat,omitempty"`
 	StopRequested      bool      `json:"stop_requested,omitempty"`
 	SnapshotFailures   int       `json:"snapshot_failures,omitempty"`
+	DeadlineAt         time.Time `json:"deadline_at,omitempty"`
 }
 
 type monitorSnapshot struct {
@@ -151,6 +155,9 @@ func writeMonitorJob(dir string, monitor *monitorJob) error {
 	}
 	_, err = store.UpdateJob(monitor.ID, func(job *JobRecord) error {
 		copy := *monitor
+		if job.Monitor != nil && !job.Monitor.DeadlineAt.IsZero() {
+			copy.DeadlineAt = job.Monitor.DeadlineAt
+		}
 		job.Monitor = &copy
 		return nil
 	})
@@ -215,7 +222,32 @@ func loadJobs(root string) ([]monitorJob, error) {
 }
 
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
+	return runGitWithEnv(ctx, dir, nil, args...)
+}
+
+func runGitWithEnv(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	if len(extraEnv) != 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
+func runGitInput(ctx context.Context, dir string, input []byte, args ...string) (string, error) {
+	return runGitInputWithEnv(ctx, dir, nil, input, args...)
+}
+
+func runGitInputWithEnv(ctx context.Context, dir string, extraEnv []string, input []byte, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
+	if len(extraEnv) != 0 {
+		cmd.Env = append(os.Environ(), extraEnv...)
+	}
+	cmd.Stdin = bytes.NewReader(input)
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
@@ -265,43 +297,117 @@ func readReviewThreads(ctx context.Context, job *monitorJob) (json.RawMessage, e
 		return nil, errors.New("invalid PR base repository for review thread lookup")
 	}
 	parts := strings.SplitN(job.BaseRepo, "/", 2)
-	data, err := runGH(ctx, "api", "graphql", "-f", "query=query($owner:String!, $repo:String!, $number:Int!) { repository(owner:$owner, name:$repo) { pullRequest(number:$number) { reviewThreads(first:100) { nodes { isResolved } pageInfo { hasNextPage endCursor } } } } }", "-F", "owner="+parts[0], "-F", "repo="+parts[1], "-F", "number="+strconv.Itoa(job.PR))
-	if err != nil {
-		return nil, fmt.Errorf("read PR review threads: %w", err)
+	type reviewComment struct {
+		Body         string `json:"body"`
+		Path         string `json:"path"`
+		Line         *int   `json:"line"`
+		OriginalLine *int   `json:"originalLine"`
 	}
-	var response struct {
-		Data struct {
-			Repository struct {
-				PullRequest struct {
-					ReviewThreads struct {
-						Nodes []struct {
-							IsResolved bool `json:"isResolved"`
-							Comments   []struct {
-								Body string `json:"body"`
-								Path string `json:"path"`
-								Line int    `json:"line"`
-							} `json:"comments"`
-						} `json:"nodes"`
-						PageInfo struct {
-							HasNextPage bool `json:"hasNextPage"`
-						} `json:"pageInfo"`
-					} `json:"reviewThreads"`
-				} `json:"pullRequest"`
-			} `json:"repository"`
-		} `json:"data"`
+	type commentPage struct {
+		Nodes    []reviewComment `json:"nodes"`
+		PageInfo *struct {
+			HasNextPage bool   `json:"hasNextPage"`
+			EndCursor   string `json:"endCursor"`
+		} `json:"pageInfo"`
 	}
-	if err := json.Unmarshal(data, &response); err != nil {
-		return nil, fmt.Errorf("invalid GitHub review thread JSON: %w", err)
+	type reviewThread struct {
+		ID         string       `json:"id"`
+		IsResolved bool         `json:"isResolved"`
+		Comments   *commentPage `json:"comments"`
 	}
-	threads := response.Data.Repository.PullRequest.ReviewThreads
-	if threads.PageInfo.HasNextPage {
-		return nil, errors.New("PR has more review threads than the monitor can safely inspect")
-	}
-	unresolved := make([]any, 0, len(threads.Nodes))
-	for _, thread := range threads.Nodes {
-		if !thread.IsResolved {
-			unresolved = append(unresolved, thread)
+	fetch := func(query string, variables ...string) ([]byte, error) {
+		args := []string{"api", "graphql", "-f", "query=" + query}
+		args = append(args, "-F", "owner="+parts[0], "-F", "repo="+parts[1], "-F", "number="+strconv.Itoa(job.PR))
+		args = append(args, variables...)
+		data, err := runGH(ctx, args...)
+		if err != nil {
+			return nil, fmt.Errorf("read PR review threads: %w", err)
 		}
+		return data, nil
+	}
+	const threadQuery = `query($owner:String!, $repo:String!, $number:Int!, $after:String) { repository(owner:$owner, name:$repo) { pullRequest(number:$number) { reviewThreads(first:100, after:$after) { nodes { id isResolved comments(first:100) { nodes { body path line originalLine } pageInfo { hasNextPage endCursor } } } pageInfo { hasNextPage endCursor } } } } }`
+	const commentsQuery = `query($id:ID!, $after:String) { node(id:$id) { ... on PullRequestReviewThread { comments(first:100, after:$after) { nodes { body path line originalLine } pageInfo { hasNextPage endCursor } } } } }`
+	var unresolved []reviewThread
+	threadCursor := ""
+	for {
+		variables := []string{}
+		if threadCursor != "" {
+			variables = append(variables, "-f", "after="+threadCursor)
+		}
+		data, err := fetch(threadQuery, variables...)
+		if err != nil {
+			return nil, err
+		}
+		var response struct {
+			Data *struct {
+				Repository *struct {
+					PullRequest *struct {
+						ReviewThreads *struct {
+							Nodes    []reviewThread `json:"nodes"`
+							PageInfo *struct {
+								HasNextPage bool   `json:"hasNextPage"`
+								EndCursor   string `json:"endCursor"`
+							} `json:"pageInfo"`
+						} `json:"reviewThreads"`
+					} `json:"pullRequest"`
+				} `json:"repository"`
+			} `json:"data"`
+			Errors []json.RawMessage `json:"errors"`
+		}
+		if err := json.Unmarshal(data, &response); err != nil {
+			return nil, fmt.Errorf("invalid GitHub review thread JSON: %w", err)
+		}
+		if len(response.Errors) > 0 || response.Data == nil || response.Data.Repository == nil || response.Data.Repository.PullRequest == nil || response.Data.Repository.PullRequest.ReviewThreads == nil {
+			return nil, errors.New("GitHub review thread response is incomplete or contains errors")
+		}
+		page := response.Data.Repository.PullRequest.ReviewThreads
+		if page.PageInfo == nil {
+			return nil, errors.New("GitHub review thread response omitted pagination metadata")
+		}
+		for _, thread := range page.Nodes {
+			if thread.Comments == nil || thread.Comments.PageInfo == nil {
+				return nil, errors.New("GitHub review thread response omitted comment pagination data")
+			}
+			lastCommentCursor := ""
+			for thread.Comments.PageInfo.HasNextPage {
+				cursor := thread.Comments.PageInfo.EndCursor
+				if thread.ID == "" || cursor == "" || cursor == lastCommentCursor {
+					return nil, errors.New("GitHub review thread comment page omitted a valid cursor")
+				}
+				lastCommentCursor = cursor
+				data, err := runGH(ctx, "api", "graphql", "-f", "query="+commentsQuery, "-F", "id="+thread.ID, "-f", "after="+cursor)
+				if err != nil {
+					return nil, fmt.Errorf("read PR review comments: %w", err)
+				}
+				var commentResponse struct {
+					Data *struct {
+						Node *struct {
+							Comments *commentPage `json:"comments"`
+						} `json:"node"`
+					} `json:"data"`
+					Errors []json.RawMessage `json:"errors"`
+				}
+				if err := json.Unmarshal(data, &commentResponse); err != nil {
+					return nil, fmt.Errorf("invalid GitHub review comment JSON: %w", err)
+				}
+				if len(commentResponse.Errors) > 0 || commentResponse.Data == nil || commentResponse.Data.Node == nil || commentResponse.Data.Node.Comments == nil || commentResponse.Data.Node.Comments.PageInfo == nil {
+					return nil, errors.New("GitHub review comment response is incomplete or contains errors")
+				}
+				next := commentResponse.Data.Node.Comments
+				thread.Comments.Nodes = append(thread.Comments.Nodes, next.Nodes...)
+				thread.Comments.PageInfo = next.PageInfo
+			}
+			if !thread.IsResolved {
+				unresolved = append(unresolved, thread)
+			}
+		}
+		if !page.PageInfo.HasNextPage {
+			break
+		}
+		if page.PageInfo.EndCursor == "" || page.PageInfo.EndCursor == threadCursor {
+			return nil, errors.New("GitHub review thread page omitted a valid cursor")
+		}
+		threadCursor = page.PageInfo.EndCursor
 	}
 	return json.Marshal(unresolved)
 }
@@ -790,16 +896,86 @@ func runMonitorWorker(id, root string, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	workerLock := filepath.Join(dir, "worker.lock")
-	unlockWorker, err := acquireOwnedLock(workerLock)
-	if err != nil {
-		return fmt.Errorf("worker already running for job %s: %w", id, err)
-	}
-	defer unlockWorker()
 	if err := cfg.Validate(); err != nil {
-		job.Status = "failed"
-		_ = saveMonitorJob(dir, job)
 		return err
+	}
+	monitorTimeout, err := cfg.monitorTimeout()
+	if err != nil {
+		return err
+	}
+	firstStartDeadline := time.Time{}
+	if monitorTimeout > 0 {
+		firstStartDeadline = time.Now().UTC().Add(monitorTimeout)
+	}
+	recoverableRunning := job.Status == "running" && job.PID == 0 && !workerFresh(*job)
+	if job.DeadlineAt.IsZero() && monitorTimeout > 0 && (job.Status == "queued" || recoverableRunning) && !job.StopRequested {
+		job, err = persistMonitorDeadline(root, id, monitorTimeout, firstStartDeadline)
+		if err != nil {
+			return err
+		}
+	}
+	lockDeadline := job.DeadlineAt
+	if lockDeadline.IsZero() {
+		lockDeadline = firstStartDeadline
+	}
+	var lockCtx context.Context
+	var cancelLock context.CancelFunc
+	if lockDeadline.IsZero() {
+		lockCtx, cancelLock = context.WithCancel(context.Background())
+	} else {
+		lockCtx, cancelLock = context.WithDeadline(context.Background(), lockDeadline)
+	}
+	defer cancelLock()
+	workerLock := filepath.Join(dir, "worker.lock")
+	lockRetry := time.NewTicker(100 * time.Millisecond)
+	defer lockRetry.Stop()
+	var unlockWorker func()
+	for {
+		unlockWorker, err = monitorAcquireWorkerLock(workerLock)
+		if err == nil {
+			defer unlockWorker()
+			break
+		}
+		if monitorTimeout == 0 && job.DeadlineAt.IsZero() {
+			current, readErr := readMonitorJob(dir)
+			if readErr != nil {
+				return readErr
+			}
+			recoverable := current.Status == "queued" || (current.Status == "running" && current.PID == 0 && !workerFresh(*current))
+			if current.StopRequested || !recoverable {
+				// A duplicate active worker must not wait indefinitely or alter its state.
+				return nil
+			}
+		}
+		select {
+		case <-lockCtx.Done():
+			_, err := finishMonitorWorkerLockTimeout(root, id)
+			return err
+		case <-lockRetry.C:
+		}
+	}
+	cancelLock()
+	// The record read before waiting for worker.lock may have been changed by
+	// stop, reset, or another lifecycle transition. Only the canonical record
+	// read under the lock can authorize this worker to start.
+	job, err = readMonitorJob(dir)
+	if err != nil {
+		return err
+	}
+	recoverableRunning = job.Status == "running" && job.PID == 0 && !workerFresh(*job)
+	if (job.Status != "queued" && !recoverableRunning) || job.StopRequested {
+		return nil
+	}
+	var workerCtx context.Context
+	var cancelWorker context.CancelFunc
+	if !job.DeadlineAt.IsZero() {
+		workerCtx, cancelWorker = context.WithDeadline(context.Background(), job.DeadlineAt)
+	} else {
+		workerCtx, cancelWorker = context.WithCancel(context.Background())
+	}
+	defer cancelWorker()
+	if workerCtx.Err() != nil {
+		return finishMonitorLifecycle(dir, job, workerCtx, "Monitor lifetime expired before worker startup.")
 	}
 	job.PID = os.Getpid()
 	job.Status = "running"
@@ -813,26 +989,11 @@ func runMonitorWorker(id, root string, cfg Config) error {
 	if err := monitorEvent(dir, job, "Detached worker registered."); err != nil {
 		return err
 	}
-	branchUnlock, err := NewJobStore(root)
-	if err != nil {
-		return err
-	}
-	branchRepository, err := repositoryIdentity(job.RepoRoot)
-	if err != nil {
-		return err
-	}
-	unlockBranch, err := branchUnlock.LockBranch(branchRepository, job.HeadBranch)
-	if err != nil {
-		return fmt.Errorf("PR branch is reserved by another detached job: %w", err)
-	}
-	defer unlockBranch()
 	defer func() {
 		job.PID = 0
 		_ = saveMonitorJob(dir, job)
 		_ = clearMonitorWorker(job.ID, dir)
 	}()
-	interval := readPollInterval()
-	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	watchDone := make(chan struct{})
 	go func() {
 		defer close(watchDone)
@@ -855,12 +1016,53 @@ func runMonitorWorker(id, root string, cfg Config) error {
 		}
 	}()
 	defer func() { cancelWorker(); <-watchDone }()
+	branchUnlock, err := NewJobStore(root)
+	if err != nil {
+		return err
+	}
+	branchRepository, err := repositoryIdentity(job.RepoRoot)
+	if err != nil {
+		return err
+	}
+	if workerCtx.Err() != nil {
+		return finishMonitorLifecycle(dir, job, workerCtx, "Stopped before acquiring the PR branch reservation.")
+	}
+	var unlockBranch func()
+	branchRetry := time.NewTicker(100 * time.Millisecond)
+	defer branchRetry.Stop()
+	for unlockBranch == nil {
+		if stopped, stopErr := jobStopped(dir); stopErr != nil {
+			return stopErr
+		} else if stopped {
+			cancelWorker()
+			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped before acquiring the PR branch reservation.")
+		}
+		unlock, acquired, lockErr := branchUnlock.TryLockBranch(branchRepository, job.HeadBranch)
+		if lockErr != nil {
+			return fmt.Errorf("PR branch is reserved by another detached job: %w", lockErr)
+		}
+		if acquired {
+			unlockBranch = unlock
+			break
+		}
+		select {
+		case <-workerCtx.Done():
+			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped before acquiring the PR branch reservation.")
+		case <-branchRetry.C:
+		}
+	}
+	defer unlockBranch()
+	workerCtx = context.WithValue(workerCtx, monitorBranchLockContextKey{}, true)
+	interval := readPollInterval()
 	attemptsBySignature := map[string]int{}
 	lastSignature := ""
 	for {
 		job, err = readMonitorJob(dir)
 		if err != nil {
 			return err
+		}
+		if workerCtx.Err() != nil {
+			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped at cooperative safe point.")
 		}
 		if stopped, stopErr := jobStopped(dir); stopErr != nil {
 			return stopErr
@@ -874,6 +1076,11 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			return err
 		}
 		if job.Worktree != "" {
+			if err := validateMonitorWorktree(job, root); err != nil {
+				job.Status = "failed"
+				_ = monitorEvent(dir, job, "Initial isolated worktree validation failed: "+err.Error())
+				return err
+			}
 			workerTop, err := runGit(context.Background(), job.Worktree, "rev-parse", "--show-toplevel")
 			if err != nil {
 				job.Status = "failed"
@@ -898,8 +1105,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 		cancel()
 		if err != nil {
 			if workerCtx.Err() != nil {
-				job.Status = "stopped"
-				return monitorEvent(dir, job, "Stopped; active GitHub query or agent canceled.")
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped; active GitHub query or agent canceled.")
 			}
 			job.SnapshotFailures++
 			_ = appendMonitorLog(dir, fmt.Sprintf("Transient GitHub query failure (%d/%d): %v", job.SnapshotFailures, monitorSnapshotMaxRetries, err))
@@ -914,10 +1120,12 @@ func runMonitorWorker(id, root string, cfg Config) error {
 				return nil
 			}
 			if !sleepMonitorContext(workerCtx, dir, monitorRetryDelay(job.SnapshotFailures)) {
-				job.Status = "stopped"
-				return monitorEvent(dir, job, "Stopped during GitHub retry backoff.")
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped during GitHub retry backoff.")
 			}
 			continue
+		}
+		if workerCtx.Err() != nil {
+			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped after GitHub snapshot query.")
 		}
 		if job.SnapshotFailures != 0 {
 			job.SnapshotFailures = 0
@@ -960,15 +1168,13 @@ func runMonitorWorker(id, root string, cfg Config) error {
 		}
 		if job.PendingSignature != "" && job.Proposal != "" {
 			if !sleepMonitorContext(workerCtx, dir, interval) {
-				job.Status = "stopped"
-				return monitorEvent(dir, job, "Stopped while waiting for approval.")
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting for approval.")
 			}
 			continue
 		}
 		if job.RejectedSignature != "" && signature == job.RejectedSignature {
 			if !sleepMonitorContext(workerCtx, dir, interval) {
-				job.Status = "stopped"
-				return monitorEvent(dir, job, "Stopped while waiting after rejection.")
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting after rejection.")
 			}
 			continue
 		}
@@ -979,8 +1185,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 		unresolvedThreads := hasUnresolvedReviewThreads(snapshot.ReviewThreads)
 		if signature == job.ProcessedSignature && job.ApprovalSignature != signature {
 			if !sleepMonitorContext(workerCtx, dir, interval) {
-				job.Status = "stopped"
-				return monitorEvent(dir, job, "Stopped while waiting for a new PR event.")
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting for a new PR event.")
 			}
 			continue
 		}
@@ -996,8 +1201,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 				_ = monitorEvent(dir, job, "Attempt cap reached; explicit approval required.")
 			}
 			if !sleepMonitorContext(workerCtx, dir, interval) {
-				job.Status = "stopped"
-				return monitorEvent(dir, job, "Stopped while waiting for an actionable PR event.")
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting for an actionable PR event.")
 			}
 			continue
 		}
@@ -1016,17 +1220,33 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			return err
 		}
 		if err := processMonitorEventContext(workerCtx, dir, job, cfg, snapshot, signature); err != nil {
+			if workerCtx.Err() != nil {
+				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped during active monitor work.")
+			}
 			_ = appendMonitorLog(dir, "Event processing failed safely: "+err.Error())
+			if job.ProcessedSignature == signature {
+				job.ProcessedSignature = ""
+			}
+			if saveErr := saveMonitorJob(dir, job); saveErr != nil {
+				return saveErr
+			}
 		}
 		if job.ApprovalSignature == signature {
 			job.ApprovalSignature, job.ApprovalScope = "", ""
 			_ = saveMonitorJob(dir, job)
 		}
 		if !sleepMonitorContext(workerCtx, dir, interval) {
-			job.Status = "stopped"
-			return monitorEvent(dir, job, "Stopped while waiting for the next PR poll.")
+			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting for the next PR poll.")
 		}
 	}
+}
+
+func finishMonitorLifecycle(dir string, job *monitorJob, ctx context.Context, explicitMessage string) error {
+	job.Status = "stopped"
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return monitorEvent(dir, job, "Monitor lifetime timeout reached; monitoring stopped.")
+	}
+	return monitorEvent(dir, job, explicitMessage)
 }
 
 func sleepMonitor(dir string, interval time.Duration) {
@@ -1062,9 +1282,9 @@ func snapshotRetryDelay(failures int) time.Duration {
 	return delay
 }
 
-func validateWorker(job *monitorJob) error {
-	if job.Worktree == "" || job.WorkerBranch == "" {
-		return errors.New("worker worktree is not registered")
+func validateWorker(job *monitorJob, dir string) error {
+	if err := validateMonitorWorktree(job, filepath.Dir(dir)); err != nil {
+		return err
 	}
 	root, err := runGit(context.Background(), job.Worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
@@ -1177,25 +1397,17 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 		if err != nil {
 			return err
 		}
-		primary, err := primaryWorktree(job.RepoRoot)
+		worktree, baseline, err := setupExistingPRWorktree(store, job.RepoRoot, job.HeadBranch, s.HeadRefOID, job.PR, job.ID)
 		if err != nil {
 			return err
 		}
-		_, alreadyOwned, err := worktreeBranchOwner(job.RepoRoot, job.HeadBranch)
-		if err != nil {
-			return err
-		}
-		worktree, baseline, err := setupExistingPRWorktree(store, job.RepoRoot, primary, job.HeadBranch, s.HeadRefOID, job.PR, true)
-		if err != nil {
-			return err
-		}
-		if worktree == "" {
-			return errors.New("PR branch is absent locally; deferred worktree setup could not create it")
-		}
-		job.Worktree, job.WorkerBranch, job.BaselineHead, job.OwnWorktree = worktree, job.HeadBranch, baseline, !alreadyOwned && worktree != primary
+		job.Worktree, job.WorkerBranch, job.BaselineHead, job.OwnWorktree = worktree, "factory-monitor/"+job.ID, baseline, true
 		if err := saveMonitorJob(dir, job); err != nil {
 			return err
 		}
+	}
+	if err := validateMonitorWorktree(job, filepath.Dir(dir)); err != nil {
+		return err
 	}
 	worktree := job.Worktree
 	job.Status = "running"
@@ -1255,12 +1467,10 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 	case "APPROVAL_REQUIRED":
 		return pauseForApproval(dir, job, signature, proposal)
 	case "ERROR":
-		_ = appendMonitorLog(dir, "Agent reported an error.")
-		return nil
+		return errors.New("agent reported ERROR protocol status")
 	case "FIXED":
 	default:
-		_ = appendMonitorLog(dir, "Agent omitted valid final protocol; no commit or push.")
-		return nil
+		return errors.New("agent omitted valid final protocol; no commit or push")
 	}
 	changed, err := changedPaths(worktree)
 	if err != nil {
@@ -1276,13 +1486,17 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 		job.Status = "stopped"
 		return monitorEvent(dir, job, "Stopped after agent; no commit or push.")
 	}
-	if err := guardedCommitPush(ctx, dir, job, signature, s, changed); err != nil {
+	captured, err := captureChangedState(worktree, changed)
+	if err != nil {
+		return err
+	}
+	if err := guardedCommitPushCaptured(ctx, dir, job, signature, s, changed, captured); err != nil {
 		_ = appendMonitorLog(dir, "Commit/push stopped safely: "+err.Error())
 		if strings.Contains(err.Error(), "stop requested") {
 			job.Status = "stopped"
 			return monitorEvent(dir, job, err.Error())
 		}
-		return nil
+		return err
 	}
 	return nil
 }
@@ -1395,7 +1609,271 @@ func validChangePath(path string) bool {
 	return true
 }
 
+type capturedChange struct {
+	path    string
+	mode    string
+	oid     string
+	deleted bool
+}
+
+var (
+	monitorBeforeIndexStage  func(string) error
+	monitorAfterTreeValidate func(string, string) error
+	monitorAfterCaptureRead  func(string) error
+)
+
+func captureChangedState(worktree string, files []string) ([]capturedChange, error) {
+	rootInfo, err := os.Lstat(worktree)
+	if err != nil || rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return nil, errors.New("monitor worktree root is not a stable directory")
+	}
+	changes := make([]capturedChange, 0, len(files))
+	for _, path := range files {
+		if !validChangePath(path) {
+			return nil, fmt.Errorf("unsafe changed path %q", path)
+		}
+		parts := strings.Split(filepath.ToSlash(path), "/")
+		parent := worktree
+		var parentInfos []os.FileInfo
+		missingParent := false
+		for i, part := range parts[:len(parts)-1] {
+			parent = filepath.Join(parent, filepath.FromSlash(part))
+			info, err := os.Lstat(parent)
+			if os.IsNotExist(err) {
+				if err := validateCaptureParents(worktree, parts[:i+1], parentInfos); err != nil {
+					return nil, err
+				}
+				if err := validateCaptureRoot(worktree, rootInfo); err != nil {
+					return nil, err
+				}
+				fullPath := filepath.Join(worktree, filepath.FromSlash(path))
+				if _, err := os.Lstat(parent); !os.IsNotExist(err) {
+					return nil, fmt.Errorf("changed path changed during capture %q", path)
+				}
+				if _, err := os.Lstat(fullPath); !os.IsNotExist(err) {
+					return nil, fmt.Errorf("changed path changed during capture %q", path)
+				}
+				if err := validateCaptureParents(worktree, parts[:i+1], parentInfos); err != nil {
+					return nil, err
+				}
+				if err := validateCaptureRoot(worktree, rootInfo); err != nil {
+					return nil, err
+				}
+				if _, err := os.Lstat(parent); !os.IsNotExist(err) {
+					return nil, fmt.Errorf("changed path changed during capture %q", path)
+				}
+				if _, err := os.Lstat(fullPath); !os.IsNotExist(err) {
+					return nil, fmt.Errorf("changed path changed during capture %q", path)
+				}
+				changes = append(changes, capturedChange{path: path, deleted: true})
+				missingParent = true
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return nil, fmt.Errorf("changed path has unsafe parent %q", path)
+			}
+			parentInfos = append(parentInfos, info)
+		}
+		if missingParent {
+			continue
+		}
+		fullPath := filepath.Join(worktree, filepath.FromSlash(path))
+		info, err := os.Lstat(fullPath)
+		if os.IsNotExist(err) {
+			if err := validateCaptureParents(worktree, parts, parentInfos); err != nil {
+				return nil, err
+			}
+			if _, err := os.Lstat(fullPath); !os.IsNotExist(err) {
+				return nil, fmt.Errorf("changed path changed during capture %q", path)
+			}
+			if err := validateCaptureRoot(worktree, rootInfo); err != nil {
+				return nil, err
+			}
+			changes = append(changes, capturedChange{path: path, deleted: true})
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if err := validateCaptureParents(worktree, parts, parentInfos); err != nil {
+			return nil, err
+		}
+		var content []byte
+		mode := "100644"
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(fullPath)
+			if err != nil {
+				return nil, err
+			}
+			content = []byte(target)
+			mode = "120000"
+		case info.Mode().IsRegular():
+			if monitorAfterCaptureRead != nil {
+				if err := monitorAfterCaptureRead(fullPath); err != nil {
+					return nil, err
+				}
+			}
+			file, err := os.Open(fullPath)
+			if err != nil {
+				return nil, err
+			}
+			openedInfo, statErr := file.Stat()
+			if statErr != nil || !os.SameFile(info, openedInfo) || info.Size() != openedInfo.Size() || !info.ModTime().Equal(openedInfo.ModTime()) || info.Mode() != openedInfo.Mode() {
+				_ = file.Close()
+				return nil, fmt.Errorf("changed path replaced during capture %q", path)
+			}
+			content, err = io.ReadAll(file)
+			if err != nil {
+				_ = file.Close()
+				return nil, err
+			}
+			endInfo, err := file.Stat()
+			if err != nil {
+				_ = file.Close()
+				return nil, err
+			}
+			if !os.SameFile(openedInfo, endInfo) || openedInfo.Size() != endInfo.Size() || !openedInfo.ModTime().Equal(endInfo.ModTime()) || openedInfo.Mode() != endInfo.Mode() {
+				_ = file.Close()
+				return nil, fmt.Errorf("changed file modified during capture %q", path)
+			}
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				_ = file.Close()
+				return nil, err
+			}
+			recaptured, err := io.ReadAll(file)
+			if err != nil {
+				_ = file.Close()
+				return nil, err
+			}
+			finalInfo, finalErr := file.Stat()
+			closeErr := file.Close()
+			if finalErr != nil {
+				return nil, finalErr
+			}
+			if closeErr != nil {
+				return nil, closeErr
+			}
+			if !bytes.Equal(content, recaptured) || !os.SameFile(endInfo, finalInfo) || endInfo.Size() != finalInfo.Size() || !endInfo.ModTime().Equal(finalInfo.ModTime()) || endInfo.Mode() != finalInfo.Mode() {
+				return nil, fmt.Errorf("changed file modified during capture %q", path)
+			}
+			if info.Mode()&0o111 != 0 {
+				mode = "100755"
+			}
+		default:
+			return nil, fmt.Errorf("unsupported file type for changed path %q", path)
+		}
+		currentInfo, err := os.Lstat(fullPath)
+		if err != nil || !os.SameFile(info, currentInfo) || info.Mode() != currentInfo.Mode() {
+			return nil, fmt.Errorf("changed path replaced during capture %q", path)
+		}
+		if err := validateCaptureParents(worktree, parts, parentInfos); err != nil {
+			return nil, err
+		}
+		if err := validateCaptureRoot(worktree, rootInfo); err != nil {
+			return nil, err
+		}
+		oid, err := runGitInput(context.Background(), worktree, content, "hash-object", "-w", "--stdin")
+		if err != nil {
+			return nil, err
+		}
+		changes = append(changes, capturedChange{path: path, mode: mode, oid: oid})
+	}
+	return changes, nil
+}
+
+func validateCaptureRoot(worktree string, before os.FileInfo) error {
+	current, err := os.Lstat(worktree)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(before, current) {
+		return errors.New("monitor worktree root replaced during capture")
+	}
+	return nil
+}
+
+func validateCaptureParents(worktree string, parts []string, before []os.FileInfo) error {
+	parent := worktree
+	for i, part := range parts[:len(parts)-1] {
+		parent = filepath.Join(parent, filepath.FromSlash(part))
+		current, err := os.Lstat(parent)
+		if err != nil || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() || !os.SameFile(before[i], current) {
+			return fmt.Errorf("changed path parent replaced during capture %q", filepath.Join(parts...))
+		}
+	}
+	return nil
+}
+
+func sameCapturedChanges(a, b []capturedChange) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateCapturedTree(worktree, baseline, tree string, files []string, captured []capturedChange) error {
+	changedOutput, err := runGit(context.Background(), worktree, "diff-tree", "--no-commit-id", "--no-renames", "--name-only", "-r", "-z", baseline, tree)
+	if err != nil {
+		return err
+	}
+	var changed []string
+	for _, path := range strings.Split(changedOutput, "\x00") {
+		if path != "" {
+			changed = append(changed, path)
+		}
+	}
+	if !sameStringSet(changed, files) {
+		return errors.New("staged tree contains paths outside captured agent changes")
+	}
+	entries, err := runGit(context.Background(), worktree, "ls-tree", "-r", "-z", "--full-tree", tree)
+	if err != nil {
+		return err
+	}
+	indexed := make(map[string]string)
+	for _, entry := range strings.Split(entries, "\x00") {
+		if entry == "" {
+			continue
+		}
+		metadata, path, ok := strings.Cut(entry, "\t")
+		if !ok {
+			return errors.New("cannot parse staged tree entry")
+		}
+		fields := strings.Fields(metadata)
+		if len(fields) != 3 {
+			return errors.New("cannot parse staged tree metadata")
+		}
+		indexed[path] = fields[0] + ":" + fields[2]
+	}
+	for _, change := range captured {
+		actual, exists := indexed[change.path]
+		if change.deleted {
+			if exists {
+				return fmt.Errorf("staged tree did not preserve deletion of %q", change.path)
+			}
+			continue
+		}
+		if !exists || actual != change.mode+":"+change.oid {
+			return fmt.Errorf("staged tree does not match captured content for %q", change.path)
+		}
+	}
+	return nil
+}
+
 func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signature string, snapshot *monitorSnapshot, files []string) error {
+	captured, err := captureChangedState(job.Worktree, files)
+	if err != nil {
+		return err
+	}
+	return guardedCommitPushCaptured(ctx, dir, job, signature, snapshot, files, captured)
+}
+
+func guardedCommitPushCaptured(ctx context.Context, dir string, job *monitorJob, signature string, snapshot *monitorSnapshot, files []string, captured []capturedChange) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("operation canceled before commit: %w", err)
 	}
@@ -1405,19 +1883,22 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if err := validateTarget(job); err != nil {
 		return err
 	}
-	branchUnlock, err := NewJobStore(filepath.Dir(dir))
-	if err != nil {
-		return err
+	var unlockBranch func()
+	if held, _ := ctx.Value(monitorBranchLockContextKey{}).(bool); !held {
+		branchUnlock, err := NewJobStore(filepath.Dir(dir))
+		if err != nil {
+			return err
+		}
+		branchRepository, err := repositoryIdentity(job.RepoRoot)
+		if err != nil {
+			return err
+		}
+		unlockBranch, err = branchUnlock.LockBranch(branchRepository, job.HeadBranch)
+		if err != nil {
+			return fmt.Errorf("PR branch is reserved by another detached job: %w", err)
+		}
+		defer unlockBranch()
 	}
-	branchRepository, err := repositoryIdentity(job.RepoRoot)
-	if err != nil {
-		return err
-	}
-	unlockBranch, err := branchUnlock.LockBranch(branchRepository, job.HeadBranch)
-	if err != nil {
-		return fmt.Errorf("PR branch is reserved by another detached job: %w", err)
-	}
-	defer unlockBranch()
 	root, err := runGit(context.Background(), job.Worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return err
@@ -1449,7 +1930,11 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if signature == "" || snapshot.HeadRefOID != job.BaselineHead {
 		return errors.New("job baseline or snapshot changed")
 	}
-	if err := validateWorker(job); err != nil {
+	pushURL, err := validatedPushURL(job.Worktree, job)
+	if err != nil {
+		return err
+	}
+	if err := validateWorker(job, dir); err != nil {
 		return err
 	}
 	live, liveSignature, err := readSnapshot(ctx, job)
@@ -1465,15 +1950,77 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if liveSignature != signature || live.HeadRefOID != snapshot.HeadRefOID {
 		return errors.New("PR/check snapshot changed before commit")
 	}
-	args := []string{"add", "--"}
-	for _, path := range files {
-		args = append(args, ":(literal)"+path)
+	if monitorBeforeIndexStage != nil {
+		if err := monitorBeforeIndexStage(job.Worktree); err != nil {
+			return err
+		}
 	}
-	if _, err := runGit(context.Background(), job.Worktree, args...); err != nil {
+	postAgentPaths, err := changedPaths(job.Worktree)
+	if err != nil {
 		return err
 	}
-	if _, err := runGit(context.Background(), job.Worktree, "diff", "--cached", "--check"); err != nil {
+	if !sameStringSet(postAgentPaths, files) {
+		return errors.New("worktree paths changed after agent completion; refusing publication")
+	}
+	current, err := captureChangedState(job.Worktree, files)
+	if err != nil {
 		return err
+	}
+	if !sameCapturedChanges(current, captured) {
+		return errors.New("worktree changed after agent completion; refusing publication")
+	}
+	tempIndex, err := os.CreateTemp(dir, "monitor-index-")
+	if err != nil {
+		return err
+	}
+	indexPath := tempIndex.Name()
+	if err := tempIndex.Close(); err != nil {
+		_ = os.Remove(indexPath)
+		return err
+	}
+	_ = os.Remove(indexPath)
+	defer os.Remove(indexPath)
+	git := func(args ...string) (string, error) {
+		return runGitWithEnv(context.Background(), job.Worktree, []string{"GIT_INDEX_FILE=" + indexPath}, args...)
+	}
+	if _, err := git("read-tree", snapshot.HeadRefOID); err != nil {
+		return err
+	}
+	objectFormat, err := runGit(context.Background(), job.Worktree, "rev-parse", "--show-object-format")
+	if err != nil {
+		return err
+	}
+	objectIDWidth := 40
+	if objectFormat == "sha256" {
+		objectIDWidth = 64
+	} else if objectFormat != "sha1" {
+		return fmt.Errorf("unsupported Git object format %q", objectFormat)
+	}
+	var indexInfo strings.Builder
+	for _, change := range captured {
+		if change.deleted {
+			indexInfo.WriteString("0 " + strings.Repeat("0", objectIDWidth) + "\t" + change.path + "\x00")
+		} else {
+			indexInfo.WriteString(change.mode + " " + change.oid + "\t" + change.path + "\x00")
+		}
+	}
+	if _, err := runGitInputWithEnv(context.Background(), job.Worktree, []string{"GIT_INDEX_FILE=" + indexPath}, []byte(indexInfo.String()), "update-index", "-z", "--index-info"); err != nil {
+		return err
+	}
+	tree, err := git("write-tree")
+	if err != nil {
+		return err
+	}
+	if err := validateCapturedTree(job.Worktree, snapshot.HeadRefOID, tree, files, captured); err != nil {
+		return err
+	}
+	if _, err := git("diff", "--cached", "--check"); err != nil {
+		return err
+	}
+	if monitorAfterTreeValidate != nil {
+		if err := monitorAfterTreeValidate(job.Worktree, tree); err != nil {
+			return err
+		}
 	}
 	if stopped, _ := jobStopped(dir); stopped {
 		return errors.New("stop requested before commit")
@@ -1484,8 +2031,15 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("operation canceled before commit: %w", err)
 	}
-	if _, err := runGit(context.Background(), job.Worktree, "commit", "-m", "fix: address PR feedback via factory monitor"); err != nil {
+	commit, err := runGit(ctx, job.Worktree, "commit-tree", tree, "-p", snapshot.HeadRefOID, "-m", "fix: address PR feedback via factory monitor")
+	if err != nil {
 		return err
+	}
+	if _, err := runGit(ctx, job.Worktree, "update-ref", "refs/heads/"+job.WorkerBranch, commit, snapshot.HeadRefOID); err != nil {
+		return fmt.Errorf("worker baseline changed before commit: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("operation canceled after local commit: %w", err)
 	}
 	if stopped, _ := jobStopped(dir); stopped {
 		return errors.New("stop requested after local commit; commit retained but not pushed")
@@ -1521,7 +2075,7 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if stopped, _ := jobStopped(dir); stopped {
 		return errors.New("stop requested immediately before push")
 	}
-	pushURL, err := validatedPushURL(job.Worktree, job)
+	pushURL, err = validatedPushURL(job.Worktree, job)
 	if err != nil {
 		return err
 	}
@@ -1536,7 +2090,7 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("operation canceled before push: %w", err)
 	}
-	if _, err := runGit(context.Background(), job.Worktree, "push", pushURL, pushed+":"+ref); err != nil {
+	if _, err := runGit(ctx, job.Worktree, "push", pushURL, pushed+":"+ref); err != nil {
 		return err
 	}
 	job.BaselineHead = pushed

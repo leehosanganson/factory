@@ -20,6 +20,7 @@ type Config struct {
 	PromptDir              string                        `json:"prompt_dir,omitempty"`
 	StateDir               string                        `json:"state_dir,omitempty"`
 	AgentTimeout           string                        `json:"agent_timeout,omitempty"`
+	MonitorTimeout         string                        `json:"monitor_timeout,omitempty"`
 }
 
 // DefaultConfig returns a copy of the built-in pi command adapter.
@@ -84,6 +85,9 @@ func (c Config) Validate() error {
 	if _, err := c.agentTimeout(); err != nil {
 		return err
 	}
+	if _, err := c.monitorTimeout(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.Command) == "" {
 		return fmt.Errorf("command must not be empty")
 	}
@@ -138,6 +142,20 @@ func validatePipelineChecks(checks [][]string) error {
 		}
 	}
 	return nil
+}
+
+func (c Config) monitorTimeout() (time.Duration, error) {
+	if c.MonitorTimeout == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(c.MonitorTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("monitor_timeout must be a valid duration: %w", err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("monitor_timeout must be positive")
+	}
+	return duration, nil
 }
 
 func (c Config) agentTimeout() (time.Duration, error) {
