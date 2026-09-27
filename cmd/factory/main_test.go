@@ -774,20 +774,40 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 }
 
 func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
-	state := t.TempDir()
-	configHome := t.TempDir()
+	root, err := os.MkdirTemp("", "factory detached worker test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeRoot := true
+	t.Cleanup(func() {
+		if !removeRoot {
+			t.Errorf("preserving detached worker test directory because worker shutdown could not be verified: %s", root)
+			return
+		}
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove detached worker test directory: %v", err)
+		}
+	})
+
+	state := filepath.Join(root, "state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	releaseWorker := filepath.Join(state, "release-worker")
+	workerStarted := filepath.Join(state, "worker-started")
+	configHome := filepath.Join(root, "config")
 	factoryConfig := filepath.Join(configHome, "factory")
 	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	script := filepath.Join(t.TempDir(), "agent")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.4\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+	script := filepath.Join(root, "agent")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n: > \"$FACTORY_TEST_STARTED\"\nwhile [ ! -f \"$FACTORY_TEST_RELEASE\" ]; do sleep 0.02; done\nprintf 'PASS\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s"}`, script, state)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(t.TempDir(), "factory")
+	binary := filepath.Join(root, "factory")
 	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -797,20 +817,9 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build factory: %v\n%s", err, output)
 	}
-	target, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
-	}
-	started := time.Now()
-	command := exec.Command(binary, "implement", "-d", "test", "detached")
-	command.Dir = target
-	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		t.Fatalf("detached implement: %v\n%s", err, output)
-	}
-	if time.Since(started) > 300*time.Millisecond || !strings.Contains(string(output), "Started implementation job") || strings.Contains(string(output), "requirements completed") {
-		t.Fatalf("detached command did not return promptly with job ID: duration=%s output=%q", time.Since(started), output)
 	}
 	storeRoot, err := factory.JobStateRoot(state)
 	if err != nil {
@@ -820,9 +829,214 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobs, err := store.ListJobs()
-	if err != nil || len(jobs) != 1 || jobs[0].Type != "implementation" || jobs[0].TaskDescription != "test detached" {
-		t.Fatalf("detached CLI job state=%+v err=%v", jobs, err)
+
+	command := exec.Command(binary, "implement", "-d", "test", "detached")
+	command.Dir = target
+	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_RELEASE="+releaseWorker, "FACTORY_TEST_STARTED="+workerStarted)
+	var commandOutput bytes.Buffer
+	command.Stdout, command.Stderr = &commandOutput, &commandOutput
+	var commandDone chan error
+	commandExited := false
+	findTestJob := func() (factory.JobRecord, bool, error) {
+		jobs, err := store.ListJobs()
+		if err != nil {
+			return factory.JobRecord{}, false, err
+		}
+		var found factory.JobRecord
+		for _, job := range jobs {
+			if job.TaskDescription == "test detached" && job.TargetPath == target {
+				if found.ID != "" {
+					return factory.JobRecord{}, false, fmt.Errorf("multiple detached test jobs found: %s and %s", found.ID, job.ID)
+				}
+				found = job
+			}
+		}
+		if found.ID == "" {
+			return factory.JobRecord{}, false, nil
+		}
+		return found, true, nil
+	}
+	findJob := func() (factory.JobRecord, bool, error) {
+		jobs, err := store.ListJobs()
+		if err != nil {
+			return factory.JobRecord{}, false, err
+		}
+		if len(jobs) == 0 {
+			return factory.JobRecord{}, false, nil
+		}
+		if len(jobs) != 1 {
+			return factory.JobRecord{}, false, fmt.Errorf("found %d detached jobs, want exactly one", len(jobs))
+		}
+		job := jobs[0]
+		if job.TaskDescription != "test detached" || job.TargetPath != target || job.Type != "implementation" {
+			return factory.JobRecord{}, false, fmt.Errorf("unexpected detached job: %+v", job)
+		}
+		return job, true, nil
+	}
+	waitForShutdown := func(timeout time.Duration, requiredStatus string) error {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			job, found, err := findTestJob()
+			if err != nil {
+				return fmt.Errorf("find detached job: %w", err)
+			}
+			statusMatches := found && job.Status != "queued" && job.Status != "running" && (requiredStatus == "" || job.Status == requiredStatus)
+			if statusMatches {
+				if _, err := store.ReadWorker(job.ID); errors.Is(err, os.ErrNotExist) {
+					unlock, acquired, err := store.TryLockTarget(target)
+					if err != nil {
+						return fmt.Errorf("check target lock after shutdown: %w", err)
+					}
+					if acquired {
+						unlock()
+						return nil
+					}
+				} else if err != nil {
+					return fmt.Errorf("read worker record after shutdown: %w", err)
+				}
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return fmt.Errorf("detached job did not reach status %q, clear its worker record, and release its target lock within %s", requiredStatus, timeout)
+	}
+	waitForCompletion := func(timeout time.Duration) error {
+		return waitForShutdown(timeout, "complete")
+	}
+	t.Cleanup(func() {
+		if commandDone == nil {
+			if removeRoot {
+				if err := os.RemoveAll(root); err != nil {
+					t.Errorf("remove detached worker test directory: %v", err)
+				}
+			}
+			return
+		}
+		if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+			t.Errorf("release detached worker during cleanup: %v", err)
+		}
+		if commandDone != nil && !commandExited {
+			select {
+			case <-commandDone:
+				commandExited = true
+			case <-time.After(5 * time.Second):
+				killErr := command.Process.Kill()
+				select {
+				case <-commandDone:
+					commandExited = true
+					if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+						t.Errorf("kill detached CLI after cleanup timeout: %v", killErr)
+					}
+				case <-time.After(5 * time.Second):
+					if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+						t.Errorf("kill detached CLI after cleanup timeout: %v", killErr)
+					}
+					t.Errorf("detached CLI remains unreaped after kill; preserving temporary directory %s", root)
+					return
+				}
+			}
+		}
+		if initialShutdownErr := waitForShutdown(10*time.Second, ""); initialShutdownErr != nil {
+			job, found, findErr := findTestJob()
+			if findErr != nil {
+				t.Errorf("could not locate detached job after shutdown timeout; preserving temporary directory %s: %v", root, findErr)
+				return
+			}
+			if !found {
+				t.Errorf("could not locate detached job after shutdown timeout; preserving temporary directory %s", root)
+				return
+			}
+			currentJob, err := store.GetJob(job.ID)
+			if err != nil {
+				t.Errorf("could not refresh detached job after shutdown timeout; preserving temporary directory %s: %v", root, err)
+				return
+			}
+			if currentJob.Status == "queued" || currentJob.Status == "running" {
+				if err := store.RequestStop(currentJob.ID); err != nil {
+					t.Errorf("request cooperative cancellation of detached job; preserving temporary directory %s: %v", root, err)
+					return
+				}
+				if err := waitForShutdown(10*time.Second, ""); err != nil {
+					t.Errorf("could not verify worker shutdown after cooperative cancellation; preserving temporary directory %s: %v (initial wait: %v)", root, err, initialShutdownErr)
+					return
+				}
+				if completedJob, found, err := findTestJob(); err == nil && found && completedJob.Status == "complete" && store.StopRequested(completedJob.ID) {
+					t.Logf("detached worker completed as a stop request raced with its final status update")
+				}
+			} else {
+				if currentJob.Status == "complete" && store.StopRequested(currentJob.ID) {
+					t.Logf("detached worker has a stop marker after reaching complete status")
+				}
+				if err := waitForShutdown(10*time.Second, currentJob.Status); err != nil {
+					t.Errorf("could not verify detached worker shutdown in status %q; preserving temporary directory %s: %v (initial wait: %v)", currentJob.Status, root, err, initialShutdownErr)
+					return
+				}
+			}
+		}
+		jobs, err := store.ListJobs()
+		if err != nil {
+			t.Errorf("could not verify detached jobs before cleanup; preserving temporary directory %s: %v", root, err)
+			return
+		}
+		if len(jobs) != 1 || jobs[0].Type != "implementation" || jobs[0].TaskDescription != "test detached" || jobs[0].TargetPath != target {
+			t.Errorf("unexpected detached jobs before cleanup; preserving temporary directory %s: got %+v, want exactly one implementation job for task %q at target %q", root, jobs, "test detached", target)
+			return
+		}
+		removeRoot = true
+	})
+
+	if err := command.Start(); err != nil {
+		t.Fatalf("start detached implement: %v", err)
+	}
+	removeRoot = false
+	commandDone = make(chan error, 1)
+	go func() { commandDone <- command.Wait() }()
+	select {
+	case err := <-commandDone:
+		commandExited = true
+		if err != nil {
+			t.Fatalf("detached implement: %v\n%s", err, commandOutput.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("detached CLI did not return within 10s; cleanup will terminate it if needed; temporary directory %s", root)
+	}
+	if !strings.Contains(commandOutput.String(), "Started implementation job") || strings.Contains(commandOutput.String(), "requirements completed") {
+		t.Fatalf("detached command returned unexpected output: %q", commandOutput.String())
+	}
+	markerDeadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(workerStarted); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("check fake worker start marker: %v", err)
+		}
+		if time.Now().After(markerDeadline) {
+			t.Fatal("fake worker did not reach its gate within 10s")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(releaseWorker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker gate was unexpectedly released before CLI returned: stat err=%v", err)
+	}
+	job, found, err := findJob()
+	if err != nil || !found || job.Type != "implementation" {
+		t.Fatalf("detached CLI job state=%+v found=%t err=%v", job, found, err)
+	}
+	if job.Status != "running" {
+		t.Fatalf("detached CLI returned after fake agent started with job status %q, want running", job.Status)
+	}
+	unlock, acquired, err := store.TryLockTarget(target)
+	if err != nil {
+		t.Fatalf("check active target lock: %v", err)
+	}
+	if acquired {
+		unlock()
+		t.Fatal("worker gate was reached without the worker holding its target lock")
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release detached worker: %v", err)
+	}
+	if err := waitForCompletion(10 * time.Second); err != nil {
+		t.Fatal(err)
 	}
 }
 
