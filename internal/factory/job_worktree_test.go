@@ -66,7 +66,7 @@ func TestCreateImplementationWorktreeUsesReadableUniqueJobName(t *testing.T) {
 			t.Errorf("checked-out branch = %q, err=%v; want %q", gotBranch, err, branch)
 		}
 		gotRoot, err := runGit(context.Background(), worktree, "rev-parse", "--show-toplevel")
-		if err != nil || gotRoot != worktree {
+		if err != nil || canonicalTestPath(t, gotRoot) != canonicalTestPath(t, worktree) {
 			t.Errorf("worktree root = %q, err=%v; want %q", gotRoot, err, worktree)
 		}
 		if _, err := os.Stat(filepath.Join(worktree, "README.md")); err != nil {
