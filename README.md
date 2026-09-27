@@ -4,6 +4,7 @@ Factory is a standard-library Go CLI for durable, agent-driven repository workfl
 
 ## Documentation
 
+- [Contributing](CONTRIBUTING.md) — branch naming and pull request conventions.
 - [Implemented features](docs/features/README.md) — current CLI capabilities, behavior, and architecture.
 - [Agent guidance](AGENTS.md) — repository-specific workflow, coding, and verification conventions.
 - [Factory operating skill](.agents/skills/factory/SKILL.md) — when and how agents should use Factory.
