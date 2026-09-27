@@ -153,15 +153,32 @@ printf '%s\n' '` + response + `'
 				}
 			}
 			workerDone := make(chan error, 1)
-			oldLauncher := monitorWorkerLauncher
+			startWorker := make(chan struct{})
+			oldLauncher, oldAcquire := monitorWorkerLauncher, monitorAcquireWorkerLock
+			startupContention := false
 			monitorWorkerLauncher = func(id, root string) (int, error) {
-				go func() { workerDone <- runMonitorWorker(id, root, cfg) }()
+				go func() {
+					<-startWorker
+					workerDone <- runMonitorWorker(id, root, cfg)
+				}()
 				return os.Getpid(), nil
 			}
-			t.Cleanup(func() { monitorWorkerLauncher = oldLauncher })
+			if tc.expired {
+				firstAcquire := true
+				monitorAcquireWorkerLock = func(path string) (func(), error) {
+					if firstAcquire {
+						firstAcquire = false
+						startupContention = true
+						return nil, errors.New("test worker startup contention")
+					}
+					return acquireOwnedLock(path)
+				}
+			}
+			t.Cleanup(func() { monitorWorkerLauncher, monitorAcquireWorkerLock = oldLauncher, oldAcquire })
 			if err := monitorAction("reset", filepath.Dir(fixture.dir), fixture.job.ID, cfg, nil, io.Discard); err != nil {
 				t.Fatal(err)
 			}
+			close(startWorker)
 			select {
 			case err := <-workerDone:
 				if err != nil {
@@ -170,6 +187,9 @@ printf '%s\n' '` + response + `'
 			case <-time.After(5 * time.Second):
 				t.Fatal("restarted worker did not finish")
 			}
+			if tc.expired && !startupContention {
+				t.Fatal("restarted worker did not encounter simulated startup lock contention")
+			}
 			got, err := readMonitorJob(fixture.dir)
 			if err != nil || got.Status != tc.wantStatus || !got.DeadlineAt.Equal(deadline) {
 				t.Fatalf("reset extended deadline or produced wrong status: status=%q deadline=%s err=%v; want %q and %s", got.Status, got.DeadlineAt, err, tc.wantStatus, deadline)
@@ -177,6 +197,24 @@ printf '%s\n' '` + response + `'
 			logData, err := os.ReadFile(filepath.Join(fixture.dir, "sessions", monitorSessionID, "session.log"))
 			if err != nil || strings.Contains(string(logData), "Monitor lifetime timeout reached") != tc.wantTimeout {
 				t.Fatalf("timeout event presence=%v err=%v; want %v; log=%s", strings.Contains(string(logData), "Monitor lifetime timeout reached"), err, tc.wantTimeout, logData)
+			}
+			if tc.wantTimeout {
+				store, err := NewJobStore(filepath.Dir(fixture.dir))
+				if err != nil {
+					t.Fatal(err)
+				}
+				record, err := store.GetJob(fixture.job.ID)
+				if err != nil || record.Status != "stopped" || record.Monitor.Status != "stopped" {
+					t.Fatalf("durable job status=%q monitor status=%q err=%v; want stopped", record.Status, record.Monitor.Status, err)
+				}
+				session, err := store.GetSession(fixture.job.ID, monitorSessionID)
+				if err != nil || session.Status != "stopped" {
+					t.Fatalf("durable session status=%q err=%v; want stopped", session.Status, err)
+				}
+				events, err := store.SessionEvents(fixture.job.ID, monitorSessionID)
+				if err != nil || len(events) == 0 || !strings.Contains(events[len(events)-1].Message, "Monitor lifetime timeout reached") {
+					t.Fatalf("durable timeout event missing: events=%+v err=%v", events, err)
+				}
 			}
 		})
 	}
