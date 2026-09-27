@@ -1947,7 +1947,7 @@ printf 'FACTORY_STATUS=FIXED\n'
 			stopWorker()
 		}
 	})
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		current, readErr := readMonitorJob(dir)
 		if readErr == nil && current.Attempts >= 3 && current.PendingSignature != "" {
