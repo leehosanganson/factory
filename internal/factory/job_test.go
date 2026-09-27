@@ -373,10 +373,10 @@ func TestDetachedWorkflowTypesShareTargetAdmission(t *testing.T) {
 	if err := store.CreateJob(JobRecord{ID: "active-tidy", Type: tidyJobType, TargetPath: target, Status: "running"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := startImplementationJob(store, target, "duplicate implementation"); err == nil || !strings.Contains(err.Error(), "already targets") {
+	if _, err := startImplementationJob(store, Config{}, target, "duplicate implementation"); err == nil || !strings.Contains(err.Error(), "already targets") {
 		t.Fatalf("implementation admission did not conflict with tidy: %v", err)
 	}
-	if _, err := startTidyJob(store, target, "duplicate tidy"); err == nil || !strings.Contains(err.Error(), "already targets") {
+	if _, err := startTidyJob(store, Config{}, target, "duplicate tidy"); err == nil || !strings.Contains(err.Error(), "already targets") {
 		t.Fatalf("tidy admission did not conflict with active tidy: %v", err)
 	}
 }

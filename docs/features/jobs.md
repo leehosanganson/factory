@@ -18,7 +18,7 @@ A start returns after launching a worker. Implementation and tidy workers serial
 
 `factory job watch <id>...` refreshes only the selected jobs' status and latest recorded activity once per second. Repeated IDs are shown once, in their first-supplied order. On a terminal it redraws the selected-job snapshot; when output is not a terminal, it prints labeled snapshots instead. It exits after all selected jobs reach a terminal status, or when interrupted/canceled. Watching is read-only with respect to worker lifecycle: it does not request cancellation, and it never displays job or session logs. A missing ID is reported as an error.
 
-Implementation jobs in a Git repository run in an isolated worktree and retain their output there; Factory does not automatically integrate or remove that output. Use `factory job get <id> --details` to find the persisted `Worktree` path and `Work branch`, then inspect the worker's changes, for example:
+Implementation jobs in a Git repository run in an isolated worktree and retain their output there; before creating the worktree, Factory asks the configured agent adapter for a concise slug and normalizes the bounded single-line response. If that proposal fails, Factory uses a deterministic slug derived from the task description. The job ID remains in the worktree directory and branch names to keep them unique. Factory does not automatically integrate or remove that output. Use `factory job get <id> --details` to find the persisted `Worktree` path and `Work branch`, then inspect the worker's changes, for example:
 
 ```sh
 factory job get <id> --details

@@ -64,7 +64,7 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		if args[1] != implementationJobType && args[1] != tidyJobType {
 			return fmt.Errorf("unsupported job type %q (supported: implementation, tidy, monitor)", args[1])
 		}
-		id, err := startWorkflowJob(store, target, description, args[1])
+		id, err := startWorkflowJob(store, cfg, target, description, args[1])
 		if err != nil {
 			return err
 		}
@@ -292,18 +292,18 @@ func StartWorkflowJob(cfg Config, target, description, jobType string) (string, 
 	if err != nil {
 		return "", err
 	}
-	return startWorkflowJob(store, target, description, jobType)
+	return startWorkflowJob(store, cfg, target, description, jobType)
 }
 
-func startImplementationJob(store *JobStore, target, description string) (string, error) {
-	return startWorkflowJob(store, target, description, implementationJobType)
+func startImplementationJob(store *JobStore, cfg Config, target, description string) (string, error) {
+	return startWorkflowJob(store, cfg, target, description, implementationJobType)
 }
 
-func startTidyJob(store *JobStore, target, description string) (string, error) {
-	return startWorkflowJob(store, target, description, tidyJobType)
+func startTidyJob(store *JobStore, cfg Config, target, description string) (string, error) {
+	return startWorkflowJob(store, cfg, target, description, tidyJobType)
 }
 
-func startWorkflowJob(store *JobStore, target, description, jobType string) (string, error) {
+func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType string) (string, error) {
 	if jobType != implementationJobType && jobType != tidyJobType {
 		return "", fmt.Errorf("unsupported workflow job type %q", jobType)
 	}
@@ -382,7 +382,10 @@ func startWorkflowJob(store *JobStore, target, description, jobType string) (str
 		if err != nil {
 			return "", err
 		}
-		worktree, workBranch, err = createImplementationWorktree(store.Root(), repository, canonicalTarget, targetHead, id)
+		proposalLog := filepath.Join(store.Root(), id+"-slug.log")
+		slug := implementationJobSlugWithFallback(context.Background(), Runner{Config: cfg}, description, store.Root(), proposalLog)
+		_ = os.Remove(proposalLog)
+		worktree, workBranch, err = createImplementationWorktreeWithSlug(store.Root(), repository, canonicalTarget, targetHead, slug, id)
 		if err != nil {
 			return "", err
 		}
