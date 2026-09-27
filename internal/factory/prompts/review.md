@@ -1,0 +1,1 @@
+Review the requested work against the task and repository conventions. Find correctness, safety, scope, and test-coverage issues. Make no changes; report only actionable findings with file and location, or state clearly that no issues were found.

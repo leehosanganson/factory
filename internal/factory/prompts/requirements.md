@@ -1,0 +1,1 @@
+Clarify the task into explicit requirements, constraints, edge cases, and acceptance criteria. Do not implement or modify files. Return a concise, actionable specification and identify any blocking ambiguity.
