@@ -201,20 +201,8 @@ func finishMonitorWorkerLockTimeout(root, id string) (bool, error) {
 	if monitor.DeadlineAt.IsZero() || time.Now().Before(monitor.DeadlineAt) {
 		return false, nil
 	}
-	// PID and worker registration are published before normal startup changes
-	// queued to running. Their presence means the contended lock belongs to a
-	// real startup/active owner, not an orphaned queued record.
-	if monitor.PID > 0 && processAlive(monitor.PID) {
-		return false, nil
-	}
-	worker, workerErr := store.ReadWorker(id)
-	if workerErr == nil && processAlive(worker.PID) {
-		return false, nil
-	}
-	if workerErr != nil && !errors.Is(workerErr, os.ErrNotExist) {
-		return false, workerErr
-	}
-
+	// This worker owns worker.lock, so another worker can no longer be in
+	// startup or active work. A live PID may refer to this timed-out worker.
 	message := "Monitor lifetime timeout reached; monitoring stopped."
 	now := time.Now().UTC()
 	setLifecycleTimes(job.Status, "stopped", &job.StartedAt, &job.EndedAt)
