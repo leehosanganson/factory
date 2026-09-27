@@ -821,6 +821,10 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	target, err = filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
 	storeRoot, err := factory.JobStateRoot(state)
 	if err != nil {
 		t.Fatal(err)
