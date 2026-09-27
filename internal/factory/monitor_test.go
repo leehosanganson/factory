@@ -572,8 +572,12 @@ func TestMonitorApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testi
 	if err := saveMonitorJob(dir, job); err != nil {
 		t.Fatal(err)
 	}
-	if err := monitorAction("approve", root, id, cfg, strings.NewReader("y\nFix only README typo\n"), &strings.Builder{}); err != nil {
+	var approvalOutput strings.Builder
+	if err := monitorAction("approve", root, id, cfg, strings.NewReader("y\nFix only README typo\n"), &approvalOutput); err != nil {
 		t.Fatal(err)
+	}
+	if got := approvalOutput.String(); !strings.Contains(got, "Pending proposal for "+id+":\nScope requested\n") {
+		t.Fatalf("approval prompt did not show proposal before confirmation: %q", got)
 	}
 	approved, err := readMonitorJob(dir)
 	if err != nil {

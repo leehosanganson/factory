@@ -107,6 +107,28 @@ of eight extant checkouts or active monitors. The observation alone does not
 establish storage growth, a leak, or a root cause. Reproduce the inventory with
 `git branch --list 'factory-babysit/*'` and `git worktree list --porcelain`.
 
+### Monitor approval prompt lacks proposal context
+
+- **Status:** Approval-gated improvement implemented in the separate
+  `feature/monitor-usability` worktree; awaiting verification and review.
+- **Reproduction before change:** For a monitor with a pending proposal, run
+  `factory monitor approve <id>`. The CLI immediately asks for exact lowercase
+  `y` and then asks for scope text, without displaying the proposal it is asking
+  the user to approve. The proposal is only visible via `factory monitor get
+  <id> --details`.
+- **Impact:** The approval action is hard to evaluate in context and may require
+  stopping to issue a separate inspection command.
+- **Evidence:** In `internal/factory/monitor.go`, the `approve` branch checked
+  that `PendingSignature` and `Proposal` were populated but printed only the
+  confirmation question. The approval regression test used a proposal
+  (`Scope requested`) and now asserts it appears before confirmation.
+- **Desired outcome:** Display the exact pending proposal before the yes/no
+  confirmation and scope prompt.
+- **Acceptance criteria:** The proposal text is labeled and printed before the
+  confirmation prompt; approval remains bound to its existing snapshot and
+  explicit non-empty scope; test verifies proposal-before-confirmation output;
+  `make test`, `make vet`, and `make build` pass.
+
 ### Other observed friction
 
 - During PR CI monitoring, the root help output was broad.

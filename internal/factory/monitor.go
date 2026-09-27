@@ -847,6 +847,7 @@ func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 		if job.PendingSignature == "" || job.Proposal == "" {
 			return fmt.Errorf("job has no pending proposal")
 		}
+		fmt.Fprintf(out, "Pending proposal for %s:\n%s\n", id, job.Proposal)
 		fmt.Fprintf(out, "Approve proposal for %s? Type exact lowercase y: ", id)
 		reader := bufio.NewReader(in)
 		answer, _ := reader.ReadString('\n')
