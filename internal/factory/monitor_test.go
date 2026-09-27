@@ -633,7 +633,7 @@ func TestMonitorFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)
-	runTestCommand(t, repo, "git", "checkout", "-b", "feature")
+	runTestCommand(t, repo, "git", "checkout", "-b", "main")
 	runTestCommand(t, repo, "git", "config", "user.name", "Factory Test")
 	runTestCommand(t, repo, "git", "config", "user.email", "factory@example.test")
 	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("before\n"), 0o600); err != nil {
@@ -641,7 +641,10 @@ func TestMonitorFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
 	}
 	runTestCommand(t, repo, "git", "add", "README.md")
 	runTestCommand(t, repo, "git", "commit", "-m", "initial")
+	runTestCommand(t, repo, "git", "push", "-u", "origin", "main")
+	runTestCommand(t, repo, "git", "checkout", "-b", "feature")
 	runTestCommand(t, repo, "git", "push", "-u", "origin", "feature")
+	runTestCommand(t, repo, "git", "checkout", "main")
 	head, err := runGit(context.Background(), repo, "rev-parse", "HEAD")
 	if err != nil {
 		t.Fatal(err)
@@ -658,6 +661,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
   printf '%s\n' "$GH_SNAPSHOT"
   exit 0
 fi
+if [ "$1" = "api" ]; then echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'; exit 0; fi
 exit 1
 `
 	if err := os.WriteFile(gh, []byte(ghScript), 0o700); err != nil {
@@ -666,7 +670,9 @@ exit 1
 	t.Setenv("PATH", base+string(os.PathListSeparator)+os.Getenv("PATH"))
 	snapshotJSON := `{"number":17,"state":"OPEN","title":"Fix docs","url":"https://github.com/team/repo/pull/17","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
 	t.Setenv("GH_SNAPSHOT", snapshotJSON)
-	job := &monitorJob{ID: "20260518T120000-0123456789ab", Description: "Fix the documented typo", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
+	prWorktree := filepath.Join(base, "pr-worktree")
+	runTestCommand(t, repo, "git", "worktree", "add", prWorktree, "feature")
+	job := &monitorJob{ID: "20260518T120000-0123456789ab", Description: "Fix the documented typo", RepoRoot: repo, Repo: "team/repo", PR: 17, HeadRepo: "team/repo", HeadBranch: "feature", BaseRepo: "team/repo", BaseBranch: "main", TargetBranch: "main", OriginURL: bare, HeadRepoURL: bare, BaselineHead: head, TargetBaseline: head, Status: "running", CreatedAt: time.Now().UTC()}
 	snap, sig, err := readSnapshot(context.Background(), job)
 	if err != nil {
 		t.Fatal(err)
@@ -946,7 +952,7 @@ func newMonitorPushFixture(t *testing.T) monitorPushFixture {
 	}
 	gh := filepath.Join(base, "gh")
 	ghJSON := `{"number":17,"state":"OPEN","title":"Fix","url":"https://github.com/team/repo/pull/17","headRefName":"feature","headRefOid":"` + head + `","headRepository":{"nameWithOwner":"team/repo"},"baseRefName":"main","baseRefOid":"` + head + `","comments":[],"statusCheckRollup":[{"name":"ci","state":"FAILURE"}]}`
-	ghScript := "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then printf '%s\\n' '" + ghJSON + "'; exit 0; fi\nexit 1\n"
+	ghScript := "#!/bin/sh\nif [ \"$1\" = pr ] && [ \"$2\" = view ]; then printf '%s\\n' '" + ghJSON + "'; exit 0; fi\nif [ \"$1\" = api ]; then echo '{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[],\"pageInfo\":{\"hasNextPage\":false}}}}}}'; exit 0; fi\nexit 1\n"
 	if err := os.WriteFile(gh, []byte(ghScript), 0o700); err != nil {
 		t.Fatal(err)
 	}

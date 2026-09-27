@@ -2,8 +2,6 @@ package factory
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -72,7 +70,7 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			fmt.Fprintln(out, "No jobs.")
 			return nil
 		}
-		writeJobTable(out, jobs)
+		writeJobTable(out, store, jobs)
 		return err
 	case "get":
 		id, details, err := parseDetailsID("factory job get <id> [--details]", args[1:])
@@ -83,7 +81,7 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		if err != nil {
 			return err
 		}
-		writeJobSummary(out, job, details)
+		writeJobSummary(out, store, job, details)
 		if details {
 			return writeJobDetails(out, store, job)
 		}
@@ -182,21 +180,28 @@ func parseDetailsID(usage string, args []string) (string, bool, error) {
 	return args[0], len(args) == 2, nil
 }
 
-func writeJobTable(out io.Writer, jobs []JobRecord) {
-	const descriptionWidth = 56
-	fmt.Fprintf(out, "%-24s %-16s %-20s %-*s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "TARGET")
+func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
+	const descriptionWidth = 42
+	fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14s %-5s %-24s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "STATUS CALLS", "PI", "ACTIVITY", "TARGET")
 	for _, job := range jobs {
 		description := strings.Join(strings.Fields(job.TaskDescription), " ")
 		runes := []rune(description)
 		if len(runes) > descriptionWidth {
 			description = string(runes[:descriptionWidth-1]) + "…"
 		}
-		fmt.Fprintf(out, "%-24s %-16s %-20s %-*s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, job.TargetPath)
+		trace := summarizeJobTrace(store, job)
+		activity := strings.TrimRight(trace.Activity, " ")
+		if len([]rune(activity)) > 24 {
+			activity = string([]rune(activity)[:23]) + "…"
+		}
+		fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14d %-5d %-24s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, trace.StatusCalls, trace.ActivePi, activity, job.TargetPath)
 	}
 }
 
-func writeJobSummary(out io.Writer, job JobRecord, details bool) {
+func writeJobSummary(out io.Writer, store *JobStore, job JobRecord, details bool) {
 	fmt.Fprintf(out, "ID: %s\nType: %s\nStatus: %s\n", job.ID, job.Type, job.Status)
+	trace := summarizeJobTrace(store, job)
+	fmt.Fprintf(out, "Latest activity: %s\nStatus calls: %d\nActive Factory-launched Pi subprocesses: %d (direct process observations only; descendants are not counted)\n", trace.Activity, trace.StatusCalls, trace.ActivePi)
 	if !details {
 		fmt.Fprintf(out, "Target: %s\n", job.TargetPath)
 		return
@@ -292,6 +297,35 @@ func startWorkflowJob(store *JobStore, target, description, jobType string) (str
 	if err != nil {
 		return "", fmt.Errorf("resolve target directory: %w", err)
 	}
+	repository, err := runGit(context.Background(), canonicalTarget, "rev-parse", "--show-toplevel")
+	if err == nil {
+		repository, err = canonicalPath(repository)
+		if err != nil {
+			return "", err
+		}
+	}
+	branch := ""
+	branchRepository := repository
+	if repository != "" {
+		branch, _ = runGit(context.Background(), canonicalTarget, "branch", "--show-current")
+		branchRepository, err = repositoryIdentity(repository)
+		if err != nil {
+			return "", err
+		}
+	}
+	unlockRepository, err := store.LockRepositoryAdmission(repositoryOrTarget(branchRepository, canonicalTarget))
+	if err != nil {
+		return "", err
+	}
+	defer unlockRepository()
+	var unlockBranch func()
+	if jobType == implementationJobType && branch != "" {
+		unlockBranch, err = store.LockBranch(branchRepository, branch)
+		if err != nil {
+			return "", fmt.Errorf("branch %q is already reserved by detached work: %w", branch, err)
+		}
+		defer unlockBranch()
+	}
 	if info, err := os.Stat(canonicalTarget); err != nil || !info.IsDir() {
 		return "", fmt.Errorf("target must be an existing directory")
 	}
@@ -323,20 +357,45 @@ func startWorkflowJob(store *JobStore, target, description, jobType string) (str
 	if err != nil {
 		return "", err
 	}
-	job := JobRecord{ID: id, Type: jobType, TaskDescription: description, TargetPath: canonicalTarget, Status: "queued"}
+	worktree := ""
+	workBranch := ""
+	targetHead := ""
+	if jobType == implementationJobType && repository != "" && branch != "" {
+		targetHead, err = runGit(context.Background(), canonicalTarget, "rev-parse", "HEAD")
+		if err != nil {
+			return "", err
+		}
+		worktree, workBranch, err = createImplementationWorktree(store.Root(), repository, canonicalTarget, targetHead, id)
+		if err != nil {
+			return "", err
+		}
+	}
+	job := JobRecord{ID: id, Type: jobType, TaskDescription: description, TargetPath: canonicalTarget, RepositoryPath: branchRepository, TargetBranch: branch, TargetHead: targetHead, Worktree: worktree, WorkBranch: workBranch, Status: "queued"}
 	if err := store.CreateJob(job); err != nil {
+		if worktree != "" {
+			_, _ = runGit(context.Background(), repository, "worktree", "remove", "--force", worktree)
+		}
 		return "", err
 	}
 	if _, err := store.CreateSession(id, "workflow", "queued"); err != nil {
 		_, _ = store.UpdateJob(id, func(job *JobRecord) error { job.Status = "failed"; return nil })
+		if worktree != "" {
+			_, _ = runGit(context.Background(), repository, "worktree", "remove", "--force", worktree)
+		}
 		return "", err
 	}
 	if err := store.CreateJobLog(id); err != nil {
 		_, _ = store.UpdateJob(id, func(job *JobRecord) error { job.Status = "failed"; return nil })
+		if worktree != "" {
+			_, _ = runGit(context.Background(), repository, "worktree", "remove", "--force", worktree)
+		}
 		return "", err
 	}
 	if _, err := launchJobWorker(id, store.Root()); err != nil {
 		_, _ = store.UpdateJob(id, func(job *JobRecord) error { job.Status = "failed"; return nil })
+		if worktree != "" {
+			_, _ = runGit(context.Background(), repository, "worktree", "remove", "--force", worktree)
+		}
 		return "", err
 	}
 	return id, nil
@@ -365,6 +424,28 @@ func RunJobWorker(id, root string) error {
 	}
 	if job.Type != implementationJobType && job.Type != tidyJobType {
 		return fmt.Errorf("unsupported worker job type %q", job.Type)
+	}
+	var unlockBranch, unlockWorkBranch func()
+	if job.Type == implementationJobType && job.TargetBranch != "" {
+		branchRepository := job.RepositoryPath
+		if branchRepository == "" {
+			branchRepository, err = repositoryIdentity(repositoryOrTarget(job.RepositoryPath, job.TargetPath))
+			if err != nil {
+				return err
+			}
+		}
+		unlockBranch, err = store.LockBranch(branchRepository, job.TargetBranch)
+		if err != nil {
+			return fmt.Errorf("reserve implementation target branch %q: %w", job.TargetBranch, err)
+		}
+		defer unlockBranch()
+	}
+	if job.WorkBranch != "" {
+		unlockWorkBranch, err = store.LockBranch(repositoryOrTarget(job.RepositoryPath, job.TargetPath), job.WorkBranch)
+		if err != nil {
+			return fmt.Errorf("reserve implementation branch %q: %w", job.WorkBranch, err)
+		}
+		defer unlockWorkBranch()
 	}
 	unlock, err := store.LockTarget(job.TargetPath)
 	if err != nil {
@@ -427,13 +508,18 @@ func RunJobWorker(id, root string) error {
 	var runErr error
 	if job.Type == tidyJobType {
 		runErr = (CleanWorkflow{
-			Agent: Runner{Config: cfg}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
-			Workdir: job.TargetPath, Observer: observer, NeverPublish: true,
+			Agent: Runner{Config: cfg, ProcessObserver: jobProcessObserver(store, id, "workflow")}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
+			Workdir: job.TargetPath, Observer: statusJobObserver{JobSessionObserver: observer, store: store, jobID: id, sessionID: "workflow"}, ProcessObserver: jobProcessObserver(store, id, "workflow"), NeverPublish: true,
 		}).RunContext(ctx, job.TaskDescription)
 	} else {
+		workdir := job.TargetPath
+		if job.Worktree != "" {
+			workdir = job.Worktree
+		}
 		workflow := Workflow{
-			Agent: Runner{Config: cfg}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
-			Workdir: job.TargetPath, Observer: observer,
+			Agent: Runner{Config: cfg, ProcessObserver: jobProcessObserver(store, id, "workflow")}, Config: cfg, In: strings.NewReader(""), Out: os.Stdout,
+			Workdir: workdir, Observer: statusJobObserver{JobSessionObserver: observer, store: store, jobID: id, sessionID: "workflow"},
+			ProcessObserver: jobProcessObserver(store, id, "workflow"),
 		}
 		runErr = workflow.RunContext(ctx, job.TaskDescription)
 	}
@@ -459,11 +545,7 @@ func finishJob(store *JobStore, id, status string) error {
 }
 
 func newJobID() (string, error) {
-	var random [8]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
-	}
-	return time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(random[:]), nil
+	return newUUIDv4()
 }
 
 func ensureCancelFile(path string) error {

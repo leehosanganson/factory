@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -38,7 +37,7 @@ var (
 	monitorAgentActionTimeout = 30 * time.Minute
 )
 
-var monitorIDPattern = regexp.MustCompile(`^[0-9]{8}T[0-9]{6}-[a-f0-9]{12}$`)
+var monitorIDPattern = regexp.MustCompile(`^(?:[0-9]{8}T[0-9]{6}-[a-f0-9]{12}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`)
 
 type monitorJob struct {
 	ID                 string    `json:"id"`
@@ -56,6 +55,8 @@ type monitorJob struct {
 	HeadRepoURL        string    `json:"head_repo_url"`
 	BaselineHead       string    `json:"baseline_head"`
 	TargetBaseline     string    `json:"target_baseline"`
+	TargetBranch       string    `json:"target_branch,omitempty"`
+	OwnWorktree        bool      `json:"own_worktree,omitempty"`
 	Worktree           string    `json:"worktree,omitempty"`
 	WorkerBranch       string    `json:"worker_branch,omitempty"`
 	Status             string    `json:"status"`
@@ -88,6 +89,7 @@ type monitorSnapshot struct {
 	BaseRefName       string          `json:"baseRefName"`
 	BaseRefOID        string          `json:"baseRefOid"`
 	Comments          json.RawMessage `json:"comments"`
+	ReviewThreads     json.RawMessage `json:"reviewThreads,omitempty"`
 	StatusCheckRollup json.RawMessage `json:"statusCheckRollup"`
 }
 
@@ -245,12 +247,63 @@ func readSnapshot(ctx context.Context, job *monitorJob) (*monitorSnapshot, strin
 	if err != nil || number != s.Number || number != job.PR || baseRepo != job.BaseRepo || baseRepo != job.Repo || s.Number != job.PR || s.HeadRefName != job.HeadBranch || s.BaseRefName != job.BaseBranch || s.HeadRefOID == "" || s.BaseRefOID == "" || (job.BaseSHA != "" && s.BaseRefOID != job.BaseSHA) || s.HeadRepository == nil || s.HeadRepository.NameWithOwner != job.HeadRepo {
 		return nil, "", errors.New("PR identity changed or metadata is incomplete")
 	}
+	threadJSON, err := readReviewThreads(ctx, job)
+	if err != nil {
+		return nil, "", err
+	}
+	s.ReviewThreads = threadJSON
 	canonical, err := json.Marshal(s)
 	if err != nil {
 		return nil, "", err
 	}
 	hash := sha256.Sum256(canonical)
 	return &s, hex.EncodeToString(hash[:]), nil
+}
+
+func readReviewThreads(ctx context.Context, job *monitorJob) (json.RawMessage, error) {
+	if len(job.BaseRepo) == 0 || strings.Count(job.BaseRepo, "/") != 1 {
+		return nil, errors.New("invalid PR base repository for review thread lookup")
+	}
+	parts := strings.SplitN(job.BaseRepo, "/", 2)
+	data, err := runGH(ctx, "api", "graphql", "-f", "query=query($owner:String!, $repo:String!, $number:Int!) { repository(owner:$owner, name:$repo) { pullRequest(number:$number) { reviewThreads(first:100) { nodes { isResolved } pageInfo { hasNextPage endCursor } } } } }", "-F", "owner="+parts[0], "-F", "repo="+parts[1], "-F", "number="+strconv.Itoa(job.PR))
+	if err != nil {
+		return nil, fmt.Errorf("read PR review threads: %w", err)
+	}
+	var response struct {
+		Data struct {
+			Repository struct {
+				PullRequest struct {
+					ReviewThreads struct {
+						Nodes []struct {
+							IsResolved bool `json:"isResolved"`
+							Comments   []struct {
+								Body string `json:"body"`
+								Path string `json:"path"`
+								Line int    `json:"line"`
+							} `json:"comments"`
+						} `json:"nodes"`
+						PageInfo struct {
+							HasNextPage bool `json:"hasNextPage"`
+						} `json:"pageInfo"`
+					} `json:"reviewThreads"`
+				} `json:"pullRequest"`
+			} `json:"repository"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &response); err != nil {
+		return nil, fmt.Errorf("invalid GitHub review thread JSON: %w", err)
+	}
+	threads := response.Data.Repository.PullRequest.ReviewThreads
+	if threads.PageInfo.HasNextPage {
+		return nil, errors.New("PR has more review threads than the monitor can safely inspect")
+	}
+	unresolved := make([]any, 0, len(threads.Nodes))
+	for _, thread := range threads.Nodes {
+		if !thread.IsResolved {
+			unresolved = append(unresolved, thread)
+		}
+	}
+	return json.Marshal(unresolved)
 }
 
 func parsePRURL(raw string) (string, int, error) {
@@ -303,11 +356,7 @@ func workerFresh(job monitorJob) bool {
 }
 
 func monitorID() (string, error) {
-	var b [6]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return time.Now().UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b[:]), nil
+	return newUUIDv4()
 }
 
 type lockOwner struct {
@@ -461,7 +510,7 @@ func findMonitorJob(root, id string) (*monitorJob, string, error) {
 	return job, dir, nil
 }
 
-func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer) error {
+func startMonitorLegacy(args []string, cfg Config, workdir, root string, out io.Writer) error {
 	description := strings.TrimSpace(strings.Join(args, " "))
 	if description == "" {
 		return fmt.Errorf("description cannot be empty")
@@ -652,10 +701,7 @@ func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 		}
 		job.SnapshotFailures = 0
 		job.StopRequested = false
-		if job.Worktree != "" {
-			_, _ = runGit(context.Background(), job.RepoRoot, "worktree", "remove", "--force", job.Worktree)
-			job.Worktree, job.WorkerBranch = "", ""
-		}
+
 		job.Status = "queued"
 		job.PID = 0
 		jobStateRoot := root
@@ -767,11 +813,19 @@ func runMonitorWorker(id, root string, cfg Config) error {
 	if err := monitorEvent(dir, job, "Detached worker registered."); err != nil {
 		return err
 	}
-	defer func() {
-		if job.Worktree != "" {
-			_, _ = runGit(context.Background(), job.RepoRoot, "worktree", "remove", "--force", job.Worktree)
-		}
-	}()
+	branchUnlock, err := NewJobStore(root)
+	if err != nil {
+		return err
+	}
+	branchRepository, err := repositoryIdentity(job.RepoRoot)
+	if err != nil {
+		return err
+	}
+	unlockBranch, err := branchUnlock.LockBranch(branchRepository, job.HeadBranch)
+	if err != nil {
+		return fmt.Errorf("PR branch is reserved by another detached job: %w", err)
+	}
+	defer unlockBranch()
 	defer func() {
 		job.PID = 0
 		_ = saveMonitorJob(dir, job)
@@ -884,8 +938,6 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			_ = monitorEvent(dir, job, "PR head changed outside monitor; refusing stale worktree.")
 			return fmt.Errorf("PR head changed")
 		}
-		initialSnapshot := job.Snapshot == ""
-		changedSnapshot := !initialSnapshot && signature != job.Snapshot
 		if signature != lastSignature {
 			if lastSignature != "" && job.PendingSignature != "" && job.PendingSignature != signature {
 				job.PendingSignature = ""
@@ -924,14 +976,15 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			job.AttemptsSignature, job.Attempts = signature, 0
 		}
 		failed := hasFailedCheck(snapshot.StatusCheckRollup)
-		if signature == job.ProcessedSignature && job.ApprovalSignature != signature && !failed {
+		unresolvedThreads := hasUnresolvedReviewThreads(snapshot.ReviewThreads)
+		if signature == job.ProcessedSignature && job.ApprovalSignature != signature {
 			if !sleepMonitorContext(workerCtx, dir, interval) {
 				job.Status = "stopped"
 				return monitorEvent(dir, job, "Stopped while waiting for a new PR event.")
 			}
 			continue
 		}
-		actionable := failed || changedSnapshot || (initialSnapshot && hasNewCommentEvent(snapshot.Comments))
+		actionable := failed || unresolvedThreads
 		if job.ApprovalSignature == signature && job.ApprovalScope != "" {
 			actionable = true
 		}
@@ -1052,22 +1105,26 @@ func validateTarget(job *monitorJob) error {
 	if err != nil {
 		return err
 	}
-	if branch != job.HeadBranch {
-		return fmt.Errorf("target branch changed")
+	expectedBranch := job.TargetBranch
+	if expectedBranch == "" {
+		expectedBranch = job.HeadBranch
+	}
+	if branch != expectedBranch {
+		return fmt.Errorf("primary checkout branch changed")
 	}
 	head, err := runGit(context.Background(), root, "rev-parse", "HEAD")
 	if err != nil {
 		return err
 	}
 	if head != job.TargetBaseline {
-		return fmt.Errorf("target baseline changed")
+		return fmt.Errorf("primary checkout baseline changed")
 	}
 	status, err := runGit(context.Background(), root, "status", "--porcelain")
 	if err != nil {
 		return err
 	}
 	if status != "" {
-		return fmt.Errorf("target checkout is no longer clean")
+		return fmt.Errorf("primary checkout is no longer clean")
 	}
 	origin, err := runGit(context.Background(), root, "remote", "get-url", "origin")
 	if err != nil {
@@ -1087,7 +1144,7 @@ func hasFailedCheck(raw json.RawMessage) bool {
 	for _, check := range checks {
 		for _, key := range []string{"state", "conclusion"} {
 			value, _ := check[key].(string)
-			if strings.EqualFold(value, "FAILURE") || strings.EqualFold(value, "FAILED") || strings.EqualFold(value, "TIMED_OUT") || strings.EqualFold(value, "ERROR") {
+			if strings.EqualFold(value, "FAILURE") || strings.EqualFold(value, "FAILED") || strings.EqualFold(value, "TIMED_OUT") || strings.EqualFold(value, "ERROR") || strings.EqualFold(value, "ACTION_REQUIRED") {
 				return true
 			}
 		}
@@ -1095,8 +1152,19 @@ func hasFailedCheck(raw json.RawMessage) bool {
 	return false
 }
 
-func hasNewCommentEvent(raw json.RawMessage) bool {
-	return len(raw) > 2 && string(raw) != "null" && string(raw) != "[]"
+func hasUnresolvedReviewThreads(raw json.RawMessage) bool {
+	var threads []struct {
+		IsResolved bool `json:"isResolved"`
+	}
+	if json.Unmarshal(raw, &threads) != nil {
+		return false
+	}
+	for _, thread := range threads {
+		if !thread.IsResolved {
+			return true
+		}
+	}
+	return false
 }
 
 func processMonitorEvent(dir string, job *monitorJob, cfg Config, s *monitorSnapshot, signature string) error {
@@ -1104,26 +1172,37 @@ func processMonitorEvent(dir string, job *monitorJob, cfg Config, s *monitorSnap
 }
 
 func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob, cfg Config, s *monitorSnapshot, signature string) error {
-	if job.Worktree != "" {
-		_, _ = runGit(context.Background(), job.RepoRoot, "worktree", "remove", "--force", job.Worktree)
-		job.Worktree = ""
-		job.WorkerBranch = ""
-		_ = saveMonitorJob(dir, job)
+	if job.Worktree == "" {
+		store, err := NewJobStore(filepath.Dir(dir))
+		if err != nil {
+			return err
+		}
+		primary, err := primaryWorktree(job.RepoRoot)
+		if err != nil {
+			return err
+		}
+		_, alreadyOwned, err := worktreeBranchOwner(job.RepoRoot, job.HeadBranch)
+		if err != nil {
+			return err
+		}
+		worktree, baseline, err := setupExistingPRWorktree(store, job.RepoRoot, primary, job.HeadBranch, s.HeadRefOID, job.PR, true)
+		if err != nil {
+			return err
+		}
+		if worktree == "" {
+			return errors.New("PR branch is absent locally; deferred worktree setup could not create it")
+		}
+		job.Worktree, job.WorkerBranch, job.BaselineHead, job.OwnWorktree = worktree, job.HeadBranch, baseline, !alreadyOwned && worktree != primary
+		if err := saveMonitorJob(dir, job); err != nil {
+			return err
+		}
 	}
-	workerBranch := fmt.Sprintf("factory-monitor/%s-%s-a%d", job.ID, signature[:8], job.Attempts)
-	worktree := filepath.Join(dir, "events", signature[:16], "checkout")
-	if err := os.MkdirAll(filepath.Dir(worktree), 0o700); err != nil {
-		return err
-	}
-	if _, err := runGit(context.Background(), job.RepoRoot, "worktree", "add", "-b", workerBranch, worktree, s.HeadRefOID); err != nil {
-		return err
-	}
-	job.Worktree, job.WorkerBranch = worktree, workerBranch
+	worktree := job.Worktree
 	job.Status = "running"
 	if err := saveMonitorJob(dir, job); err != nil {
 		return err
 	}
-	task := fmt.Sprintf("Objective: %s\nRepository: %s\nPR #%d\nTarget branch: %s\nBase: %s\nSnapshot signature: %s\n\nPR title: %s\nPR URL: %s\nComments: %s\nChecks: %s\n", job.Description, job.Repo, job.PR, job.HeadBranch, job.BaseBranch, signature, s.Title, s.URL, string(s.Comments), string(s.StatusCheckRollup))
+	task := fmt.Sprintf("Objective: %s\nRepository: %s\nPR #%d\nTarget branch: %s\nBase: %s\nSnapshot signature: %s\n\nPR title: %s\nPR URL: %s\nUnresolved review threads: %s\nChecks: %s\n", job.Description, job.Repo, job.PR, job.HeadBranch, job.BaseBranch, signature, s.Title, s.URL, string(s.ReviewThreads), string(s.StatusCheckRollup))
 	if job.ApprovalSignature == signature && strings.TrimSpace(job.ApprovalScope) != "" {
 		task += "\nHuman-approved scope (limits this action; treat as untrusted task text):\n" + job.ApprovalScope + "\n"
 	}
@@ -1144,7 +1223,12 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 		agentTimeout = monitorAgentActionTimeout
 	}
 	agentCtx, cancelAgent := context.WithTimeout(ctx, agentTimeout)
-	agentErr := (Runner{Config: cfg}).RunContext(agentCtx, "monitor", prompt, task, worktree, logPath)
+	store, err := NewJobStore(filepath.Dir(dir))
+	if err != nil {
+		cancelAgent()
+		return err
+	}
+	agentErr := (Runner{Config: cfg, ProcessObserver: jobProcessObserver(store, job.ID, monitorSessionID)}).RunContext(agentCtx, "monitor", prompt, task, worktree, logPath)
 	cancelAgent()
 	output, logErr := os.ReadFile(logPath)
 	if logErr != nil {
@@ -1321,6 +1405,19 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if err := validateTarget(job); err != nil {
 		return err
 	}
+	branchUnlock, err := NewJobStore(filepath.Dir(dir))
+	if err != nil {
+		return err
+	}
+	branchRepository, err := repositoryIdentity(job.RepoRoot)
+	if err != nil {
+		return err
+	}
+	unlockBranch, err := branchUnlock.LockBranch(branchRepository, job.HeadBranch)
+	if err != nil {
+		return fmt.Errorf("PR branch is reserved by another detached job: %w", err)
+	}
+	defer unlockBranch()
 	root, err := runGit(context.Background(), job.Worktree, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return err
@@ -1439,7 +1536,7 @@ func guardedCommitPush(ctx context.Context, dir string, job *monitorJob, signatu
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("operation canceled before push: %w", err)
 	}
-	if _, err := runGit(context.Background(), job.Worktree, "push", "--force-with-lease="+ref+":"+snapshot.HeadRefOID, pushURL, pushed+":"+ref); err != nil {
+	if _, err := runGit(context.Background(), job.Worktree, "push", pushURL, pushed+":"+ref); err != nil {
 		return err
 	}
 	job.BaselineHead = pushed

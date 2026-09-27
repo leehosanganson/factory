@@ -83,6 +83,7 @@ type Workflow struct {
 	Stages           []string
 	FinalApproval    string
 	Observer         WorkflowObserver
+	ProcessObserver  func(string, int, bool)
 	DeferCompletion  bool
 	Managed          bool
 	RunCreated       func(runDir, runID string)
@@ -416,7 +417,9 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 	}
 	progress := startProgress(w.Out, w.Terminal, stage, stageLog)
 	runErr := runWithProgress(progress, func() error {
-		return runWithSecondaryStatus(ctx, w, progress, stage, stageTask, stageWorkdir, stageLog, observe, func(primaryCtx context.Context) error {
+		statusWorkflow := w
+		statusWorkflow.ProcessObserver = w.ProcessObserver
+		return runWithSecondaryStatus(ctx, statusWorkflow, progress, stage, stageTask, stageWorkdir, stageLog, observe, func(primaryCtx context.Context) error {
 			if stage == "implement" {
 				parallelWorkflow := w
 				parallelWorkflow.Agent = stageAgent

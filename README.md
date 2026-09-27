@@ -12,7 +12,7 @@ Factory’s primary value is managing a durable workflow through sequential stag
 factory job start implementation <description>
 factory job start tidy <description>
 factory job start monitor <description>
-factory job list
+factory job list  # includes latest activity, status-call count, and observed Pi count
 factory job get <id> [--details]
 factory job logs <id>
 factory job logs <id> --session workflow
@@ -23,7 +23,7 @@ factory job stop <id>
 
 `start` returns after launching the worker. Workflow events and worker output are retained in job/session logs; implement and tidy jobs use a `workflow` session. Detached tidy runs review/fix/document and verification but never commits or pushes, even when pristine or when local commits are ahead. Generated changes remain in the target checkout and are reported as unpublished. `attach` follows worker output to terminal state; Ctrl-C detaches only the observer, and the worker continues. Reattach later with the same command or use `job logs --follow`. `stop` writes a durable cooperative cancellation request; the worker polls it and cancels active work. Implementation sessions use one job-level `workflow` session. Monitor jobs use the monitor ID for both the detached job and its `monitor` session; `factory monitor stop/reset` operate on that same job and session.
 
-Inspect jobs, runs, or monitors with their respective `get` commands; each accepts `--details` for long descriptions, records, proposals, and logs. List output is tabulated; individual `get` output is concise labeled fields.
+Inspect jobs, runs, or monitors with their respective `get` commands; each accepts `--details` for long descriptions, records, proposals, and logs. Job list/get includes the latest recorded workflow or monitor activity, the count of secondary status invocations (including failed and canceled calls), and a count of currently live Factory-launched direct Pi subprocesses. Pi counts are best-effort direct-process observations only: they do not include descendants and are not used for liveness or stuck-job decisions. List output is tabulated; individual `get` output is concise labeled fields.
 
 ## Requirements
 

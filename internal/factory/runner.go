@@ -22,7 +22,8 @@ type Agent interface {
 
 // Runner executes the configured command without invoking a shell.
 type Runner struct {
-	Config Config
+	Config          Config
+	ProcessObserver func(command string, pid int, started bool)
 }
 
 const stdoutProtocolCaptureLimit = maxSubtaskPlanBytes
@@ -155,7 +156,17 @@ func (r Runner) runContext(ctx context.Context, stage, systemPrompt, task, workd
 		cmd.Stdout = io.MultiWriter(log, response)
 	}
 	cmd.Stderr = log
-	if err := cmd.Run(); err != nil {
+	if err := cmd.Start(); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("run %s agent: %w", stage, ctx.Err())
+		}
+		return fmt.Errorf("run %s agent: %w", stage, err)
+	}
+	if r.ProcessObserver != nil {
+		r.ProcessObserver(command, cmd.Process.Pid, true)
+		defer r.ProcessObserver(command, cmd.Process.Pid, false)
+	}
+	if err := cmd.Wait(); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("run %s agent: %w", stage, ctx.Err())
 		}

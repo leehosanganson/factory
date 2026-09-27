@@ -102,9 +102,12 @@ func createRun(root, workdir, task string) (string, *State, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return "", nil, fmt.Errorf("create state directory: %w", err)
 	}
-	id := time.Now().UTC().Format("20060102T150405.000000000")
-	dir, err := os.MkdirTemp(root, id+"-")
+	id, err := newJobID()
 	if err != nil {
+		return "", nil, fmt.Errorf("create run ID: %w", err)
+	}
+	dir := filepath.Join(root, id)
+	if err := os.Mkdir(dir, 0o700); err != nil {
 		return "", nil, fmt.Errorf("create run directory: %w", err)
 	}
 	state := &State{

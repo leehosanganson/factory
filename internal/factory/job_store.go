@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,7 +25,7 @@ const (
 	orphanJobGracePeriod     = 30 * time.Second
 )
 
-var storedIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
+var storedIDPattern = regexp.MustCompile(`^(?:[A-Za-z0-9][A-Za-z0-9_-]{0,127}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`)
 var errFileLockBusy = errors.New("file lock is busy")
 
 var jobLockMu sync.Mutex
@@ -37,6 +38,11 @@ type JobRecord struct {
 	Type            string            `json:"type"`
 	TaskDescription string            `json:"task_description,omitempty"`
 	TargetPath      string            `json:"target_path,omitempty"`
+	RepositoryPath  string            `json:"repository_path,omitempty"`
+	TargetBranch    string            `json:"target_branch,omitempty"`
+	TargetHead      string            `json:"target_head,omitempty"`
+	Worktree        string            `json:"worktree,omitempty"`
+	WorkBranch      string            `json:"work_branch,omitempty"`
 	Status          string            `json:"status"`
 	CreatedAt       time.Time         `json:"created_at"`
 	UpdatedAt       time.Time         `json:"updated_at"`
@@ -88,9 +94,14 @@ type WorkerRecord struct {
 
 // SessionEvent is appended to a session's durable event history.
 type SessionEvent struct {
-	At      time.Time `json:"at"`
-	Type    string    `json:"type"`
-	Message string    `json:"message"`
+	At         time.Time `json:"at"`
+	Type       string    `json:"type"`
+	Message    string    `json:"message"`
+	Command    string    `json:"command,omitempty"`
+	PID        int       `json:"pid,omitempty"`
+	Invocation string    `json:"invocation,omitempty"`
+	Outcome    string    `json:"outcome,omitempty"`
+	Summary    string    `json:"summary,omitempty"`
 }
 
 // JobStore provides concurrency-safe persistence beneath a jobs state root.
@@ -116,7 +127,28 @@ func (o JobSessionObserver) ObserveWorkflowEvent(event WorkflowEvent) error {
 	if event.Stage != "" {
 		message = fmt.Sprintf("stage=%s %s", event.Stage, message)
 	}
-	if err := o.Store.AppendSessionEvent(o.JobID, o.SessionID, event.Type, message); err != nil {
+	record := SessionEvent{Type: event.Type, Message: message, Outcome: event.Outcome}
+	if strings.HasPrefix(event.Type, "status.") {
+		fields := strings.Fields(event.Message)
+		if len(fields) > 0 && strings.HasPrefix(fields[0], "stage=") {
+			fields = fields[1:]
+		}
+		if event.Type == "status.started" {
+			record.Invocation = event.Message
+			if len(fields) > 0 {
+				record.Invocation = fields[len(fields)-1]
+			}
+		} else if len(fields) > 0 {
+			record.Invocation = fields[0]
+		}
+		if event.Type == "status.completed" && len(fields) > 1 {
+			record.Outcome = strings.TrimPrefix(fields[1], "outcome=")
+			if record.Outcome == "success" {
+				record.Summary = sanitizeSecondaryStatus(strings.TrimPrefix(strings.Join(fields[2:], " "), "summary="))
+			}
+		}
+	}
+	if err := o.Store.AppendSessionEventDetails(o.JobID, o.SessionID, record); err != nil {
 		return err
 	}
 	return o.Store.AppendSessionLog(o.JobID, o.SessionID, []byte(fmt.Sprintf("%s %s %s\n", time.Now().UTC().Format(time.RFC3339), event.Type, message)))
@@ -175,6 +207,85 @@ func (s *JobStore) TryLockTarget(target string) (func(), bool, error) {
 // LockTargetAdmission serializes job creation for a target without blocking its worker lock.
 func (s *JobStore) LockTargetAdmission(target string) (func(), error) {
 	return s.lockTargetIn(".admissions", target)
+}
+
+// LockBranch reserves one branch in a canonical repository across detached jobs.
+func (s *JobStore) LockBranch(repository, branch string) (func(), error) {
+	return s.lockBranch(repository, branch, false)
+}
+
+func (s *JobStore) LockRepositoryAdmission(repository string) (func(), error) {
+	canonical, err := canonicalPath(repository)
+	if err != nil {
+		return nil, fmt.Errorf("resolve admission repository: %w", err)
+	}
+	locks := filepath.Join(s.root, ".repository-admissions")
+	if err := os.MkdirAll(locks, 0o700); err != nil {
+		return nil, err
+	}
+	if err := ensureRealDirectory(s.root, locks); err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	return s.lockNamed(filepath.Join(locks, hex.EncodeToString(sum[:])+".lock"), false)
+}
+
+func (s *JobStore) TryLockBranch(repository, branch string) (func(), bool, error) {
+	unlock, err := s.lockBranch(repository, branch, true)
+	if errors.Is(err, errFileLockBusy) {
+		return nil, false, nil
+	}
+	return unlock, err == nil, err
+}
+
+func (s *JobStore) lockBranch(repository, branch string, try bool) (func(), error) {
+	canonical, err := canonicalPath(repository)
+	if err != nil {
+		return nil, fmt.Errorf("resolve branch repository: %w", err)
+	}
+	if strings.TrimSpace(branch) == "" || strings.ContainsRune(branch, 0) {
+		return nil, fmt.Errorf("branch name must not be empty")
+	}
+	locks := filepath.Join(s.root, ".branches")
+	if err := os.MkdirAll(locks, 0o700); err != nil {
+		return nil, err
+	}
+	if err := ensureRealDirectory(s.root, locks); err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(canonical + "\x00" + branch))
+	path := filepath.Join(locks, hex.EncodeToString(sum[:])+".lock")
+	return s.lockNamed(path, try)
+}
+
+func (s *JobStore) lockNamed(path string, try bool) (func(), error) {
+	jobLockMu.Lock()
+	localLock := jobLockByPath[path]
+	if localLock == nil {
+		localLock = &sync.Mutex{}
+		jobLockByPath[path] = localLock
+	}
+	jobLockMu.Unlock()
+	if try {
+		if !localLock.TryLock() {
+			return nil, errFileLockBusy
+		}
+	} else {
+		localLock.Lock()
+	}
+	timeout := 30 * time.Second
+	if try {
+		timeout = 0
+	}
+	file, err := acquireFileLock(path, timeout)
+	if err != nil {
+		localLock.Unlock()
+		return nil, err
+	}
+	return func() {
+		_ = releaseFileLock(file)
+		localLock.Unlock()
+	}, nil
 }
 
 func (s *JobStore) lockTargetIn(lockDir, target string) (func(), error) {
@@ -623,6 +734,12 @@ func (s *JobStore) UpdateJob(id string, update func(*JobRecord) error) (JobRecor
 			return JobRecord{}, fmt.Errorf("resolve job target path: %w", err)
 		}
 	}
+	if job.RepositoryPath != "" {
+		job.RepositoryPath, err = canonicalPath(job.RepositoryPath)
+		if err != nil {
+			return JobRecord{}, fmt.Errorf("resolve job repository path: %w", err)
+		}
+	}
 	if oldStatus != job.Status {
 		setLifecycleTimes(oldStatus, job.Status, &job.StartedAt, &job.EndedAt)
 	}
@@ -962,6 +1079,10 @@ func (s *JobStore) SessionLogPath(jobID, sessionID string) (string, error) {
 // AppendSessionEvent persists an event and updates the session timestamp under
 // the per-job lock, so independent jobs never contend with one another.
 func (s *JobStore) AppendSessionEvent(jobID, sessionID, eventType, message string) error {
+	return s.AppendSessionEventDetails(jobID, sessionID, SessionEvent{Type: eventType, Message: message})
+}
+
+func (s *JobStore) AppendSessionEventDetails(jobID, sessionID string, event SessionEvent) error {
 	unlock, err := s.LockJob(jobID)
 	if err != nil {
 		return err
@@ -975,7 +1096,7 @@ func (s *JobStore) AppendSessionEvent(jobID, sessionID, eventType, message strin
 	if err != nil {
 		return err
 	}
-	event := SessionEvent{At: time.Now().UTC(), Type: eventType, Message: message}
+	event.At = time.Now().UTC()
 	line, err := json.Marshal(event)
 	if err != nil {
 		return err

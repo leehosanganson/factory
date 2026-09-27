@@ -19,21 +19,22 @@ import (
 
 // CleanWorkflow reviews and verifies a checkout, publishing only from pristine mode; dirty safe mode never stages, commits, or pushes.
 type CleanWorkflow struct {
-	Agent         Agent
-	Config        Config
-	In            io.Reader
-	Out           io.Writer
-	Workdir       string
-	Terminal      bool
-	Gate          bool
-	NeverPublish  bool
-	Observer      WorkflowObserver
-	Git           func(string, ...string) ([]byte, error)
-	GitContext    func(context.Context, string, ...string) ([]byte, error)
-	GitAt         func(context.Context, string, string, ...string) ([]byte, error)
-	Make          func(string, ...string) error
-	OpenCheckLog  func(string) (*os.File, error)
-	SetupWorktree func(context.Context, string, string) (string, func() error, error)
+	Agent           Agent
+	Config          Config
+	In              io.Reader
+	Out             io.Writer
+	Workdir         string
+	Terminal        bool
+	Gate            bool
+	NeverPublish    bool
+	Observer        WorkflowObserver
+	ProcessObserver func(string, int, bool)
+	Git             func(string, ...string) ([]byte, error)
+	GitContext      func(context.Context, string, ...string) ([]byte, error)
+	GitAt           func(context.Context, string, string, ...string) ([]byte, error)
+	Make            func(string, ...string) error
+	OpenCheckLog    func(string) (*os.File, error)
+	SetupWorktree   func(context.Context, string, string) (string, func() error, error)
 }
 
 type cleanBaseline struct {
@@ -187,7 +188,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if _, ok := workflowInput.(ContextLineReader); !ok {
 		workflowInput = bufio.NewReader(workflowInput)
 	}
-	workflow := Workflow{Agent: w.Agent, Config: w.Config, In: workflowInput, Out: runOutput, Workdir: root, Terminal: w.Terminal, Gate: w.Gate, RequireComplete: true, DeferCompletion: true, Observer: w.Observer, Stages: []string{"review", "fix", "document"}, FinalApproval: finalApproval, RunCreated: runOutput.setRun}
+	workflow := Workflow{Agent: w.Agent, Config: w.Config, In: workflowInput, Out: runOutput, Workdir: root, Terminal: w.Terminal, Gate: w.Gate, RequireComplete: true, DeferCompletion: true, Observer: w.Observer, ProcessObserver: w.ProcessObserver, Stages: []string{"review", "fix", "document"}, FinalApproval: finalApproval, RunCreated: runOutput.setRun}
 	defer func() {
 		if runOutput.runDir == "" {
 			return

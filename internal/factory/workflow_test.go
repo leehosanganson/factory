@@ -122,17 +122,23 @@ func TestSecondaryStatusRunsDuringActiveStageAndPersistsSanitizedUpdate(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	statusStarted, statusCompleted := false, false
 	for _, event := range events {
-		if event.Type == "stage.status" {
-			found = true
-			if strings.ContainsAny(event.Message, "\x1b\r\n") || len(event.Message) > secondaryStatusLimit+100 {
-				t.Fatalf("status event was not bounded/sanitized: %q", event.Message)
+		if event.Type == "status.started" {
+			statusStarted = true
+		}
+		if event.Type == "status.completed" && event.Outcome == "success" && event.Summary != "" {
+			statusCompleted = true
+			if strings.ContainsAny(event.Summary, "\x1b\r\n") || len(event.Summary) > secondaryStatusLimit {
+				t.Fatalf("status summary was not bounded/sanitized: %q", event.Summary)
 			}
 		}
 	}
-	if !found || !strings.Contains(output.String(), "status: p…") {
-		t.Fatalf("status was not persisted and rendered: events=%+v output=%q", events, output.String())
+	if !statusStarted || !statusCompleted {
+		t.Fatalf("status call lifecycle was not persisted: events=%+v output=%q", events, output.String())
+	}
+	if got := summarizeJobTrace(store, JobRecord{ID: "status-job", Type: implementationJobType}).StatusCalls; got != 1 {
+		t.Fatalf("status invocation count = %d, want one", got)
 	}
 }
 
