@@ -1,9 +1,10 @@
 # Usability issues
 
-This note records four user-reported findings and factual observations from a
+This note records user-reported findings and factual observations from a
 session. Findings remain separate; observations do not imply root causes or set
 priorities. Status refers to the actual CLI/worker implementation, not to
-intentions or documentation alone.
+intentions or documentation alone. See the [issues index](README.md) for
+recording guidance.
 
 ## User-reported findings
 
@@ -24,7 +25,7 @@ intentions or documentation alone.
   including running multiple jobs in parallel.
 - **Desired outcome:** Discoverable workflow guidance that explains job
   concurrency and its limits.
-- **Status:** Implemented in `.agents/skills/factory-usage/SKILL.md`; multiple
+- **Status:** Implemented in `.agents/skills/factory/SKILL.md`; multiple
   detached jobs are only claimed concurrently for different canonical
   implementation targets, while same-target implementation admission rejects
   an active duplicate. This documentation does not imply universal parallel
