@@ -23,11 +23,20 @@ func JobCommand(args []string, cfg Config, target string, in io.Reader, out io.W
 	return JobCommandContext(context.Background(), args, cfg, target, in, out)
 }
 
-// JobCommandContext runs a job management command. Cancellation of attach only
-// stops this observer; it never signals the detached worker.
+// JobCommandContext runs a job management command. Cancellation of attach or
+// watch only stops that observer; it never signals the detached worker.
 func JobCommandContext(ctx context.Context, args []string, cfg Config, target string, in io.Reader, out io.Writer) error {
+	return jobCommandContext(ctx, args, cfg, target, in, out, false)
+}
+
+// JobCommandContextWithTerminal runs a job command with terminal-aware output selection.
+func JobCommandContextWithTerminal(ctx context.Context, args []string, cfg Config, target string, in io.Reader, out io.Writer, terminal bool) error {
+	return jobCommandContext(ctx, args, cfg, target, in, out, terminal)
+}
+
+func jobCommandContext(ctx context.Context, args []string, cfg Config, target string, in io.Reader, out io.Writer, terminal bool) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory job start <type> <description> | list | get <id> [--details] | logs <id> [--session <id>] [--follow] | attach <id> | stop <id>")
+		return fmt.Errorf("usage: factory job start <type> <description> | list | get <id> [--details] | logs <id> [--session <id>] [--follow] | attach <id> | stop <id> | watch <id>...")
 	}
 	root, err := JobStateRoot(cfg.StateDir)
 	if err != nil {
@@ -86,6 +95,8 @@ func JobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			return writeJobDetails(out, store, job)
 		}
 		return nil
+	case "watch":
+		return watchJobs(ctx, store, args[1:], out, terminal, jobWatchPollInterval)
 	case "attach":
 		if len(args) != 2 {
 			return fmt.Errorf("usage: factory job attach <id>")

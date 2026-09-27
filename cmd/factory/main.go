@@ -79,7 +79,10 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			ctx, stop := foregroundContext()
 			defer stop()
-			return factory.JobCommandContext(ctx, args[1:], cfg, workdir, in, out)
+			stdin, inputIsFile := inputFile(in)
+			stdout, outputIsFile := out.(*os.File)
+			watchTerminal := inputIsFile && outputIsFile && isTerminal(stdin) && isTerminal(stdout) && strings.TrimSpace(os.Getenv("TERM")) != "dumb"
+			return factory.JobCommandContextWithTerminal(ctx, args[1:], cfg, workdir, in, out, watchTerminal)
 		case "monitor":
 			cfg, err := factory.LoadConfig("")
 			if err != nil {
@@ -246,6 +249,7 @@ func jobHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow logs."},
 		{"factory job attach <id>", "Follow worker output."},
 		{"factory job stop <id>", "Request cancellation."},
+		{"factory job watch <id>...", "Refresh selected job status and latest activity."},
 	}
 	return selectCommandHelp(all, subcommand, "")
 }

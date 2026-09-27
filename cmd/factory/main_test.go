@@ -140,6 +140,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
 		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "factory job show"}},
+		{name: "job watch help", args: []string{"job", "watch", "--help"}, want: []string{"factory job watch <id>...", "Refresh selected job status and latest activity"}, omit: []string{"factory job logs", "factory job stop"}},
 		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"Gated runs", "factory run events"}, omit: []string{"factory job", "Monitor management", "Example:"}},
 		{name: "run get canonical", args: []string{"run", "get", "--help"}, want: []string{"factory run get", "--details", "metadata"}, omit: []string{"factory run show"}},
 		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "proposals"}, omit: []string{"factory monitor describe"}},
@@ -365,6 +366,37 @@ func TestRunCommandDispatchesGatedRunControls(t *testing.T) {
 	}
 	if out.String() != "No gated runs.\n" {
 		t.Fatalf("run list output=%q", out.String())
+	}
+}
+
+func TestJobWatchCLIUsesPlainSnapshotForNonTerminalStreams(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "watch-terminal-job"
+	if err := store.CreateJob(factory.JobRecord{ID: id, Type: "implementation", Status: "complete"}); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"job", "watch", id}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("job watch dispatch: %v", err)
+	}
+	if got, want := out.String(), "Selected jobs\nJob "+id+"\n  Status: complete\n  Latest activity: No recorded activity\n\n"; got != want {
+		t.Fatalf("non-terminal job watch output = %q, want snapshot %q", got, want)
+	}
+	if strings.Contains(out.String(), "\033[") {
+		t.Fatalf("non-terminal job watch output contains ANSI redraw codes: %q", out.String())
+	}
+	if errOut.Len() != 0 {
+		t.Fatalf("job watch wrote unexpected stderr: %q", errOut.String())
 	}
 }
 
