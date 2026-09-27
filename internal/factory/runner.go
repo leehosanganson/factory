@@ -117,16 +117,25 @@ func (r Runner) RunContext(ctx context.Context, stage, systemPrompt, task, workd
 // RunWithOutputContext starts an agent and returns its stdout while recording both
 // stdout and stderr in logPath. It is intended for callers with a stdout protocol.
 func (r Runner) RunWithOutputContext(parent context.Context, stage, systemPrompt, task, workdir, logPath string) (string, error) {
+	return r.RunWithOutputLimitContext(parent, stage, systemPrompt, task, workdir, logPath, stdoutProtocolCaptureLimit)
+}
+
+// RunWithOutputLimitContext is like RunWithOutputContext but applies a caller-specified
+// maximum to captured stdout protocol data.
+func (r Runner) RunWithOutputLimitContext(parent context.Context, stage, systemPrompt, task, workdir, logPath string, limit int) (string, error) {
+	if limit <= 0 {
+		return "", fmt.Errorf("agent stdout protocol limit must be positive")
+	}
 	timeout, err := r.Config.agentTimeout()
 	if err != nil {
 		return "", err
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	stdout := &protocolCapture{limit: stdoutProtocolCaptureLimit}
+	stdout := &protocolCapture{limit: limit}
 	err = r.runContext(ctx, stage, systemPrompt, task, workdir, logPath, stdout)
 	if err == nil && stdout.truncated {
-		err = fmt.Errorf("agent stdout protocol exceeds %d bytes", stdoutProtocolCaptureLimit)
+		err = fmt.Errorf("agent stdout protocol exceeds %d bytes", limit)
 	}
 	return stdout.String(), err
 }

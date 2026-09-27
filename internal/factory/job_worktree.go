@@ -5,7 +5,16 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+const implementationSlugTimeout = 10 * time.Second
+const implementationSlugOutputLimit = 256
+
+const implementationSlugPrompt = `Propose a concise slug for this task description. Output only a few lowercase kebab-case words (letters and digits separated by single hyphens), no explanation or punctuation.
+
+Task description:
+`
 
 func repositoryOrTarget(repository, target string) string {
 	if repository != "" {
@@ -15,13 +24,53 @@ func repositoryOrTarget(repository, target string) string {
 }
 
 func createImplementationWorktree(stateRoot, repository, target, head, description, id string) (string, string, error) {
-	name := implementationJobName(description, id)
+	return createImplementationWorktreeWithSlug(stateRoot, repository, target, head, implementationJobSlug(description), id)
+}
+
+func createImplementationWorktreeWithSlug(stateRoot, repository, target, head, slug, id string) (string, string, error) {
+	name := implementationJobName(slug, id)
 	branch := "factory-job-" + name
 	worktree := filepath.Join(stateRoot, name)
 	if _, err := runGit(context.Background(), repository, "worktree", "add", "-b", branch, worktree, head); err != nil {
 		return "", "", fmt.Errorf("create isolated implementation worktree: %w", err)
 	}
 	return worktree, branch, nil
+}
+
+func implementationJobSlugWithFallback(parent context.Context, runner Runner, description, workdir, logPath string) string {
+	fallback := implementationJobSlug(description)
+	ctx, cancel := context.WithTimeout(parent, implementationSlugTimeout)
+	defer cancel()
+	slug, err := proposeImplementationJobSlug(ctx, runner, description, workdir, logPath)
+	if err != nil {
+		return fallback
+	}
+	return slug
+}
+
+func proposeImplementationJobSlug(ctx context.Context, runner Runner, description, workdir, logPath string) (string, error) {
+	output, err := runner.RunWithOutputLimitContext(ctx, "slug", implementationSlugPrompt, description, workdir, logPath, implementationSlugOutputLimit)
+	if err != nil {
+		return "", err
+	}
+	if len(output) > implementationSlugOutputLimit {
+		return "", fmt.Errorf("agent slug response exceeds %d bytes", implementationSlugOutputLimit)
+	}
+	output = strings.TrimSuffix(output, "\n")
+	output = strings.TrimSuffix(output, "\r")
+	if strings.ContainsAny(output, "\r\n") {
+		return "", fmt.Errorf("agent slug response must be a single line")
+	}
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return "", fmt.Errorf("agent returned an empty slug")
+	}
+	if strings.IndexFunc(output, func(char rune) bool {
+		return char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9'
+	}) == -1 {
+		return "", fmt.Errorf("agent slug did not contain any ASCII letters or digits")
+	}
+	return implementationJobSlug(output), nil
 }
 
 func implementationJobName(description, id string) string {

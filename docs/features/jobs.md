@@ -15,7 +15,7 @@ factory job stop <id>
 
 A start returns after launching a worker. Implementation and tidy workers serialize against other Factory jobs for the same canonical target. Attach follows worker output; Ctrl-C detaches the observer without stopping the worker. `stop` records a cooperative cancellation request, which the worker checks; it is not a promise of immediate forced termination. Logs and workflow events are retained. Job list/get include latest activity and best-effort status-call and direct Pi subprocess counts.
 
-Implementation jobs in a Git repository run in an isolated worktree and retain their output there; Factory does not automatically integrate or remove that output. Use `factory job get <id> --details` to find the persisted `Worktree` path and `Work branch`, then inspect the worker's changes, for example:
+Implementation jobs in a Git repository run in an isolated worktree and retain their output there; before creating the worktree, Factory asks the configured agent adapter for a concise slug and normalizes the bounded single-line response. If that proposal fails, Factory uses a deterministic slug derived from the task description. The job ID remains in the worktree directory and branch names to keep them unique. Factory does not automatically integrate or remove that output. Use `factory job get <id> --details` to find the persisted `Worktree` path and `Work branch`, then inspect the worker's changes, for example:
 
 ```sh
 factory job get <id> --details
