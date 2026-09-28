@@ -211,6 +211,13 @@ func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
 
 func writeJobSummary(out io.Writer, store *JobStore, job JobRecord, details bool) {
 	fmt.Fprintf(out, "ID: %s\nType: %s\nStatus: %s\n", job.ID, job.Type, job.Status)
+	if job.PublicationStatus != "" {
+		fmt.Fprintf(out, "Publication: %s\n", job.PublicationStatus)
+		if !details && job.PublicationSummary != "" {
+			summary := strings.SplitN(job.PublicationSummary, "\n", 2)[0]
+			fmt.Fprintf(out, "Publication summary: %s\n", summary)
+		}
+	}
 	trace := summarizeJobTrace(store, job)
 	fmt.Fprintf(out, "Latest activity: %s\nStatus calls: %d\nActive Factory-launched Pi subprocesses: %d (direct process observations only; descendants are not counted)\n", trace.Activity, trace.StatusCalls, trace.ActivePi)
 	if !details {
@@ -231,6 +238,9 @@ func writeJobSummary(out io.Writer, store *JobStore, job JobRecord, details bool
 		fmt.Fprintf(out, "Ended: %s\n", job.EndedAt.Format(time.RFC3339))
 	}
 	fmt.Fprintf(out, "Description: %s\n", job.TaskDescription)
+	if job.PublicationSummary != "" {
+		fmt.Fprintf(out, "Publication summary: %s\n", job.PublicationSummary)
+	}
 	for _, session := range job.Sessions {
 		fmt.Fprintf(out, "Session: %s (%s)\n", session.ID, session.Status)
 	}
@@ -377,6 +387,16 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 	worktree := ""
 	workBranch := ""
 	targetHead := ""
+	if jobType == implementationJobType {
+		if err := requireImplementationCheckout(context.Background(), resolvedTarget); err != nil {
+			return "", err
+		}
+		if cfg.AutoPublish {
+			if err := requireCleanCheckout(context.Background(), resolvedTarget); err != nil {
+				return "", err
+			}
+		}
+	}
 	if jobType == implementationJobType && repository != "" && branch != "" {
 		targetHead, err = runGit(context.Background(), resolvedTarget, "rev-parse", "HEAD")
 		if err != nil {
@@ -550,6 +570,30 @@ func RunJobWorker(id, root string) error {
 			ProcessObserver: jobProcessObserver(store, id, "workflow"),
 		}
 		runErr = workflow.RunContext(ctx, job.TaskDescription)
+		if runErr == nil && cfg.AutoPublish && job.Worktree != "" {
+			result, publishErr := publishImplementation(ctx, job.Worktree, job.TargetPath, job.TargetHead, job.TargetBranch, job.WorkBranch, job.TaskDescription, cfg.PipelineChecks)
+			publicationStatus, publicationSummary := result.Status, result.Message
+			if publishErr != nil {
+				publicationStatus, publicationSummary = "unpublished", publishErr.Error()
+				fmt.Fprintf(os.Stdout, "Workflow completed; PR publication did not complete.\n%s\n", publishErr)
+			} else if result.Message != "" {
+				fmt.Fprintln(os.Stdout, result.Message)
+			}
+			if publicationStatus != "" {
+				_, updateErr := store.UpdateJob(id, func(record *JobRecord) error {
+					record.PublicationStatus = publicationStatus
+					record.PublicationSummary = publicationSummary
+					return nil
+				})
+				if updateErr != nil {
+					runErr = updateErr
+				} else if publicationStatus == "published" {
+					if err := cleanupPublishedImplementationWorktree(job.TargetPath, job.Worktree); err != nil {
+						fmt.Fprintf(os.Stdout, "Published result is intact, but cleanup failed; worktree was retained at %s: %v\n", job.Worktree, err)
+					}
+				}
+			}
+		}
 	}
 	cancel()
 	<-watchDone

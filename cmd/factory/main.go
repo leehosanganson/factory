@@ -362,7 +362,13 @@ func runPipelineContextWithTerminalCheck(ctx context.Context, args []string, gat
 		if err != nil {
 			return fmt.Errorf("get target repository directory: %w", err)
 		}
+		if gate && cfg.AutoPublish {
+			return factory.RunAutomaticImplementation(ctx, cfg, filepath.Clean(workdir), task, workflowIn, out, terminal, true)
+		}
 		if gate {
+			if err := factory.ValidateImplementationCheckout(filepath.Clean(workdir)); err != nil {
+				return err
+			}
 			workflow := factory.Workflow{Agent: factory.Runner{Config: cfg}, Config: cfg, In: workflowIn, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: true, Managed: true}
 			return workflow.RunContext(ctx, task)
 		}

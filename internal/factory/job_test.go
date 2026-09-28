@@ -16,7 +16,7 @@ import (
 
 func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	state := t.TempDir()
-	target := resolvedTestPath(t, t.TempDir())
+	target := initTestGitRepo(t)
 	script := filepath.Join(t.TempDir(), "fake-agent")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.2\ncase \"$2\" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -25,7 +25,7 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)
+	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s","auto_publish":false}`, script, state)
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 		t.Fatalf("start waited for workflow completion: %s", time.Since(startedAt))
 	}
 	changedState := filepath.Join(t.TempDir(), "replacement-state")
-	config = fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, changedState)
+	config = fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s","auto_publish":false}`, script, changedState)
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
 		targetLock()
 		t.Fatal(err)
@@ -193,7 +193,7 @@ func TestDetachedTidyJobRunsNonpublishingAndIsListed(t *testing.T) {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)
+	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s","auto_publish":false}`, script, state)
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestDetachedTidyJobFailureAndStopStatuses(t *testing.T) {
 			if err := os.MkdirAll(configDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)), 0o600); err != nil {
+			if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s","auto_publish":false}`, script, state)), 0o600); err != nil {
 				t.Fatal(err)
 			}
 			t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
@@ -334,7 +334,7 @@ func TestDetachedImplementationJobFailurePersistsWorkflowStatus(t *testing.T) {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, script, state)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s","auto_publish":false}`, script, state)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
@@ -462,7 +462,7 @@ func TestDuplicateJobWorkerCannotRerunOrReplaceWorkerIdentity(t *testing.T) {
 	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q}`, script, stateDir)
+	config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"auto_publish":false}`, script, stateDir)
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -536,9 +536,137 @@ func TestRunJobWorkerRequiresResolvedPrivateRoot(t *testing.T) {
 	}
 }
 
+func TestDetachedImplementationPublicationOutcomePersistsAndCleansOnlyOnPublish(t *testing.T) {
+	for _, outcome := range []struct {
+		name      string
+		published bool
+		noOp      bool
+	}{
+		{name: "published", published: true},
+		{name: "unpublished"},
+		{name: "no-op", noOp: true},
+	} {
+		t.Run(outcome.name, func(t *testing.T) {
+			published := outcome.published
+			stateDir := t.TempDir()
+			target := initTestGitRepo(t)
+			baseline := strings.TrimSpace(runPublishTestGit(t, "-C", target, "rev-parse", "HEAD"))
+			var remote string
+			if published {
+				remote = filepath.Join(t.TempDir(), "origin.git")
+				runPublishTestGit(t, "init", "--bare", remote)
+				runPublishTestGit(t, "-C", target, "remote", "add", "origin", remote)
+			}
+			parent := filepath.Join(t.TempDir(), "jobs-worktrees")
+			worktree, branch, err := createImplementationWorktreeAtParent(target, target, baseline, "test", "abcd-job-publication", parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			agent := filepath.Join(t.TempDir(), "agent")
+			agentScript := "#!/bin/sh\nprintf 'PASS\\n'\n"
+			if !outcome.noOp {
+				agentScript += "printf 'generated\\n' > generated.txt\n"
+			}
+			if err := os.WriteFile(agent, []byte(agentScript), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, "gh"), []byte("#!/bin/sh\nprintf 'https://github.com/example/repo/pull/1\\n'\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			oldPath := os.Getenv("PATH")
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+oldPath)
+			configDir := filepath.Join(t.TempDir(), "config", "factory")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"auto_publish":true}`, agent, stateDir)
+			if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
+			t.Setenv("XDG_STATE_HOME", stateDir)
+			store, err := NewJobStore(filepath.Join(stateDir, "factory", "detached-jobs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJob(JobRecord{
+				ID: "abcd-job-publication", Type: implementationJobType, TaskDescription: "publish changes",
+				TargetPath: target, RepositoryPath: target, TargetBranch: publishTestTargetBranch(t, target), TargetHead: baseline,
+				Worktree: worktree, WorkBranch: branch, Status: "queued",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSession("abcd-job-publication", "workflow", "queued"); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CreateJobLog("abcd-job-publication"); err != nil {
+				t.Fatal(err)
+			}
+			if err := RunJobWorker("abcd-job-publication", store.Root()); err != nil {
+				t.Fatalf("worker: %v", err)
+			}
+			job, err := store.GetJob("abcd-job-publication")
+			wantPublication := "unpublished"
+			if published {
+				wantPublication = "published"
+			} else if outcome.noOp {
+				wantPublication = "no-op"
+			}
+			if err != nil || job.Status != "complete" || job.PublicationStatus != wantPublication || job.PublicationSummary == "" {
+				t.Fatalf("job outcome = %+v, err=%v", job, err)
+			}
+			session, err := store.GetSession("abcd-job-publication", "workflow")
+			if err != nil || session.Status != "complete" {
+				t.Fatalf("workflow session = %+v, err=%v; session lifecycle must remain complete", session, err)
+			}
+			if published {
+				if _, err := os.Stat(worktree); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("published worktree remains: %v", err)
+				}
+				if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("empty worktree parent remains: %v", err)
+				}
+			} else if info, err := os.Stat(worktree); err != nil || !info.IsDir() {
+				t.Fatalf("unpublished recovery worktree missing: %v", err)
+			}
+			var output bytes.Buffer
+			if err := JobCommand([]string{"get", "abcd-job-publication"}, Config{StateDir: stateDir}, target, strings.NewReader(""), &output); err != nil || !strings.Contains(output.String(), "Publication: "+job.PublicationStatus) {
+				t.Fatalf("job get output=%q err=%v", output.String(), err)
+			}
+		})
+	}
+}
+
+func TestImplementationOptOutStillRequiresGitButAllowsDirtyCheckout(t *testing.T) {
+	cfg := Config{StateDir: filepath.Join(t.TempDir(), "state"), Command: "/bin/true", Args: []string{"{task}"}, AutoPublish: false}
+	if _, err := StartImplementationJob(cfg, t.TempDir(), "non-Git target"); err == nil || !strings.Contains(err.Error(), "Git checkout") {
+		t.Fatalf("non-Git implementation with publication disabled error = %v", err)
+	}
+	target := initTestGitRepo(t)
+	if err := os.WriteFile(filepath.Join(target, "user-change.txt"), []byte("preserve me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	id, err := StartImplementationJob(cfg, target, "dirty Git target")
+	if err != nil {
+		t.Fatalf("publication opt-out should allow a dirty Git checkout: %v", err)
+	}
+	job, err := NewJobStore(filepath.Join(cfg.StateDir, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := job.GetJob(id)
+	if err != nil || record.Worktree == "" {
+		t.Fatalf("dirty-checkout implementation job = %+v, %v", record, err)
+	}
+	if status := runPublishTestGit(t, "-C", target, "status", "--porcelain"); !strings.Contains(status, "user-change.txt") {
+		t.Fatalf("existing user change was not retained: %s", status)
+	}
+}
+
 func TestAdmissionRecoversOrphanQueueButNeverStealsActiveWorker(t *testing.T) {
 	state := t.TempDir()
-	target := t.TempDir()
+	target := initTestGitRepo(t)
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
@@ -556,7 +684,7 @@ func TestAdmissionRecoversOrphanQueueButNeverStealsActiveWorker(t *testing.T) {
 		t.Fatalf("stale queued job=%+v err=%v", job, err)
 	}
 
-	liveTarget := t.TempDir()
+	liveTarget := initTestGitRepo(t)
 	if err := store.CreateJob(JobRecord{ID: "live-running", Type: implementationJobType, TargetPath: liveTarget, Status: "running", CreatedAt: time.Now().Add(-orphanJobGracePeriod - time.Second)}); err != nil {
 		t.Fatal(err)
 	}
@@ -795,7 +923,7 @@ func TestJobStopLiveTargetOnlyRequestsCancellation(t *testing.T) {
 
 func TestRunJobWorkerStopRequestCancelsWorkflow(t *testing.T) {
 	state := t.TempDir()
-	target := t.TempDir()
+	target := initTestGitRepo(t)
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
@@ -811,7 +939,7 @@ func TestRunJobWorkerStopRequestCancelsWorkflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	stateDir := filepath.Join(t.TempDir(), "state")
-	config := fmt.Sprintf(`{"command":"/bin/sh","args":["-c","sleep 30; echo PASS; echo PASS >&2","{system_prompt}","{task}"],"state_dir":%q}`, stateDir)
+	config := fmt.Sprintf(`{"command":"/bin/sh","args":["-c","sleep 30; echo PASS; echo PASS >&2","{system_prompt}","{task}"],"state_dir":%q,"auto_publish":false}`, stateDir)
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}

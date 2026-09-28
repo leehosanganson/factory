@@ -102,7 +102,11 @@ func TestTidyAndNonGitImplementationDoNotProposeSlug(t *testing.T) {
 			script := writeSlugScript(t, fmt.Sprintf("if [ \"$1\" = slug ]; then printf called >> %q; fi\nprintf 'PASS\\n'", marker))
 			cfg := Config{Command: script, Args: []string{"{stage}", "{system_prompt}", "{task}"}}
 			_, err = startWorkflowJob(store, cfg, tc.target(t), "description", tc.typeName)
-			if err != nil {
+			if tc.typeName == implementationJobType {
+				if err == nil || !strings.Contains(err.Error(), "Git checkout") {
+					t.Fatalf("non-Git implementation error = %v", err)
+				}
+			} else if err != nil {
 				t.Fatalf("start job: %v", err)
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {

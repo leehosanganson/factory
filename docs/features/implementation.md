@@ -2,7 +2,25 @@
 
 `factory implement [description...]` runs a persisted workflow through requirements, implementation, review, and documentation. With no description, it prompts for task text and requires an interactive terminal. Bare `factory` starts the same interactive implementation workflow. Each stage invokes the configured agent once; nonzero exit or invocation failure stops the workflow. Successful exit is not an independent correctness evaluation.
 
-By default `implement` starts a detached implementation job and attaches to its output. `--detach` starts and returns immediately; manage it with `factory job`. `--gate` selects the foreground workflow and enables exact `yes` approvals between successful stages; it cannot be combined with detached mode. Foreground `factory run` records are managed separately from detached jobs. The implementation workflow itself does not create a branch or commit.
+By default `implement` starts a detached implementation job and attaches to its output. `--detach` starts and returns immediately; manage it with `factory job`. `--gate` selects the foreground workflow and enables exact `yes` approvals between successful stages; it cannot be combined with detached mode. Foreground `factory run` records are managed separately from detached jobs.
+
+## Automatic PR publication
+
+Automatic publication is enabled by default for implementation workflows. Set `auto_publish` to `false` in the configuration file to opt out; see the [configuration example](../../config.json.example).
+
+Both the default detached-and-attached `factory implement <description>` path and `factory implement --detach <description>` run publication in the detached worker. Gated `factory implement --gate <description>` runs the isolated workflow and publisher in the foreground, with stage approvals. Every implementation mode—including `auto_publish: false`—requires the target to be a Git checkout root on a named branch. The clean-checkout requirement applies only when automatic publication is enabled. The workflow runs in a separate Git worktree and task branch named `factory-implement-<id>`; the invoking checkout's files, branch, and HEAD are not used for generated changes or changed by publication.
+
+After all workflow stages and configured `pipeline_checks` succeed, Factory:
+
+1. Revalidates that the invoking checkout remains clean and its branch and HEAD still match the captured baseline, and verifies the isolated worktree and task branch.
+2. Leaves a no-op workflow uncommitted and reports that no PR was created.
+3. Requires `gh`, an `origin` remote, and an unused remote task branch; it refuses to reuse an existing remote branch.
+4. Stages the worktree changes, commits them using the task description, and pushes the task branch to `origin`.
+5. Creates a GitHub pull request using the task as its title and a body listing changed files and configured checks.
+
+Failures do not trigger an automatic retry. A failed workflow retains its worktree and branch. Detached jobs persist a separate publication outcome (`published`, `unpublished`, or `no-op`) and recovery summary in the job record; the workflow job/session remains `complete` when the workflow succeeded even if publication did not. `factory job get` shows this outcome. If publication cannot complete after the workflow succeeds, Factory reports the reason, worktree, and branch, along with manual recovery commands. The local commit is created before checking `gh`, `origin`, or remote branch availability, so prerequisite and collision failures retain the commit but do not push. Missing `gh` instructions require installing/authenticating it before the supplied push and PR commands; missing `origin` instructions show how to configure it before pushing and creating the PR. If the intended remote branch already exists, Factory refuses to overwrite it and supplies commands to switch to a unique recovery branch, push that new branch, and create its PR. Pushes are non-force; failures and interruption do not trigger an automatic retry. Successful publication reports the URL returned by `gh pr create` and removes its temporary worktree (and its parent only when the parent is empty); unsuccessful publication preserves it for recovery. If publication is canceled or its deadline expires in the foreground gated flow, the command returns the context error and the managed run is recorded as interrupted while retaining the worktree and local commit. The invoking checkout is preserved even when publication cannot proceed.
+
+With `auto_publish: false`, no automatic commit, push, or PR is made, and the workflow uses its configured nonpublishing execution path. The Git checkout root and named-branch prerequisite still applies; a clean worktree is not required. In automatic mode, Factory commits the workflow changes before checking `gh`, `origin`, and branch availability, preserving the local commit if a prerequisite fails; these failures do not push.
 
 ## Opt-in parallel implementation
 
@@ -12,4 +30,4 @@ This is guarded output integration, not a security sandbox: agents and external 
 
 Implementation detached worktrees use the configurable `worktree_parent` template (default `../{repo}.worktrees`); `{repo}` is the primary checkout basename, and relative templates resolve from that checkout. The parent must be outside both the primary and invoking checkouts. Folder names use a four-character hexadecimal job-ID prefix plus a safe slug, extending the prefix if that name already exists; branch names keep the full ID.
 
-See the [configuration example](../../config.json.example), [job lifecycle](jobs.md), and [Factory operating skill](../../.agents/skills/factory/SKILL.md).
+See the [job lifecycle](jobs.md) and [Factory operating skill](../../.agents/skills/factory/SKILL.md).

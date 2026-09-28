@@ -20,6 +20,7 @@ type Config struct {
 	PromptDir              string                        `json:"prompt_dir,omitempty"`
 	StateDir               string                        `json:"state_dir,omitempty"`
 	WorktreeParent         string                        `json:"worktree_parent,omitempty"`
+	AutoPublish            bool                          `json:"auto_publish"`
 	AgentTimeout           string                        `json:"agent_timeout,omitempty"`
 	MonitorTimeout         string                        `json:"monitor_timeout,omitempty"`
 }
@@ -31,6 +32,7 @@ func DefaultConfig() Config {
 		Args:           []string{"-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"},
 		AgentTimeout:   "60m",
 		WorktreeParent: defaultWorktreeParent,
+		AutoPublish:    true,
 	}
 }
 
@@ -75,6 +77,13 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return Config{}, fmt.Errorf("parse config %s: expected one JSON value", path)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if _, configured := fields["auto_publish"]; !configured {
+		cfg.AutoPublish = true
 	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)

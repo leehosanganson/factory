@@ -14,7 +14,7 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 || cfg.MonitorTimeout != "" || cfg.WorktreeParent != defaultWorktreeParent {
+	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 || cfg.MonitorTimeout != "" || cfg.WorktreeParent != defaultWorktreeParent || !cfg.AutoPublish {
 		t.Fatalf("unexpected default config: %#v", cfg)
 	}
 	if timeout, err := cfg.agentTimeout(); err != nil || timeout != 60*time.Minute {
@@ -75,6 +75,16 @@ func TestLoadConfigParallelImplementationIsExplicitlyOptIn(t *testing.T) {
 	cfg, err := LoadConfig(file)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !cfg.AutoPublish {
+		t.Fatal("automatic publication must default on when omitted")
+	}
+	if err := os.WriteFile(file, []byte(`{"command":"pi","args":["{task}","{system_prompt}"],"auto_publish":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = LoadConfig(file)
+	if err != nil || cfg.AutoPublish {
+		t.Fatalf("explicit auto_publish=false = %v, err=%v", cfg.AutoPublish, err)
 	}
 	if cfg.ParallelImplementation != nil || (Config{ParallelImplementation: &ParallelImplementationConfig{Enabled: false}}).ParallelImplementation.Enabled {
 		t.Fatal("parallel implementation must remain disabled unless explicitly enabled")
