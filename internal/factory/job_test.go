@@ -592,7 +592,7 @@ func TestDetachedImplementationPublicationOutcomePersistsAndCleansOnlyOnPublish(
 			}
 			if err := store.CreateJob(JobRecord{
 				ID: "abcd-job-publication", Type: implementationJobType, TaskDescription: "publish changes",
-				TargetPath: target, RepositoryPath: target, TargetBranch: "main", TargetHead: baseline,
+				TargetPath: target, RepositoryPath: target, TargetBranch: publishTestTargetBranch(t, target), TargetHead: baseline,
 				Worktree: worktree, WorkBranch: branch, Status: "queued",
 			}); err != nil {
 				t.Fatal(err)
