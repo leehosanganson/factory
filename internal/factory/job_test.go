@@ -219,8 +219,8 @@ func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 		t.Fatalf("job get: %v", err)
 	}
 	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
-	if len(lines) != 2 || !strings.Contains(lines[0], "ID") {
-		t.Fatalf("default job get should have one table header and one row: %q", output.String())
+	if len(lines) != 2 || !strings.Contains(lines[0], "ID") || !strings.Contains(lines[0], "PUBLICATION") {
+		t.Fatalf("default job get should have one compact table header and one row: %q", output.String())
 	}
 	row := lines[1]
 	for _, want := range []string{job.ID, job.Type, job.Status, target, strings.Repeat("long description ", 2), "…", "stage.updated: activity…"} {
@@ -239,6 +239,71 @@ func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 	for _, want := range []string{"Description: " + description, "Target: " + target, "Worktree: " + worktree, "Work branch: factory-job/compact-job", "Session: workflow (stopped)", "complete worker transcript"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("detailed job output omitted %q: %s", want, output.String())
+		}
+	}
+}
+
+func TestJobTableShowsPublicationOnlyForImplementationOutcomes(t *testing.T) {
+	state := t.TempDir()
+	target := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := []JobRecord{
+		{ID: "outcome-1", Type: implementationJobType, Status: "complete", PublicationStatus: "published", TargetPath: target},
+		{ID: "outcome-2", Type: implementationJobType, Status: "complete", PublicationStatus: "unpublished", TargetPath: target},
+		{ID: "outcome-3", Type: implementationJobType, Status: "complete", PublicationStatus: "no-op", TargetPath: target},
+		{ID: "outcome-4", Type: implementationJobType, Status: "running", TargetPath: target},
+		{ID: "outcome-5", Type: tidyJobType, Status: "complete", PublicationStatus: "published", TargetPath: target},
+	}
+	for _, job := range jobs {
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var list bytes.Buffer
+	if err := JobCommand([]string{"list"}, Config{StateDir: state}, target, strings.NewReader(""), &list); err != nil {
+		t.Fatalf("job list: %v", err)
+	}
+	listLines := strings.Split(strings.TrimSuffix(list.String(), "\n"), "\n")
+	if len(listLines) != len(jobs)+1 || !strings.Contains(listLines[0], "PUBLICATION") {
+		t.Fatalf("job list changed compact table shape or omitted publication column: %q", list.String())
+	}
+	for _, job := range jobs {
+		var row string
+		for _, line := range listLines[1:] {
+			if strings.Contains(line, job.ID) {
+				row = line
+				break
+			}
+		}
+		if row == "" {
+			t.Fatalf("job list omitted %s: %q", job.ID, list.String())
+		}
+		if job.Type == implementationJobType && job.PublicationStatus != "" {
+			if !strings.Contains(row, job.PublicationStatus) {
+				t.Errorf("job list row %s omitted publication status %q: %q", job.ID, job.PublicationStatus, row)
+			}
+		} else if strings.Contains(row, "published") || strings.Contains(row, "unpublished") || strings.Contains(row, "no-op") {
+			t.Errorf("job list row %s exposed a publication outcome: %q", job.ID, row)
+		}
+
+		var get bytes.Buffer
+		if err := JobCommand([]string{"get", job.ID}, Config{StateDir: state}, target, strings.NewReader(""), &get); err != nil {
+			t.Fatalf("job get %s: %v", job.ID, err)
+		}
+		getLines := strings.Split(strings.TrimSuffix(get.String(), "\n"), "\n")
+		if len(getLines) != 2 || !strings.Contains(getLines[0], "PUBLICATION") {
+			t.Fatalf("job get %s did not preserve one header and one row: %q", job.ID, get.String())
+		}
+		if job.Type == implementationJobType && job.PublicationStatus != "" {
+			if !strings.Contains(getLines[1], job.PublicationStatus) {
+				t.Errorf("job get row %s omitted publication status %q: %q", job.ID, job.PublicationStatus, getLines[1])
+			}
+		} else if strings.Contains(getLines[1], "published") || strings.Contains(getLines[1], "unpublished") || strings.Contains(getLines[1], "no-op") {
+			t.Errorf("job get row %s exposed a publication outcome: %q", job.ID, getLines[1])
 		}
 	}
 }

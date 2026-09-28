@@ -194,7 +194,7 @@ func parseDetailsID(usage string, args []string) (string, bool, error) {
 
 func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
 	const descriptionWidth = 42
-	fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14s %-5s %-24s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "STATUS CALLS", "PI", "ACTIVITY", "TARGET")
+	fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14s %-5s %-24s %-12s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "STATUS CALLS", "PI", "ACTIVITY", "PUBLICATION", "TARGET")
 	for _, job := range jobs {
 		description := strings.Join(strings.Fields(job.TaskDescription), " ")
 		runes := []rune(description)
@@ -202,11 +202,15 @@ func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
 			description = string(runes[:descriptionWidth-1]) + "…"
 		}
 		trace := summarizeJobTrace(store, job)
+		publication := ""
+		if job.Type == implementationJobType {
+			publication = job.PublicationStatus
+		}
 		activity := strings.TrimRight(trace.Activity, " ")
 		if len([]rune(activity)) > 24 {
 			activity = string([]rune(activity)[:23]) + "…"
 		}
-		fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14d %-5d %-24s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, trace.StatusCalls, trace.ActivePi, activity, job.TargetPath)
+		fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14d %-5d %-24s %-12s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, trace.StatusCalls, trace.ActivePi, activity, publication, job.TargetPath)
 	}
 }
 
