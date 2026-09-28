@@ -1367,11 +1367,71 @@ func TestMonitorLifetimeTimeoutMarksQueuedJobAfterWorkerLockWait(t *testing.T) {
 		t.Fatalf("queued worker-lock timeout lifecycle event missing: events=%+v err=%v", events, err)
 	}
 	var output bytes.Buffer
-	if err := MonitorCommand([]string{"get", fixture.job.ID}, cfg, fixture.repo, nil, &output, io.Discard); err != nil {
-		t.Fatalf("monitor get after worker-lock timeout: %v", err)
+	if err := MonitorCommand([]string{"get", fixture.job.ID, "--details"}, cfg, fixture.repo, nil, &output, io.Discard); err != nil {
+		t.Fatalf("monitor get --details after worker-lock timeout: %v", err)
 	}
 	if !strings.Contains(output.String(), "Monitor lifetime timeout reached") {
 		t.Fatalf("monitor get omitted worker-lock timeout from recent events: %s", output.String())
+	}
+}
+
+func TestMonitorGetConciseByDefaultAndFullWithDetails(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "20260518T120010-0123456789ab"
+	checkedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	monitor := &monitorJob{
+		ID: id, Description: "monitor task details", Repo: "team/repo", PR: 7, HeadBranch: "feature", Status: "running",
+		Phase: "agent_work", LatestCheckAt: checkedAt, LatestCheckResult: "2 passed, 1 failed, 0 pending",
+		PendingSignature: "snapshot", Proposal: "Needs human judgment",
+		RecentEvents: []monitorTraceEvent{{At: checkedAt, Phase: "polling", Message: "verbose event trail entry"}},
+	}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TaskDescription: monitor.Description, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSessionLog(id, monitorSessionID, []byte("verbose worker log entry\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := MonitorCommand([]string{"get", id}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	concise := out.String()
+	for _, want := range []string{
+		"ID: " + id, "Status: running", "Repository: team/repo", "PR: #7", "Branch: feature",
+		"Phase: approval_pending", "Latest successful PR/check query:", checkedAt.Format(time.RFC3339),
+		"2 passed, 1 failed, 0 pending", "Approval pending: Needs human judgment",
+	} {
+		if !strings.Contains(concise, want) {
+			t.Errorf("default monitor get omitted %q: %s", want, concise)
+		}
+	}
+	for _, omitted := range []string{"Recent monitor events:", "verbose event trail entry", "Details:", "monitor task details", "verbose worker log entry", "Worktree:"} {
+		if strings.Contains(concise, omitted) {
+			t.Errorf("default monitor get included %q: %s", omitted, concise)
+		}
+	}
+
+	out.Reset()
+	if err := MonitorCommand([]string{"get", id, "--details"}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	detailed := out.String()
+	for _, want := range []string{"Recent monitor events:", "verbose event trail entry", `"proposal": "Needs human judgment"`, "monitor task details", "verbose worker log entry", "Session log monitor path:"} {
+		if !strings.Contains(detailed, want) {
+			t.Errorf("detailed monitor get omitted %q: %s", want, detailed)
+		}
 	}
 }
 

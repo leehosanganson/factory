@@ -696,7 +696,7 @@ func TestDetachedImplementationPublicationOutcomePersistsAndCleansOnlyOnPublish(
 				t.Fatalf("unpublished recovery worktree missing: %v", err)
 			}
 			var output bytes.Buffer
-			if err := JobCommand([]string{"get", "abcd-job-publication"}, Config{StateDir: stateDir}, target, strings.NewReader(""), &output); err != nil || !strings.Contains(output.String(), "Publication: "+job.PublicationStatus) {
+			if err := JobCommand([]string{"get", "abcd-job-publication", "--details"}, Config{StateDir: stateDir}, target, strings.NewReader(""), &output); err != nil || !strings.Contains(output.String(), "Publication: "+job.PublicationStatus) {
 				t.Fatalf("job get output=%q err=%v", output.String(), err)
 			}
 		})

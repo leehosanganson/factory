@@ -226,13 +226,23 @@ func TestMonitorStatusExposesPhaseCheckFreshnessApprovalAndBoundedEvents(t *test
 		t.Fatal(err)
 	}
 	text := out.String()
-	for _, want := range []string{"Phase: approval_pending", "Latest successful PR/check query:", checkedAt.Format(time.RFC3339), "2 passed, 1 failed, 0 pending", "Approval pending: Needs human judgment", "Recent monitor events:"} {
+	for _, want := range []string{"Phase: approval_pending", "Latest successful PR/check query:", checkedAt.Format(time.RFC3339), "2 passed, 1 failed, 0 pending", "Approval pending: Needs human judgment"} {
 		if !strings.Contains(text, want) {
-			t.Errorf("monitor status missing %q: %s", want, text)
+			t.Errorf("concise monitor status missing %q: %s", want, text)
 		}
 	}
-	if strings.Contains(text, "transition 0") || strings.Contains(text, "transition 2") || !strings.Contains(text, "transition 3") {
-		t.Fatalf("monitor status did not retain only bounded recent events: %s", text)
+	if strings.Contains(text, "Recent monitor events:") || strings.Contains(text, "transition ") {
+		t.Fatalf("concise monitor status included the event trail: %s", text)
+	}
+	out.Reset()
+	if err := MonitorCommand([]string{"get", id, "--details"}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	text = out.String()
+	for _, want := range []string{"Recent monitor events:", "transition 3", "transition 14", `"proposal": "Needs human judgment"`} {
+		if !strings.Contains(text, want) {
+			t.Errorf("detailed monitor status missing %q: %s", want, text)
+		}
 	}
 }
 
@@ -252,8 +262,8 @@ func TestMonitorGetReturnsRecentEventWriterErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := &failingMonitorWriter{failAfter: 4}
-	if err := MonitorCommand([]string{"get", id}, Config{StateDir: state}, t.TempDir(), nil, writer, io.Discard); err == nil {
-		t.Fatal("monitor get swallowed recent-event output error")
+	if err := MonitorCommand([]string{"get", id, "--details"}, Config{StateDir: state}, t.TempDir(), nil, writer, io.Discard); err == nil {
+		t.Fatal("monitor get --details swallowed recent-event output error")
 	}
 	if writer.writes != 5 {
 		t.Fatalf("writer received %d writes before error; want failure while writing a recent event", writer.writes)
