@@ -676,6 +676,9 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		if !details {
 			return nil
 		}
+		if err := writeMonitorRecentEvents(out, job.RecentEvents, ""); err != nil {
+			return err
+		}
 		data, err := json.MarshalIndent(job, "", "  ")
 		if err != nil {
 			return err
@@ -725,7 +728,7 @@ func writeMonitorStatus(out io.Writer, job *monitorJob) error {
 			return err
 		}
 	}
-	return writeMonitorRecentEvents(out, job.RecentEvents, "")
+	return nil
 }
 
 func monitorDisplayPhase(job *monitorJob) string {

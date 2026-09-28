@@ -269,7 +269,7 @@ func monitorHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
 		{"factory monitor <description>", "Start monitoring an open PR."},
 		{"factory monitor list", "List monitor jobs."},
-		{"factory monitor get <id> [--details]", "Show phase, latest PR check, recent events; --details includes proposals."},
+		{"factory monitor get <id> [--details]", "Show concise phase, latest PR check, and pending approval; --details includes proposals, recent events, and diagnostics."},
 		{"factory monitor approve <id>", "Approve a proposal with a scope."},
 		{"factory monitor reject <id>", "Reject a pending proposal."},
 		{"factory monitor stop <id>", "Stop monitoring."},

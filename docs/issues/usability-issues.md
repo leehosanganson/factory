@@ -58,11 +58,16 @@ recording guidance.
 
 ## Session observations
 
-These are observations from a session, not claims about underlying causes. The
-compile and test failures in the historical sequence below are not current: the
-integrated tree now passes `make test` and `make vet`.
+These are observations from a session, not claims about underlying causes.
 
-### Historical symlink-`TMPDIR` test observations (not current failures)
+- Focused monitor tests plus `make vet` and `make build` succeeded. A full test
+  run exposed stale assertions in
+  `TestDetachedImplementationPublicationOutcomePersistsAndCleansOnlyOnPublish`:
+  it expected publication details from default `job get`, but those details are
+  behind `--details` since the compact-output change. The assertions now request
+  `--details`, matching the existing CLI contract.
+
+### Historical symlink-`TMPDIR` test observations
 
 During that session, `TMPDIR` was set to a symlink to `/tmp` before running the
 following commands from the repository root (the temporary symlink was removed
@@ -129,6 +134,33 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
   confirmation prompt; approval remains bound to its existing snapshot and
   explicit non-empty scope; test verifies proposal-before-confirmation output;
   `make test`, `make vet`, and `make build` pass.
+
+### Monitor inspection output is too verbose by default
+
+- **Status:** Implementation and focused regression tests are complete:
+  default `factory monitor get <id>` shows identity, status, phase, latest
+  successful PR/check query, and actionable pending approval state without
+  events or verbose metadata. `--details` retains the event trail, full JSON
+  record, job metadata, and logs. Focused monitor tests, `make vet`, and
+  `make build` pass. Stale job-output assertions were updated to use
+  `--details`; the full suite will be rerun before publication.
+- **Reproduction:** Run `factory monitor get <id>` and then
+  `factory monitor get <id> --details` for an existing monitor.
+- **Impact:** Routine status checks can expose more operational details than
+  needed and make the key phase/check status harder to scan. The existing
+  `--details` switch provides a natural place for full diagnostics.
+- **Evidence:** `internal/factory/monitor.go` prints the concise status fields
+  for both modes and writes recent events, marshaled job JSON, and job details
+  only when `--details` is selected. `internal/factory/monitor_test.go` and
+  `internal/factory/monitor_job_test.go` exercise the default and detailed
+  outputs, including suppression and presence of event trail and logs.
+- **Desired outcome:** Keep default `monitor get` concise and scannable while
+  retaining complete diagnostics behind `--details`.
+- **Acceptance criteria:** Default output reports identity, status, phase,
+  latest successful PR/check result, and actionable pending approval state
+  without dumping recent events or verbose fields; `--details` retains the
+  current event trail, full record, and metadata/logs; regression tests cover
+  both modes; `make test`, `make vet`, and `make build` pass.
 
 ### Other observed friction
 
