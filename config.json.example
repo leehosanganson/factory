@@ -10,6 +10,7 @@
   "prompt_dir": "",
   "state_dir": "",
   "worktree_parent": "../{repo}.worktrees",
+  "auto_publish": true,
   "agent_timeout": "60m",
   "monitor_timeout": "",
   "pipeline_checks": [

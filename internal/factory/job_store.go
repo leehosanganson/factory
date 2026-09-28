@@ -33,23 +33,25 @@ var jobLockByPath = make(map[string]*sync.Mutex)
 
 // JobRecord is the versioned, shared lifecycle record for a unit of work.
 type JobRecord struct {
-	Version         int               `json:"version"`
-	ID              string            `json:"id"`
-	Type            string            `json:"type"`
-	TaskDescription string            `json:"task_description,omitempty"`
-	TargetPath      string            `json:"target_path,omitempty"`
-	RepositoryPath  string            `json:"repository_path,omitempty"`
-	TargetBranch    string            `json:"target_branch,omitempty"`
-	TargetHead      string            `json:"target_head,omitempty"`
-	Worktree        string            `json:"worktree,omitempty"`
-	WorkBranch      string            `json:"work_branch,omitempty"`
-	Status          string            `json:"status"`
-	CreatedAt       time.Time         `json:"created_at"`
-	UpdatedAt       time.Time         `json:"updated_at"`
-	StartedAt       time.Time         `json:"started_at,omitempty"`
-	EndedAt         time.Time         `json:"ended_at,omitempty"`
-	Sessions        []SessionMetadata `json:"sessions,omitempty"`
-	Monitor         *monitorJob       `json:"monitor,omitempty"`
+	Version            int               `json:"version"`
+	ID                 string            `json:"id"`
+	Type               string            `json:"type"`
+	TaskDescription    string            `json:"task_description,omitempty"`
+	TargetPath         string            `json:"target_path,omitempty"`
+	RepositoryPath     string            `json:"repository_path,omitempty"`
+	TargetBranch       string            `json:"target_branch,omitempty"`
+	TargetHead         string            `json:"target_head,omitempty"`
+	Worktree           string            `json:"worktree,omitempty"`
+	WorkBranch         string            `json:"work_branch,omitempty"`
+	PublicationStatus  string            `json:"publication_status,omitempty"`
+	PublicationSummary string            `json:"publication_summary,omitempty"`
+	Status             string            `json:"status"`
+	CreatedAt          time.Time         `json:"created_at"`
+	UpdatedAt          time.Time         `json:"updated_at"`
+	StartedAt          time.Time         `json:"started_at,omitempty"`
+	EndedAt            time.Time         `json:"ended_at,omitempty"`
+	Sessions           []SessionMetadata `json:"sessions,omitempty"`
+	Monitor            *monitorJob       `json:"monitor,omitempty"`
 }
 
 // SessionMetadata preserves session order and lifecycle metadata in the job record.

@@ -752,7 +752,7 @@ func TestDetachHelpAndGateConflictValidation(t *testing.T) {
 
 func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "fake-agent")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.1\ncase \"$2\" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.1\nprintf 'workflow output\\n' > generated.txt\ncase \"$2\" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(t.TempDir(), "factory")
@@ -769,6 +769,31 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			state := t.TempDir()
 			realTarget := t.TempDir()
+			git := func(args ...string) {
+				t.Helper()
+				command := exec.Command("git", args...)
+				command.Dir = realTarget
+				if output, err := command.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, output)
+				}
+			}
+			git("init", "-q", "-b", "main")
+			git("config", "user.name", "Factory Test")
+			git("config", "user.email", "factory-test@example.invalid")
+			if err := os.WriteFile(filepath.Join(realTarget, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git("add", "tracked.txt")
+			git("commit", "-qm", "baseline")
+			remote := filepath.Join(t.TempDir(), "origin.git")
+			if output, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+				t.Fatalf("initialize origin: %v\n%s", err, output)
+			}
+			git("remote", "add", "origin", remote)
+			fakeBin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			target := filepath.Join(filepath.Dir(realTarget), "target-alias")
 			if err := os.Symlink(realTarget, target); err != nil {
 				t.Skipf("directory symlinks unavailable: %v", err)
@@ -783,13 +808,13 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 			}
 			command := exec.Command(binary, name, "complete", "the", "task")
 			command.Dir = target
-			command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Dir(configDir), "XDG_STATE_HOME="+state)
+			command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Dir(configDir), "XDG_STATE_HOME="+state, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			output, err := command.CombinedOutput()
 			if err != nil {
 				t.Fatalf("%s command: %v\n%s", name, err, output)
 			}
-			if !strings.Contains(string(output), "Started pipeline job ") || !strings.Contains(string(output), "requirements completed") {
-				t.Fatalf("%s did not attach and stream worker output: %q", name, output)
+			if !strings.Contains(string(output), "Started pipeline job ") || !strings.Contains(string(output), "requirements completed") || !strings.Contains(string(output), "Published implementation PR") {
+				t.Fatalf("%s did not attach to the detached worker and publish its isolated branch: %q", name, output)
 			}
 			storeRoot, err := factory.JobStateRoot(state)
 			if err != nil {
@@ -800,11 +825,164 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 				t.Fatal(err)
 			}
 			jobs, err := store.ListJobs()
-			if err != nil || len(jobs) != 1 || jobs[0].Status != "complete" || jobs[0].TaskDescription != "complete the task" || !sameResolvedTestPath(t, jobs[0].TargetPath, target) {
+			if err != nil || len(jobs) != 1 || jobs[0].Status != "complete" || jobs[0].TaskDescription != "complete the task" || !sameResolvedTestPath(t, jobs[0].TargetPath, target) || jobs[0].Worktree == "" || jobs[0].WorkBranch == "" {
 				t.Fatalf("%s job records = %+v, err=%v", name, jobs, err)
+			}
+			if _, err := exec.Command("git", "--git-dir", remote, "show-ref", "--verify", "refs/heads/"+jobs[0].WorkBranch).CombinedOutput(); err != nil {
+				t.Fatalf("%s worker did not push its isolated branch %q: %v", name, jobs[0].WorkBranch, err)
 			}
 		})
 	}
+}
+
+func TestGatedImplementOptOutStillRejectsNonGitTarget(t *testing.T) {
+	state := t.TempDir()
+	configHome := t.TempDir()
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(t.TempDir(), "agent-ran")
+	agent := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf called > "+marker+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"auto_publish":false}`, agent, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Chdir(t.TempDir())
+	input, approvals, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	_ = approvals.Close()
+	output, err := os.CreateTemp(t.TempDir(), "gated-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	err = runPipelineContextWithTerminalCheck(context.Background(), []string{"reject non-Git"}, true, input, output, func(*os.File) bool { return true })
+	if err == nil || !strings.Contains(err.Error(), "Git checkout") {
+		t.Fatalf("gated non-Git implementation error = %v", err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("agent ran before gated Git prerequisite validation (stat error %v)", err)
+	}
+}
+
+func TestGatedImplementUsesAutomaticForegroundPublisherByDefault(t *testing.T) {
+	target := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		command := exec.Command("git", args...)
+		command.Dir = target
+		output, err := command.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+		return string(output)
+	}
+	git("init", "-q", "-b", "main")
+	git("config", "user.name", "Factory Test")
+	git("config", "user.email", "factory-test@example.invalid")
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "tracked.txt")
+	git("commit", "-qm", "baseline")
+	baseline := strings.TrimSpace(git("rev-parse", "HEAD"))
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+		t.Fatalf("initialize origin: %v\n%s", err, output)
+	}
+	git("remote", "add", "origin", remote)
+	t.Chdir(target)
+
+	state := t.TempDir()
+	configHome := t.TempDir()
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agent := filepath.Join(t.TempDir(), "agent")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'PASS\\n'\nprintf 'workflow output\\n' > generated.txt\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, agent, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	input, approvals, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	if _, err := approvals.WriteString(strings.Repeat("yes\n", 4)); err != nil {
+		t.Fatal(err)
+	}
+	if err := approvals.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.CreateTemp(t.TempDir(), "foreground-output-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Close()
+	terminalCheck := func(*os.File) bool { return true }
+	if err := runPipelineContextWithTerminalCheck(context.Background(), []string{"publish the task"}, true, input, output, terminalCheck); err != nil {
+		t.Fatalf("gated implementation: %v", err)
+	}
+	if _, err := output.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	outputText, err := io.ReadAll(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(outputText), "Published implementation PR") {
+		t.Fatalf("gated implementation did not use foreground publisher: %s", outputText)
+	}
+	if head := strings.TrimSpace(git("rev-parse", "HEAD")); head != baseline {
+		t.Fatalf("foreground publication changed invoking checkout HEAD: %s", head)
+	}
+	if status := strings.TrimSpace(git("status", "--porcelain")); status != "" {
+		t.Fatalf("foreground publication changed invoking checkout: %s", status)
+	}
+	refs := strings.TrimSpace(runTestGit(t, "--git-dir", remote, "for-each-ref", "--format=%(refname:short)"))
+	if !strings.HasPrefix(refs, "factory-implement-") {
+		t.Fatalf("foreground publisher did not push an isolated task branch: %s", refs)
+	}
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs, err := store.ListJobs(); err != nil || len(jobs) != 0 {
+		t.Fatalf("gated invocation created detached jobs: %+v, %v", jobs, err)
+	}
+}
+
+func runTestGit(t *testing.T, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", args...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return string(output)
 }
 
 func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
@@ -835,10 +1013,10 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := filepath.Join(root, "agent")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\n: > \"$FACTORY_TEST_STARTED\"\nwhile [ ! -f \"$FACTORY_TEST_RELEASE\" ]; do sleep 0.02; done\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncase \"$1\" in *'Propose a concise slug'*) printf 'test-detached\\n'; exit 0 ;; esac\n: > \"$FACTORY_TEST_STARTED\"\nwhile [ ! -f \"$FACTORY_TEST_RELEASE\" ]; do sleep 0.02; done\nprintf 'PASS\\n'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s"}`, script, state)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":false}`, script, state)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(root, "factory")
@@ -854,6 +1032,20 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	target := filepath.Join(root, "target")
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main", target}, {"-C", target, "config", "user.name", "Factory Test"}, {"-C", target, "config", "user.email", "factory-test@example.invalid"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", target, "add", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, output)
 	}
 	target, err = filepath.EvalSymlinks(target)
 	if err != nil {
