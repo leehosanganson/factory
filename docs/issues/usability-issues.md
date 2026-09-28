@@ -56,6 +56,16 @@ recording guidance.
   values, and full details/log output. Verified with the focused `go test
   ./internal/factory` cases for job inspection and trace display.
 
+### 5. Explore a kubectl-inspired CLI experience
+
+- **Finding:** The user values kubectl's CLI design and wants Factory to draw
+  inspiration from it.
+- **Desired outcome:** Evaluate which CLI design principles could improve
+  Factory's consistency, discoverability, and ease of use, adapting them to
+  Factory's workflows rather than copying kubectl's commands or behavior.
+- **Status:** Open; recorded for future CLI design and usability work. No
+  particular command redesign or compatibility change has been approved.
+
 ## Session observations
 
 These are observations from a session, not claims about underlying causes. The
@@ -128,6 +138,29 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
 - **Acceptance criteria:** The proposal text is labeled and printed before the
   confirmation prompt; approval remains bound to its existing snapshot and
   explicit non-empty scope; test verifies proposal-before-confirmation output;
+  `make test`, `make vet`, and `make build` pass.
+
+### Job inspection hides implementation publication outcome
+
+- **Status:** Open; source inspection confirms `JobRecord` persists
+  `PublicationStatus` and `PublicationSummary`, but default `factory job get`
+  renders only the compact job table. The outcome is visible with `--details`.
+- **Reproduction:** Complete an implementation job, then run
+  `factory job get <id>` and `factory job get <id> --details`.
+- **Impact:** Users cannot tell from the routine status view whether an
+  implementation job created a PR, completed without publishing, or produced
+  no changes. A next-action hint can therefore send users to inspect details
+  even when the publication outcome is the important result.
+- **Evidence:** `internal/factory/job.go` writes publication status and summary
+  in `writeJobSummary` but not `writeJobTable`; publication outcomes are stored
+  by `RunJobWorker` and the detached job publication tests cover published,
+  unpublished, and no-op cases.
+- **Desired outcome:** Show a compact publication outcome for implementation
+  jobs in the default `job get` view without restoring verbose summary output.
+- **Acceptance criteria:** The default output retains its compact table format
+  and communicates publication status for implementation jobs that have an
+  outcome; other job types and jobs without an outcome remain unchanged;
+  behavioral tests cover published, unpublished, and no-op statuses;
   `make test`, `make vet`, and `make build` pass.
 
 ### Other observed friction
