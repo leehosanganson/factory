@@ -65,7 +65,7 @@ func StateRoot(override string) (string, error) {
 	return filepath.Join(base, "factory", "runs"), nil
 }
 
-func canonicalPath(path string) (string, error) {
+func resolvedPath(path string) (string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", err

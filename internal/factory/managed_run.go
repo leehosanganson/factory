@@ -149,7 +149,7 @@ func managedRunRoot(override string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return canonicalPath(root)
+	return resolvedPath(root)
 }
 
 // RunCommand controls only gated, foreground pipeline records.

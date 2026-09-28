@@ -771,11 +771,11 @@ func startMonitorLegacy(args []string, cfg Config, workdir, root string, out io.
 	if err != nil {
 		return fmt.Errorf("not inside a git repository: %w", err)
 	}
-	rootRepo, err = canonicalPath(rootRepo)
+	rootRepo, err = resolvedPath(rootRepo)
 	if err != nil {
 		return err
 	}
-	statePath, err := canonicalPath(root)
+	statePath, err := resolvedPath(root)
 	if err != nil {
 		return err
 	}
@@ -1233,7 +1233,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 				_ = monitorEvent(dir, job, "Initial worktree unavailable.")
 				return err
 			}
-			workerTop, err = canonicalPath(workerTop)
+			workerTop, err = resolvedPath(workerTop)
 			if err != nil || workerTop != job.Worktree {
 				job.Status = "failed"
 				_ = monitorEvent(dir, job, "Initial worktree identity validation failed.")
@@ -1466,7 +1466,7 @@ func validateWorker(job *monitorJob, dir string) error {
 	if err != nil {
 		return err
 	}
-	root, err = canonicalPath(root)
+	root, err = resolvedPath(root)
 	if err != nil || root != job.Worktree {
 		return errors.New("worker worktree changed")
 	}
@@ -1490,7 +1490,7 @@ func validateTarget(job *monitorJob) error {
 	if err != nil {
 		return err
 	}
-	root, err = canonicalPath(root)
+	root, err = resolvedPath(root)
 	if err != nil {
 		return err
 	}
@@ -2089,7 +2089,7 @@ func guardedCommitPushCaptured(ctx context.Context, dir string, job *monitorJob,
 	if err != nil {
 		return err
 	}
-	root, err = canonicalPath(root)
+	root, err = resolvedPath(root)
 	if err != nil || root != job.Worktree {
 		return errors.New("worker worktree changed")
 	}
@@ -2237,7 +2237,7 @@ func guardedCommitPushCaptured(ctx context.Context, dir string, job *monitorJob,
 	if err != nil {
 		return err
 	}
-	workerTop, err = canonicalPath(workerTop)
+	workerTop, err = resolvedPath(workerTop)
 	if err != nil || workerTop != job.Worktree {
 		return errors.New("worker worktree changed before push")
 	}

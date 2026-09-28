@@ -10,20 +10,20 @@ import (
 const defaultWorktreeParent = "../{repo}.worktrees"
 
 func validateWorktreeParent(parent string, checkouts ...string) (string, error) {
-	canonicalParent, err := canonicalPath(parent)
+	resolvedParent, err := resolvedPath(parent)
 	if err != nil {
 		return "", err
 	}
 	for _, checkout := range checkouts {
-		canonicalCheckout, err := canonicalPath(checkout)
+		resolvedCheckout, err := resolvedPath(checkout)
 		if err != nil {
 			return "", err
 		}
-		if isWithin(canonicalCheckout, canonicalParent) {
+		if isWithin(resolvedCheckout, resolvedParent) {
 			return "", fmt.Errorf("worktree parent must be outside the target repository")
 		}
 	}
-	return canonicalParent, nil
+	return resolvedParent, nil
 }
 
 func resolveWorktreeParent(template, primaryCheckout string) (string, error) {

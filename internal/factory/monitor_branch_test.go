@@ -27,7 +27,7 @@ func TestMonitorWorktreePathIncludesReadableBranchAndCollisionResistantIdentity(
 }
 
 func TestMonitorUsesIsolatedBranchWhenPRBranchIsCheckedOutElsewhere(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)
@@ -58,7 +58,7 @@ func TestMonitorUsesIsolatedBranchWhenPRBranchIsCheckedOutElsewhere(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if baseline != head || worktree == userCheckout || worktree == repo || !strings.HasPrefix(worktree, stateRoot+string(filepath.Separator)) {
+	if baseline != head || sameResolvedTestPath(t, worktree, userCheckout) || sameResolvedTestPath(t, worktree, repo) || !isWithin(resolvedTestPath(t, stateRoot), resolvedTestPath(t, worktree)) {
 		t.Fatalf("monitor did not create its own checkout: path=%q baseline=%q", worktree, baseline)
 	}
 	branch, err := runGit(context.Background(), worktree, "branch", "--show-current")
@@ -84,7 +84,7 @@ func TestMonitorUsesIsolatedBranchWhenPRBranchIsCheckedOutElsewhere(t *testing.T
 }
 
 func TestConfiguredMonitorWorktreeParentIsPersistableAndValidated(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)
@@ -111,7 +111,7 @@ func TestConfiguredMonitorWorktreeParentIsPersistableAndValidated(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if baseline != head || filepath.Dir(worktree) != canonicalTestPath(t, parent) || filepath.Base(worktree) != "a1b2-feature" {
+	if baseline != head || !sameResolvedTestPath(t, filepath.Dir(worktree), parent) || filepath.Base(worktree) != "a1b2-feature" {
 		t.Fatalf("configured monitor worktree = %q, baseline %q", worktree, baseline)
 	}
 	branch := "factory-monitor/" + id

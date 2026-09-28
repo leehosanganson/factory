@@ -105,7 +105,7 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	if err := validatePipelineChecks(w.Config.PipelineChecks); err != nil {
 		return err
 	}
-	target, err := canonicalPath(w.Workdir)
+	target, err := resolvedPath(w.Workdir)
 	if err != nil {
 		return fmt.Errorf("resolve target directory: %w", err)
 	}
@@ -114,7 +114,7 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	if err != nil {
 		return err
 	}
-	root, err = canonicalPath(root)
+	root, err = resolvedPath(root)
 	if err != nil {
 		return fmt.Errorf("resolve state directory: %w", err)
 	}

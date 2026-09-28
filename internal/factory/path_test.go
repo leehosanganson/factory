@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestCanonicalTestPathResolvesSymlink(t *testing.T) {
+func TestResolvedTestPathResolvesSymlink(t *testing.T) {
 	root := t.TempDir()
 	real := filepath.Join(root, "real")
 	alias := filepath.Join(root, "alias")
@@ -17,16 +17,21 @@ func TestCanonicalTestPathResolvesSymlink(t *testing.T) {
 		t.Skipf("directory symlinks unavailable: %v", err)
 	}
 
-	if got, want := canonicalTestPath(t, alias), canonicalTestPath(t, real); got != want {
-		t.Fatalf("canonical test path for symlink = %q, want resolved target %q", got, want)
+	if got, want := resolvedTestPath(t, alias), resolvedTestPath(t, real); got != want {
+		t.Fatalf("resolved test path for symlink = %q, want resolved target %q", got, want)
 	}
 }
 
-func canonicalTestPath(t *testing.T, path string) string {
+func resolvedTestPath(t *testing.T, path string) string {
 	t.Helper()
-	resolved, err := canonicalPath(path)
+	resolved, err := resolvedPath(path)
 	if err != nil {
-		t.Fatalf("canonicalize test path %q: %v", path, err)
+		t.Fatalf("resolve test path %q: %v", path, err)
 	}
 	return resolved
+}
+
+func sameResolvedTestPath(t *testing.T, left, right string) bool {
+	t.Helper()
+	return resolvedTestPath(t, left) == resolvedTestPath(t, right)
 }

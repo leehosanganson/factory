@@ -54,7 +54,7 @@ func TestCreateImplementationWorktreeUsesReadableUniqueJobName(t *testing.T) {
 		if filepath.Base(worktree) != id[:4]+"-add-readable-job-names" {
 			t.Errorf("worktree directory = %q, want short ID and readable slug", filepath.Base(worktree))
 		}
-		if filepath.Dir(worktree) != parent {
+		if !sameResolvedTestPath(t, filepath.Dir(worktree), parent) {
 			t.Errorf("worktree parent = %q, want configured parent %q", filepath.Dir(worktree), parent)
 		}
 		if branch != "factory-job-add-readable-job-names-"+id {
@@ -70,7 +70,7 @@ func TestCreateImplementationWorktreeUsesReadableUniqueJobName(t *testing.T) {
 			t.Errorf("checked-out branch = %q, err=%v; want %q", gotBranch, err, branch)
 		}
 		gotRoot, err := runGit(context.Background(), worktree, "rev-parse", "--show-toplevel")
-		if err != nil || canonicalTestPath(t, gotRoot) != canonicalTestPath(t, worktree) {
+		if err != nil || resolvedTestPath(t, gotRoot) != resolvedTestPath(t, worktree) {
 			t.Errorf("worktree root = %q, err=%v; want %q", gotRoot, err, worktree)
 		}
 		if _, err := os.Stat(filepath.Join(worktree, "README.md")); err != nil {

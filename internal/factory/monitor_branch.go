@@ -59,7 +59,7 @@ func repositoryIdentity(repository string) (string, error) {
 	if !filepath.IsAbs(commonDir) {
 		commonDir = filepath.Join(repository, commonDir)
 	}
-	return canonicalPath(commonDir)
+	return resolvedPath(commonDir)
 }
 
 func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer) error {
@@ -80,7 +80,7 @@ func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer
 	if err != nil {
 		return fmt.Errorf("not inside a git repository: %w", err)
 	}
-	repository, err = canonicalPath(repository)
+	repository, err = resolvedPath(repository)
 	if err != nil {
 		return err
 	}
@@ -92,7 +92,7 @@ func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer
 	if err != nil {
 		return err
 	}
-	statePath, err := canonicalPath(root)
+	statePath, err := resolvedPath(root)
 	if err != nil {
 		return err
 	}
@@ -258,7 +258,7 @@ func primaryWorktree(repository string) (string, error) {
 	}
 	for _, line := range strings.Split(data, "\n") {
 		if strings.HasPrefix(line, "worktree ") {
-			return canonicalPath(strings.TrimPrefix(line, "worktree "))
+			return resolvedPath(strings.TrimPrefix(line, "worktree "))
 		}
 	}
 	return "", fmt.Errorf("cannot identify primary checkout")
@@ -330,8 +330,8 @@ func worktreeBranchOwner(repository, branch string) (string, bool, error) {
 			continue
 		}
 		if line == "branch refs/heads/"+branch {
-			canonical, err := canonicalPath(path)
-			return canonical, true, err
+			resolved, err := resolvedPath(path)
+			return resolved, true, err
 		}
 	}
 	return "", false, nil
@@ -381,7 +381,7 @@ func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
 	if !job.OwnWorktree || job.Worktree == "" || job.WorkerBranch != "factory-monitor/"+job.ID {
 		return errors.New("monitor worker is not using a registered Factory-owned worktree")
 	}
-	root, err := canonicalPath(stateRoot)
+	root, err := resolvedPath(stateRoot)
 	if err != nil {
 		return err
 	}
@@ -392,7 +392,7 @@ func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
 	expected := monitorPRWorktreePath(root, identity, job.HeadBranch, job.PR, job.ID)
 	legacyCheckout := filepath.Join(root, job.ID, "checkout")
 	if job.WorktreeParent != "" {
-		parent, parentErr := canonicalPath(job.WorktreeParent)
+		parent, parentErr := resolvedPath(job.WorktreeParent)
 		primary, primaryErr := primaryWorktree(job.RepoRoot)
 		if parentErr != nil || primaryErr != nil || parent != job.WorktreeParent || isWithin(job.RepoRoot, parent) || isWithin(primary, parent) || !isWithin(parent, job.Worktree) {
 			return errors.New("monitor worktree parent is not the registered isolated parent")
@@ -402,7 +402,7 @@ func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
 			return err
 		}
 	}
-	worktree, err := canonicalPath(job.Worktree)
+	worktree, err := resolvedPath(job.Worktree)
 	matchesRegisteredPath := worktree == expected || job.WorktreeParent == "" && worktree == legacyCheckout
 	if err != nil || worktree != job.Worktree || !matchesRegisteredPath || !isWithin(root, worktree) && job.WorktreeParent == "" || isWithin(job.RepoRoot, worktree) {
 		return errors.New("monitor worktree is not the expected isolated Factory checkout")
@@ -411,7 +411,7 @@ func validateMonitorWorktree(job *monitorJob, stateRoot string) error {
 	if err != nil {
 		return err
 	}
-	top, err = canonicalPath(top)
+	top, err = resolvedPath(top)
 	if err != nil || top != worktree {
 		return errors.New("monitor worktree identity validation failed")
 	}
@@ -470,15 +470,15 @@ func setupExistingPRWorktreeAtParent(store *JobStore, repository, branch, head s
 			return "", "", err
 		}
 	}
-	canonicalRoot, err := canonicalPath(store.Root())
+	resolvedRoot, err := resolvedPath(store.Root())
 	if err != nil {
 		return "", "", err
 	}
-	canonicalParent, err := canonicalPath(filepath.Dir(path))
+	resolvedParent, err := resolvedPath(filepath.Dir(path))
 	if err != nil {
 		return "", "", err
 	}
-	if configuredParent == "" && !isWithin(canonicalRoot, canonicalParent) || configuredParent != "" && (canonicalParent != configuredParent || isWithin(repository, canonicalParent)) {
+	if configuredParent == "" && !isWithin(resolvedRoot, resolvedParent) || configuredParent != "" && (resolvedParent != configuredParent || isWithin(repository, resolvedParent)) {
 		return "", "", fmt.Errorf("monitor worktree path escapes its isolated parent")
 	}
 	if _, err := os.Lstat(path); err == nil {

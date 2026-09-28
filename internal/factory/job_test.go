@@ -16,7 +16,7 @@ import (
 
 func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 	state := t.TempDir()
-	target := canonicalTestPath(t, t.TempDir())
+	target := resolvedTestPath(t, t.TempDir())
 	script := filepath.Join(t.TempDir(), "fake-agent")
 	if err := os.WriteFile(script, []byte("#!/bin/sh\nsleep 0.2\ncase \"$2\" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 		return err == nil && isTerminalStatus(job.Status) && len(job.Sessions) == 1 && job.Sessions[0].Status == job.Status
 	})
 	job, err := store.GetJob(id)
-	if err != nil || job.Status != "complete" || job.Type != implementationJobType || job.TargetPath != canonicalTestPath(t, target) || job.TaskDescription != "exercise detached job" {
+	if err != nil || job.Status != "complete" || job.Type != implementationJobType || job.TargetPath != resolvedTestPath(t, target) || job.TaskDescription != "exercise detached job" {
 		t.Fatalf("job record = %+v, err=%v", job, err)
 	}
 	if len(job.Sessions) != 1 || job.Sessions[0].Status != "complete" {
@@ -146,7 +146,7 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 
 func TestJobDetailsExposePersistedImplementationWorktree(t *testing.T) {
 	state := t.TempDir()
-	target := canonicalTestPath(t, t.TempDir())
+	target := resolvedTestPath(t, t.TempDir())
 	worktree := filepath.Join(state, "factory", "detached-jobs", "job-id", "worktree")
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
@@ -181,7 +181,7 @@ func TestJobDetailsExposePersistedImplementationWorktree(t *testing.T) {
 func TestDetachedTidyJobRunsNonpublishingAndIsListed(t *testing.T) {
 	state := t.TempDir()
 	repo := newCleanRepo(t)
-	target := canonicalTestPath(t, repo.work)
+	target := resolvedTestPath(t, repo.work)
 	if err := os.WriteFile(filepath.Join(target, "Makefile"), []byte("fmt test vet:\n\t@true\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestDetachedTidyJobFailureAndStopStatuses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			state := t.TempDir()
 			repo := newCleanRepo(t)
-			target := canonicalTestPath(t, repo.work)
+			target := resolvedTestPath(t, repo.work)
 			_ = os.WriteFile(filepath.Join(target, "Makefile"), []byte("fmt test vet:\n\t@true\n"), 0o600)
 			script := filepath.Join(t.TempDir(), "agent")
 			if err := os.WriteFile(script, []byte("#!/bin/sh\n"+tc.scriptBody), 0o700); err != nil {
@@ -518,10 +518,10 @@ func TestDuplicateJobWorkerCannotRerunOrReplaceWorkerIdentity(t *testing.T) {
 	}
 }
 
-func TestRunJobWorkerRequiresCanonicalPrivateRoot(t *testing.T) {
+func TestRunJobWorkerRequiresResolvedPrivateRoot(t *testing.T) {
 	store := newTestJobStore(t)
 	for _, root := range []string{"relative", store.Root() + string(filepath.Separator) + "."} {
-		if err := RunJobWorker("missing", root); err == nil || !strings.Contains(err.Error(), "absolute") && !strings.Contains(err.Error(), "canonical") {
+		if err := RunJobWorker("missing", root); err == nil || !strings.Contains(err.Error(), "absolute") && !strings.Contains(err.Error(), "resolved") {
 			t.Errorf("RunJobWorker root %q error=%v, want root validation failure", root, err)
 		}
 	}

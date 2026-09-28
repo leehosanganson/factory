@@ -104,7 +104,7 @@ func TestCleanPristineUsesIsolatedWorktreeAndPublishesOnlyItsChanges(t *testing.
 	if err := workflow.Run(""); err != nil {
 		t.Fatalf("isolated pristine clean failed: %v", err)
 	}
-	if agent.workdir == "" || agent.workdir == repo.work || isWithin(repo.work, agent.workdir) {
+	if agent.workdir == "" || sameResolvedTestPath(t, agent.workdir, repo.work) || isWithin(resolvedTestPath(t, repo.work), resolvedTestPath(t, agent.workdir)) {
 		t.Fatalf("agent ran outside an external isolated worktree: target=%q agent=%q", repo.work, agent.workdir)
 	}
 	if _, err := os.Stat(agent.workdir); !os.IsNotExist(err) {
@@ -115,7 +115,7 @@ func TestCleanPristineUsesIsolatedWorktreeAndPublishesOnlyItsChanges(t *testing.
 		t.Fatal(err)
 	}
 	for _, workdir := range strings.Fields(string(lines)) {
-		if workdir != agent.workdir {
+		if !sameResolvedTestPath(t, workdir, agent.workdir) {
 			t.Errorf("check ran in %q, want isolated worktree %q", workdir, agent.workdir)
 		}
 	}
@@ -179,7 +179,7 @@ func TestCleanPristineRejectsExternalChangesWithoutPublishingThem(t *testing.T) 
 			if err == nil || !strings.Contains(err.Error(), "original checkout changed") {
 				t.Fatalf("external mutation error = %v, want publish refusal", err)
 			}
-			if agent.workdir == "" || agent.workdir == repo.work || isWithin(repo.work, agent.workdir) {
+			if agent.workdir == "" || sameResolvedTestPath(t, agent.workdir, repo.work) || isWithin(resolvedTestPath(t, repo.work), resolvedTestPath(t, agent.workdir)) {
 				t.Fatalf("agent did not receive isolated worktree: target=%q agent=%q", repo.work, agent.workdir)
 			}
 			if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {
@@ -327,7 +327,7 @@ func TestCleanGitAtReceivesOriginalAndIsolatedWorkdirs(t *testing.T) {
 	workflow := cleanTestWorkflow(repo.work, &cleanNoopAgent{})
 	var workdirs []string
 	workflow.GitAt = func(ctx context.Context, workdir, name string, args ...string) ([]byte, error) {
-		workdirs = append(workdirs, canonicalTestPath(t, workdir))
+		workdirs = append(workdirs, resolvedTestPath(t, workdir))
 		cmd := exec.CommandContext(ctx, name, args...)
 		cmd.Dir = workdir
 		return cmd.Output()
@@ -337,8 +337,8 @@ func TestCleanGitAtReceivesOriginalAndIsolatedWorkdirs(t *testing.T) {
 	}
 	seenOriginal, seenIsolated := false, false
 	for _, workdir := range workdirs {
-		seenOriginal = seenOriginal || workdir == canonicalTestPath(t, repo.work)
-		seenIsolated = seenIsolated || workdir != canonicalTestPath(t, repo.work)
+		seenOriginal = seenOriginal || workdir == resolvedTestPath(t, repo.work)
+		seenIsolated = seenIsolated || workdir != resolvedTestPath(t, repo.work)
 	}
 	if !seenOriginal || !seenIsolated {
 		t.Fatalf("GitAt workdirs = %v, want original %q and isolated checkout", workdirs, repo.work)
@@ -2160,7 +2160,7 @@ func cleanTestWorkflow(work string, agent Agent) CleanWorkflow {
 			if err != nil {
 				return "", nil, err
 			}
-			key := canonicalCleanTestKey(target)
+			key := resolvedCleanTestKey(target)
 			cleanTestWorkdirs.Store(key, path)
 
 			wrappedCleanup := func() error {
@@ -2187,7 +2187,7 @@ var cleanTestWorkdirScopes sync.Map
 var cleanTestPublishing sync.Map
 
 func cleanTestGitScope(target string, args []string) func() {
-	key := canonicalCleanTestKey(target)
+	key := resolvedCleanTestKey(target)
 	if _, ok := cleanTestWorkdirs.Load(key); !ok {
 		return func() {}
 	}
@@ -2211,7 +2211,7 @@ func cleanTestGitScope(target string, args []string) func() {
 }
 
 func cleanTestWorkdir(target string) string {
-	key := canonicalCleanTestKey(target)
+	key := resolvedCleanTestKey(target)
 	if _, publishing := cleanTestPublishing.Load(key); publishing {
 		return target
 	}
@@ -2221,8 +2221,8 @@ func cleanTestWorkdir(target string) string {
 	return target
 }
 
-func canonicalCleanTestKey(path string) string {
-	resolved, err := canonicalPath(path)
+func resolvedCleanTestKey(path string) string {
+	resolved, err := resolvedPath(path)
 	if err != nil {
 		return filepath.Clean(path)
 	}
