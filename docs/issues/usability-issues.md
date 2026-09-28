@@ -44,16 +44,17 @@ recording guidance.
 
 ### 4. Make inspection output easier to scan
 
-- **Finding:** Show/describe output is difficult to scan when long strings and
-  detailed records are inline.
-- **Desired outcome:** Concise tables by default, with long values and full
-  records available through a details option.
-- **Status:** Partially implemented in the current CLI source: list views are
-  tabulated; individual `get` commands default to concise summaries; and
-  `--details` includes long descriptions, records, proposals, and logs. The
-  individual summaries are labeled fields rather than tables, so the agreed
-  tabular-default design is incomplete. The integrated implementation is
-  verified by the current `make test` and `make vet` checks.
+- **Finding:** Individual job inspection prints multiple labeled fields, including
+  a long process-count explanation, rather than a compact row like `job list`.
+- **Desired outcome:** `factory job get <id>` shows one compact table row by
+  default, with the description and latest activity bounded as in `job list`;
+  `--details` continues to show full metadata and logs.
+- **Status:** Implemented in `internal/factory/job.go`: default `factory job
+  get <id>` uses the `writeJobTable` format for a single bounded row; `--details`
+  retains the full summary, metadata, and logs. Behavioral coverage verifies
+  one header plus one row, bounded description/activity, ID/type/status/target
+  values, and full details/log output. Verified with the focused `go test
+  ./internal/factory` cases for job inspection and trace display.
 
 ## Session observations
 
