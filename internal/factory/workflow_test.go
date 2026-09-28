@@ -91,7 +91,7 @@ func TestSecondaryStatusRunsDuringActiveStageAndPersistsSanitizedUpdate(t *testi
 	var output strings.Builder
 	workflow := Workflow{
 		Agent: agent, Config: Config{StateDir: filepath.Join(base, "state")}, Out: &output, Workdir: t.TempDir(),
-		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		Stages: []string{"implement"}, statusInterval: 100 * time.Millisecond,
 		Observer: JobSessionObserver{Store: store, JobID: "status-job", SessionID: "workflow"},
 		statusCall: func(ctx context.Context, _, _, _, _ string) (string, error) {
 			select {
