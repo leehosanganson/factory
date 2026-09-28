@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func sameCanonicalTestPath(t *testing.T, left, right string) bool {
+func sameResolvedTestPath(t *testing.T, left, right string) bool {
 	t.Helper()
 	left, err := filepath.EvalSymlinks(left)
 	if err != nil {

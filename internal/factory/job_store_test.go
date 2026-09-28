@@ -200,7 +200,7 @@ func TestJobStateRootUsesCanonicalDetachedJobsRoot(t *testing.T) {
 	}
 }
 
-func TestJobStateRootUsesDetachedJobsAndTargetLocksCanonicalizeAliases(t *testing.T) {
+func TestJobStateRootUsesDetachedJobsAndTargetLocksResolveAliases(t *testing.T) {
 	state := t.TempDir()
 	root, err := JobStateRoot(state)
 	if err != nil || root != filepath.Join(state, "factory", "detached-jobs") {
@@ -232,7 +232,7 @@ func TestJobStateRootUsesDetachedJobsAndTargetLocksCanonicalizeAliases(t *testin
 	select {
 	case release := <-acquired:
 		release()
-		t.Fatal("canonical target alias acquired a second lock")
+		t.Fatal("resolved target alias acquired a second lock")
 	case err := <-failed:
 		t.Fatal(err)
 	case <-time.After(50 * time.Millisecond):
@@ -244,7 +244,7 @@ func TestJobStateRootUsesDetachedJobsAndTargetLocksCanonicalizeAliases(t *testin
 	case err := <-failed:
 		t.Fatal(err)
 	case <-time.After(time.Second):
-		t.Fatal("canonical target lock was not released")
+		t.Fatal("resolved target lock was not released")
 	}
 }
 

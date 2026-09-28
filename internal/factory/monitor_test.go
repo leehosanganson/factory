@@ -30,7 +30,7 @@ func setupTestMonitorWorktree(t *testing.T, repository, stateRoot string, job *m
 }
 
 func TestWorkerMarksSnapshotRetryCapRecoverableAndResetRelaunches(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -343,7 +343,7 @@ func TestOwnedLockReclaimsOnlyDeadOwners(t *testing.T) {
 }
 
 func TestDetachedWorkerLifecycleStopRecoveryAndClosedPR(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -548,7 +548,7 @@ func TestMonitorIDsAndAtomicMetadata(t *testing.T) {
 }
 
 func TestMonitorApprovalBindsScopeToExactSnapshotAndInvalidatesOnChange(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	gh := filepath.Join(base, "gh")
 	if err := os.WriteFile(gh, []byte("#!/bin/sh\ncase \"$*\" in *graphql*) echo '{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"isResolved\":true,\"comments\":{\"nodes\":[],\"pageInfo\":{\"hasNextPage\":false}}}],\"pageInfo\":{\"hasNextPage\":false}}}}}}'; exit 0;; esac\ncase \"$*\" in *baseRepository*) echo 'unsupported JSON field: baseRepository' >&2; exit 2;; esac\ncat \"$GH_RESPONSE\"\n"), 0o700); err != nil {
 		t.Fatal(err)
@@ -734,7 +734,7 @@ func TestMonitorChangedPathsIncludeStagedUntrackedAndNoRenameEndpoints(t *testin
 }
 
 func TestMonitorApprovalRequiredStillPausesBeforeAnyPublish(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -786,7 +786,7 @@ printf 'FACTORY_STATUS=APPROVAL_REQUIRED\n'
 }
 
 func TestMonitorFixedCommitsAndPushesOnlyGitDerivedChangedPaths(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -889,7 +889,7 @@ func TestMonitorBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			base := canonicalTestPath(t, t.TempDir())
+			base := resolvedTestPath(t, t.TempDir())
 			bare := filepath.Join(base, "remote.git")
 			repo := filepath.Join(base, "repo")
 			runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -927,7 +927,7 @@ func TestMonitorBadOriginAndBranchBlockAutomaticCommit(t *testing.T) {
 }
 
 func TestMonitorStopBeforeCommitDoesNotCreateCommit(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare := filepath.Join(base, "remote.git")
 	repo := filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
@@ -1058,7 +1058,7 @@ type monitorPushFixture struct {
 
 func newMonitorPushFixture(t *testing.T) monitorPushFixture {
 	t.Helper()
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)
@@ -1752,7 +1752,7 @@ func TestCaptureChangedStateRejectsContentMutationDuringRead(t *testing.T) {
 }
 
 func TestMonitorSHA256NestedDirectoryDeletionUsesFormatWidthZeroOID(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", "--object-format=sha256", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)
@@ -1888,7 +1888,7 @@ func TestMonitorConcurrentEditsCannotChangePublishedTree(t *testing.T) {
 }
 
 func TestMonitorRetriesPublishFailuresThroughAttemptCap(t *testing.T) {
-	base := canonicalTestPath(t, t.TempDir())
+	base := resolvedTestPath(t, t.TempDir())
 	bare, repo := filepath.Join(base, "remote.git"), filepath.Join(base, "repo")
 	runTestCommand(t, base, "git", "init", "--bare", bare)
 	runTestCommand(t, base, "git", "clone", bare, repo)

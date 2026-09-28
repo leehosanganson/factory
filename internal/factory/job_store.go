@@ -162,7 +162,7 @@ func NewJobStore(root string) (*JobStore, error) {
 	if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, fmt.Errorf("create job state root: %w", err)
 	}
-	root, err := canonicalPath(root)
+	root, err := resolvedPath(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve job state root: %w", err)
 	}
@@ -191,10 +191,10 @@ func JobStateRoot(override string) (string, error) {
 	return filepath.Join(base, "factory", "detached-jobs"), nil
 }
 
-// Root returns the canonical filesystem path backing this store.
+// Root returns the resolved filesystem path backing this store.
 func (s *JobStore) Root() string { return s.root }
 
-// LockTarget serializes jobs targeting the same canonical path across processes.
+// LockTarget serializes jobs targeting the same resolved path across processes.
 func (s *JobStore) LockTarget(target string) (func(), error) {
 	return s.lockTargetIn(".targets", target)
 }
@@ -209,13 +209,13 @@ func (s *JobStore) LockTargetAdmission(target string) (func(), error) {
 	return s.lockTargetIn(".admissions", target)
 }
 
-// LockBranch reserves one branch in a canonical repository across detached jobs.
+// LockBranch reserves one branch in a resolved repository across detached jobs.
 func (s *JobStore) LockBranch(repository, branch string) (func(), error) {
 	return s.lockBranch(repository, branch, false)
 }
 
 func (s *JobStore) LockRepositoryAdmission(repository string) (func(), error) {
-	canonical, err := canonicalPath(repository)
+	resolved, err := resolvedPath(repository)
 	if err != nil {
 		return nil, fmt.Errorf("resolve admission repository: %w", err)
 	}
@@ -226,7 +226,7 @@ func (s *JobStore) LockRepositoryAdmission(repository string) (func(), error) {
 	if err := ensureRealDirectory(s.root, locks); err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256([]byte(canonical))
+	sum := sha256.Sum256([]byte(resolved))
 	return s.lockNamed(filepath.Join(locks, hex.EncodeToString(sum[:])+".lock"), false)
 }
 
@@ -239,7 +239,7 @@ func (s *JobStore) TryLockBranch(repository, branch string) (func(), bool, error
 }
 
 func (s *JobStore) lockBranch(repository, branch string, try bool) (func(), error) {
-	canonical, err := canonicalPath(repository)
+	resolved, err := resolvedPath(repository)
 	if err != nil {
 		return nil, fmt.Errorf("resolve branch repository: %w", err)
 	}
@@ -253,7 +253,7 @@ func (s *JobStore) lockBranch(repository, branch string, try bool) (func(), erro
 	if err := ensureRealDirectory(s.root, locks); err != nil {
 		return nil, err
 	}
-	sum := sha256.Sum256([]byte(canonical + "\x00" + branch))
+	sum := sha256.Sum256([]byte(resolved + "\x00" + branch))
 	path := filepath.Join(locks, hex.EncodeToString(sum[:])+".lock")
 	return s.lockNamed(path, try)
 }
@@ -328,7 +328,7 @@ func (s *JobStore) tryLockTargetIn(lockDir, target string) (func(), bool, error)
 }
 
 func (s *JobStore) targetLockPath(lockDir, target string) (string, *sync.Mutex, error) {
-	canonical, err := canonicalPath(target)
+	resolved, err := resolvedPath(target)
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve job target: %w", err)
 	}
@@ -339,7 +339,7 @@ func (s *JobStore) targetLockPath(lockDir, target string) (string, *sync.Mutex, 
 	if err := ensureRealDirectory(s.root, locks); err != nil {
 		return "", nil, err
 	}
-	sum := sha256.Sum256([]byte(canonical))
+	sum := sha256.Sum256([]byte(resolved))
 	path := filepath.Join(locks, hex.EncodeToString(sum[:])+".lock")
 	jobLockMu.Lock()
 	localLock := jobLockByPath[path]
@@ -629,7 +629,7 @@ func (s *JobStore) CreateJob(job JobRecord) error {
 		if !filepath.IsAbs(job.TargetPath) {
 			return fmt.Errorf("job target path must be absolute")
 		}
-		job.TargetPath, err = canonicalPath(job.TargetPath)
+		job.TargetPath, err = resolvedPath(job.TargetPath)
 		if err != nil {
 			return fmt.Errorf("resolve job target path: %w", err)
 		}
@@ -729,13 +729,13 @@ func (s *JobStore) UpdateJob(id string, update func(*JobRecord) error) (JobRecor
 		if !filepath.IsAbs(job.TargetPath) {
 			return JobRecord{}, fmt.Errorf("job target path must be absolute")
 		}
-		job.TargetPath, err = canonicalPath(job.TargetPath)
+		job.TargetPath, err = resolvedPath(job.TargetPath)
 		if err != nil {
 			return JobRecord{}, fmt.Errorf("resolve job target path: %w", err)
 		}
 	}
 	if job.RepositoryPath != "" {
-		job.RepositoryPath, err = canonicalPath(job.RepositoryPath)
+		job.RepositoryPath, err = resolvedPath(job.RepositoryPath)
 		if err != nil {
 			return JobRecord{}, fmt.Errorf("resolve job repository path: %w", err)
 		}
@@ -1465,7 +1465,7 @@ func validateStoredID(id string) error {
 }
 
 func ensureRealDirectory(parent, path string) error {
-	parentPath, err := canonicalPath(parent)
+	parentPath, err := resolvedPath(parent)
 	if err != nil {
 		return err
 	}
@@ -1476,7 +1476,7 @@ func ensureRealDirectory(parent, path string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("state path is not a real directory: %s", path)
 	}
-	resolved, err := canonicalPath(path)
+	resolved, err := resolvedPath(path)
 	if err != nil {
 		return err
 	}

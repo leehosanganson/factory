@@ -616,7 +616,7 @@ func TestWorkflowObserverPersistsSingleInvocationFailureLifecycle(t *testing.T) 
 		}
 	}
 	if runDir == "" {
-		t.Fatal("workflow did not expose the canonical run directory")
+		t.Fatal("workflow did not expose the resolved run directory")
 	}
 	localEvents, err := os.ReadFile(filepath.Join(runDir, "workflow-events.jsonl"))
 	if err != nil {

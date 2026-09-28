@@ -310,13 +310,13 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 	if strings.TrimSpace(description) == "" {
 		return "", fmt.Errorf("job description must not be empty")
 	}
-	canonicalTarget, err := canonicalPath(target)
+	resolvedTarget, err := resolvedPath(target)
 	if err != nil {
 		return "", fmt.Errorf("resolve target directory: %w", err)
 	}
-	repository, err := runGit(context.Background(), canonicalTarget, "rev-parse", "--show-toplevel")
+	repository, err := runGit(context.Background(), resolvedTarget, "rev-parse", "--show-toplevel")
 	if err == nil {
-		repository, err = canonicalPath(repository)
+		repository, err = resolvedPath(repository)
 		if err != nil {
 			return "", err
 		}
@@ -324,13 +324,13 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 	branch := ""
 	branchRepository := repository
 	if repository != "" {
-		branch, _ = runGit(context.Background(), canonicalTarget, "branch", "--show-current")
+		branch, _ = runGit(context.Background(), resolvedTarget, "branch", "--show-current")
 		branchRepository, err = repositoryIdentity(repository)
 		if err != nil {
 			return "", err
 		}
 	}
-	unlockRepository, err := store.LockRepositoryAdmission(repositoryOrTarget(branchRepository, canonicalTarget))
+	unlockRepository, err := store.LockRepositoryAdmission(repositoryOrTarget(branchRepository, resolvedTarget))
 	if err != nil {
 		return "", err
 	}
@@ -343,13 +343,13 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 		}
 		defer unlockBranch()
 	}
-	if info, err := os.Stat(canonicalTarget); err != nil || !info.IsDir() {
+	if info, err := os.Stat(resolvedTarget); err != nil || !info.IsDir() {
 		return "", fmt.Errorf("target must be an existing directory")
 	}
-	if isWithin(canonicalTarget, store.Root()) {
-		return "", fmt.Errorf("job state directory %s must be outside target directory %s", store.Root(), canonicalTarget)
+	if isWithin(resolvedTarget, store.Root()) {
+		return "", fmt.Errorf("job state directory %s must be outside target directory %s", store.Root(), resolvedTarget)
 	}
-	unlock, err := store.LockTargetAdmission(canonicalTarget)
+	unlock, err := store.LockTargetAdmission(resolvedTarget)
 	if err != nil {
 		return "", err
 	}
@@ -359,7 +359,7 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 		return "", err
 	}
 	for _, job := range jobs {
-		if job.TargetPath != canonicalTarget || isTerminalStatus(job.Status) {
+		if job.TargetPath != resolvedTarget || isTerminalStatus(job.Status) {
 			continue
 		}
 		stale, err := store.reconcileOrphan(job)
@@ -367,7 +367,7 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 			return "", err
 		}
 		if !stale {
-			return "", fmt.Errorf("active job %s already targets %s", job.ID, canonicalTarget)
+			return "", fmt.Errorf("active job %s already targets %s", job.ID, resolvedTarget)
 		}
 	}
 	id, err := newJobID()
@@ -378,7 +378,7 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 	workBranch := ""
 	targetHead := ""
 	if jobType == implementationJobType && repository != "" && branch != "" {
-		targetHead, err = runGit(context.Background(), canonicalTarget, "rev-parse", "HEAD")
+		targetHead, err = runGit(context.Background(), resolvedTarget, "rev-parse", "HEAD")
 		if err != nil {
 			return "", err
 		}
@@ -393,12 +393,12 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 		if err != nil {
 			return "", err
 		}
-		worktree, workBranch, err = createImplementationWorktreeAtParent(repository, canonicalTarget, targetHead, slug, id, worktreeParent)
+		worktree, workBranch, err = createImplementationWorktreeAtParent(repository, resolvedTarget, targetHead, slug, id, worktreeParent)
 		if err != nil {
 			return "", err
 		}
 	}
-	job := JobRecord{ID: id, Type: jobType, TaskDescription: description, TargetPath: canonicalTarget, RepositoryPath: branchRepository, TargetBranch: branch, TargetHead: targetHead, Worktree: worktree, WorkBranch: workBranch, Status: "queued"}
+	job := JobRecord{ID: id, Type: jobType, TaskDescription: description, TargetPath: resolvedTarget, RepositoryPath: branchRepository, TargetBranch: branch, TargetHead: targetHead, Worktree: worktree, WorkBranch: workBranch, Status: "queued"}
 	if err := store.CreateJob(job); err != nil {
 		if worktree != "" {
 			_, _ = runGit(context.Background(), repository, "worktree", "remove", "--force", worktree)
@@ -434,9 +434,9 @@ func RunJobWorker(id, root string) error {
 	if !filepath.IsAbs(root) {
 		return fmt.Errorf("job state root must be absolute")
 	}
-	canonicalRoot, err := canonicalPath(root)
-	if err != nil || canonicalRoot != root {
-		return fmt.Errorf("job state root must be canonical")
+	resolvedRoot, err := resolvedPath(root)
+	if err != nil || resolvedRoot != root {
+		return fmt.Errorf("job state root must use its resolved path")
 	}
 	rootInfo, err := os.Stat(root)
 	if err != nil || !rootInfo.IsDir() || rootInfo.Mode().Perm()&0o077 != 0 {

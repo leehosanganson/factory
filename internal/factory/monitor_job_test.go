@@ -67,7 +67,7 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing
 	if job.Monitor == nil || job.Monitor.ID != id || job.Monitor.Repo != "team/fork" {
 		t.Fatalf("canonical monitor state missing from job record: %+v", job.Monitor)
 	}
-	wantParent := canonicalTestPath(t, filepath.Join(filepath.Dir(repo), filepath.Base(repo)+".worktrees"))
+	wantParent := resolvedTestPath(t, filepath.Join(filepath.Dir(repo), filepath.Base(repo)+".worktrees"))
 	if job.Monitor.WorktreeParent != wantParent {
 		t.Fatalf("registered monitor worktree parent = %q, want %q", job.Monitor.WorktreeParent, wantParent)
 	}

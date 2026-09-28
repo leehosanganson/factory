@@ -64,7 +64,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("clean interrupted: %w", err)
 	}
-	root, err := canonicalPath(w.Workdir)
+	root, err := resolvedPath(w.Workdir)
 	if err != nil {
 		return fmt.Errorf("resolve target directory: %w", err)
 	}
@@ -73,7 +73,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 	if stateErr != nil {
 		return stateErr
 	}
-	stateRoot, stateErr = canonicalPath(stateRoot)
+	stateRoot, stateErr = resolvedPath(stateRoot)
 	if stateErr != nil {
 		return fmt.Errorf("resolve clean state directory: %w", stateErr)
 	}
@@ -156,7 +156,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 			return fmt.Errorf("create pristine clean worktree: cleanup function is required")
 		}
 		cleanupWorktree = cleanup
-		root, err = canonicalPath(isolatedRoot)
+		root, err = resolvedPath(isolatedRoot)
 		if err != nil {
 			return errors.Join(fmt.Errorf("resolve pristine worktree: %w", err), cleanupWorktree())
 		}

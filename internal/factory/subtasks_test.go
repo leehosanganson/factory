@@ -66,15 +66,15 @@ func TestParallelImplementationRecognizesSymlinkedTemporaryRoot(t *testing.T) {
 	}
 
 	root, eligible, err := parallelImplementationEligible(alias)
-	if err != nil || !eligible || !sameCanonicalTestPath(t, root, alias) {
-		t.Fatalf("symlinked Git root eligibility = %q, %v, %v; want eligible canonical root", root, eligible, err)
+	if err != nil || !eligible || !sameResolvedTestPath(t, root, alias) {
+		t.Fatalf("symlinked Git root eligibility = %q, %v, %v; want eligible resolved root", root, eligible, err)
 	}
 }
 
 func TestParallelImplementationRequiresCleanGitRootAndFallsBackOtherwise(t *testing.T) {
 	dir := initTestGitRepo(t)
 	root, eligible, err := parallelImplementationEligible(dir)
-	if err != nil || !eligible || !sameCanonicalTestPath(t, root, dir) {
+	if err != nil || !eligible || !sameResolvedTestPath(t, root, dir) {
 		t.Fatalf("clean git repository eligibility = %q, %v, %v; want eligible root", root, eligible, err)
 	}
 	if _, eligible, err := parallelImplementationEligible(filepath.Dir(dir)); err != nil || eligible {
@@ -495,7 +495,7 @@ func (a *parallelWorkflowAgent) RunWithOutputContext(ctx context.Context, stage,
 
 func initTestGitRepo(t *testing.T) string {
 	t.Helper()
-	dir := canonicalTestPath(t, t.TempDir())
+	dir := resolvedTestPath(t, t.TempDir())
 	for _, args := range [][]string{{"init", "-q", dir}, {"-C", dir, "config", "user.email", "factory-test@example.invalid"}, {"-C", dir, "config", "user.name", "Factory Test"}} {
 		cmd := exec.Command("git", args...)
 		if output, err := cmd.CombinedOutput(); err != nil {

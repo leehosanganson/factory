@@ -77,11 +77,11 @@ func parallelImplementationEligible(workdir string) (string, bool, error) {
 	if err != nil {
 		return "", false, nil
 	}
-	root, err = canonicalPath(strings.TrimSpace(root))
+	root, err = resolvedPath(strings.TrimSpace(root))
 	if err != nil {
 		return "", false, err
 	}
-	target, err := canonicalPath(workdir)
+	target, err := resolvedPath(workdir)
 	if err != nil {
 		return "", false, err
 	}

@@ -46,7 +46,7 @@ func TestValidateWorktreeParentRejectsPrimaryAndInvokingLinkedCheckout(t *testin
 			t.Errorf("parent inside checkout %q was accepted", checkout)
 		}
 	}
-	if got, err := validateWorktreeParent(outside, primary, linked); err != nil || got != canonicalTestPath(t, outside) {
+	if got, err := validateWorktreeParent(outside, primary, linked); err != nil || got != resolvedTestPath(t, outside) {
 		t.Fatalf("external parent = %q, err=%v", got, err)
 	}
 	alias := filepath.Join(base, "worktree-alias")
