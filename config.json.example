@@ -9,6 +9,7 @@
   ],
   "prompt_dir": "",
   "state_dir": "",
+  "worktree_parent": "../{repo}.worktrees",
   "agent_timeout": "60m",
   "monitor_timeout": "",
   "pipeline_checks": [

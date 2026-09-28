@@ -14,7 +14,7 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 || cfg.MonitorTimeout != "" {
+	if cfg.Command != "pi" || strings.Join(cfg.Args, " ") != "-p --no-session --append-system-prompt {system_prompt} {task}" || len(cfg.PipelineChecks) != 0 || cfg.MonitorTimeout != "" || cfg.WorktreeParent != defaultWorktreeParent {
 		t.Fatalf("unexpected default config: %#v", cfg)
 	}
 	if timeout, err := cfg.agentTimeout(); err != nil || timeout != 60*time.Minute {
@@ -27,6 +27,8 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 		`{"command":"pi","args":["{task}","{system_prompt}"],"unexpected":true}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"]} {}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"],"state_dir":"relative"}`,
+		`{"command":"pi","args":["{task}","{system_prompt}"],"worktree_parent":"  "}`,
+		`{"command":"pi","args":["{task}","{system_prompt}"],"worktree_parent":"bad\u0000path"}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[[]]}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[["", "arg"]]}`,
 		`{"command":"pi","args":["{task}","{system_prompt}"],"pipeline_checks":[["make", "bad\u0000arg"]]}`,
@@ -210,7 +212,7 @@ func TestConfigPathHonorsXDGAndRequiresAbsolute(t *testing.T) {
 func TestLoadMonitorPromptExternalOverridesAndEmbeddedFallback(t *testing.T) {
 	dir := t.TempDir()
 	prompt, err := LoadPrompt(dir, "monitor")
-	if err != nil || !strings.Contains(prompt, "FACTORY_STATUS=FIXED") || !strings.Contains(prompt, "re-derives and validates") || !strings.Contains(prompt, "snapshot guards") {
+	if err != nil || !strings.Contains(prompt, "FACTORY_STATUS=FIXED") || !strings.Contains(prompt, "independently deriving changed paths") || !strings.Contains(prompt, "low-risk routine fixes automatically") || !strings.Contains(prompt, "pauses after three failed automatic actions") || !strings.Contains(prompt, "live PR/check snapshot guard") {
 		t.Fatalf("embedded monitor prompt = %q, %v", prompt, err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "monitor.md"), []byte(" custom monitor prompt "), 0o600); err != nil {

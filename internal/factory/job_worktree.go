@@ -3,6 +3,7 @@ package factory
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -28,9 +29,31 @@ func createImplementationWorktree(stateRoot, repository, target, head, descripti
 }
 
 func createImplementationWorktreeWithSlug(stateRoot, repository, target, head, slug, id string) (string, string, error) {
-	name := implementationJobName(slug, id)
-	branch := "factory-job-" + name
-	worktree := filepath.Join(stateRoot, name)
+	return createImplementationWorktreeAtParent(repository, target, head, slug, id, stateRoot)
+}
+
+func createImplementationWorktreeAtParent(repository, target, head, slug, id, parent string) (string, string, error) {
+	branch := "factory-job-" + implementationJobSlug(slug) + "-" + id
+	primary, err := primaryWorktree(repository)
+	if err != nil {
+		return "", "", err
+	}
+	parent, err = validateWorktreeParent(parent, primary, target)
+	if err != nil {
+		return "", "", err
+	}
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return "", "", fmt.Errorf("create worktree parent: %w", err)
+	}
+	parent, err = validateWorktreeParent(parent, primary, target)
+	if err != nil {
+		return "", "", err
+	}
+	name, err := availableJobWorktreeName(parent, slug, id, "")
+	if err != nil {
+		return "", "", err
+	}
+	worktree := filepath.Join(parent, name)
 	if _, err := runGit(context.Background(), repository, "worktree", "add", "-b", branch, worktree, head); err != nil {
 		return "", "", fmt.Errorf("create isolated implementation worktree: %w", err)
 	}

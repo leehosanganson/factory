@@ -385,7 +385,15 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 		proposalLog := filepath.Join(store.Root(), id+"-slug.log")
 		slug := implementationJobSlugWithFallback(context.Background(), Runner{Config: cfg}, description, store.Root(), proposalLog)
 		_ = os.Remove(proposalLog)
-		worktree, workBranch, err = createImplementationWorktreeWithSlug(store.Root(), repository, canonicalTarget, targetHead, slug, id)
+		primary, err := primaryWorktree(repository)
+		if err != nil {
+			return "", err
+		}
+		worktreeParent, err := resolveWorktreeParent(cfg.WorktreeParent, primary)
+		if err != nil {
+			return "", err
+		}
+		worktree, workBranch, err = createImplementationWorktreeAtParent(repository, canonicalTarget, targetHead, slug, id, worktreeParent)
 		if err != nil {
 			return "", err
 		}

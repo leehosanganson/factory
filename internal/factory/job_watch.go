@@ -11,9 +11,13 @@ import (
 const jobWatchPollInterval = time.Second
 
 type watchedJob struct {
-	ID       string
-	Status   string
-	Activity string
+	ID                string
+	Status            string
+	Activity          string
+	Phase             string
+	LatestCheckAt     time.Time
+	LatestCheckResult string
+	RecentEvents      []monitorTraceEvent
 }
 
 func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer, terminal bool, interval time.Duration) error {
@@ -32,7 +36,14 @@ func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer
 			if err != nil {
 				return fmt.Errorf("watch job %s: %w", id, err)
 			}
-			jobs = append(jobs, watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity})
+			watched := watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity}
+			if job.Monitor != nil {
+				watched.Phase = monitorDisplayPhase(job.Monitor)
+				watched.LatestCheckAt = job.Monitor.LatestCheckAt
+				watched.LatestCheckResult = job.Monitor.LatestCheckResult
+				watched.RecentEvents = append([]monitorTraceEvent(nil), job.Monitor.RecentEvents...)
+			}
+			jobs = append(jobs, watched)
 			if !isTerminalStatus(job.Status) {
 				allTerminal = false
 			}
@@ -49,6 +60,30 @@ func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer
 		case <-ticker.C:
 		}
 	}
+}
+
+func writeMonitorRecentEvents(out io.Writer, events []monitorTraceEvent, indent string) error {
+	start := 0
+	if len(events) > monitorRecentEventLimit {
+		start = len(events) - monitorRecentEventLimit
+	}
+	if _, err := fmt.Fprintf(out, "%sRecent monitor events:\n", indent); err != nil {
+		return err
+	}
+	if len(events) == 0 {
+		_, err := fmt.Fprintf(out, "%s  (none)\n", indent)
+		return err
+	}
+	for _, event := range events[start:] {
+		at := "unknown time"
+		if !event.At.IsZero() {
+			at = event.At.Local().Format("15:04:05")
+		}
+		if _, err := fmt.Fprintf(out, "%s  %s %s: %s\n", indent, at, event.Phase, conciseMonitorEvent(event.Message)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func uniqueJobIDs(ids []string) []string {
@@ -76,6 +111,25 @@ func writeJobWatchSnapshot(out io.Writer, jobs []watchedJob, terminal bool) erro
 	for _, job := range jobs {
 		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n  Latest activity: %s\n", job.ID, job.Status, strings.TrimSpace(job.Activity)); err != nil {
 			return err
+		}
+		if job.Phase != "" {
+			if _, err := fmt.Fprintf(out, "  Monitor phase: %s\n", job.Phase); err != nil {
+				return err
+			}
+			checkAt := "never"
+			if !job.LatestCheckAt.IsZero() {
+				checkAt = job.LatestCheckAt.UTC().Format(time.RFC3339)
+			}
+			result := job.LatestCheckResult
+			if result == "" {
+				result = "unavailable"
+			}
+			if _, err := fmt.Fprintf(out, "  Latest successful PR/check query: %s (%s)\n", checkAt, result); err != nil {
+				return err
+			}
+			if err := writeMonitorRecentEvents(out, job.RecentEvents, "  "); err != nil {
+				return err
+			}
 		}
 	}
 	if !terminal {

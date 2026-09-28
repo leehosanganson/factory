@@ -207,7 +207,8 @@ func finishMonitorWorkerLockTimeout(root, id string) (bool, error) {
 	now := time.Now().UTC()
 	setLifecycleTimes(job.Status, "stopped", &job.StartedAt, &job.EndedAt)
 	job.Status, job.UpdatedAt = "stopped", now
-	monitor.Status, monitor.LastEvent, monitor.UpdatedAt = "stopped", message, now
+	monitor.Status, monitor.Phase, monitor.UpdatedAt = "stopped", "stopped", now
+	recordMonitorRecentEvent(monitor, monitor.Phase, message, now)
 	session, err := store.GetSession(id, monitorSessionID)
 	if err != nil {
 		return false, err

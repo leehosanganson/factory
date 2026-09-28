@@ -415,7 +415,7 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 	if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.started", Stage: stage, Message: stageLog}); err != nil {
 		return false, err
 	}
-	progress := startProgress(w.Out, w.Terminal, stage, stageLog)
+	progress := startWorkflowProgress(w.Out, w.Terminal, stage, stageLog, runDir)
 	runErr := runWithProgress(progress, func() error {
 		statusWorkflow := w
 		statusWorkflow.ProcessObserver = w.ProcessObserver

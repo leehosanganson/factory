@@ -10,4 +10,6 @@ Parallel implementation is disabled by default. Set `parallel_implementation.ena
 
 This is guarded output integration, not a security sandbox: agents and external processes may have access beyond worker worktrees. Parallel implementation is not general concurrency control for arbitrary tasks or chained jobs.
 
+Implementation detached worktrees use the configurable `worktree_parent` template (default `../{repo}.worktrees`); `{repo}` is the primary checkout basename, and relative templates resolve from that checkout. The parent must be outside both the primary and invoking checkouts. Folder names use a four-character hexadecimal job-ID prefix plus a safe slug, extending the prefix if that name already exists; branch names keep the full ID.
+
 See the [configuration example](../../config.json.example), [job lifecycle](jobs.md), and [Factory operating skill](../../.agents/skills/factory/SKILL.md).

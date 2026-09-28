@@ -43,43 +43,57 @@ var (
 var monitorIDPattern = regexp.MustCompile(`^(?:[0-9]{8}T[0-9]{6}-[a-f0-9]{12}|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$`)
 
 type monitorJob struct {
-	ID                 string    `json:"id"`
-	Description        string    `json:"description"`
-	RepoRoot           string    `json:"repo_root"`
-	Repo               string    `json:"repo"`
-	PR                 int       `json:"pr"`
-	HeadRepo           string    `json:"head_repo"`
-	HeadBranch         string    `json:"head_branch"`
-	BaseRepo           string    `json:"base_repo"`
-	BaseBranch         string    `json:"base_branch"`
-	BaseSHA            string    `json:"base_sha"`
-	HeartbeatPath      string    `json:"heartbeat_path,omitempty"`
-	OriginURL          string    `json:"origin_url"`
-	HeadRepoURL        string    `json:"head_repo_url"`
-	BaselineHead       string    `json:"baseline_head"`
-	TargetBaseline     string    `json:"target_baseline"`
-	TargetBranch       string    `json:"target_branch,omitempty"`
-	OwnWorktree        bool      `json:"own_worktree,omitempty"`
-	Worktree           string    `json:"worktree,omitempty"`
-	WorkerBranch       string    `json:"worker_branch,omitempty"`
-	Status             string    `json:"status"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
-	LastEvent          string    `json:"last_event,omitempty"`
-	Snapshot           string    `json:"snapshot,omitempty"`
-	PendingSignature   string    `json:"pending_signature,omitempty"`
-	Proposal           string    `json:"proposal,omitempty"`
-	ApprovalScope      string    `json:"approval_scope,omitempty"`
-	ApprovalSignature  string    `json:"approval_signature,omitempty"`
-	RejectedSignature  string    `json:"rejected_signature,omitempty"`
-	Attempts           int       `json:"attempts,omitempty"`
-	AttemptsSignature  string    `json:"attempts_signature,omitempty"`
-	ProcessedSignature string    `json:"processed_signature,omitempty"`
-	PID                int       `json:"pid,omitempty"`
-	Heartbeat          time.Time `json:"heartbeat,omitempty"`
-	StopRequested      bool      `json:"stop_requested,omitempty"`
-	SnapshotFailures   int       `json:"snapshot_failures,omitempty"`
-	DeadlineAt         time.Time `json:"deadline_at,omitempty"`
+	ID                 string              `json:"id"`
+	Description        string              `json:"description"`
+	RepoRoot           string              `json:"repo_root"`
+	Repo               string              `json:"repo"`
+	PR                 int                 `json:"pr"`
+	HeadRepo           string              `json:"head_repo"`
+	HeadBranch         string              `json:"head_branch"`
+	BaseRepo           string              `json:"base_repo"`
+	BaseBranch         string              `json:"base_branch"`
+	BaseSHA            string              `json:"base_sha"`
+	HeartbeatPath      string              `json:"heartbeat_path,omitempty"`
+	OriginURL          string              `json:"origin_url"`
+	HeadRepoURL        string              `json:"head_repo_url"`
+	BaselineHead       string              `json:"baseline_head"`
+	TargetBaseline     string              `json:"target_baseline"`
+	TargetBranch       string              `json:"target_branch,omitempty"`
+	OwnWorktree        bool                `json:"own_worktree,omitempty"`
+	WorktreeParent     string              `json:"worktree_parent,omitempty"`
+	Worktree           string              `json:"worktree,omitempty"`
+	WorkerBranch       string              `json:"worker_branch,omitempty"`
+	Status             string              `json:"status"`
+	Phase              string              `json:"phase,omitempty"`
+	CreatedAt          time.Time           `json:"created_at"`
+	UpdatedAt          time.Time           `json:"updated_at"`
+	LastEvent          string              `json:"last_event,omitempty"`
+	RecentEvents       []monitorTraceEvent `json:"recent_events,omitempty"`
+	LatestCheckAt      time.Time           `json:"latest_check_at,omitempty"`
+	LatestCheckResult  string              `json:"latest_check_result,omitempty"`
+	Snapshot           string              `json:"snapshot,omitempty"`
+	PendingSignature   string              `json:"pending_signature,omitempty"`
+	Proposal           string              `json:"proposal,omitempty"`
+	ApprovalScope      string              `json:"approval_scope,omitempty"`
+	ApprovalSignature  string              `json:"approval_signature,omitempty"`
+	RejectedSignature  string              `json:"rejected_signature,omitempty"`
+	Attempts           int                 `json:"attempts,omitempty"`
+	AttemptsSignature  string              `json:"attempts_signature,omitempty"`
+	ProcessedSignature string              `json:"processed_signature,omitempty"`
+	PID                int                 `json:"pid,omitempty"`
+	Heartbeat          time.Time           `json:"heartbeat,omitempty"`
+	StopRequested      bool                `json:"stop_requested,omitempty"`
+	SnapshotFailures   int                 `json:"snapshot_failures,omitempty"`
+	DeadlineAt         time.Time           `json:"deadline_at,omitempty"`
+}
+
+const monitorRecentEventLimit = 12
+
+// monitorTraceEvent is a concise, bounded status transition retained for observers.
+type monitorTraceEvent struct {
+	At      time.Time `json:"at"`
+	Phase   string    `json:"phase"`
+	Message string    `json:"message"`
 }
 
 type monitorSnapshot struct {
@@ -195,11 +209,92 @@ func monitorEvent(dir string, job *monitorJob, message string) error {
 	if err := appendMonitorLog(dir, message); err != nil {
 		return err
 	}
-	job.LastEvent = message
+	if isTerminalStatus(job.Status) || job.Status == "recoverable_failure" {
+		job.Phase = monitorPhaseForStatus(job.Status)
+	} else if job.PendingSignature != "" && job.Proposal != "" && job.ApprovalSignature != job.PendingSignature {
+		job.Phase = "approval_pending"
+	} else if job.Phase == "" {
+		job.Phase = monitorPhaseForStatus(job.Status)
+	}
+	now := time.Now().UTC()
+	recordMonitorRecentEvent(job, job.Phase, message, now)
 	if err := writeMonitorJob(dir, job); err != nil {
 		return err
 	}
 	return syncMonitorJobEvent(dir, job)
+}
+
+func monitorPhaseForStatus(status string) string {
+	switch status {
+	case "queued":
+		return "starting"
+	case "recoverable_failure":
+		return "recoverable_failure"
+	case "complete":
+		return "complete"
+	case "closed":
+		return "closed"
+	case "stopped", "cancelled":
+		return "stopped"
+	case "failed", "interrupted":
+		return "failed"
+	default:
+		return "polling"
+	}
+}
+
+func conciseMonitorEvent(message string) string {
+	message = strings.Join(strings.Fields(terminalSafeText(message)), " ")
+	if len(message) > 180 {
+		message = truncateUTF8(message, 177) + "…"
+	}
+	return message
+}
+
+func recordMonitorRecentEvent(job *monitorJob, phase, message string, at time.Time) {
+	job.LastEvent = message
+	job.RecentEvents = append(job.RecentEvents, monitorTraceEvent{At: at, Phase: phase, Message: conciseMonitorEvent(message)})
+	if len(job.RecentEvents) > monitorRecentEventLimit {
+		job.RecentEvents = append([]monitorTraceEvent(nil), job.RecentEvents[len(job.RecentEvents)-monitorRecentEventLimit:]...)
+	}
+}
+
+func setMonitorPhase(dir string, job *monitorJob, phase, message string) error {
+	if job.Phase == phase {
+		return nil
+	}
+	job.Phase = phase
+	now := time.Now().UTC()
+	recordMonitorRecentEvent(job, phase, message, now)
+	return writeMonitorJob(dir, job)
+}
+
+func monitorCheckSummary(raw json.RawMessage) string {
+	var checks []map[string]any
+	if json.Unmarshal(raw, &checks) != nil {
+		return "check results unavailable"
+	}
+	passed, failed, pending, neutral := 0, 0, 0, 0
+	for _, check := range checks {
+		state := ""
+		for _, key := range []string{"conclusion", "state"} {
+			if value, ok := check[key].(string); ok && value != "" {
+				state = strings.ToUpper(value)
+				break
+			}
+		}
+		switch state {
+		case "SUCCESS", "SUCCEEDED":
+			passed++
+		case "FAILURE", "FAILED", "TIMED_OUT", "ERROR", "ACTION_REQUIRED":
+			failed++
+		case "NEUTRAL", "SKIPPED":
+			neutral++
+		default:
+			pending++
+		}
+	}
+	return fmt.Sprintf("%d passed, %d failed, %d pending, %d neutral/skipped", passed, failed, pending, neutral)
 }
 
 func loadJobs(root string) ([]monitorJob, error) {
@@ -572,7 +667,12 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "ID: %s\nStatus: %s\nRepository: %s\nPR: #%d\nBranch: %s\n", job.ID, job.Status, job.Repo, job.PR, job.HeadBranch)
+		if _, err := fmt.Fprintf(out, "ID: %s\nStatus: %s\nRepository: %s\nPR: #%d\nBranch: %s\n", job.ID, job.Status, job.Repo, job.PR, job.HeadBranch); err != nil {
+			return err
+		}
+		if err := writeMonitorStatus(out, job); err != nil {
+			return err
+		}
 		if !details {
 			return nil
 		}
@@ -602,6 +702,43 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 	default:
 		return startMonitor(args, cfg, workdir, root, out)
 	}
+}
+
+func writeMonitorStatus(out io.Writer, job *monitorJob) error {
+	phase := monitorDisplayPhase(job)
+	if _, err := fmt.Fprintf(out, "Phase: %s\n", phase); err != nil {
+		return err
+	}
+	checkAt := "never"
+	if !job.LatestCheckAt.IsZero() {
+		checkAt = job.LatestCheckAt.UTC().Format(time.RFC3339)
+	}
+	checkResult := job.LatestCheckResult
+	if checkResult == "" {
+		checkResult = "unavailable"
+	}
+	if _, err := fmt.Fprintf(out, "Latest successful PR/check query: %s (%s)\n", checkAt, checkResult); err != nil {
+		return err
+	}
+	if job.PendingSignature != "" && job.Proposal != "" && job.ApprovalSignature != job.PendingSignature {
+		if _, err := fmt.Fprintf(out, "Approval pending: %s\n", conciseMonitorEvent(job.Proposal)); err != nil {
+			return err
+		}
+	}
+	return writeMonitorRecentEvents(out, job.RecentEvents, "")
+}
+
+func monitorDisplayPhase(job *monitorJob) string {
+	if isTerminalStatus(job.Status) || job.Status == "recoverable_failure" {
+		return monitorPhaseForStatus(job.Status)
+	}
+	if job.PendingSignature != "" && job.Proposal != "" && job.ApprovalSignature != job.PendingSignature {
+		return "approval_pending"
+	}
+	if job.Phase != "" {
+		return job.Phase
+	}
+	return monitorPhaseForStatus(job.Status)
 }
 
 func findMonitorJob(root, id string) (*monitorJob, string, error) {
@@ -786,6 +923,7 @@ func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 	switch action {
 	case "stop":
 		job.StopRequested = true
+		job.Phase = "stopping"
 		store, err := NewJobStore(root)
 		if err != nil {
 			return err
@@ -837,6 +975,7 @@ func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 			return fmt.Errorf("job has no pending proposal")
 		}
 		job.RejectedSignature = job.PendingSignature
+		job.Phase = "polling"
 		job.PendingSignature = ""
 		job.Proposal = ""
 		job.ApprovalScope = ""
@@ -847,6 +986,7 @@ func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 		if job.PendingSignature == "" || job.Proposal == "" {
 			return fmt.Errorf("job has no pending proposal")
 		}
+		fmt.Fprintf(out, "Pending proposal for %s:\n%s\n", id, job.Proposal)
 		fmt.Fprintf(out, "Approve proposal for %s? Type exact lowercase y: ", id)
 		reader := bufio.NewReader(in)
 		answer, _ := reader.ReadString('\n')
@@ -866,9 +1006,11 @@ func monitorAction(action, root, id string, cfg Config, in io.Reader, out io.Wri
 			job.ApprovalScope = ""
 			job.ApprovalSignature = ""
 			job.Status = "running"
+			job.Phase = "polling"
 			_ = monitorEvent(dir, job, "Approval invalidated: live PR/check snapshot changed.")
 			return fmt.Errorf("proposal snapshot changed; watcher must reassess")
 		}
+		job.Phase = "approval_scoped"
 		job.ApprovalScope = scope
 		job.ApprovalSignature = signature
 		job.RejectedSignature = ""
@@ -979,6 +1121,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 	}
 	job.PID = os.Getpid()
 	job.Status = "running"
+	job.Phase = "starting"
 	heartbeat := filepath.Join(dir, "heartbeat")
 	if err := os.WriteFile(heartbeat, nil, 0o600); err != nil {
 		return err
@@ -1054,6 +1197,9 @@ func runMonitorWorker(id, root string, cfg Config) error {
 	defer unlockBranch()
 	workerCtx = context.WithValue(workerCtx, monitorBranchLockContextKey{}, true)
 	interval := readPollInterval()
+	if err := setMonitorPhase(dir, job, "polling", "Polling the pull request and checks."); err != nil {
+		return err
+	}
 	attemptsBySignature := map[string]int{}
 	lastSignature := ""
 	for {
@@ -1109,6 +1255,9 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			}
 			job.SnapshotFailures++
 			_ = appendMonitorLog(dir, fmt.Sprintf("Transient GitHub query failure (%d/%d): %v", job.SnapshotFailures, monitorSnapshotMaxRetries, err))
+			if phaseErr := setMonitorPhase(dir, job, "retrying_snapshot", fmt.Sprintf("GitHub check failed (%d/%d); retrying.", job.SnapshotFailures, monitorSnapshotMaxRetries)); phaseErr != nil {
+				return phaseErr
+			}
 			if saveErr := saveMonitorJob(dir, job); saveErr != nil {
 				return saveErr
 			}
@@ -1127,17 +1276,24 @@ func runMonitorWorker(id, root string, cfg Config) error {
 		if workerCtx.Err() != nil {
 			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped after GitHub snapshot query.")
 		}
+		job.LatestCheckAt = time.Now().UTC()
+		job.LatestCheckResult = monitorCheckSummary(snapshot.StatusCheckRollup)
 		if job.SnapshotFailures != 0 {
 			job.SnapshotFailures = 0
-			if err := saveMonitorJob(dir, job); err != nil {
-				return err
-			}
+		}
+		if err := saveMonitorJob(dir, job); err != nil {
+			return err
+		}
+		if err := setMonitorPhase(dir, job, "polling", "PR/check snapshot refreshed: "+job.LatestCheckResult+"."); err != nil {
+			return err
 		}
 		if strings.EqualFold(snapshot.State, "MERGED") || strings.EqualFold(snapshot.State, "CLOSED") {
 			if strings.EqualFold(snapshot.State, "MERGED") {
 				job.Status = "complete"
+				job.Phase = "complete"
 			} else {
 				job.Status = "closed"
+				job.Phase = "closed"
 			}
 			return monitorEvent(dir, job, "PR is "+strings.ToLower(snapshot.State)+"; monitoring stopped.")
 		}
@@ -1153,6 +1309,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 				job.ApprovalScope = ""
 				job.ApprovalSignature = ""
 				job.Status = "running"
+				job.Phase = "polling"
 				_ = monitorEvent(dir, job, "Pending approval invalidated because PR/check snapshot changed.")
 			}
 			if job.ApprovalSignature != "" && job.ApprovalSignature != signature {
@@ -1166,13 +1323,19 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			}
 			lastSignature = signature
 		}
-		if job.PendingSignature != "" && job.Proposal != "" {
+		if job.PendingSignature != "" && job.Proposal != "" && job.ApprovalSignature != signature {
+			if err := setMonitorPhase(dir, job, "approval_pending", "Paused for explicit human approval."); err != nil {
+				return err
+			}
 			if !sleepMonitorContext(workerCtx, dir, interval) {
 				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting for approval.")
 			}
 			continue
 		}
 		if job.RejectedSignature != "" && signature == job.RejectedSignature {
+			if err := setMonitorPhase(dir, job, "polling", "Waiting for a new PR event after rejection."); err != nil {
+				return err
+			}
 			if !sleepMonitorContext(workerCtx, dir, interval) {
 				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting after rejection.")
 			}
@@ -1198,6 +1361,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 				job.Status = "running"
 				job.PendingSignature = signature
 				job.Proposal = "Automatic attempt cap (3) reached for unchanged PR/check snapshot."
+				job.Phase = "approval_pending"
 				_ = monitorEvent(dir, job, "Attempt cap reached; explicit approval required.")
 			}
 			if !sleepMonitorContext(workerCtx, dir, interval) {
@@ -1208,6 +1372,9 @@ func runMonitorWorker(id, root string, cfg Config) error {
 		if job.ApprovalSignature != "" && job.ApprovalSignature != signature {
 			job.ApprovalSignature = ""
 			job.ApprovalScope = ""
+		}
+		if err := setMonitorPhase(dir, job, "preparing_fix", "Starting an automatic routine-fix attempt."); err != nil {
+			return err
 		}
 		attemptsBySignature[signature]++
 		if job.ApprovalSignature == signature {
@@ -1224,6 +1391,9 @@ func runMonitorWorker(id, root string, cfg Config) error {
 				return finishMonitorLifecycle(dir, job, workerCtx, "Stopped during active monitor work.")
 			}
 			_ = appendMonitorLog(dir, "Event processing failed safely: "+err.Error())
+			if phaseErr := setMonitorPhase(dir, job, "retrying_action", "Routine action failed safely; retrying within the existing attempt cap."); phaseErr != nil {
+				return phaseErr
+			}
 			if job.ProcessedSignature == signature {
 				job.ProcessedSignature = ""
 			}
@@ -1235,6 +1405,11 @@ func runMonitorWorker(id, root string, cfg Config) error {
 			job.ApprovalSignature, job.ApprovalScope = "", ""
 			_ = saveMonitorJob(dir, job)
 		}
+		if job.PendingSignature == "" && job.Phase != "polling" {
+			if err := setMonitorPhase(dir, job, "polling", "Routine action finished; continuing to monitor."); err != nil {
+				return err
+			}
+		}
 		if !sleepMonitorContext(workerCtx, dir, interval) {
 			return finishMonitorLifecycle(dir, job, workerCtx, "Stopped while waiting for the next PR poll.")
 		}
@@ -1243,6 +1418,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 
 func finishMonitorLifecycle(dir string, job *monitorJob, ctx context.Context, explicitMessage string) error {
 	job.Status = "stopped"
+	job.Phase = "stopped"
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 		return monitorEvent(dir, job, "Monitor lifetime timeout reached; monitoring stopped.")
 	}
@@ -1397,7 +1573,7 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 		if err != nil {
 			return err
 		}
-		worktree, baseline, err := setupExistingPRWorktree(store, job.RepoRoot, job.HeadBranch, s.HeadRefOID, job.PR, job.ID)
+		worktree, baseline, err := setupExistingPRWorktreeAtParent(store, job.RepoRoot, job.HeadBranch, s.HeadRefOID, job.PR, job.ID, job.WorktreeParent)
 		if err != nil {
 			return err
 		}
@@ -1411,6 +1587,9 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 	}
 	worktree := job.Worktree
 	job.Status = "running"
+	if err := setMonitorPhase(dir, job, "agent_work", "Agent is inspecting the PR and making a routine fix."); err != nil {
+		return err
+	}
 	if err := saveMonitorJob(dir, job); err != nil {
 		return err
 	}
@@ -1463,7 +1642,7 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 	switch protocol {
 	case "NO_ACTION":
 		_ = appendMonitorLog(dir, "Agent reported no action.")
-		return nil
+		return setMonitorPhase(dir, job, "polling", "No routine fix was needed; continuing to monitor.")
 	case "APPROVAL_REQUIRED":
 		return pauseForApproval(dir, job, signature, proposal)
 	case "ERROR":
@@ -1472,13 +1651,16 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 	default:
 		return errors.New("agent omitted valid final protocol; no commit or push")
 	}
+	if err := setMonitorPhase(dir, job, "validating_fix", "Re-deriving changed paths and validating the proposed fix."); err != nil {
+		return err
+	}
 	changed, err := changedPaths(worktree)
 	if err != nil {
 		return err
 	}
 	if len(changed) == 0 {
 		_ = appendMonitorLog(dir, "FIXED response had no changes; no commit or push.")
-		return nil
+		return setMonitorPhase(dir, job, "polling", "No changes to publish; continuing to monitor.")
 	}
 	if stopped, err := jobStopped(dir); err != nil {
 		return err
@@ -1488,6 +1670,9 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 	}
 	captured, err := captureChangedState(worktree, changed)
 	if err != nil {
+		return err
+	}
+	if err := setMonitorPhase(dir, job, "guarded_publish", "Publishing only after all commit/push guards pass."); err != nil {
 		return err
 	}
 	if err := guardedCommitPushCaptured(ctx, dir, job, signature, s, changed, captured); err != nil {
@@ -1545,6 +1730,7 @@ func pauseForApproval(dir string, job *monitorJob, signature, proposal string) e
 		proposal = "Agent requested explicit human review; inspect the logs before approval."
 	}
 	job.Status = "running"
+	job.Phase = "approval_pending"
 	job.PendingSignature = signature
 	job.Proposal = proposal
 	job.ApprovalScope = ""
@@ -2100,6 +2286,7 @@ func guardedCommitPushCaptured(ctx context.Context, dir string, job *monitorJob,
 	job.PendingSignature = ""
 	job.Proposal = ""
 	job.Status = "running"
+	job.Phase = "polling"
 	job.ApprovalScope, job.ApprovalSignature = "", ""
 	return monitorEvent(dir, job, "Validated changed paths; committed and pushed guarded changes to "+job.HeadBranch+".")
 }

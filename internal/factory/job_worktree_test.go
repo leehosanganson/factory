@@ -41,17 +41,21 @@ func TestCreateImplementationWorktreeUsesReadableUniqueJobName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	parent := filepath.Join(filepath.Dir(repo), "configured-worktrees")
 	description := "Add/readable job names"
-	ids := []string{"stable-job-id-one", "stable-job-id-two"}
+	ids := []string{"a1b2c3d4-1111-4111-8111-111111111111", "b2c3d4e5-2222-4222-8222-222222222222"}
 	paths := make(map[string]bool)
 	branches := make(map[string]bool)
 	for _, id := range ids {
-		worktree, branch, err := createImplementationWorktree(stateRoot, repo, repo, head, description, id)
+		worktree, branch, err := createImplementationWorktreeAtParent(repo, repo, head, description, id, parent)
 		if err != nil {
 			t.Fatalf("create worktree for %s: %v", id, err)
 		}
-		if filepath.Base(worktree) != "add-readable-job-names-"+id {
-			t.Errorf("worktree directory = %q, want readable name with full id", filepath.Base(worktree))
+		if filepath.Base(worktree) != id[:4]+"-add-readable-job-names" {
+			t.Errorf("worktree directory = %q, want short ID and readable slug", filepath.Base(worktree))
+		}
+		if filepath.Dir(worktree) != parent {
+			t.Errorf("worktree parent = %q, want configured parent %q", filepath.Dir(worktree), parent)
 		}
 		if branch != "factory-job-add-readable-job-names-"+id {
 			t.Errorf("work branch = %q, want readable hyphenated namespace with full id", branch)
