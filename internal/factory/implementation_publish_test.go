@@ -31,7 +31,7 @@ func TestPublishImplementationCreatesCommitPushAndPRFromIsolatedChanges(t *testi
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", ghPath+string(os.PathListSeparator)+os.Getenv("PATH"))
-	result, err := publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "Add carefully", [][]string{{"make", "test"}})
+	result, err := publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "Add carefully", [][]string{{"make", "test"}})
 	if err != nil || !strings.Contains(result.Message, "Published implementation PR") || !strings.Contains(result.Message, "https://github.com/example/repo/pull/42") {
 		t.Fatalf("publication = %+v, %v", result, err)
 	}
@@ -62,7 +62,7 @@ func TestPublishImplementationNoopSkipsGitHubAndPush(t *testing.T) {
 	runPublishTestGit(t, "-C", target, "remote", "add", "origin", remote)
 	branch, worktree := "factory-implement-noop", filepath.Join(t.TempDir(), "worktree")
 	runPublishTestGit(t, "-C", target, "worktree", "add", "-b", branch, worktree, baseline)
-	result, err := publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "No changes", nil)
+	result, err := publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "No changes", nil)
 	if err != nil || !strings.Contains(result.Message, "no commit or PR") {
 		t.Fatalf("no-op = %+v, %v", result, err)
 	}
@@ -83,7 +83,7 @@ func TestPublishImplementationRejectsRemoteBranchCollision(t *testing.T) {
 		t.Fatal(err)
 	}
 	runPublishTestGit(t, "-C", worktree, "push", "origin", "HEAD:refs/heads/"+branch)
-	_, err := publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "Collision", nil)
+	_, err := publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "Collision", nil)
 	if err == nil || !strings.Contains(err.Error(), "already exists") || !strings.Contains(err.Error(), "switch -c") || !strings.Contains(err.Error(), "gh pr create --head") {
 		t.Fatalf("remote collision recovery = %v", err)
 	}
@@ -130,7 +130,7 @@ exit "$status"
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", wrapperDir+string(os.PathListSeparator)+ghPath+string(os.PathListSeparator)+os.Getenv("PATH"))
-	_, err = publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "Race", nil)
+	_, err = publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "Race", nil)
 	if err == nil || !strings.Contains(err.Error(), "push failed") || !strings.Contains(err.Error(), "retained locally") {
 		t.Fatalf("concurrent branch creation should refuse publication and retain commit: %v", err)
 	}
@@ -157,7 +157,7 @@ func TestPublishImplementationStaleBaselineDoesNotCommitOrPush(t *testing.T) {
 	}
 	runPublishTestGit(t, "-C", target, "add", "concurrent.txt")
 	runPublishTestGit(t, "-C", target, "commit", "-m", "advance")
-	_, err := publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "Stale task", nil)
+	_, err := publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "Stale task", nil)
 	if err == nil || !strings.Contains(err.Error(), "baseline changed") {
 		t.Fatalf("stale error = %v", err)
 	}
@@ -199,7 +199,7 @@ func TestPublishImplementationMissingPrerequisitesRetainCommitWithoutPushAndGive
 				}
 				t.Cleanup(func() { implementationLookPath = oldLookPath })
 			}
-			_, err := publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "Recover prerequisites", nil)
+			_, err := publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "Recover prerequisites", nil)
 			if err == nil || !strings.Contains(err.Error(), "no push was made") || !strings.Contains(err.Error(), "push --force-with-lease") || !strings.Contains(err.Error(), "gh pr create") {
 				t.Fatalf("recovery details = %v", err)
 			}
@@ -233,7 +233,7 @@ func TestPublishImplementationPRFailureRetainsPushedCommitAndRecoveryDetails(t *
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", ghPath+string(os.PathListSeparator)+os.Getenv("PATH"))
-	_, err := publishImplementation(context.Background(), worktree, target, baseline, "main", branch, "Recover me", nil)
+	_, err := publishImplementation(context.Background(), worktree, target, baseline, publishTestTargetBranch(t, target), branch, "Recover me", nil)
 	if err == nil || !strings.Contains(err.Error(), "PR creation failed") || !strings.Contains(err.Error(), "Commit:") || !strings.Contains(err.Error(), "gh pr create") {
 		t.Fatalf("recovery = %v", err)
 	}
@@ -481,6 +481,11 @@ func TestRunAutomaticImplementationPreservesWorktreeWhenPublicationIsUnavailable
 	if info, err := os.Stat(worktreePath); err != nil || !info.IsDir() {
 		t.Fatalf("unpublished recovery worktree was not preserved at %s: %v", worktreePath, err)
 	}
+}
+
+func publishTestTargetBranch(t *testing.T, target string) string {
+	t.Helper()
+	return strings.TrimSpace(runPublishTestGit(t, "-C", target, "symbolic-ref", "--quiet", "--short", "HEAD"))
 }
 
 func runPublishTestGit(t *testing.T, args ...string) string {
