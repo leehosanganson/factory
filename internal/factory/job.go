@@ -90,11 +90,12 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		if err != nil {
 			return err
 		}
-		writeJobSummary(out, store, job, details)
-		if details {
-			return writeJobDetails(out, store, job)
+		if !details {
+			writeJobTable(out, store, []JobRecord{job})
+			return nil
 		}
-		return nil
+		writeJobSummary(out, store, job, true)
+		return writeJobDetails(out, store, job)
 	case "watch":
 		return watchJobs(ctx, store, args[1:], out, terminal, jobWatchPollInterval)
 	case "attach":

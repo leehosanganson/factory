@@ -95,8 +95,11 @@ func TestDetachedImplementationJobRunsWorkerAndPersistsLifecycle(t *testing.T) {
 		t.Fatalf("job list output=%q err=%v", cliOutput.String(), err)
 	}
 	cliOutput.Reset()
-	if err := JobCommand([]string{"get", id}, Config{StateDir: state}, target, strings.NewReader(""), &cliOutput); err != nil || !strings.Contains(cliOutput.String(), "Status: complete") {
+	if err := JobCommand([]string{"get", id}, Config{StateDir: state}, target, strings.NewReader(""), &cliOutput); err != nil {
 		t.Fatalf("job get output=%q err=%v", cliOutput.String(), err)
+	}
+	if lines := strings.Split(strings.TrimSuffix(cliOutput.String(), "\n"), "\n"); len(lines) != 2 || !strings.Contains(lines[0], "ID") || !strings.Contains(lines[1], id) || !strings.Contains(lines[1], "complete") {
+		t.Fatalf("job get should render one table header and row: %q", cliOutput.String())
 	}
 	if strings.Contains(cliOutput.String(), "requirements completed") || strings.Contains(cliOutput.String(), "Description:") {
 		t.Fatalf("concise job output leaked detailed content: %q", cliOutput.String())
@@ -175,6 +178,68 @@ func TestJobDetailsExposePersistedImplementationWorktree(t *testing.T) {
 	}
 	if strings.Contains(output.String(), worktree) || strings.Contains(output.String(), "factory-job/job-id") {
 		t.Errorf("concise job output unexpectedly includes worktree details: %s", output.String())
+	}
+}
+
+func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
+	state := t.TempDir()
+	target := resolvedTestPath(t, t.TempDir())
+	worktree := filepath.Join(state, "worktree")
+	description := strings.Repeat("long description ", 8)
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := JobRecord{
+		ID: "compact-job", Type: tidyJobType, TaskDescription: description, TargetPath: target,
+		Worktree: worktree, WorkBranch: "factory-job/compact-job", Status: "stopped",
+	}
+	if err := store.CreateJob(job); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(job.ID, "workflow", "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJobLog(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AppendSessionEvent(job.ID, "workflow", "stage.updated", "activity "+strings.Repeat("detail ", 20)); err != nil {
+		t.Fatal(err)
+	}
+	logPath, err := store.JobLogPath(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("complete worker transcript\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var output bytes.Buffer
+	if err := JobCommand([]string{"get", job.ID}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("job get: %v", err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[0], "ID") {
+		t.Fatalf("default job get should have one table header and one row: %q", output.String())
+	}
+	row := lines[1]
+	for _, want := range []string{job.ID, job.Type, job.Status, target, strings.Repeat("long description ", 2), "…", "stage.updated: activity…"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("default row omitted %q: %q", want, row)
+		}
+	}
+	if strings.Contains(row, description) || strings.Contains(row, "complete worker transcript") {
+		t.Fatalf("default row exposed unbounded details: %q", row)
+	}
+
+	output.Reset()
+	if err := JobCommand([]string{"get", job.ID, "--details"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("job get --details: %v", err)
+	}
+	for _, want := range []string{"Description: " + description, "Target: " + target, "Worktree: " + worktree, "Work branch: factory-job/compact-job", "Session: workflow (stopped)", "complete worker transcript"} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("detailed job output omitted %q: %s", want, output.String())
+		}
 	}
 }
 
@@ -854,8 +919,8 @@ func TestJobGetReconcilesOnlyRequestedStaleJob(t *testing.T) {
 	if err := JobCommand([]string{"get", "show-stale"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "Status: interrupted") {
-		t.Fatalf("get output=%q, want reconciled status", output.String())
+	if lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n"); len(lines) != 2 || !strings.Contains(lines[0], "STATUS") || !strings.Contains(lines[1], "interrupted") {
+		t.Fatalf("get output=%q, want a compact row with reconciled status", output.String())
 	}
 	shown, err := store.GetJob("show-stale")
 	if err != nil || shown.Status != "interrupted" {

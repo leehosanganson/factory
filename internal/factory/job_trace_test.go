@@ -71,8 +71,8 @@ func TestJobTraceCountsStatusAttemptsAndTracksOnlyLivePiSubprocesses(t *testing.
 	if err := JobCommand([]string{"get", "trace-job"}, Config{StateDir: state}, t.TempDir(), nil, &cli); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cli.String(), "Status calls: 4") || !strings.Contains(cli.String(), "direct process observations only") {
-		t.Fatalf("job get omitted trace or observation caveat: %q", cli.String())
+	if lines := strings.Split(strings.TrimSuffix(cli.String(), "\n"), "\n"); len(lines) != 2 || !strings.Contains(lines[0], "STATUS CALLS") || !strings.Contains(lines[1], " 4 ") || !strings.Contains(lines[1], "status.completed") {
+		t.Fatalf("job get omitted compact trace table values: %q", cli.String())
 	}
 	cli.Reset()
 	if err := JobCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &cli); err != nil {
