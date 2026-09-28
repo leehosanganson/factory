@@ -139,6 +139,53 @@ func TestJobWatchCancellationDoesNotStopWorker(t *testing.T) {
 	}
 }
 
+func TestJobWatchNextActionHintsArePhaseAwareAndDoNotEchoTaskContent(t *testing.T) {
+	cases := []struct {
+		name   string
+		job    JobRecord
+		want   string
+		secret string
+	}{
+		{
+			name:   "pending monitor proposal",
+			job:    JobRecord{ID: "pending", Type: monitorJobType, Status: "running", TaskDescription: "secret task", Monitor: &monitorJob{Status: "running", Phase: "approval_pending", PendingSignature: "sig", Proposal: "secret proposal"}},
+			want:   "factory monitor get pending --details`, then `factory monitor approve pending` or `factory monitor reject pending",
+			secret: "secret",
+		},
+		{
+			name: "recoverable monitor",
+			job:  JobRecord{ID: "recover", Type: monitorJobType, Status: "recoverable_failure", Monitor: &monitorJob{Status: "recoverable_failure"}},
+			want: "confirming the monitor worker stopped",
+		},
+		{
+			name: "failed implementation",
+			job:  JobRecord{ID: "failed", Type: implementationJobType, Status: "failed"},
+			want: "factory job get failed --details` and `factory job logs failed",
+		},
+		{
+			name: "completed implementation",
+			job:  JobRecord{ID: "done", Type: implementationJobType, Status: "complete", Worktree: "/tmp/worktree"},
+			want: "review the recorded worktree diff",
+		},
+		{
+			name: "active implementation",
+			job:  JobRecord{ID: "active", Type: implementationJobType, Status: "running"},
+			want: "No action needed; let the job continue",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hint := jobWatchNextAction(tc.job)
+			if !strings.Contains(hint, tc.want) {
+				t.Fatalf("next action = %q, want %q", hint, tc.want)
+			}
+			if tc.secret != "" && strings.Contains(hint, tc.secret) {
+				t.Fatalf("next action exposed task/proposal content: %q", hint)
+			}
+		})
+	}
+}
+
 func TestJobWatchIncludesMonitorPhaseFreshnessAndBoundedEvents(t *testing.T) {
 	store := newWatchTestStore(t)
 	checkedAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
@@ -178,14 +225,14 @@ func TestJobWatchMonitorRecentEventWriterErrorIsReturned(t *testing.T) {
 }
 
 func TestJobWatchPlainAndTerminalSnapshots(t *testing.T) {
-	jobs := []watchedJob{{ID: "job-1", Status: "running", Activity: "stage.started: work"}}
+	jobs := []watchedJob{{ID: "job-1", Status: "running", Activity: "stage.started: work", NextAction: "No action needed; let the job continue."}}
 	for _, tc := range []struct {
 		name     string
 		terminal bool
 		contains string
 		omits    string
 	}{
-		{name: "plain", contains: "Selected jobs", omits: "\033[H"},
+		{name: "plain", contains: "Next action: No action needed", omits: "\033[H"},
 		{name: "terminal", terminal: true, contains: "\033[H\033[2J", omits: "\n\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

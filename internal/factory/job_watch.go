@@ -14,6 +14,7 @@ type watchedJob struct {
 	ID                string
 	Status            string
 	Activity          string
+	NextAction        string
 	Phase             string
 	LatestCheckAt     time.Time
 	LatestCheckResult string
@@ -36,7 +37,7 @@ func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer
 			if err != nil {
 				return fmt.Errorf("watch job %s: %w", id, err)
 			}
-			watched := watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity}
+			watched := watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity, NextAction: jobWatchNextAction(job)}
 			if job.Monitor != nil {
 				watched.Phase = monitorDisplayPhase(job.Monitor)
 				watched.LatestCheckAt = job.Monitor.LatestCheckAt
@@ -59,6 +60,31 @@ func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer
 			return nil
 		case <-ticker.C:
 		}
+	}
+}
+
+func jobWatchNextAction(job JobRecord) string {
+	if job.Type == monitorJobType && job.Monitor != nil {
+		switch monitorDisplayPhase(job.Monitor) {
+		case "approval_pending":
+			return fmt.Sprintf("Review with `factory monitor get %s --details`, then `factory monitor approve %s` or `factory monitor reject %s`.", job.ID, job.ID, job.ID)
+		case "recoverable_failure":
+			return fmt.Sprintf("After confirming the monitor worker stopped, run `factory monitor reset %s` to resume.", job.ID)
+		}
+	}
+	switch job.Status {
+	case "failed", "interrupted", "stopped", "cancelled":
+		return fmt.Sprintf("Inspect with `factory job get %s --details` and `factory job logs %s`.", job.ID, job.ID)
+	case "complete":
+		if job.Type == implementationJobType && job.Worktree != "" {
+			return fmt.Sprintf("Inspect the implementation output with `factory job get %s --details`, then review the recorded worktree diff.", job.ID)
+		}
+		if job.Type == tidyJobType {
+			return fmt.Sprintf("Review the tidy results with `factory job get %s --details` and inspect the target diff.", job.ID)
+		}
+		return fmt.Sprintf("Inspect the completed result with `factory job get %s --details`.", job.ID)
+	default:
+		return "No action needed; let the job continue and check again later."
 	}
 }
 
@@ -109,7 +135,7 @@ func writeJobWatchSnapshot(out io.Writer, jobs []watchedJob, terminal bool) erro
 		return err
 	}
 	for _, job := range jobs {
-		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n  Latest activity: %s\n", job.ID, job.Status, strings.TrimSpace(job.Activity)); err != nil {
+		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n  Latest activity: %s\n  Next action: %s\n", job.ID, job.Status, strings.TrimSpace(job.Activity), job.NextAction); err != nil {
 			return err
 		}
 		if job.Phase != "" {
