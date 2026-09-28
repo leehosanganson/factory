@@ -116,7 +116,7 @@ func TestWorkflowIntegrationFailsAfterOneRunnerInvocationAndKeepsArtifactsOutsid
 	if err != nil {
 		t.Fatalf("resolve external state directory: %v", err)
 	}
-	if calls[0].Workdir == target || !isWithin(canonicalState, calls[0].Workdir) {
+	if sameCanonicalTestPath(t, calls[0].Workdir, target) || !isWithin(canonicalState, canonicalTestPath(t, calls[0].Workdir)) {
 		t.Errorf("requirements workdir = %q, want a run directory under external state %q", calls[0].Workdir, canonicalState)
 	}
 	if count, err := os.ReadFile(counter); err != nil || strings.TrimSpace(string(count)) != "1" {

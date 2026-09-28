@@ -104,7 +104,7 @@ func TestCleanPristineUsesIsolatedWorktreeAndPublishesOnlyItsChanges(t *testing.
 	if err := workflow.Run(""); err != nil {
 		t.Fatalf("isolated pristine clean failed: %v", err)
 	}
-	if agent.workdir == "" || agent.workdir == repo.work || isWithin(repo.work, agent.workdir) {
+	if agent.workdir == "" || sameCanonicalTestPath(t, agent.workdir, repo.work) || isWithin(canonicalTestPath(t, repo.work), canonicalTestPath(t, agent.workdir)) {
 		t.Fatalf("agent ran outside an external isolated worktree: target=%q agent=%q", repo.work, agent.workdir)
 	}
 	if _, err := os.Stat(agent.workdir); !os.IsNotExist(err) {
@@ -115,7 +115,7 @@ func TestCleanPristineUsesIsolatedWorktreeAndPublishesOnlyItsChanges(t *testing.
 		t.Fatal(err)
 	}
 	for _, workdir := range strings.Fields(string(lines)) {
-		if workdir != agent.workdir {
+		if !sameCanonicalTestPath(t, workdir, agent.workdir) {
 			t.Errorf("check ran in %q, want isolated worktree %q", workdir, agent.workdir)
 		}
 	}
@@ -179,7 +179,7 @@ func TestCleanPristineRejectsExternalChangesWithoutPublishingThem(t *testing.T) 
 			if err == nil || !strings.Contains(err.Error(), "original checkout changed") {
 				t.Fatalf("external mutation error = %v, want publish refusal", err)
 			}
-			if agent.workdir == "" || agent.workdir == repo.work || isWithin(repo.work, agent.workdir) {
+			if agent.workdir == "" || sameCanonicalTestPath(t, agent.workdir, repo.work) || isWithin(canonicalTestPath(t, repo.work), canonicalTestPath(t, agent.workdir)) {
 				t.Fatalf("agent did not receive isolated worktree: target=%q agent=%q", repo.work, agent.workdir)
 			}
 			if got := strings.TrimSpace(string(gitClean(t, repo.work, "rev-parse", "HEAD"))); got != initial {

@@ -189,7 +189,7 @@ func TestJobStateRootUsesCanonicalDetachedJobsRoot(t *testing.T) {
 	root, err := JobStateRoot(state)
 	want := filepath.Join(state, "factory", "detached-jobs")
 	if err != nil || root != want {
-		t.Fatalf("JobStateRoot=%q err=%v, want canonical root %q", root, err, want)
+		t.Fatalf("JobStateRoot=%q err=%v, want lexical root %q", root, err, want)
 	}
 	store, err := NewJobStore(root)
 	if err != nil {

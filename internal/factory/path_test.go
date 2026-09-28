@@ -30,3 +30,8 @@ func canonicalTestPath(t *testing.T, path string) string {
 	}
 	return resolved
 }
+
+func sameCanonicalTestPath(t *testing.T, left, right string) bool {
+	t.Helper()
+	return canonicalTestPath(t, left) == canonicalTestPath(t, right)
+}

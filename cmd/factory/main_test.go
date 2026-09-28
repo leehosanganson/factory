@@ -768,9 +768,10 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 	for _, name := range []string{"implement"} {
 		t.Run(name, func(t *testing.T) {
 			state := t.TempDir()
-			target, err := filepath.EvalSymlinks(t.TempDir())
-			if err != nil {
-				t.Fatal(err)
+			realTarget := t.TempDir()
+			target := filepath.Join(filepath.Dir(realTarget), "target-alias")
+			if err := os.Symlink(realTarget, target); err != nil {
+				t.Skipf("directory symlinks unavailable: %v", err)
 			}
 			configDir := filepath.Join(t.TempDir(), "config", "factory")
 			if err := os.MkdirAll(configDir, 0o700); err != nil {
@@ -799,7 +800,7 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 				t.Fatal(err)
 			}
 			jobs, err := store.ListJobs()
-			if err != nil || len(jobs) != 1 || jobs[0].Status != "complete" || jobs[0].TaskDescription != "complete the task" || jobs[0].TargetPath != target {
+			if err != nil || len(jobs) != 1 || jobs[0].Status != "complete" || jobs[0].TaskDescription != "complete the task" || !sameCanonicalTestPath(t, jobs[0].TargetPath, target) {
 				t.Fatalf("%s job records = %+v, err=%v", name, jobs, err)
 			}
 		})
@@ -881,7 +882,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 		}
 		var found factory.JobRecord
 		for _, job := range jobs {
-			if job.TaskDescription == "test detached" && job.TargetPath == target {
+			if job.TaskDescription == "test detached" && sameCanonicalTestPath(t, job.TargetPath, target) {
 				if found.ID != "" {
 					return factory.JobRecord{}, false, fmt.Errorf("multiple detached test jobs found: %s and %s", found.ID, job.ID)
 				}
@@ -905,7 +906,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 			return factory.JobRecord{}, false, fmt.Errorf("found %d detached jobs, want exactly one", len(jobs))
 		}
 		job := jobs[0]
-		if job.TaskDescription != "test detached" || job.TargetPath != target || job.Type != "implementation" {
+		if job.TaskDescription != "test detached" || !sameCanonicalTestPath(t, job.TargetPath, target) || job.Type != "implementation" {
 			return factory.JobRecord{}, false, fmt.Errorf("unexpected detached job: %+v", job)
 		}
 		return job, true, nil
@@ -1014,7 +1015,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 			t.Errorf("could not verify detached jobs before cleanup; preserving temporary directory %s: %v", root, err)
 			return
 		}
-		if len(jobs) != 1 || jobs[0].Type != "implementation" || jobs[0].TaskDescription != "test detached" || jobs[0].TargetPath != target {
+		if len(jobs) != 1 || jobs[0].Type != "implementation" || jobs[0].TaskDescription != "test detached" || !sameCanonicalTestPath(t, jobs[0].TargetPath, target) {
 			t.Errorf("unexpected detached jobs before cleanup; preserving temporary directory %s: got %+v, want exactly one implementation job for task %q at target %q", root, jobs, "test detached", target)
 			return
 		}
