@@ -99,6 +99,25 @@ func TestWorkflowRunsConfiguredChecksAndPersistsCompleteLogs(t *testing.T) {
 	}
 }
 
+func TestWorkflowCheckStartFailurePersistsResultAndFailsRun(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	workflow := pipelineCheckWorkflow(t, stateDir, t.TempDir())
+	workflow.Config.PipelineChecks = [][]string{{filepath.Join(t.TempDir(), "missing-check-executable")}}
+
+	err := workflow.Run("check start failure")
+	if err == nil || !strings.Contains(err.Error(), "exit code -1") {
+		t.Fatalf("Run() error = %v, want process start failure with exit code -1", err)
+	}
+	state, runDir := readPipelineCheckState(t, stateDir)
+	if state.Status != "failed" || len(state.Checks) != 1 || state.Checks[0].ExitCode != -1 {
+		t.Fatalf("failed check state = %+v, want persisted start failure", state)
+	}
+	assertPipelineCheckEvents(t, runDir, []workflowEventRecord{
+		{Type: "check.started", Command: state.Checks[0].Command, Transcript: state.Checks[0].Log, StartedAt: timePointer(state.Checks[0].StartedAt)},
+		{Type: "check.completed", Outcome: "failure", ExitCode: intPointer(-1), Command: state.Checks[0].Command, Transcript: state.Checks[0].Log, StartedAt: timePointer(state.Checks[0].StartedAt), EndedAt: timePointer(state.Checks[0].EndedAt)},
+	})
+}
+
 func TestWorkflowFailedCheckPersistsResultAndFailsRun(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	t.Setenv(pipelineCheckTestMode, "fail")
@@ -326,6 +345,133 @@ func TestPipelineCheckArgumentsAreNotInterpretedByShell(t *testing.T) {
 	if err != nil || strings.TrimSpace(string(logData)) != literal {
 		t.Fatalf("literal argument transcript = %q, %v (runs=%d)", logData, err, len(entries))
 	}
+}
+
+func TestRunPipelineChecksWithFakeRunner(t *testing.T) {
+	failure := errors.New("check failed")
+	startupFailure := errors.New("executable not found")
+	cases := []struct {
+		name        string
+		run         func(context.Context) (int, error)
+		wantCode    int
+		wantOutcome string
+		wantErr     string
+		wantIs      error
+	}{
+		{
+			name:     "success",
+			run:      func(context.Context) (int, error) { return 0, nil },
+			wantCode: 0, wantOutcome: "success",
+		},
+		{
+			name:     "nonzero result",
+			run:      func(context.Context) (int, error) { return 9, failure },
+			wantCode: 9, wantOutcome: "failure", wantErr: "exit code 9", wantIs: failure,
+		},
+		{
+			name:     "runner startup failure",
+			run:      func(context.Context) (int, error) { return -1, startupFailure },
+			wantCode: -1, wantOutcome: "failure", wantErr: "exit code -1", wantIs: startupFailure,
+		},
+		{
+			name: "cancellation",
+			run: func(ctx context.Context) (int, error) {
+				return -1, ctx.Err()
+			},
+			wantCode: -1, wantOutcome: "canceled", wantErr: "interrupted", wantIs: context.Canceled,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			workdir := filepath.Join(t.TempDir(), "target")
+			if err := os.Mkdir(workdir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"check-tool", "--label", "value with spaces"}
+			ctx := context.Background()
+			if tc.name == "cancellation" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				t.Cleanup(cancel)
+				originalRun := tc.run
+				tc.run = func(context.Context) (int, error) {
+					cancel()
+					return originalRun(ctx)
+				}
+			}
+			runner := &fakePipelineCheckRunner{
+				output: "runner transcript\n",
+				run:    tc.run,
+			}
+			state := State{ID: "test-run"}
+			var events []WorkflowEvent
+			err := runPipelineChecks(ctx, [][]string{args}, workdir, runDir, &state, func(event WorkflowEvent) error {
+				events = append(events, event)
+				return nil
+			}, runner)
+
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("runPipelineChecks() error = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tc.wantErr) || !errors.Is(err, tc.wantIs) {
+				t.Fatalf("runPipelineChecks() error = %v, want %q wrapping %v", err, tc.wantErr, tc.wantIs)
+			}
+			if runner.workdir != workdir || strings.Join(runner.args, "\x00") != strings.Join(args, "\x00") {
+				t.Fatalf("runner received workdir=%q args=%q, want %q %q", runner.workdir, runner.args, workdir, args)
+			}
+			if len(state.Checks) != 1 || state.Checks[0].ExitCode != tc.wantCode || strings.Join(state.Checks[0].Command, "\x00") != strings.Join(args, "\x00") {
+				t.Fatalf("persisted check result = %+v", state.Checks)
+			}
+			if len(events) != 2 || events[0].Type != "check.started" || events[1].Type != "check.completed" || events[1].Outcome != tc.wantOutcome || events[1].ExitCode == nil || *events[1].ExitCode != tc.wantCode {
+				t.Fatalf("check lifecycle events = %+v", events)
+			}
+			logData, readErr := os.ReadFile(filepath.Join(runDir, state.Checks[0].Log))
+			if readErr != nil || string(logData) != runner.output {
+				t.Fatalf("check transcript = %q, %v", logData, readErr)
+			}
+		})
+	}
+}
+
+func TestRunPipelineChecksForwardsExactArgumentsAndWorkdir(t *testing.T) {
+	workdir := filepath.Join(t.TempDir(), "selected-working-directory")
+	args := []string{"tool path", "argument with spaces", "$(not-a-shell-expression)"}
+	runner := &fakePipelineCheckRunner{output: "forwarded output\n", run: func(context.Context) (int, error) { return 0, nil }}
+	runDir := t.TempDir()
+	state := State{ID: "forwarding-run"}
+	if err := runPipelineChecks(context.Background(), [][]string{args}, workdir, runDir, &state, func(WorkflowEvent) error { return nil }, runner); err != nil {
+		t.Fatal(err)
+	}
+	if runner.workdir != workdir || strings.Join(runner.args, "\x00") != strings.Join(args, "\x00") {
+		t.Fatalf("runner received workdir=%q args=%q, want %q %q", runner.workdir, runner.args, workdir, args)
+	}
+	args[1] = "mutated after invocation"
+	if runner.args[1] != "argument with spaces" || state.Checks[0].Command[1] != "argument with spaces" {
+		t.Fatalf("forwarded command aliases caller input: runner=%q state=%q", runner.args, state.Checks[0].Command)
+	}
+	logData, err := os.ReadFile(filepath.Join(runDir, state.Checks[0].Log))
+	if err != nil || string(logData) != runner.output {
+		t.Fatalf("runner output transcript = %q, %v", logData, err)
+	}
+}
+
+type fakePipelineCheckRunner struct {
+	workdir string
+	args    []string
+	output  string
+	run     func(context.Context) (int, error)
+}
+
+func (r *fakePipelineCheckRunner) Run(ctx context.Context, workdir string, args []string, output io.Writer) (int, error) {
+	r.workdir = workdir
+	r.args = append([]string(nil), args...)
+	if _, err := io.WriteString(output, r.output); err != nil {
+		return -1, err
+	}
+	return r.run(ctx)
 }
 
 func pipelineCheckWorkflow(t *testing.T, stateDir, workdir string) Workflow {

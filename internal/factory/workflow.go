@@ -256,7 +256,7 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 		return fail(fmt.Errorf("workflow interrupted: %w", ctx.Err()))
 	}
 	if !w.DeferCompletion {
-		if err := runPipelineChecks(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe); err != nil {
+		if err := runPipelineChecks(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe, processPipelineCheckRunner{}); err != nil {
 			return fail(err)
 		}
 	}
@@ -269,7 +269,30 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	return nil
 }
 
-func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error) error {
+type pipelineCheckRunner interface {
+	Run(context.Context, string, []string, io.Writer) (int, error)
+}
+
+type processPipelineCheckRunner struct{}
+
+func (processPipelineCheckRunner) Run(ctx context.Context, workdir string, args []string, output io.Writer) (int, error) {
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	configureProcessCancellation(cmd)
+	cmd.Dir = workdir
+	cmd.Stdout = output
+	cmd.Stderr = output
+	err := cmd.Run()
+	if err == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), err
+	}
+	return -1, err
+}
+
+func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner pipelineCheckRunner) error {
 	for i, args := range checks {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("pipeline check interrupted: %w", err)
@@ -301,22 +324,9 @@ func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir s
 			eventErr := observe(completedEvent)
 			return errors.Join(fmt.Errorf("create pipeline check log %s: %w", logName, err), stateErr, eventErr)
 		}
-		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-		configureProcessCancellation(cmd)
-		cmd.Dir = workdir
-		cmd.Stdout = log
-		cmd.Stderr = log
-		runErr := cmd.Run()
+		exitCode, runErr := runner.Run(ctx, workdir, args, log)
 		closeErr := pipelineCheckCloseFile(log)
 		ended := time.Now().UTC()
-		exitCode := 0
-		if runErr != nil {
-			exitCode = -1
-			var exitErr *exec.ExitError
-			if errors.As(runErr, &exitErr) {
-				exitCode = exitErr.ExitCode()
-			}
-		}
 		if closeErr != nil && runErr == nil {
 			exitCode = -1
 		}
