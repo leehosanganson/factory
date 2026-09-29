@@ -26,4 +26,4 @@ review findings.
   friction, and do not infer causes without evidence.
 
 The original findings and session observations are preserved in their
-individual topic files and the [historical observation archive](usability/session-observations/archive.md).
+individual topic files and the [historical observation archive](usability/session-observations/archive.md). New finding records—including those for active PRs—are added in separate files under `usability/`; they are not indexed here, avoiding a shared link-list edit on every addition.
