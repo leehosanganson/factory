@@ -183,7 +183,7 @@ func TestJobDetailsExposePersistedImplementationWorktree(t *testing.T) {
 
 func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 	state := t.TempDir()
-	target := resolvedTestPath(t, t.TempDir())
+	target := filepath.Join(string(filepath.Separator), "repo")
 	worktree := filepath.Join(state, "worktree")
 	description := strings.Repeat("long description ", 8)
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
@@ -245,7 +245,7 @@ func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 
 func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 	state := t.TempDir()
-	shortPath := filepath.Join(t.TempDir(), "repo")
+	shortPath := filepath.Join(string(filepath.Separator), "repo")
 	longPath := filepath.Join(t.TempDir(), strings.Repeat("recognizable-segment-", 8))
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
