@@ -217,6 +217,10 @@ These are observations from a session, not claims about underlying causes.
   shortened with a visible ellipsis, and full path retention in `job get
   --details`. Focused tests, `make test`, `make vet`, `make build`, and
   `git diff --check` passed.
+- For the macOS long-target-path regression, the test now derives its bounded
+  display and details expectations from the path persisted by the store, and
+  checks that it matches the canonical resolved input. Focused test,
+  `make test`, `make vet`, `make build`, and `git diff --check` passed.
 
 ### Historical symlink-`TMPDIR` test observations
 

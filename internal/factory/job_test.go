@@ -260,6 +260,13 @@ func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	persistedLongJob, err := store.GetJob("long-path")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := resolvedTestPath(t, longPath); persistedLongJob.TargetPath != want {
+		t.Fatalf("persisted long target path = %q, want canonical path %q", persistedLongJob.TargetPath, want)
+	}
 
 	var output bytes.Buffer
 	if err := JobCommand([]string{"list"}, Config{StateDir: state}, shortPath, strings.NewReader(""), &output); err != nil {
@@ -284,8 +291,8 @@ func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 	if longRow == "" {
 		t.Fatalf("job list omitted long-path: %q", output.String())
 	}
-	wantDisplay := string([]rune(longPath)[:79]) + "…"
-	if !strings.Contains(longRow, wantDisplay) || strings.Contains(longRow, longPath) {
+	wantDisplay := string([]rune(persistedLongJob.TargetPath)[:79]) + "…"
+	if !strings.Contains(longRow, wantDisplay) || strings.Contains(longRow, persistedLongJob.TargetPath) {
 		t.Fatalf("long target path was not bounded to its recognizable prefix: want %q in %q", wantDisplay, longRow)
 	}
 
@@ -293,8 +300,8 @@ func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 	if err := JobCommand([]string{"get", "long-path", "--details"}, Config{StateDir: state}, shortPath, strings.NewReader(""), &output); err != nil {
 		t.Fatalf("job get --details: %v", err)
 	}
-	if !strings.Contains(output.String(), "Target: "+longPath) {
-		t.Fatalf("detailed output omitted complete target path %q: %s", longPath, output.String())
+	if !strings.Contains(output.String(), "Target: "+persistedLongJob.TargetPath) {
+		t.Fatalf("detailed output omitted complete target path %q: %s", persistedLongJob.TargetPath, output.String())
 	}
 }
 
