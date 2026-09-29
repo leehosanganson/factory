@@ -2,7 +2,7 @@
 
 `factory implement [description...]` runs a persisted workflow through requirements, implementation, review, and documentation. With no description, it prompts for task text and requires an interactive terminal. Bare `factory` starts the same interactive implementation workflow. Each stage invokes the configured agent once; nonzero exit or invocation failure stops the workflow. Successful exit is not an independent correctness evaluation.
 
-By default `implement` starts a detached implementation job and attaches to its output. `--detach` starts and returns immediately; manage it with `factory job`. `--gate` selects the foreground workflow and enables exact `yes` approvals between successful stages; it cannot be combined with detached mode. Foreground `factory run` records are managed separately from detached jobs.
+By default `implement` starts a detached implementation job and attaches to its output. `--detach` starts and returns immediately; manage it with `factory job`. `--gate` selects the foreground workflow and enables exact `yes` approvals between successful stages; it cannot be combined with detached mode. Each gated run is recorded separately from detached jobs and managed with `factory run`: use `factory run list` and `factory run get <id>` to inspect it, `factory run events <id>` to read its event history, and `factory run stop <id>` to request cancellation. These commands only manage `factory implement --gate` runs; they do not show detached `factory job` records.
 
 ## Automatic PR publication
 

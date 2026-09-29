@@ -163,11 +163,6 @@ func TestJobWatchNextActionHintsArePhaseAwareAndDoNotEchoTaskContent(t *testing.
 			want: "factory job get failed --details` and `factory job logs failed",
 		},
 		{
-			name: "completed implementation",
-			job:  JobRecord{ID: "done", Type: implementationJobType, Status: "complete", Worktree: "/tmp/worktree"},
-			want: "review the recorded worktree diff",
-		},
-		{
 			name: "active implementation",
 			job:  JobRecord{ID: "active", Type: implementationJobType, Status: "running"},
 			want: "No action needed; let the job continue",
@@ -181,6 +176,79 @@ func TestJobWatchNextActionHintsArePhaseAwareAndDoNotEchoTaskContent(t *testing.
 			}
 			if tc.secret != "" && strings.Contains(hint, tc.secret) {
 				t.Fatalf("next action exposed task/proposal content: %q", hint)
+			}
+		})
+	}
+}
+
+func TestJobWatchNextActionForCompletedImplementationReflectsPublicationAndWorktree(t *testing.T) {
+	availableWorktree := t.TempDir()
+	missingWorktree := filepath.Join(t.TempDir(), "removed-worktree")
+	cases := []struct {
+		name        string
+		id          string
+		publication string
+		worktree    string
+		want        string
+		wantNot     string
+	}{
+		{
+			name:        "published worktree is not suggested",
+			id:          "published",
+			publication: "published",
+			worktree:    availableWorktree,
+			want:        "factory job get published --details",
+			wantNot:     "recorded worktree diff",
+		},
+		{
+			name:        "unpublished available worktree remains reviewable",
+			id:          "unpublished",
+			publication: "unpublished",
+			worktree:    availableWorktree,
+			want:        "review the recorded worktree diff",
+		},
+		{
+			name:        "no-op available worktree remains reviewable",
+			id:          "no-op",
+			publication: "no-op",
+			worktree:    availableWorktree,
+			want:        "review the recorded worktree diff",
+		},
+		{
+			name:     "unknown publication available worktree remains reviewable",
+			id:       "unknown",
+			worktree: availableWorktree,
+			want:     "review the recorded worktree diff",
+		},
+		{
+			name:        "unpublished missing worktree is not suggested",
+			id:          "missing",
+			publication: "unpublished",
+			worktree:    missingWorktree,
+			want:        "factory job get missing --details",
+			wantNot:     "recorded worktree diff",
+		},
+		{
+			name:    "missing worktree metadata is not suggested",
+			id:      "absent",
+			want:    "factory job get absent --details",
+			wantNot: "recorded worktree diff",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hint := jobWatchNextAction(JobRecord{
+				ID: tc.id, Type: implementationJobType, Status: "complete",
+				PublicationStatus: tc.publication, Worktree: tc.worktree,
+			})
+			if !strings.Contains(hint, tc.want) {
+				t.Errorf("next action = %q, want it to contain %q", hint, tc.want)
+			}
+			if tc.wantNot != "" && strings.Contains(hint, tc.wantNot) {
+				t.Errorf("next action = %q, want it not to contain %q", hint, tc.wantNot)
+			}
+			if strings.Contains(strings.ToLower(hint), "correct") {
+				t.Errorf("next action implies publication proves correctness: %q", hint)
 			}
 		})
 	}
