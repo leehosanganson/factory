@@ -80,6 +80,59 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing
 	}
 }
 
+func TestMonitorListAlignsColumnsForUUIDAndTimestampIDs(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{
+		"20260518T120010-0123456789ab",
+		"aecf5e83-3974-4357-9e5d-d34a64e58cee",
+	}
+	for _, id := range ids {
+		monitor := &monitorJob{
+			ID: id, Repo: "team/repo", PR: 7, Status: "running",
+			CreatedAt: time.Date(2026, time.May, 18, 12, 0, 10, 0, time.UTC),
+		}
+		if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := MonitorCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("monitor list output = %q, want header and two rows", out.String())
+	}
+	const statusColumn = 37
+	if strings.Index(lines[0], "STATUS") != statusColumn || strings.Index(lines[1], "running") != statusColumn || strings.Index(lines[2], "running") != statusColumn {
+		t.Fatalf("status columns are misaligned: %q", out.String())
+	}
+	for _, id := range ids {
+		found := false
+		for _, line := range lines[1:] {
+			if strings.HasPrefix(line, id) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("monitor list omitted full ID %q: %q", id, out.String())
+		}
+	}
+}
+
 func TestMonitorListOrdersByUpdatedAtDescending(t *testing.T) {
 	state := t.TempDir()
 	root, err := JobStateRoot(state)
