@@ -130,16 +130,9 @@ func TestMonitorListOrdersByUpdatedAtDescending(t *testing.T) {
 	}
 }
 
-func TestMonitorListUsesCanonicalDetachedJobs(t *testing.T) {
+func TestMonitorListLimitTruncatesNewestFirstAndDefaultsToUnlimited(t *testing.T) {
 	state := t.TempDir()
 	cfg := Config{StateDir: state}
-	var out bytes.Buffer
-	if err := MonitorCommand([]string{"list"}, cfg, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
-		t.Fatal(err)
-	}
-	if out.String() != "No monitor jobs.\n" {
-		t.Fatalf("empty list=%q", out.String())
-	}
 	root, err := JobStateRoot(state)
 	if err != nil {
 		t.Fatal(err)
@@ -148,22 +141,81 @@ func TestMonitorListUsesCanonicalDetachedJobs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	id := "20260518T120010-0123456789ab"
-	monitor := &monitorJob{ID: id, Repo: "team/repo", PR: 7, Status: "running"}
-	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+	var empty bytes.Buffer
+	if err := MonitorCommand([]string{"list"}, cfg, t.TempDir(), strings.NewReader(""), &empty, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
-		t.Fatal(err)
+	if empty.String() != "No monitor jobs.\n" {
+		t.Fatalf("empty list = %q", empty.String())
 	}
-	out.Reset()
-	if err := MonitorCommand([]string{"list"}, cfg, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
-		t.Fatal(err)
+	ids := []string{
+		"20260518T120010-0123456789ab",
+		"20260518T120011-1123456789ab",
+		"20260518T120012-2123456789ab",
 	}
-	for _, field := range []string{id, "team/repo", "#7"} {
-		if !strings.Contains(out.String(), field) {
-			t.Errorf("list missing %q: %s", field, out.String())
+	for index, id := range ids {
+		monitor := &monitorJob{
+			ID: id, Repo: fmt.Sprintf("team/repo-%d", index), PR: index + 7, Status: "running",
+			CreatedAt: time.Date(2026, time.May, 18, 12, 0, index+10, 0, time.UTC),
 		}
+		if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		count int
+		order []string
+	}{
+		{name: "unlimited default", args: []string{"list"}, count: 3, order: []string{ids[2], ids[1], ids[0]}},
+		{name: "limited newest-first", args: []string{"list", "--limit", "2"}, count: 2, order: []string{ids[2], ids[1]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if err := MonitorCommand(tc.args, cfg, t.TempDir(), strings.NewReader(""), &out, io.Discard); err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if len(lines) != tc.count+1 {
+				t.Fatalf("monitor list printed %d lines, want header plus %d rows: %q", len(lines), tc.count, out.String())
+			}
+			for i, id := range tc.order {
+				if !strings.Contains(lines[i+1], id) {
+					t.Errorf("row %d = %q, want newest-first ID %s", i+1, lines[i+1], id)
+				}
+			}
+			if !strings.Contains(out.String(), "team/repo-2") || !strings.Contains(out.String(), "#9") {
+				t.Errorf("monitor list omitted canonical repository or PR fields: %s", out.String())
+			}
+		})
+	}
+}
+
+func TestMonitorListRejectsInvalidLimitOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing value", args: []string{"list", "--limit"}, want: "--limit requires a positive integer"},
+		{name: "duplicate", args: []string{"list", "--limit", "1", "--limit", "2"}, want: "--limit may only be specified once"},
+		{name: "zero", args: []string{"list", "--limit", "0"}, want: "--limit requires a positive integer"},
+		{name: "negative", args: []string{"list", "--limit", "-1"}, want: "--limit requires a positive integer"},
+		{name: "noninteger", args: []string{"list", "--limit", "1.5"}, want: "--limit requires a positive integer"},
+		{name: "unknown option", args: []string{"list", "--other"}, want: "unknown monitor list argument"},
+		{name: "unexpected positional argument", args: []string{"list", "1"}, want: "unknown monitor list argument"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := MonitorCommand(tc.args, Config{StateDir: t.TempDir()}, t.TempDir(), strings.NewReader(""), io.Discard, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("MonitorCommand(%v) error = %v, want containing %q", tc.args, err, tc.want)
+			}
+		})
 	}
 }
 
