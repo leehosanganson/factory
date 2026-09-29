@@ -622,7 +622,7 @@ func acquireMonitorLock(root string) (func(), error) {
 // MonitorCommand implements monitor user-facing and internal worker commands.
 func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out, errOut io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory monitor <description> | list | get <id> [--details] | approve <id> | reject <id> | stop <id> | reset <id>")
+		return fmt.Errorf("usage: factory monitor <description> | list [--limit <n>] | get <id> [--details] | approve <id> | reject <id> | stop <id> | reset <id>")
 	}
 	root, err := monitorRoot(cfg)
 	if err != nil {
@@ -639,8 +639,9 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 	}
 	switch args[0] {
 	case "list":
-		if len(args) != 1 {
-			return fmt.Errorf("list takes no arguments")
+		limit, err := parseMonitorListLimit(args[1:])
+		if err != nil {
+			return err
 		}
 		if err := os.MkdirAll(root, 0o700); err != nil {
 			return err
@@ -648,6 +649,9 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		jobs, err := loadJobs(root)
 		if err != nil {
 			return err
+		}
+		if limit > 0 && len(jobs) > limit {
+			jobs = jobs[:limit]
 		}
 		if len(jobs) == 0 {
 			fmt.Fprintln(out, "No monitor jobs.")
@@ -700,11 +704,33 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		}
 		return monitorAction(args[0], root, args[1], cfg, in, out)
 	case "-h", "--help", "help":
-		fmt.Fprintln(out, "Usage: factory monitor <description>\n       factory monitor list\n       factory monitor get <id> [--details]\n       factory monitor approve <id>\n       factory monitor reject <id>\n       factory monitor stop <id>\n       factory monitor reset <id>")
+		fmt.Fprintln(out, "Usage: factory monitor <description>\n       factory monitor list [--limit <n>]\n       factory monitor get <id> [--details]\n       factory monitor approve <id>\n       factory monitor reject <id>\n       factory monitor stop <id>\n       factory monitor reset <id>\n\nThe list limit must be a positive integer and selects newest jobs first.")
 		return nil
 	default:
 		return startMonitor(args, cfg, workdir, root, out)
 	}
+}
+
+func parseMonitorListLimit(args []string) (int, error) {
+	limit := 0
+	for i := 0; i < len(args); i++ {
+		if args[i] != "--limit" {
+			return 0, fmt.Errorf("unknown monitor list argument %q (usage: factory monitor list [--limit <n>])", args[i])
+		}
+		if limit != 0 {
+			return 0, fmt.Errorf("--limit may only be specified once")
+		}
+		if i+1 >= len(args) {
+			return 0, fmt.Errorf("--limit requires a positive integer")
+		}
+		i++
+		parsed, err := strconv.Atoi(args[i])
+		if err != nil || parsed <= 0 {
+			return 0, fmt.Errorf("--limit requires a positive integer")
+		}
+		limit = parsed
+	}
+	return limit, nil
 }
 
 func writeMonitorStatus(out io.Writer, job *monitorJob) error {
