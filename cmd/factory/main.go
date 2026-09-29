@@ -244,7 +244,7 @@ func jobHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory job start implementation <description>", "Start an implementation job."},
 		{"factory job start tidy <description>", "Start a nonpublishing tidy job."},
 		{"factory job start monitor <description>", "Start a PR monitor."},
-		{"factory job list", "List detached jobs."},
+		{"factory job list [--limit <n>]", "List detached jobs, optionally limited to the newest positive number of jobs."},
 		{"factory job get <id> [--details]", "Show job status; --details includes metadata."},
 		{"factory job logs <id> [--session <id>] [--follow]", "Read or follow logs."},
 		{"factory job attach <id>", "Follow worker output."},

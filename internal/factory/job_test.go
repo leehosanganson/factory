@@ -893,6 +893,14 @@ func TestJobListPrintsReadableJobsAlongsideReconciliationErrors(t *testing.T) {
 		!strings.Contains(listErr.Error(), "invalid worker record") || !strings.Contains(listErr.Error(), "cannot unmarshal string") {
 		t.Fatalf("job list error = %v, want both aggregate reconciliation errors", listErr)
 	}
+	var limitedOutput bytes.Buffer
+	limitedErr := JobCommand([]string{"list", "--limit", "1"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &limitedOutput)
+	if limitedErr == nil || !strings.Contains(limitedErr.Error(), "reconcile job bad-worker") || !strings.Contains(limitedErr.Error(), "reconcile job bad-worker-metadata") {
+		t.Fatalf("limited job list error = %v, want all reconciliation errors", limitedErr)
+	}
+	if strings.Contains(limitedOutput.String(), "bad-worker-metadata") || !strings.Contains(limitedOutput.String(), "bad-worker") || strings.Contains(limitedOutput.String(), "good-job") {
+		t.Fatalf("limited job list should truncate output only after reconciling all jobs: %q", limitedOutput.String())
+	}
 	got := output.String()
 	badWorkerLine := "bad-worker"
 	malformedWorkerLine := "bad-worker-metadata"
@@ -907,6 +915,83 @@ func TestJobListPrintsReadableJobsAlongsideReconciliationErrors(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(got), "\n")
 	if len(lines) != 4 || len(lines[1]) < 24+1+16+1+20+1+56 {
 		t.Fatalf("job list is not a human-readable aligned table: %q", got)
+	}
+}
+
+func TestJobListLimitShowsNewestJobsAndOmittedLimitRemainsUnbounded(t *testing.T) {
+	state := t.TempDir()
+	target := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().Add(-4 * time.Minute)
+	for index, id := range []string{"oldest-job", "older-job", "newer-job", "newest-job"} {
+		if err := store.CreateJob(JobRecord{
+			ID: id, Type: tidyJobType, Status: "complete", TargetPath: target,
+			CreatedAt: createdAt.Add(time.Duration(index) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var unbounded bytes.Buffer
+	if err := JobCommand([]string{"list"}, Config{StateDir: state}, target, strings.NewReader(""), &unbounded); err != nil {
+		t.Fatalf("unbounded job list: %v", err)
+	}
+	unboundedLines := strings.Split(strings.TrimSpace(unbounded.String()), "\n")
+	if len(unboundedLines) != 5 {
+		t.Fatalf("unbounded job list printed %d lines, want header and all four jobs: %q", len(unboundedLines), unbounded.String())
+	}
+	for index, id := range []string{"newest-job", "newer-job", "older-job", "oldest-job"} {
+		if !strings.Contains(unboundedLines[index+1], id) {
+			t.Errorf("unbounded job list row %d = %q, want %s in newest-first order", index+1, unboundedLines[index+1], id)
+		}
+	}
+
+	var limited bytes.Buffer
+	if err := JobCommand([]string{"list", "--limit", "2"}, Config{StateDir: state}, target, strings.NewReader(""), &limited); err != nil {
+		t.Fatalf("limited job list: %v", err)
+	}
+	limitedLines := strings.Split(strings.TrimSpace(limited.String()), "\n")
+	if len(limitedLines) != 3 {
+		t.Fatalf("limited job list printed %d lines, want header and two jobs: %q", len(limitedLines), limited.String())
+	}
+	for index, id := range []string{"newest-job", "newer-job"} {
+		if !strings.Contains(limitedLines[index+1], id) {
+			t.Errorf("limited job list row %d = %q, want %s in newest-first order", index+1, limitedLines[index+1], id)
+		}
+	}
+	for _, omitted := range []string{"older-job", "oldest-job"} {
+		if strings.Contains(limited.String(), omitted) {
+			t.Errorf("limited job list unexpectedly included %s: %q", omitted, limited.String())
+		}
+	}
+}
+
+func TestJobListRejectsInvalidLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing value", args: []string{"list", "--limit"}, want: "usage: factory job list [--limit <n>]"},
+		{name: "duplicate", args: []string{"list", "--limit", "1", "--limit", "2"}, want: "--limit may only be specified once"},
+		{name: "zero", args: []string{"list", "--limit", "0"}, want: "--limit must be a positive integer"},
+		{name: "negative", args: []string{"list", "--limit", "-1"}, want: "--limit must be a positive integer"},
+		{name: "noninteger", args: []string{"list", "--limit", "1.5"}, want: "--limit must be a positive integer"},
+		{name: "unknown option", args: []string{"list", "--other"}, want: "usage: factory job list [--limit <n>]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			err := JobCommand(tc.args, Config{StateDir: t.TempDir()}, t.TempDir(), strings.NewReader(""), &output)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("job list error = %v, want %q", err, tc.want)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("invalid job list arguments printed output: %q", output.String())
+			}
+		})
 	}
 }
 
