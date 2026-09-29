@@ -138,7 +138,15 @@ recording guidance.
   positive integer option. Behavioral tests cover truncation, order, unlimited
   default, and invalid arguments.
 
-### 10. Avoid stale worktree hints after implementation publication
+### 10. Show complete repository names in monitor lists
+
+- **Finding:** The `REPO` column in `factory monitor list` uses a fixed minimum width but does not truncate longer repository names, which can shift the PR and update columns.
+- **Evidence:** Source inspection of the list renderer in `internal/factory/monitor.go` showed the raw repository value was printed with a 28-character minimum width, not a maximum. Local monitored repository names fit the displayed width, so no overlong value was reproduced interactively.
+- **Desired outcome:** Keep monitor-list rows aligned by bounding the repository column, while retaining the full owner/repository value in `factory monitor get`.
+- **Acceptance criteria:** Long repository values in list output are truncated predictably with an ellipsis; shorter names remain unchanged; get output retains the complete repository name; tests verify both and table alignment.
+- **Status:** Implemented in `internal/factory/monitor.go`: list output truncates repository values longer than 28 Unicode code points to a 27-code-point prefix and ellipsis. The detailed repository field is unchanged. Behavioral coverage verifies long and short values and confirms the following columns remain positioned correctly.
+
+### 11. Avoid stale worktree hints after implementation publication
 
 - **Finding:** A completed implementation job with a persisted publication
   outcome may still be told to inspect its worktree diff.
@@ -161,7 +169,7 @@ recording guidance.
   unpublished/no-op, absent outcome, and missing worktrees. Publication is not
   presented as proof of correctness.
 
-### 11. Improve unit-test seams with mock dependencies
+### 12. Improve unit-test seams with mock dependencies
 
 - **Finding:** The user wants modules and tests structured for unit testing
   with mocked dependencies.
@@ -192,6 +200,13 @@ recording guidance.
 ## Session observations
 
 These are observations from a session, not claims about underlying causes.
+
+- For issue 10, focused output tests cover long and short repository names,
+  ellipsis truncation, PR column placement, and full repository retention in
+  `monitor get`. The first expected prefix was off by one code point; the
+  focused test exposed the mismatch, and the corrected test passed along with
+  the full checks. The local records contained no overlong repository to
+  reproduce the original observation directly.
 
 - For issue 10, focused next-action tests passed. An initial `make test` run
   caught a CLI snapshot expectation for completed jobs; keeping the existing
