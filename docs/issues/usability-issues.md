@@ -102,7 +102,24 @@ recording guidance.
   ordering, the unchanged unbounded default, invalid limit arguments, and
   reconciliation of jobs beyond the output limit.
 
-### 8. Improve unit-test seams with mock dependencies
+### 8. Sort monitor-list rows by displayed update time
+
+- **Finding:** `factory monitor list` displays an `UPDATED` timestamp but orders
+  rows by monitor creation time.
+- **Evidence:** Source inspection showed `loadJobs` in
+  `internal/factory/monitor.go` sorting by `CreatedAt`, while the list renderer
+  displays `UpdatedAt`. In the audited local records, creation and update order
+  happened to agree, so the mismatch was not reproduced from that snapshot.
+- **Desired outcome:** Order monitor-list results by the same update timestamp
+  shown in the table, newest first.
+- **Acceptance criteria:** Monitor list sorting uses `UpdatedAt` descending;
+  tests include records whose creation and update order differ and assert the
+  displayed order; other monitor commands and persisted records are unchanged.
+- **Status:** Implemented in `internal/factory/monitor.go`; behavioral coverage
+  seeds monitor records with opposing creation and update order and asserts the
+  rendered list order.
+
+### 9. Improve unit-test seams with mock dependencies
 
 - **Finding:** The user wants modules and tests structured for unit testing
   with mocked dependencies.
@@ -223,6 +240,12 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
   confirmation prompt; approval remains bound to its existing snapshot and
   explicit non-empty scope; test verifies proposal-before-confirmation output;
   `make test`, `make vet`, and `make build` pass.
+
+- Monitor-list audit verification found 12 saved monitor records. For this
+  snapshot, `CreatedAt` and `UpdatedAt` happened to be in the same order, so no
+  user-visible ordering error was reproduced; source inspection confirmed that
+  sorting and the displayed timestamp use different fields. The regression
+  test uses deliberately conflicting times.
 
 ### Job inspection hides implementation publication outcome
 

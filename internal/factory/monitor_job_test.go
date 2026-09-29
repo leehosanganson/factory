@@ -80,6 +80,56 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing
 	}
 }
 
+func TestMonitorListOrdersByUpdatedAtDescending(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdOld := time.Date(2026, time.May, 18, 10, 0, 0, 0, time.UTC)
+	createdNew := createdOld.Add(time.Hour)
+	updatedOld := createdOld.Add(2 * time.Hour)
+	updatedNew := createdOld.Add(3 * time.Hour)
+	for _, tc := range []struct {
+		id        string
+		createdAt time.Time
+		updatedAt time.Time
+	}{
+		{id: "older-created", createdAt: createdOld, updatedAt: updatedNew},
+		{id: "newer-created", createdAt: createdNew, updatedAt: updatedOld},
+	} {
+		monitor := &monitorJob{ID: tc.id, Repo: tc.id, PR: 7, Status: "running", CreatedAt: tc.createdAt, UpdatedAt: tc.updatedAt}
+		if err := store.CreateJob(JobRecord{ID: tc.id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", CreatedAt: tc.createdAt, Monitor: monitor}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpdateJob(tc.id, func(job *JobRecord) error {
+			job.Monitor.UpdatedAt = tc.updatedAt
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := MonitorCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("monitor list rows = %q, want header and two jobs", out.String())
+	}
+	if !strings.Contains(lines[1], "older-created") || !strings.Contains(lines[1], updatedNew.Format(time.RFC3339)) {
+		t.Errorf("first monitor row = %q, want most recently updated older-created job", lines[1])
+	}
+	if !strings.Contains(lines[2], "newer-created") || !strings.Contains(lines[2], updatedOld.Format(time.RFC3339)) {
+		t.Errorf("second monitor row = %q, want less recently updated newer-created job", lines[2])
+	}
+}
+
 func TestMonitorListUsesCanonicalDetachedJobs(t *testing.T) {
 	state := t.TempDir()
 	cfg := Config{StateDir: state}

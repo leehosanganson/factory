@@ -312,7 +312,7 @@ func loadJobs(root string) ([]monitorJob, error) {
 			jobs = append(jobs, *record.Monitor)
 		}
 	}
-	sort.Slice(jobs, func(i, j int) bool { return jobs[i].CreatedAt.After(jobs[j].CreatedAt) })
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].UpdatedAt.After(jobs[j].UpdatedAt) })
 	return jobs, nil
 }
 
