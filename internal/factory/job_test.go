@@ -243,6 +243,61 @@ func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 	}
 }
 
+func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
+	state := t.TempDir()
+	shortPath := filepath.Join(t.TempDir(), "repo")
+	longPath := filepath.Join(t.TempDir(), strings.Repeat("recognizable-segment-", 8))
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := []JobRecord{
+		{ID: "short-path", Type: tidyJobType, Status: "complete", TargetPath: shortPath},
+		{ID: "long-path", Type: tidyJobType, Status: "complete", TargetPath: longPath},
+	}
+	for _, job := range jobs {
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var output bytes.Buffer
+	if err := JobCommand([]string{"list"}, Config{StateDir: state}, shortPath, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("job list: %v", err)
+	}
+	rows := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(rows) != len(jobs)+1 {
+		t.Fatalf("job list rows = %q", output.String())
+	}
+	var shortRow, longRow string
+	for _, row := range rows[1:] {
+		switch {
+		case strings.Contains(row, "short-path"):
+			shortRow = row
+		case strings.Contains(row, "long-path"):
+			longRow = row
+		}
+	}
+	if shortRow == "" || !strings.Contains(shortRow, shortPath) {
+		t.Fatalf("short target path changed in compact output: %q", shortRow)
+	}
+	if longRow == "" {
+		t.Fatalf("job list omitted long-path: %q", output.String())
+	}
+	wantDisplay := string([]rune(longPath)[:79]) + "…"
+	if !strings.Contains(longRow, wantDisplay) || strings.Contains(longRow, longPath) {
+		t.Fatalf("long target path was not bounded to its recognizable prefix: want %q in %q", wantDisplay, longRow)
+	}
+
+	output.Reset()
+	if err := JobCommand([]string{"get", "long-path", "--details"}, Config{StateDir: state}, shortPath, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("job get --details: %v", err)
+	}
+	if !strings.Contains(output.String(), "Target: "+longPath) {
+		t.Fatalf("detailed output omitted complete target path %q: %s", longPath, output.String())
+	}
+}
+
 func TestJobTableShowsPublicationOnlyForImplementationOutcomes(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()

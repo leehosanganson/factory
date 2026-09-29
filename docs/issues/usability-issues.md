@@ -137,7 +137,25 @@ recording guidance.
   positive integer option. Behavioral tests cover truncation, order, unlimited
   default, and invalid arguments.
 
-### 10. Improve unit-test seams with mock dependencies
+### 10. Keep compact job-list rows within a useful width
+
+- **Finding:** Detached-job list rows append the full target path, so long
+  paths can dominate otherwise compact output.
+- **Evidence:** Running `./bin/factory job list --limit 30` against the local
+  state store produced a 260-character data row and a 179-character header.
+  The target column is written without a width bound by `writeJobTable`.
+- **Desired outcome:** Keep target paths in the default list bounded and
+  recognizable, while preserving the complete path in detailed job inspection.
+- **Acceptance criteria:** Long target paths do not cause unbounded list rows;
+  common short paths remain unchanged; `factory job get <id> --details` retains
+  the full target path; tests cover both short and long paths.
+- **Status:** Implemented in `internal/factory/job.go`: compact rows truncate
+  target paths longer than 80 Unicode code points to a recognizable prefix
+  ending in an ellipsis. The stored path and detailed output remain complete.
+  Behavioral tests cover unchanged short paths, bounded long paths, and complete
+  `--details` output.
+
+### 11. Improve unit-test seams with mock dependencies
 
 - **Finding:** The user wants modules and tests structured for unit testing
   with mocked dependencies.
@@ -194,6 +212,10 @@ These are observations from a session, not claims about underlying causes.
   truncation, unchanged unlimited output, and malformed, missing, duplicate,
   zero, negative, noninteger, and unknown arguments. `make help` is unavailable
   in this repository; the Makefile lists the supported targets directly.
+- The compact job-target display test covers unchanged short paths, a long path
+  shortened with a visible ellipsis, and full path retention in `job get
+  --details`. Focused tests, `make test`, `make vet`, `make build`, and
+  `git diff --check` passed.
 
 ### Historical symlink-`TMPDIR` test observations
 
