@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -77,7 +78,12 @@ func jobWatchNextAction(job JobRecord) string {
 		return fmt.Sprintf("Inspect with `factory job get %s --details` and `factory job logs %s`.", job.ID, job.ID)
 	case "complete":
 		if job.Type == implementationJobType && job.Worktree != "" {
-			return fmt.Sprintf("Inspect the implementation output with `factory job get %s --details`, then review the recorded worktree diff.", job.ID)
+			if job.PublicationStatus != "published" {
+				if info, err := os.Stat(job.Worktree); err == nil && info.IsDir() {
+					return fmt.Sprintf("Inspect the implementation output with `factory job get %s --details`, then review the recorded worktree diff.", job.ID)
+				}
+			}
+			return fmt.Sprintf("Inspect the implementation output with `factory job get %s --details`.", job.ID)
 		}
 		if job.Type == tidyJobType {
 			return fmt.Sprintf("Review the tidy results with `factory job get %s --details` and inspect the target diff.", job.ID)
