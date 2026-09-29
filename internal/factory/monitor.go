@@ -659,7 +659,11 @@ func MonitorCommand(args []string, cfg Config, workdir string, in io.Reader, out
 		}
 		fmt.Fprintf(out, "%-36s %-20s %-28s %-8s %s\n", "ID", "STATUS", "REPO", "PR", "UPDATED")
 		for _, j := range jobs {
-			fmt.Fprintf(out, "%-36s %-20s %-28s #%d %s\n", j.ID, j.Status, j.Repo, j.PR, j.UpdatedAt.Format(time.RFC3339))
+			repo := j.Repo
+			if runes := []rune(repo); len(runes) > 28 {
+				repo = string(runes[:27]) + "…"
+			}
+			fmt.Fprintf(out, "%-36s %-20s %-28s #%d %s\n", j.ID, j.Status, repo, j.PR, j.UpdatedAt.Format(time.RFC3339))
 		}
 		return nil
 	case "get":

@@ -80,6 +80,52 @@ func TestMonitorJobStartsForForkHeadAndCreatesMatchingDetachedSession(t *testing
 	}
 }
 
+func TestMonitorListBoundsRepositoryColumnButGetShowsFullValue(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "20260518T120010-0123456789ab"
+	const repo = "a-very-long-organization-name/repository-with-a-long-name"
+	monitor := &monitorJob{
+		ID: id, Repo: repo, PR: 7, Status: "running",
+		CreatedAt: time.Date(2026, time.May, 18, 12, 0, 10, 0, time.UTC),
+	}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, monitorSessionID, "running"); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{StateDir: state}
+	var listOut bytes.Buffer
+	if err := MonitorCommand([]string{"list"}, cfg, t.TempDir(), strings.NewReader(""), &listOut, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(strings.TrimSpace(listOut.String()), "\n")
+	if len(rows) != 2 {
+		t.Fatalf("monitor list output = %q, want header and one row", listOut.String())
+	}
+	fields := strings.Fields(rows[1])
+	if len(fields) != 5 || fields[2] != "a-very-long-organization-na…" || fields[3] != "#7" {
+		t.Fatalf("monitor list row = %q, want bounded repository and aligned PR column", rows[1])
+	}
+
+	var getOut bytes.Buffer
+	if err := MonitorCommand([]string{"get", id}, cfg, t.TempDir(), strings.NewReader(""), &getOut, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(getOut.String(), "Repository: "+repo+"\n") {
+		t.Fatalf("monitor get output = %q, want complete repository name", getOut.String())
+	}
+}
+
 func TestMonitorListAlignsColumnsForUUIDAndTimestampIDs(t *testing.T) {
 	state := t.TempDir()
 	root, err := JobStateRoot(state)
@@ -90,15 +136,9 @@ func TestMonitorListAlignsColumnsForUUIDAndTimestampIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ids := []string{
-		"20260518T120010-0123456789ab",
-		"aecf5e83-3974-4357-9e5d-d34a64e58cee",
-	}
+	ids := []string{"20260518T120010-0123456789ab", "aecf5e83-3974-4357-9e5d-d34a64e58cee"}
 	for _, id := range ids {
-		monitor := &monitorJob{
-			ID: id, Repo: "team/repo", PR: 7, Status: "running",
-			CreatedAt: time.Date(2026, time.May, 18, 12, 0, 10, 0, time.UTC),
-		}
+		monitor := &monitorJob{ID: id, Repo: "team/repo", PR: 7, Status: "running", CreatedAt: time.Date(2026, time.May, 18, 12, 0, 10, 0, time.UTC)}
 		if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: t.TempDir(), Status: "running", Monitor: monitor}); err != nil {
 			t.Fatal(err)
 		}
@@ -106,7 +146,6 @@ func TestMonitorListAlignsColumnsForUUIDAndTimestampIDs(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
 	var out bytes.Buffer
 	if err := MonitorCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &out, io.Discard); err != nil {
 		t.Fatal(err)
