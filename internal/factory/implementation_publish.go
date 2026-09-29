@@ -108,7 +108,7 @@ func RunAutomaticImplementation(ctx context.Context, cfg Config, target, task st
 			runErr = stateErr
 		} else {
 			observe := func(event WorkflowEvent) error { return persistWorkflowEvent(runDir, event) }
-			runErr = runPipelineChecks(ctx, cfg.PipelineChecks, worktree, runDir, &state, observe)
+			runErr = runPipelineChecks(ctx, cfg.PipelineChecks, worktree, runDir, &state, observe, processPipelineCheckRunner{})
 			if runErr != nil {
 				status := "failed"
 				if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
