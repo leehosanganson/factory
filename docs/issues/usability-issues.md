@@ -66,13 +66,73 @@ recording guidance.
 - **Status:** Open; recorded for future CLI design and usability work. No
   particular command redesign or compatibility change has been approved.
 
+### 6. Job inspection hides implementation publication outcome
+
+- **Finding:** The compact default `factory job get`/`job list` table omits the
+  persisted publication outcome for completed implementation jobs.
+- **Desired outcome:** Keep the default table compact while showing publication
+  status when an implementation job has one; leave other rows unchanged.
+- **Status:** Implemented in `internal/factory/job.go` with a `PUBLICATION`
+  column containing the outcome for implementation rows only. Rows without an
+  outcome and non-implementation rows keep this cell blank. Behavioral tests
+  cover `published`, `unpublished`, `no-op`, absent outcomes, both default
+  commands, and the unchanged one-header/one-row `job get` shape. Verified by
+  `make test`, `make vet`, and `make build`.
+- **Reproduction:** Inspect completed implementation jobs with
+  `factory job get <id>` and `factory job list`.
+- **Impact:** Users cannot distinguish successfully published work from
+  unpublished or no-op results without opening detailed output.
+
+### 7. Improve unit-test seams with mock dependencies
+
+- **Finding:** The user wants modules and tests structured for unit testing
+  with mocked dependencies.
+- **Desired outcome:** Add narrow dependency seams where they enable
+  deterministic unit tests, while retaining integration tests for actual
+  process, filesystem, Git, and CLI contracts. Avoid a broad rewrite or mocks
+  that erase important end-to-end behavior.
+- **Status:** Pilot implemented in `internal/factory/workflow.go`: pipeline
+  orchestration accepts a narrow runner, and the production process adapter is
+  supplied by both workflow and automatic-publication call sites. The adapter
+  retains context-aware subprocess execution and platform process cancellation;
+  orchestration retains transcript, state, and event handling. No wider
+  interfaces or refactors were introduced.
+- **Acceptance criteria:** Fake-runner unit tests cover success, nonzero exit,
+  process-start failure, cancellation classification, and exact
+  argument/workdir forwarding. Existing subprocess integration tests remain
+  and continue to cover real process output, start/nonzero failures,
+  cancellation, workdir, argument ordering, and shell-free execution.
+- **Evidence:** The fake-runner cases verify persisted check outcomes,
+  completed lifecycle events, transcript output, and exact command/workdir
+  forwarding. A missing-executable workflow integration test verifies the
+  start-failure result and persisted lifecycle. Existing subprocess tests in
+  `pipeline_check_test.go` remain. `make test`, `make vet`, `make build`, and
+  `git diff --check` pass.
+- **Desired outcome:** Demonstrate a focused, maintainable unit-test seam before
+  considering wider module or test restructuring.
+
 ## Session observations
 
-These are observations from a session, not claims about underlying causes. The
-compile and test failures in the historical sequence below are not current: the
-integrated tree now passes `make test` and `make vet`.
+These are observations from a session, not claims about underlying causes.
 
-### Historical symlink-`TMPDIR` test observations (not current failures)
+- For the pipeline-check seam pilot, focused fake-runner and existing
+  subprocess integration tests passed. The first `make test` run reported a
+  `TempDir` cleanup error in
+  `TestDetachedTidyCLIUsesDefaultDescriptionAndNeverPublishes`; an immediate
+  standalone rerun of `make test` passed. `make vet` and `make build` passed.
+
+- The `PUBLICATION` column keeps default job inspection to one table row while
+  making persisted implementation outcomes visible; focused tests and `make
+  test`, `make vet`, and `make build` passed. `make help` is not defined; the
+  Makefile lists its targets directly.
+- Focused monitor tests plus `make vet` and `make build` succeeded. A full test
+  run exposed stale assertions in
+  `TestDetachedImplementationPublicationOutcomePersistsAndCleansOnlyOnPublish`:
+  it expected publication details from default `job get`, but those details are
+  behind `--details` since the compact-output change. The assertions now request
+  `--details`, matching the existing CLI contract.
+
+### Historical symlink-`TMPDIR` test observations
 
 During that session, `TMPDIR` was set to a symlink to `/tmp` before running the
 following commands from the repository root (the temporary symlink was removed
@@ -142,26 +202,39 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
 
 ### Job inspection hides implementation publication outcome
 
-- **Status:** Open; source inspection confirms `JobRecord` persists
-  `PublicationStatus` and `PublicationSummary`, but default `factory job get`
-  renders only the compact job table. The outcome is visible with `--details`.
-- **Reproduction:** Complete an implementation job, then run
-  `factory job get <id>` and `factory job get <id> --details`.
-- **Impact:** Users cannot tell from the routine status view whether an
-  implementation job created a PR, completed without publishing, or produced
-  no changes. A next-action hint can therefore send users to inspect details
-  even when the publication outcome is the important result.
-- **Evidence:** `internal/factory/job.go` writes publication status and summary
-  in `writeJobSummary` but not `writeJobTable`; publication outcomes are stored
-  by `RunJobWorker` and the detached job publication tests cover published,
-  unpublished, and no-op cases.
-- **Desired outcome:** Show a compact publication outcome for implementation
-  jobs in the default `job get` view without restoring verbose summary output.
-- **Acceptance criteria:** The default output retains its compact table format
-  and communicates publication status for implementation jobs that have an
-  outcome; other job types and jobs without an outcome remain unchanged;
-  behavioral tests cover published, unpublished, and no-op statuses;
-  `make test`, `make vet`, and `make build` pass.
+- **Status:** Implemented in `internal/factory/job.go` with a `PUBLICATION`
+  column containing the outcome for implementation rows only. Rows without an
+  outcome and non-implementation rows keep this cell blank. Behavioral tests
+  cover `published`, `unpublished`, `no-op`, absent outcomes, both default
+  commands, and the unchanged one-header/one-row `job get` shape. Verified by
+  `make test`, `make vet`, and `make build`.
+- **Reproduction:** Inspect completed implementation jobs with
+  `factory job get <id>` and `factory job list`.
+- **Impact:** Users cannot distinguish successfully published work from
+  unpublished or no-op results without opening detailed output.
+
+### Monitor inspection output is too verbose by default
+
+- **Status:** Implemented on PR #11: default `factory monitor get <id>` shows
+  identity, status, phase, latest successful PR/check query, and pending
+  approval state without events or verbose metadata. `--details` retains the
+  event trail, full record, job metadata, and logs. Focused and full tests, vet,
+  and build passed; the change is merged to `main`.
+- **Reproduction:** Run `factory monitor get <id>` and then
+  `factory monitor get <id> --details` for an existing monitor.
+- **Impact:** Routine status checks can expose more operational details than
+  needed and make the key phase/check status harder to scan. The existing
+  `--details` switch provides a natural place for full diagnostics.
+- **Evidence:** `internal/factory/monitor.go` prints the concise status fields
+  for both modes and writes recent events, marshaled job JSON, and job details
+  only when `--details` is selected. `internal/factory/monitor_test.go` and
+  `internal/factory/monitor_job_test.go` exercise both modes, including
+  suppression and presence of the event trail and logs.
+- **Desired outcome:** Keep default `monitor get` concise and scannable while
+  retaining complete diagnostics behind `--details`.
+- **Acceptance criteria:** Default output reports identity, status, phase,
+  latest successful PR/check result, and pending approval state without the
+  event trail or verbose fields; `--details` retains the full diagnostics.
 
 ### Other observed friction
 
