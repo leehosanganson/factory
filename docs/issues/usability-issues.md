@@ -102,7 +102,24 @@ recording guidance.
   ordering, the unchanged unbounded default, invalid limit arguments, and
   reconciliation of jobs beyond the output limit.
 
-### 8. Limit monitor-list output on request
+### 8. Sort monitor-list rows by displayed update time
+
+- **Finding:** `factory monitor list` displays an `UPDATED` timestamp but orders
+  rows by monitor creation time.
+- **Evidence:** Source inspection showed `loadJobs` in
+  `internal/factory/monitor.go` sorting by `CreatedAt`, while the list renderer
+  displays `UpdatedAt`. In the audited local records, creation and update order
+  happened to agree, so the mismatch was not reproduced from that snapshot.
+- **Desired outcome:** Order monitor-list results by the same update timestamp
+  shown in the table, newest first.
+- **Acceptance criteria:** Monitor list sorting uses `UpdatedAt` descending;
+  tests include records whose creation and update order differ and assert the
+  displayed order; other monitor commands and persisted records are unchanged.
+- **Status:** Implemented in `internal/factory/monitor.go`; behavioral coverage
+  seeds monitor records with opposing creation and update order and asserts the
+  rendered list order.
+
+### 9. Limit monitor-list output on request
 
 - **Finding:** `factory monitor list` prints every persisted monitor, making
   recent monitor jobs harder to find in a long history.
@@ -120,7 +137,7 @@ recording guidance.
   positive integer option. Behavioral tests cover truncation, order, unlimited
   default, and invalid arguments.
 
-### 9. Improve unit-test seams with mock dependencies
+### 10. Improve unit-test seams with mock dependencies
 
 - **Finding:** The user wants modules and tests structured for unit testing
   with mocked dependencies.
@@ -245,6 +262,35 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
   confirmation prompt; approval remains bound to its existing snapshot and
   explicit non-empty scope; test verifies proposal-before-confirmation output;
   `make test`, `make vet`, and `make build` pass.
+
+- Monitor-list audit verification found 12 saved monitor records. For this
+  snapshot, `CreatedAt` and `UpdatedAt` happened to be in the same order, so no
+  user-visible ordering error was reproduced; source inspection confirmed that
+  sorting and the displayed timestamp use different fields. The regression
+  test uses deliberately conflicting times.
+
+### Monitor inspection output is too verbose by default
+
+- **Status:** Implemented on PR #11: default `factory monitor get <id>` shows
+  identity, status, phase, latest successful PR/check query, and pending
+  approval state without events or verbose metadata. `--details` retains the
+  event trail, full record, job metadata, and logs. Focused and full tests, vet,
+  and build passed; the change is merged to `main`.
+- **Reproduction:** Run `factory monitor get <id>` and then
+  `factory monitor get <id> --details` for an existing monitor.
+- **Impact:** Routine status checks can expose more operational details than
+  needed and make the key phase/check status harder to scan. The existing
+  `--details` switch provides a natural place for full diagnostics.
+- **Evidence:** `internal/factory/monitor.go` prints the concise status fields
+  for both modes and writes recent events, marshaled job JSON, and job details
+  only when `--details` is selected. `internal/factory/monitor_test.go` and
+  `internal/factory/monitor_job_test.go` exercise both modes, including
+  suppression and presence of the event trail and logs.
+- **Desired outcome:** Keep default `monitor get` concise and scannable while
+  retaining complete diagnostics behind `--details`.
+- **Acceptance criteria:** Default output reports identity, status, phase,
+  latest successful PR/check result, and pending approval state without the
+  event trail or verbose fields; `--details` retains the full diagnostics.
 
 ### Job inspection hides implementation publication outcome
 
