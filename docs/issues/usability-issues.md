@@ -146,6 +146,24 @@ recording guidance.
 - **Acceptance criteria:** `factory run list` orders managed runs by `UpdatedAt` descending, with deterministic ordering for equal timestamps; tests seed deliberately conflicting timestamps and assert display order. Unmanaged records remain excluded and run persistence is unchanged.
 - **Status:** Implemented in `internal/factory/managed_run.go`; list rows are sorted by `UpdatedAt` descending and then ID ascending for ties. Tests assert both recency order and tie order while confirming unmanaged records remain excluded.
 
+### 11. Keep compact job-list rows within a useful width
+
+- **Finding:** Detached-job list rows append the full target path, so long
+  paths can dominate otherwise compact output.
+- **Evidence:** Running `./bin/factory job list --limit 30` against the local
+  state store produced a 260-character data row and a 179-character header.
+  The target column is written without a width bound by `writeJobTable`.
+- **Desired outcome:** Keep target paths in the default list bounded and
+  recognizable, while preserving the complete path in detailed job inspection.
+- **Acceptance criteria:** Long target paths do not cause unbounded list rows;
+  common short paths remain unchanged; `factory job get <id> --details` retains
+  the full target path; tests cover both short and long paths.
+- **Status:** Implemented in `internal/factory/job.go`: compact rows truncate
+  target paths longer than 80 Unicode code points to a recognizable prefix
+  ending in an ellipsis. The stored path and detailed output remain complete.
+  Behavioral tests cover unchanged short paths, bounded long paths, and complete
+  `--details` output.
+
 ### 11. Avoid stale worktree hints after implementation publication
 
 - **Finding:** A completed implementation job with a persisted publication
@@ -237,6 +255,14 @@ These are observations from a session, not claims about underlying causes.
   truncation, unchanged unlimited output, and malformed, missing, duplicate,
   zero, negative, noninteger, and unknown arguments. `make help` is unavailable
   in this repository; the Makefile lists the supported targets directly.
+- The compact job-target display test covers unchanged short paths, a long path
+  shortened with a visible ellipsis, and full path retention in `job get
+  --details`. Focused tests, `make test`, `make vet`, `make build`, and
+  `git diff --check` passed.
+- For the macOS long-target-path regression, the test now derives its bounded
+  display and details expectations from the path persisted by the store, and
+  checks that it matches the canonical resolved input. Focused test,
+  `make test`, `make vet`, `make build`, and `git diff --check` passed.
 
 ### Historical symlink-`TMPDIR` test observations
 

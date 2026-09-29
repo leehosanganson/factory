@@ -221,6 +221,7 @@ func parseDetailsID(usage string, args []string) (string, bool, error) {
 
 func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
 	const descriptionWidth = 42
+	const targetPathWidth = 80
 	fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14s %-5s %-24s %-12s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "STATUS CALLS", "PI", "ACTIVITY", "PUBLICATION", "TARGET")
 	for _, job := range jobs {
 		description := strings.Join(strings.Fields(job.TaskDescription), " ")
@@ -237,7 +238,11 @@ func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
 		if len([]rune(activity)) > 24 {
 			activity = string([]rune(activity)[:23]) + "…"
 		}
-		fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14d %-5d %-24s %-12s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, trace.StatusCalls, trace.ActivePi, activity, publication, job.TargetPath)
+		targetPath := job.TargetPath
+		if runes := []rune(targetPath); len(runes) > targetPathWidth {
+			targetPath = string(runes[:targetPathWidth-1]) + "…"
+		}
+		fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14d %-5d %-24s %-12s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, trace.StatusCalls, trace.ActivePi, activity, publication, targetPath)
 	}
 }
 
