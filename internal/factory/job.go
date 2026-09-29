@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -71,13 +72,17 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		fmt.Fprintf(out, "Started %s job %s\n", args[1], id)
 		return nil
 	case "list":
-		if len(args) != 1 {
-			return fmt.Errorf("usage: factory job list")
+		limit, err := parseJobListLimit(args[1:])
+		if err != nil {
+			return err
 		}
 		jobs, err := store.reconcileJobs()
 		if len(jobs) == 0 && err == nil {
 			fmt.Fprintln(out, "No jobs.")
 			return nil
+		}
+		if limit > 0 && len(jobs) > limit {
+			jobs = jobs[:limit]
 		}
 		writeJobTable(out, store, jobs)
 		return err
@@ -180,6 +185,28 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 	default:
 		return fmt.Errorf("unknown job command %q", args[0])
 	}
+}
+
+func parseJobListLimit(args []string) (int, error) {
+	if len(args) == 0 {
+		return 0, nil
+	}
+	if args[0] != "--limit" || len(args) < 2 || args[1] == "--limit" {
+		return 0, fmt.Errorf("usage: factory job list [--limit <n>]")
+	}
+	if len(args) > 2 {
+		for _, arg := range args[2:] {
+			if arg == "--limit" {
+				return 0, fmt.Errorf("--limit may only be specified once")
+			}
+		}
+		return 0, fmt.Errorf("usage: factory job list [--limit <n>]")
+	}
+	limit, err := strconv.Atoi(args[1])
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("--limit must be a positive integer")
+	}
+	return limit, nil
 }
 
 func parseDetailsID(usage string, args []string) (string, bool, error) {
