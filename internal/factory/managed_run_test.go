@@ -60,7 +60,7 @@ func TestRunCommandListsShowsEventsAndCooperativelyStopsOnlyManagedRuns(t *testi
 
 	var out bytes.Buffer
 	cfg := Config{StateDir: stateRoot}
-	if err := RunCommand(context.Background(), []string{"list"}, cfg, &out); err != nil || !strings.Contains(out.String(), "ID") || !strings.Contains(out.String(), "LIVENESS") || !strings.Contains(out.String(), state.ID) || !strings.Contains(out.String(), "heartbeat_fresh") {
+	if err := RunCommand(context.Background(), []string{"list"}, cfg, &out); err != nil || !strings.Contains(out.String(), "ID") || !strings.Contains(out.String(), "LIVENESS") || !strings.Contains(out.String(), "UPDATED") || !strings.Contains(out.String(), state.ID) || !strings.Contains(out.String(), "heartbeat_fresh") {
 		t.Fatalf("list output=%q err=%v", out.String(), err)
 	}
 	out.Reset()
@@ -320,9 +320,20 @@ func TestRunListOrdersByUpdatedAtDescendingAndIDForTies(t *testing.T) {
 	if len(lines) != 5 || !strings.HasPrefix(lines[0], "ID") {
 		t.Fatalf("run list output = %q", out.String())
 	}
+	if !strings.Contains(lines[0], "UPDATED") {
+		t.Fatalf("run list header omitted update column: %q", lines[0])
+	}
+	updatedAtByID := map[string]time.Time{
+		"newest": updatedAt.Add(time.Hour), "tie-a": updatedAt,
+		"tie-b": updatedAt, "older": updatedAt.Add(-time.Hour),
+	}
 	var got []string
 	for _, line := range lines[1:] {
-		got = append(got, strings.Fields(line)[0])
+		fields := strings.Fields(line)
+		got = append(got, fields[0])
+		if fields[3] != updatedAtByID[fields[0]].Format(time.RFC3339) {
+			t.Errorf("run %s updated column = %q, want %q", fields[0], fields[3], updatedAtByID[fields[0]].Format(time.RFC3339))
+		}
 	}
 	want := []string{"newest", "tie-a", "tie-b", "older"}
 	if !slices.Equal(got, want) {

@@ -203,7 +203,7 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 			rows = append(rows, runRow{
 				updatedAt: state.UpdatedAt,
 				id:        state.ID,
-				text:      fmt.Sprintf("%-32s %-16s %-20s %s", state.ID, state.Status, life, state.Stage),
+				text:      fmt.Sprintf("%-32s %-16s %-20s %-25s %s", state.ID, state.Status, life, state.UpdatedAt.Format(time.RFC3339), state.Stage),
 			})
 		}
 		sort.Slice(rows, func(i, j int) bool {
@@ -216,7 +216,7 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 			fmt.Fprintln(out, "No gated runs.")
 			return nil
 		}
-		fmt.Fprintf(out, "%-32s %-16s %-20s %s\n", "ID", "STATUS", "LIVENESS", "STAGE")
+		fmt.Fprintf(out, "%-32s %-16s %-20s %-25s %s\n", "ID", "STATUS", "LIVENESS", "UPDATED", "STAGE")
 		for _, row := range rows {
 			fmt.Fprintln(out, row.text)
 		}
