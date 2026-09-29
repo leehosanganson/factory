@@ -56,7 +56,17 @@ recording guidance.
   values, and full details/log output. Verified with the focused `go test
   ./internal/factory` cases for job inspection and trace display.
 
-### 5. Job inspection hides implementation publication outcome
+### 5. Explore a kubectl-inspired CLI experience
+
+- **Finding:** The user values kubectl's CLI design and wants Factory to draw
+  inspiration from it.
+- **Desired outcome:** Evaluate which CLI design principles could improve
+  Factory's consistency, discoverability, and ease of use, adapting them to
+  Factory's workflows rather than copying kubectl's commands or behavior.
+- **Status:** Open; recorded for future CLI design and usability work. No
+  particular command redesign or compatibility change has been approved.
+
+### 6. Job inspection hides implementation publication outcome
 
 - **Finding:** The compact default `factory job get`/`job list` table omits the
   persisted publication outcome for completed implementation jobs.
@@ -73,7 +83,7 @@ recording guidance.
 - **Impact:** Users cannot distinguish successfully published work from
   unpublished or no-op results without opening detailed output.
 
-### 6. Improve unit-test seams with mock dependencies
+### 7. Improve unit-test seams with mock dependencies
 
 - **Finding:** The user wants modules and tests structured for unit testing
   with mocked dependencies.
@@ -190,15 +200,26 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
   explicit non-empty scope; test verifies proposal-before-confirmation output;
   `make test`, `make vet`, and `make build` pass.
 
+### Job inspection hides implementation publication outcome
+
+- **Status:** Implemented in `internal/factory/job.go` with a `PUBLICATION`
+  column containing the outcome for implementation rows only. Rows without an
+  outcome and non-implementation rows keep this cell blank. Behavioral tests
+  cover `published`, `unpublished`, `no-op`, absent outcomes, both default
+  commands, and the unchanged one-header/one-row `job get` shape. Verified by
+  `make test`, `make vet`, and `make build`.
+- **Reproduction:** Inspect completed implementation jobs with
+  `factory job get <id>` and `factory job list`.
+- **Impact:** Users cannot distinguish successfully published work from
+  unpublished or no-op results without opening detailed output.
+
 ### Monitor inspection output is too verbose by default
 
-- **Status:** Implementation and focused regression tests are complete:
-  default `factory monitor get <id>` shows identity, status, phase, latest
-  successful PR/check query, and actionable pending approval state without
-  events or verbose metadata. `--details` retains the event trail, full JSON
-  record, job metadata, and logs. Focused monitor tests, `make vet`, and
-  `make build` pass. Stale job-output assertions were updated to use
-  `--details`; the full suite will be rerun before publication.
+- **Status:** Implemented on PR #11: default `factory monitor get <id>` shows
+  identity, status, phase, latest successful PR/check query, and pending
+  approval state without events or verbose metadata. `--details` retains the
+  event trail, full record, job metadata, and logs. Focused and full tests, vet,
+  and build passed; the change is merged to `main`.
 - **Reproduction:** Run `factory monitor get <id>` and then
   `factory monitor get <id> --details` for an existing monitor.
 - **Impact:** Routine status checks can expose more operational details than
@@ -207,15 +228,13 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
 - **Evidence:** `internal/factory/monitor.go` prints the concise status fields
   for both modes and writes recent events, marshaled job JSON, and job details
   only when `--details` is selected. `internal/factory/monitor_test.go` and
-  `internal/factory/monitor_job_test.go` exercise the default and detailed
-  outputs, including suppression and presence of event trail and logs.
+  `internal/factory/monitor_job_test.go` exercise both modes, including
+  suppression and presence of the event trail and logs.
 - **Desired outcome:** Keep default `monitor get` concise and scannable while
   retaining complete diagnostics behind `--details`.
 - **Acceptance criteria:** Default output reports identity, status, phase,
-  latest successful PR/check result, and actionable pending approval state
-  without dumping recent events or verbose fields; `--details` retains the
-  current event trail, full record, and metadata/logs; regression tests cover
-  both modes; `make test`, `make vet`, and `make build` pass.
+  latest successful PR/check result, and pending approval state without the
+  event trail or verbose fields; `--details` retains the full diagnostics.
 
 ### Other observed friction
 
