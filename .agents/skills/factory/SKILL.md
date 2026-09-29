@@ -53,7 +53,7 @@ engine and duplicate guard. Current job commands are:
 factory job start implementation <description>
 factory job start tidy <description>
 factory job start monitor <description>
-factory job list
+factory job list [--limit <n>]
 factory job get <id> [--details]
 factory job logs <id> [--session workflow] [--follow]
 factory job attach <id>
