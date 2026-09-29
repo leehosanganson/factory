@@ -38,9 +38,10 @@ recording guidance.
 - **Desired outcome:** Use `get`. The original finding did not specify command
   families.
 - **Status:** Implemented in the current CLI source for job, run, and monitor
-  inspection. `get` is canonical and `show` (job/run) or `describe` (monitor)
-  remains accepted as a compatibility alias. The integrated tree is verified
-  by the current `make test` and `make vet` checks.
+  inspection. `get` is canonical; the former `show` (job/run) and `describe`
+  (monitor) aliases are rejected with guidance to use the canonical command.
+  The integrated tree is verified by the current `make test` and `make vet`
+  checks.
 
 ### 4. Make inspection output easier to scan
 
@@ -242,10 +243,9 @@ the source compiled, that historical `TMPDIR="$link" make test` run reported
 failures in
 `TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch/monitor_canonical`,
 `.../babysit_alias` (a historical assertion expecting the phrase `describe
-remains an alias` on a removed CLI alias route; this is stale and is not current
-user-facing behavior—`monitor describe` remains a compatibility alias for
-`monitor get`),
-and `TestBabysitListAndDescribePersistedMetadata` (expected persisted metadata
+remains an alias` on a removed CLI alias route; this assertion is stale because
+`monitor describe` is rejected by current command routing), and
+`TestBabysitListAndDescribePersistedMetadata` (expected persisted metadata
 and log details). `go test ./internal/factory` passed in that run. These results
 show failures observed with symlinked `TMPDIR`, not proof that the symlink caused
 them; the same full test failure was observed without the symlink. Recent test
@@ -265,8 +265,8 @@ establish storage growth, a leak, or a root cause. Reproduce the inventory with
 
 ### Monitor approval prompt lacks proposal context
 
-- **Status:** Approval-gated improvement implemented in the separate
-  `feature/monitor-usability` worktree; awaiting verification and review.
+- **Status:** Implemented and merged in PR #6 (`feature/monitor-usability`);
+  verification and review are complete.
 - **Reproduction before change:** For a monitor with a pending proposal, run
   `factory monitor approve <id>`. The CLI immediately asks for exact lowercase
   `y` and then asks for scope text, without displaying the proposal it is asking
