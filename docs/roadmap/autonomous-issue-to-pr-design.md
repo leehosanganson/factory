@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document records an agreed product direction and an ordered design/implementation plan. Everything described here is future work; it is not a statement of current Factory capability or a release commitment. Today Factory is a Go CLI with the workflows described in the [implemented feature index](../features/README.md). It does not currently accept engineering work from issues or run an issue-to-PR lifecycle.
+This document records an agreed product direction and an ordered design/implementation plan. Most of the lifecycle described here remains future work; this is not a release commitment. Today Factory is a Go CLI with the workflows described in the [implemented feature index](../features/README.md), plus a local CLI for durably queuing and inspecting provider-neutral issue work requests. The intake CLI does not fetch issues, run engineering work, or create/update pull requests.
 
 The intended system takes a bounded engineering issue, works through changes in a repository, and maintains a pull request for human review. The system continuously observes the source issue while work is active, incorporates relevant changes, and stops for human direction when the requested scope is ambiguous or exceeds policy. It can prepare and update a PR, but people retain authority over merge, release, and deployment.
 
@@ -90,13 +90,15 @@ Define the canonical request and durable state transitions shared by CLI and wor
 
 Implement the local durable queue and shared admission/worker path, initially exercising lifecycle transitions without enabling unbounded provider mutations. Add idempotent admission, exclusive ownership/fencing, durable checkpoints, bounded retry/cancellation, and restart recovery. Define operator-visible state and corruption/stuck-work handling.
 
-**Progress:** The first queue-foundation slice is implemented on branch `feature/durable-work-request-queue`: a provider-neutral `WorkRequest`/`WorkQueue` contract and local atomic-JSON queue provide idempotent admission, explicit payload conflicts, exclusive process-bound claims, and generation fencing. This does not yet include CLI intake, a worker, provider adapters, broader request lifecycle/checkpoints, or restart recovery for workflow side effects. See the queue implementation PR for its current review status.
+**Progress:** The queue foundation provides a provider-neutral `WorkRequest`/`WorkQueue` contract and a local atomic-JSON queue with idempotent admission, explicit payload conflicts, exclusive process-bound claims, and generation fencing. A follow-on CLI intake slice adds `factory work submit/list/get`, deterministic default request identity, explicit re-run keys, and private local persistence under `factory/work-requests`. Submission is only queue admission; no issue is fetched and no worker starts. Provider adapters, a worker, broader request lifecycle/checkpoints, and restart recovery for workflow side effects are not implemented.
 
-**Acceptance criteria:** CLI and local queue converge on the same canonical job path; duplicate submissions do not create duplicate active requests; restart tests cover every durable transition and interrupted side effect boundary; competing workers cannot authoritatively complete the same request; uncertain work is reconciled or paused, not blindly replayed.
+**Acceptance criteria:** CLI and local queue converge on the same canonical request type; duplicate submissions do not create duplicate active requests; restart tests cover every durable transition and interrupted side effect boundary; competing workers cannot authoritatively complete the same request; uncertain work is reconciled or paused, not blindly replayed. The current CLI intake does not yet establish the worker path or restart recovery for workflow side effects.
 
 ### Slice 3 — GitHub issue intake and continuous observation
 
 Implement the GitHub Issues tracker adapter, CLI submission, issue refresh, durable issue observations, and detection of issue updates and closure. Keep the queue as the durable handoff into the worker. Do not add webhooks, Azure, server mode, or a distributed broker.
+
+**Progress:** The provider-neutral CLI can queue and inspect tracker/code-host references, but GitHub Issues APIs, issue fetching/refresh, issue observations, and a worker are not implemented.
 
 **Acceptance criteria:** accepted work survives process restart; issue state continues to refresh while active; changed issue evidence is durably recorded and delivered to reconciliation; closure stops further engineering activity and reports status without closing/merging the PR or deleting the worktree.
 

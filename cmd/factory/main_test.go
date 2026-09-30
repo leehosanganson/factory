@@ -64,7 +64,7 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
-		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory job", "factory run", "--gate", "factory version"} {
+		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory work", "factory job", "factory run", "--gate", "factory version"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("root %v help missing %q: %s", args, want, out.String())
 			}
@@ -97,6 +97,15 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Tidy workflow") {
 		t.Fatalf("tidy help missing canonical workflow: %s", out.String())
+	}
+	out.Reset()
+	if err := run([]string{"work", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Issue work requests", "factory work submit", "factory work list", "factory work get", "does not fetch issues"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("work help missing %q: %s", want, out.String())
+		}
 	}
 	out.Reset()
 	if err := run([]string{"job", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
