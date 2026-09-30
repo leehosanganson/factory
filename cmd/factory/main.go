@@ -47,7 +47,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "--gate" {
+		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
@@ -93,6 +93,14 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 				return fmt.Errorf("get current directory: %w", err)
 			}
 			return factory.MonitorCommand(args[1:], cfg, workdir, in, out, errOut)
+		case "work":
+			cfg, err := factory.LoadConfig("")
+			if err != nil {
+				return err
+			}
+			ctx, stop := foregroundContext()
+			defer stop()
+			return factory.WorkCommand(ctx, args[1:], cfg, out)
 		case "implement":
 			gate, detached, task, err := parseWorkflowOptions(args[1:])
 			if err != nil {
@@ -175,7 +183,7 @@ func commandHelpRequested(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "implement", "tidy", "job", "run", "monitor":
+	case "implement", "tidy", "job", "run", "monitor", "work":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -215,6 +223,9 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "monitor":
 		title = "Monitor management"
 		commands, paragraphs = monitorHelp(subcommand)
+	case "work":
+		title = "Issue work requests"
+		commands, paragraphs = workHelp(subcommand)
 	}
 	width := detectHelpWidth(out)
 	_, noColor := os.LookupEnv("NO_COLOR")
@@ -276,6 +287,15 @@ func monitorHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory monitor reset <id>", "Reset a recoverable failure."},
 	}
 	return selectCommandHelp(all, subcommand, "")
+}
+
+func workHelp(subcommand string) ([]helpCommand, []string) {
+	all := []helpCommand{
+		{"factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>]", "Queue a request only; providers and a worker are not configured."},
+		{"factory work list", "List persisted work request identities and states."},
+		{"factory work get <dedup-key>", "Show a persisted work request."},
+	}
+	return selectCommandHelp(all, subcommand, "Submission does not fetch issues, create PRs, or start engineering work.")
 }
 
 func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCommand, []string) {
@@ -611,6 +631,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory implement [-d|--detach] [--gate] [description...]", "Start an implementation workflow."},
 		{"factory tidy [-d|--detach] [--gate] [description...]", "Review, fix, document, and verify."},
 		{"factory monitor <description>", "Monitor an open pull request."},
+		{"factory work <command>", "Queue and inspect issue work requests; does not start engineering."},
 		{"factory job <command>", "Manage detached jobs."},
 		{"factory run <command>", "Manage gated runs."},
 		{"factory version", "Print the build version."},
