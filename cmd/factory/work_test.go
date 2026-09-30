@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/leehosanganson/factory/internal/factory"
 )
 
 func TestWorkSubmitListGetPersistsOnlyQueuedRequests(t *testing.T) {
@@ -127,6 +130,75 @@ func TestWorkCommandsRejectInvalidArgumentsProvidersAndMissingRequests(t *testin
 				t.Fatalf("run(%v) error = %v, want containing %q", tc.args, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestWorkIssueCommandFetchesOneGitHubSnapshotWithoutChangingQueue(t *testing.T) {
+	state := t.TempDir()
+	config := t.TempDir()
+	bin := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("XDG_CONFIG_HOME", config)
+	calls := filepath.Join(t.TempDir(), "gh-calls")
+	t.Setenv("FACTORY_GH_CALLS", calls)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FACTORY_GH_CALLS\"\nprintf '%s' '{\"id\":101,\"number\":42,\"title\":\"Fix widget handling\",\"body\":\"\",\"state\":\"open\",\"html_url\":\"https://github.com/acme/widget/issues/42\",\"updated_at\":\"2025-03-04T05:06:07Z\"}'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	queue, err := factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := factory.WorkRequest{
+		TrackerProvider: "github", IssueID: "42", CodeHostProvider: "github",
+		Repository: "acme/widget", DeduplicationKey: "inspect-integration",
+	}
+	if err := queue.Enqueue(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	before, err := queue.Get(context.Background(), request.DeduplicationKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"work", "issue", request.DeduplicationKey}, nil, &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"Dedup key: inspect-integration", "Issue: 42", "Repository: acme/widget",
+		"Title: Fix widget handling", "State: open", "Updated: 2025-03-04T05:06:07Z",
+		"Version:", "URL: https://github.com/acme/widget/issues/42",
+	} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("work issue output missing %q: %s", want, out.String())
+		}
+	}
+	callData, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.TrimSpace(string(callData)), "api --method GET repos/acme/widget/issues/42"; got != want {
+		t.Fatalf("gh calls = %q, want exactly one %q call", got, want)
+	}
+
+	queue, err = factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	after, err := queue.Get(context.Background(), request.DeduplicationKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("work issue command changed queued item:\nbefore: %+v\nafter:  %+v", before, after)
 	}
 }
 

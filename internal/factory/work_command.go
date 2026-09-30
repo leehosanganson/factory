@@ -9,13 +9,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
-// WorkCommand manages locally queued issue work requests. It does not fetch
-// issues or start engineering work.
-func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) (result error) {
+// WorkCommand manages locally queued issue work requests. Issue snapshots are
+// fetched only by the explicit issue subcommand; no command starts engineering.
+func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
+	return WorkCommandWithIssueTracker(ctx, args, cfg, out, NewGitHubIssueTracker())
+}
+
+// WorkCommandWithIssueTracker makes the read-only issue lookup dependency explicit.
+func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config, out io.Writer, tracker IssueTracker) (result error) {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key>")
+		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key>")
 	}
 	if args[0] == "submit" {
 		request, hasDeduplicationKey, err := parseWorkSubmit(args[1:])
@@ -75,9 +81,9 @@ func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) 
 			printWorkItem(out, item)
 		}
 		return nil
-	case "get":
+	case "get", "issue":
 		if len(args) != 2 || strings.HasPrefix(args[1], "-") {
-			return fmt.Errorf("usage: factory work get <dedup-key>")
+			return fmt.Errorf("usage: factory work %s <dedup-key>", args[0])
 		}
 		item, err := queue.Get(ctx, args[1])
 		if err != nil {
@@ -87,6 +93,20 @@ func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) 
 			return fmt.Errorf("get work request: %w", err)
 		}
 		printWorkItem(out, item)
+		if args[0] == "get" {
+			return nil
+		}
+		if item.Request.TrackerProvider != "github" {
+			return fmt.Errorf("cannot inspect issue for tracker %q: only github is supported", item.Request.TrackerProvider)
+		}
+		if tracker == nil {
+			return fmt.Errorf("inspect issue: issue tracker is unavailable")
+		}
+		snapshot, err := tracker.GetIssue(ctx, item.Request.Repository, item.Request.IssueID)
+		if err != nil {
+			return fmt.Errorf("inspect issue: %w", err)
+		}
+		printIssueSnapshot(out, snapshot)
 		return nil
 	default:
 		return fmt.Errorf("unknown work subcommand %q (try factory work help)", args[0])
@@ -152,4 +172,9 @@ func printWorkItem(out io.Writer, item WorkItem) {
 	request := item.Request
 	fmt.Fprintf(out, "Dedup key: %s\nState: %s\nTracker: %s\nIssue: %s\nCode host: %s\nRepository: %s\n",
 		request.DeduplicationKey, item.State, request.TrackerProvider, request.IssueID, request.CodeHostProvider, request.Repository)
+}
+
+func printIssueSnapshot(out io.Writer, snapshot IssueSnapshot) {
+	fmt.Fprintf(out, "Issue snapshot:\nTitle: %s\nState: %s\nUpdated: %s\nVersion: %s\nURL: %s\n",
+		sanitizeProgressLine(snapshot.Title), snapshot.State, snapshot.UpdatedAt.UTC().Format(time.RFC3339Nano), snapshot.Version, snapshot.URL)
 }
