@@ -102,6 +102,26 @@ func TestJobStorePersistsVersionedJobSessionAndPrivateLogs(t *testing.T) {
 	}
 }
 
+func TestGetJobReportsMissingRecordsWithoutMaskingUnsafeStatePaths(t *testing.T) {
+	store := newTestJobStore(t)
+	for _, id := range []string{"missing", "malformed-missing"} {
+		_, err := store.GetJob(id)
+		if err == nil || err.Error() != "job not found: "+id {
+			t.Errorf("GetJob(%q) error = %v, want clear not-found error", id, err)
+		}
+	}
+	if _, err := store.GetJob("../outside"); err == nil || !strings.Contains(err.Error(), "invalid job or session id") {
+		t.Fatalf("invalid ID error = %v, want ID validation", err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(store.Root(), "unsafe")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetJob("unsafe"); err == nil || !strings.Contains(err.Error(), "state path is not a real directory") {
+		t.Fatalf("symlinked job path error = %v, want unsafe path rejection", err)
+	}
+}
+
 func TestJobStoreRejectsInvalidIDsAndSymlinkEscapes(t *testing.T) {
 	store := newTestJobStore(t)
 	for _, id := range []string{"", ".", "..", "../outside", "/absolute", "a/b", "a\\b", strings.Repeat("x", 129)} {
