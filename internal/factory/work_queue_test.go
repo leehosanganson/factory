@@ -219,6 +219,47 @@ func TestLocalWorkQueueRecoversClaimAfterProcessDeath(t *testing.T) {
 	}
 }
 
+func TestLocalWorkQueueCloseSerializesWithClaimCompletion(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		root := filepath.Join(t.TempDir(), "queue")
+		queue, err := NewLocalWorkQueue(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := testWorkRequest("issue:close-race")
+		if err := queue.Enqueue(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		claim, err := queue.Claim(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var acknowledgeErr, closeErr error
+		go func() {
+			defer wg.Done()
+			<-start
+			acknowledgeErr = queue.Acknowledge(context.Background(), claim)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			closeErr = queue.Close()
+		}()
+		close(start)
+		wg.Wait()
+		if closeErr != nil {
+			t.Fatalf("Close() error = %v", closeErr)
+		}
+		if acknowledgeErr != nil && !errors.Is(acknowledgeErr, ErrStaleWorkClaim) && !strings.Contains(acknowledgeErr.Error(), "closed") {
+			t.Fatalf("Acknowledge() error = %v, want success or closed/stale result", acknowledgeErr)
+		}
+	}
+}
+
 func TestLocalWorkQueueReleaseMakesRequestClaimableAgain(t *testing.T) {
 	queue := newTestWorkQueue(t)
 	request := testWorkRequest("issue:release")

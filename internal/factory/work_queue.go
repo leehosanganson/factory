@@ -331,9 +331,9 @@ func (q *LocalWorkQueue) finishClaim(ctx context.Context, claim WorkClaim, state
 	}
 	defer unlock()
 	q.mu.Lock()
+	defer q.mu.Unlock()
 	claimKey := workClaimMapKey(claim.Request.DeduplicationKey, claim.Generation)
 	claimUnlock, ownsClaim := q.claims[claimKey]
-	q.mu.Unlock()
 	if !ownsClaim {
 		return ErrStaleWorkClaim
 	}
@@ -348,9 +348,7 @@ func (q *LocalWorkQueue) finishClaim(ctx context.Context, claim WorkClaim, state
 	if err := writeWorkQueueRecord(q.recordPath(claim.Request.DeduplicationKey), record); err != nil {
 		return err
 	}
-	q.mu.Lock()
 	delete(q.claims, claimKey)
-	q.mu.Unlock()
 	claimUnlock()
 	return nil
 }
