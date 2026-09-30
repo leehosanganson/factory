@@ -8,6 +8,10 @@ Factory's long-term direction is to manage a durable feedback loop that turns in
 
 The loop should retain context, decisions, evidence, and outcomes at each transition. Feedback from checks, deployments, users, and operations should refine requirements and future work rather than being discarded at job completion. Human direction remains essential for ambiguity, risk, and approval; automation should not be presented as an independent correctness verdict.
 
+## Approved next implementation slice
+
+The detailed containerized REST server MVP design remains under review. The first approved server-related code slice is limited to a startup-loaded, server-independent per-principal bearer-token verifier registry. It must not add HTTP routes, OAuth, remote work admission, or automated execution. See [the REST-server verifier-loader implementation item](../issues/usability/implement-principal-bearer-verifier-loader.md) for scope and acceptance criteria.
+
 Today Factory is a Go CLI with sequential implementation stages, a repository-wide tidy workflow, detached PR monitoring, detached jobs, and opt-in parallel implementation within an eligible implementation stage. It does not currently provide a server, fleet coordinator, issue scheduler, deployment engine, generic arbitrary-command `run`, reusable workflow/task catalog, or chained jobs. The [feature index](../features/README.md) describes implemented behavior.
 
 This is a directional roadmap, not a commitment to specific features, release dates, or ordering. The capabilities below are aspirations and require design, validation, and explicit product decisions before implementation.
