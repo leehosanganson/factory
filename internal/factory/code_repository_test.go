@@ -8,11 +8,11 @@ import (
 	"time"
 )
 
-func TestGitHubCodeHostGetPullRequestMapsOpenAndClosedSnapshots(t *testing.T) {
+func TestGitHubCodeRepositoryGetPullRequestMapsOpenAndClosedSnapshots(t *testing.T) {
 	for _, state := range []string{"open", "closed"} {
 		t.Run(state, func(t *testing.T) {
 			called := false
-			host := newGitHubCodeHost(func(_ context.Context, args ...string) ([]byte, error) {
+			host := newGitHubCodeRepository(func(_ context.Context, args ...string) ([]byte, error) {
 				called = true
 				if got, want := strings.Join(args, " "), "api --method GET repos/acme/widget/pulls/17"; got != want {
 					t.Fatalf("gh args = %q, want only read request %q", got, want)
@@ -38,9 +38,9 @@ func TestGitHubCodeHostGetPullRequestMapsOpenAndClosedSnapshots(t *testing.T) {
 	}
 }
 
-func TestGitHubCodeHostVersionChangesWhenPullRequestUpdates(t *testing.T) {
+func TestGitHubCodeRepositoryVersionChangesWhenPullRequestUpdates(t *testing.T) {
 	response := `{"number":17,"title":"Original","body":"Details","state":"open","html_url":"https://github.com/acme/widget/pull/17","updated_at":"2025-02-03T04:05:06Z","head":{"ref":"feature/widget","sha":"head-sha"},"base":{"ref":"main","sha":"base-sha","repo":{"full_name":"acme/widget"}}}`
-	host := newGitHubCodeHost(func(context.Context, ...string) ([]byte, error) { return []byte(response), nil })
+	host := newGitHubCodeRepository(func(context.Context, ...string) ([]byte, error) { return []byte(response), nil })
 	first, err := host.GetPullRequest(context.Background(), "acme/widget", 17)
 	if err != nil {
 		t.Fatal(err)
@@ -55,9 +55,9 @@ func TestGitHubCodeHostVersionChangesWhenPullRequestUpdates(t *testing.T) {
 	}
 }
 
-func TestGitHubCodeHostRejectsInvalidReferencesBeforeCommand(t *testing.T) {
+func TestGitHubCodeRepositoryRejectsInvalidReferencesBeforeCommand(t *testing.T) {
 	called := false
-	host := newGitHubCodeHost(func(context.Context, ...string) ([]byte, error) {
+	host := newGitHubCodeRepository(func(context.Context, ...string) ([]byte, error) {
 		called = true
 		return nil, nil
 	})
@@ -77,18 +77,18 @@ func TestGitHubCodeHostRejectsInvalidReferencesBeforeCommand(t *testing.T) {
 	}
 }
 
-func TestGitHubCodeHostReportsAPIAndJSONErrors(t *testing.T) {
-	host := newGitHubCodeHost(func(context.Context, ...string) ([]byte, error) { return nil, errors.New("repository not found") })
+func TestGitHubCodeRepositoryReportsAPIAndJSONErrors(t *testing.T) {
+	host := newGitHubCodeRepository(func(context.Context, ...string) ([]byte, error) { return nil, errors.New("repository not found") })
 	if _, err := host.GetPullRequest(context.Background(), "acme/widget", 17); err == nil || !strings.Contains(err.Error(), "repository not found") {
 		t.Fatalf("GetPullRequest() error = %v, want API failure detail", err)
 	}
-	host = newGitHubCodeHost(func(context.Context, ...string) ([]byte, error) { return []byte("not json"), nil })
+	host = newGitHubCodeRepository(func(context.Context, ...string) ([]byte, error) { return []byte("not json"), nil })
 	if _, err := host.GetPullRequest(context.Background(), "acme/widget", 17); err == nil || !strings.Contains(err.Error(), "invalid GitHub pull request JSON") {
 		t.Fatalf("GetPullRequest() error = %v, want invalid response error", err)
 	}
 }
 
-func TestGitHubCodeHostRejectsMismatchedIdentityAndURL(t *testing.T) {
+func TestGitHubCodeRepositoryRejectsMismatchedIdentityAndURL(t *testing.T) {
 	base := `"number":17,"title":"PR","body":"","state":"open","html_url":"https://github.com/acme/widget/pull/17","updated_at":"2025-02-03T04:05:06Z","head":{"ref":"feature","sha":"head"},"base":{"ref":"main","sha":"base","repo":{"full_name":"acme/widget"}}`
 	for _, test := range []struct {
 		name, response, wantError string
@@ -100,7 +100,7 @@ func TestGitHubCodeHostRejectsMismatchedIdentityAndURL(t *testing.T) {
 		{"host", strings.Replace(base, "github.com", "evil.example", 1), "unexpected URL"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			host := newGitHubCodeHost(func(context.Context, ...string) ([]byte, error) { return []byte("{" + test.response + "}"), nil })
+			host := newGitHubCodeRepository(func(context.Context, ...string) ([]byte, error) { return []byte("{" + test.response + "}"), nil })
 			if _, err := host.GetPullRequest(context.Background(), "acme/widget", 17); err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("GetPullRequest() error = %v, want %q", err, test.wantError)
 			}

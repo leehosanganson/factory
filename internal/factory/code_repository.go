@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-// CodeHost reads pull request state from a repository provider. It is separate
-// from IssueTracker because repository and issue-provider responsibilities are
-// independent even when one provider implements both.
-type CodeHost interface {
+// CodeRepository reads pull request state from a repository provider. It is
+// separate from IssueTracker because repository and issue-provider
+// responsibilities are independent even when one provider implements both.
+type CodeRepository interface {
 	GetPullRequest(context.Context, string, int) (PullRequestSnapshot, error)
 }
 
@@ -39,29 +39,29 @@ type PullRequestSnapshot struct {
 	Version    string    `json:"version"`
 }
 
-type githubCodeHostCommand func(context.Context, ...string) ([]byte, error)
+type githubCodeRepositoryCommand func(context.Context, ...string) ([]byte, error)
 
-// GitHubCodeHost reads pull requests through the authenticated GitHub CLI.
+// GitHubCodeRepository reads pull requests through the authenticated GitHub CLI.
 // Authentication remains managed by gh; this type does not handle credentials.
-type GitHubCodeHost struct {
-	run githubCodeHostCommand
+type GitHubCodeRepository struct {
+	run githubCodeRepositoryCommand
 }
 
-var _ CodeHost = (*GitHubCodeHost)(nil)
+var _ CodeRepository = (*GitHubCodeRepository)(nil)
 
-// NewGitHubCodeHost creates a code host that uses the installed gh executable
-// and its existing authentication configuration.
-func NewGitHubCodeHost() *GitHubCodeHost {
-	return newGitHubCodeHost(runGitHubCodeHostCommand)
+// NewGitHubCodeRepository creates a repository adapter that uses the installed
+// gh executable and its existing authentication configuration.
+func NewGitHubCodeRepository() *GitHubCodeRepository {
+	return newGitHubCodeRepository(runGitHubCodeRepositoryCommand)
 }
 
-func newGitHubCodeHost(run githubCodeHostCommand) *GitHubCodeHost {
-	return &GitHubCodeHost{run: run}
+func newGitHubCodeRepository(run githubCodeRepositoryCommand) *GitHubCodeRepository {
+	return &GitHubCodeRepository{run: run}
 }
 
-func (h *GitHubCodeHost) GetPullRequest(ctx context.Context, repository string, number int) (PullRequestSnapshot, error) {
+func (h *GitHubCodeRepository) GetPullRequest(ctx context.Context, repository string, number int) (PullRequestSnapshot, error) {
 	if ctx == nil {
-		return PullRequestSnapshot{}, errors.New("code host context must not be nil")
+		return PullRequestSnapshot{}, errors.New("code repository context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return PullRequestSnapshot{}, err
@@ -73,7 +73,7 @@ func (h *GitHubCodeHost) GetPullRequest(ctx context.Context, repository string, 
 		return PullRequestSnapshot{}, fmt.Errorf("invalid GitHub pull request number %d: expected a positive number", number)
 	}
 	if h == nil || h.run == nil {
-		return PullRequestSnapshot{}, errors.New("GitHub code host command is unavailable")
+		return PullRequestSnapshot{}, errors.New("GitHub code repository command is unavailable")
 	}
 
 	numberText := strconv.Itoa(number)
@@ -140,7 +140,7 @@ func (h *GitHubCodeHost) GetPullRequest(ctx context.Context, repository string, 
 	return snapshot, nil
 }
 
-func runGitHubCodeHostCommand(ctx context.Context, args ...string) ([]byte, error) {
+func runGitHubCodeRepositoryCommand(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", args...)
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
