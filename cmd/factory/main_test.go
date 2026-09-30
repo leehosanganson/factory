@@ -102,7 +102,7 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 	if err := run([]string{"work", "help"}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Issue work requests", "factory work submit", "factory work list", "factory work get", "factory work issue", "factory work refresh", "factory work history", "do not change the queue"} {
+	for _, want := range []string{"Issue work requests", "factory work submit", "factory work list", "factory work get", "factory work issue", "factory work refresh", "factory work history", "factory work watch", "autonomous worker", "do not change the queue"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("work help missing %q: %s", want, out.String())
 		}

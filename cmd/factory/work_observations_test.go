@@ -76,6 +76,60 @@ func TestWorkRefreshHistoryCLIRecordsDuplicateAndLeavesQueueUnchanged(t *testing
 	}
 }
 
+func TestWorkWatchCLIRecordsClosedSnapshotAndExits(t *testing.T) {
+	state, config, bin := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("XDG_CONFIG_HOME", config)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	gh := filepath.Join(bin, "gh")
+	script := "#!/bin/sh\nprintf '%s' '{\"id\":101,\"number\":42,\"title\":\"Widget fixed\",\"body\":\"details\",\"state\":\"closed\",\"html_url\":\"https://github.com/acme/widget/issues/42\",\"updated_at\":\"2025-03-04T05:06:07Z\"}'\n"
+	if err := os.WriteFile(gh, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := factory.WorkRequest{TrackerProvider: "github", IssueID: "42", CodeHostProvider: "github", Repository: "acme/widget", DeduplicationKey: "watch-integration"}
+	if err := queue.Enqueue(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	before, err := queue.Get(context.Background(), request.DeduplicationKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"work", "watch", request.DeduplicationKey, "--interval", "1ms"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("watch should exit successfully for a closed issue: %v", err)
+	}
+	for _, want := range []string{"Title: Widget fixed", "State: closed", "Observation: newly recorded"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("watch output missing %q: %s", want, out.String())
+		}
+	}
+	store, err := factory.NewLocalIssueObservationStore(filepath.Join(state, "factory", "work-observations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations, err := store.List(context.Background(), request.DeduplicationKey)
+	if err != nil || len(observations) != 1 || observations[0].Snapshot.State != "closed" {
+		t.Fatalf("watch history = %+v, %v; want one closed observation", observations, err)
+	}
+	queue, err = factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	after, err := queue.Get(context.Background(), request.DeduplicationKey)
+	if err != nil || after != before {
+		t.Fatalf("watch changed queued request: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
 func TestWorkRefreshCLIPreflightAndFetchFailures(t *testing.T) {
 	state, config, bin := t.TempDir(), t.TempDir(), t.TempDir()
 	t.Setenv("XDG_STATE_HOME", state)

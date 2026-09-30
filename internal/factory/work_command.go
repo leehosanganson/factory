@@ -13,7 +13,7 @@ import (
 )
 
 // WorkCommand manages locally queued issue work requests. Issue snapshots are
-// fetched only by explicit issue and refresh subcommands; no command starts engineering.
+// fetched only by explicit issue, refresh, and foreground watch subcommands; no command starts engineering.
 func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
 	return WorkCommandWithIssueTracker(ctx, args, cfg, out, NewGitHubIssueTracker())
 }
@@ -21,7 +21,7 @@ func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) 
 // WorkCommandWithIssueTracker makes the read-only issue lookup dependency explicit.
 func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config, out io.Writer, tracker IssueTracker) (result error) {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key> | refresh <dedup-key> | history <dedup-key>")
+		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key> | refresh <dedup-key> | history <dedup-key> | watch <dedup-key> [--interval <duration>]")
 	}
 	if args[0] == "submit" {
 		request, hasDeduplicationKey, err := parseWorkSubmit(args[1:])
@@ -81,14 +81,24 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 			printWorkItem(out, item)
 		}
 		return nil
-	case "get", "issue", "refresh", "history":
-		if len(args) != 2 || strings.HasPrefix(args[1], "-") {
+	case "get", "issue", "refresh", "history", "watch":
+		key := ""
+		interval := defaultWorkWatchInterval
+		if args[0] == "watch" {
+			var err error
+			key, interval, err = parseWorkWatch(args[1:])
+			if err != nil {
+				return err
+			}
+		} else if len(args) == 2 && !strings.HasPrefix(args[1], "-") {
+			key = args[1]
+		} else {
 			return fmt.Errorf("usage: factory work %s <dedup-key>", args[0])
 		}
-		item, err := queue.Get(ctx, args[1])
+		item, err := queue.Get(ctx, key)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return fmt.Errorf("work request %q not found", args[1])
+				return fmt.Errorf("work request %q not found", key)
 			}
 			return fmt.Errorf("get work request: %w", err)
 		}
@@ -116,6 +126,13 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 				printIssueSnapshot(out, observation.Snapshot)
 			}
 			return nil
+		}
+		if args[0] == "watch" {
+			store, err := openIssueObservationStore(cfg.StateDir)
+			if err != nil {
+				return err
+			}
+			return watchIssue(ctx, item, tracker, store, interval, out, waitWorkWatchInterval)
 		}
 		operation := args[0]
 		if operation == "issue" {
