@@ -257,7 +257,7 @@ func jobHelp(subcommand string) ([]helpCommand, []string) {
 
 func runHelp(subcommand string) ([]helpCommand, []string) {
 	all := []helpCommand{
-		{"factory run list", "List gated runs."},
+		{"factory run list [--limit <n>]", "List gated runs, optionally limited to the newest positive number of runs."},
 		{"factory run get <id> [--details]", "Show run status; --details includes metadata."},
 		{"factory run events <id> [--follow]", "Read or follow events."},
 		{"factory run stop <id>", "Request cancellation."},

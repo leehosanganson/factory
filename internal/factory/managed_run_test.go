@@ -339,6 +339,65 @@ func TestRunListOrdersByUpdatedAtDescendingAndIDForTies(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Fatalf("run list order = %v, want %v; output: %s", got, want, out.String())
 	}
+
+	out.Reset()
+	if err := RunCommand(context.Background(), []string{"list", "--limit", "2"}, Config{StateDir: stateRoot}, &out); err != nil {
+		t.Fatal(err)
+	}
+	limitedLines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(limitedLines) != 3 || !strings.HasPrefix(limitedLines[1], "newest") || !strings.HasPrefix(limitedLines[2], "tie-a") {
+		t.Fatalf("limited run list = %q, want newest two managed runs", out.String())
+	}
+}
+
+func TestRunListRejectsInvalidLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "missing value", args: []string{"list", "--limit"}, want: "usage: factory run list [--limit <n>]"},
+		{name: "zero", args: []string{"list", "--limit", "0"}, want: "--limit must be a positive integer"},
+		{name: "negative", args: []string{"list", "--limit", "-1"}, want: "--limit must be a positive integer"},
+		{name: "noninteger", args: []string{"list", "--limit", "1.5"}, want: "--limit must be a positive integer"},
+		{name: "extra value", args: []string{"list", "--limit", "1", "extra"}, want: "usage: factory run list [--limit <n>]"},
+		{name: "unknown option", args: []string{"list", "--other"}, want: "usage: factory run list [--limit <n>]"},
+		{name: "duplicate option", args: []string{"list", "--limit", "1", "--limit", "2"}, want: "usage: factory run list [--limit <n>]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			err := RunCommand(context.Background(), tc.args, Config{StateDir: t.TempDir()}, &out)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("RunCommand(%v) error = %v, want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunListValidatesEveryManagedRecordBeforeApplyingLimit(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "state")
+	runsRoot, err := StateRoot(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, contents := range map[string]string{
+		"newest": `{"id":"newest","status":"complete","managed":true,"stage_history_version":1,"stages":[],"updated_at":"2026-09-30T00:00:00Z"}`,
+		"broken": `{"id":"broken","status":`,
+	} {
+		dir := filepath.Join(runsRoot, id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	err = RunCommand(context.Background(), []string{"list", "--limit", "1"}, Config{StateDir: stateRoot}, &out)
+	if err == nil || !strings.Contains(err.Error(), "read run broken") {
+		t.Fatalf("limited run list error = %v, want malformed older run validation", err)
+	}
 }
 
 func TestRunListEmptyIsHumanReadable(t *testing.T) {

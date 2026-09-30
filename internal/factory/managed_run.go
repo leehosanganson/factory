@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -145,6 +146,20 @@ func managedLiveness(owner managedOwner, now time.Time) string {
 	return "heartbeat_stale"
 }
 
+func parseRunListLimit(args []string) (int, error) {
+	if len(args) == 0 {
+		return 0, nil
+	}
+	if len(args) != 2 || args[0] != "--limit" {
+		return 0, fmt.Errorf("usage: factory run list [--limit <n>]")
+	}
+	limit, err := strconv.Atoi(args[1])
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("--limit must be a positive integer")
+	}
+	return limit, nil
+}
+
 func managedRunRoot(override string) (string, error) {
 	root, err := StateRoot(override)
 	if err != nil {
@@ -156,7 +171,7 @@ func managedRunRoot(override string) (string, error) {
 // RunCommand controls only gated, foreground pipeline records.
 func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory run list | get <id> [--details] | events <id> [--follow] | stop <id>")
+		return fmt.Errorf("usage: factory run list [--limit <n>] | get <id> [--details] | events <id> [--follow] | stop <id>")
 	}
 	root, err := managedRunRoot(cfg.StateDir)
 	if err != nil {
@@ -164,8 +179,9 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 	}
 	switch args[0] {
 	case "list":
-		if len(args) != 1 {
-			return fmt.Errorf("usage: factory run list")
+		limit, err := parseRunListLimit(args[1:])
+		if err != nil {
+			return err
 		}
 		entries, err := os.ReadDir(root)
 		if errors.Is(err, os.ErrNotExist) {
@@ -215,6 +231,9 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 		if len(rows) == 0 {
 			fmt.Fprintln(out, "No gated runs.")
 			return nil
+		}
+		if limit > 0 && len(rows) > limit {
+			rows = rows[:limit]
 		}
 		fmt.Fprintf(out, "%-32s %-16s %-20s %-25s %s\n", "ID", "STATUS", "LIVENESS", "UPDATED", "STAGE")
 		for _, row := range rows {
