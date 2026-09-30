@@ -71,15 +71,15 @@ func TestJobTraceCountsStatusAttemptsAndTracksOnlyLivePiSubprocesses(t *testing.
 	if err := JobCommand([]string{"get", "trace-job"}, Config{StateDir: state}, t.TempDir(), nil, &cli); err != nil {
 		t.Fatal(err)
 	}
-	if lines := strings.Split(strings.TrimSuffix(cli.String(), "\n"), "\n"); len(lines) != 2 || !strings.Contains(lines[0], "STATUS CALLS") || !strings.Contains(lines[1], " 4 ") || !strings.Contains(lines[1], "status.completed") {
-		t.Fatalf("job get omitted compact trace table values: %q", cli.String())
+	if lines := strings.Split(strings.TrimSuffix(cli.String(), "\n"), "\n"); len(lines) != 2 || !strings.Contains(lines[0], "ACTIVITY") || !strings.Contains(lines[1], "status.comp…") {
+		t.Fatalf("job get omitted compact trace activity: %q", cli.String())
 	}
 	cli.Reset()
 	if err := JobCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &cli); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cli.String(), "STATUS CALLS") || !strings.Contains(cli.String(), " 4 ") {
-		t.Fatalf("job list omitted status invocation count: %q", cli.String())
+	if !strings.Contains(cli.String(), "ACTIVITY") || !strings.Contains(cli.String(), "status.comp…") {
+		t.Fatalf("job list omitted compact trace activity: %q", cli.String())
 	}
 	observer("pi", currentProcessID(), false)
 	cmd := exec.CommandContext(context.Background(), "sleep", "30")

@@ -223,10 +223,13 @@ func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 		t.Fatalf("default job get should have one compact table header and one row: %q", output.String())
 	}
 	row := lines[1]
-	for _, want := range []string{job.ID, job.Type, job.Status, target, strings.Repeat("long description ", 2), "…", "stage.updated: activity…"} {
+	for _, want := range []string{job.Type, job.Status, target, "long descri…", "…", "stage.updat…"} {
 		if !strings.Contains(row, want) {
 			t.Errorf("default row omitted %q: %q", want, row)
 		}
+	}
+	if len([]rune(row)) > 120 {
+		t.Errorf("default row width = %d, want at most 120: %q", len([]rune(row)), row)
 	}
 	if strings.Contains(row, description) || strings.Contains(row, "complete worker transcript") {
 		t.Fatalf("default row exposed unbounded details: %q", row)
@@ -243,10 +246,16 @@ func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 	}
 }
 
+func TestTruncateJobListFieldPreservesUnicodeCodePoints(t *testing.T) {
+	if got, want := truncateJobListField("项目目录名称", 4), "项目目…"; got != want {
+		t.Fatalf("truncated Unicode field = %q, want %q", got, want)
+	}
+}
+
 func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 	state := t.TempDir()
 	shortPath := filepath.Join(string(filepath.Separator), "repo")
-	longPath := filepath.Join(t.TempDir(), strings.Repeat("recognizable-segment-", 8))
+	longPath := filepath.Join(t.TempDir(), strings.Repeat("项目-segment-", 8))
 	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
@@ -276,6 +285,9 @@ func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 	if len(rows) != len(jobs)+1 {
 		t.Fatalf("job list rows = %q", output.String())
 	}
+	if len([]rune(rows[0])) > 120 {
+		t.Errorf("job list header width = %d, want at most 120: %q", len([]rune(rows[0])), rows[0])
+	}
 	var shortRow, longRow string
 	for _, row := range rows[1:] {
 		switch {
@@ -291,9 +303,12 @@ func TestJobTableBoundsLongTargetPathsAndPreservesDetails(t *testing.T) {
 	if longRow == "" {
 		t.Fatalf("job list omitted long-path: %q", output.String())
 	}
-	wantDisplay := string([]rune(persistedLongJob.TargetPath)[:79]) + "…"
+	wantDisplay := string([]rune(filepath.Base(persistedLongJob.TargetPath))[:10]) + "…"
 	if !strings.Contains(longRow, wantDisplay) || strings.Contains(longRow, persistedLongJob.TargetPath) {
 		t.Fatalf("long target path was not bounded to its recognizable prefix: want %q in %q", wantDisplay, longRow)
+	}
+	if len([]rune(longRow)) > 120 {
+		t.Errorf("job list row width = %d, want at most 120: %q", len([]rune(longRow)), longRow)
 	}
 
 	output.Reset()
@@ -968,14 +983,14 @@ func TestJobListPrintsReadableJobsAlongsideReconciliationErrors(t *testing.T) {
 	malformedWorkerLine := "bad-worker-metadata"
 	goodJobLine := "good-job"
 	if !strings.Contains(got, "ID") || !strings.Contains(got, "DESCRIPTION") || !strings.Contains(got, "TARGET") ||
-		!strings.Contains(got, "worker metadata is corrupt") || !strings.Contains(got, "worker metadata is malformed") || !strings.Contains(got, "still available") {
+		strings.Count(got, "worker meta…") != 2 || !strings.Contains(got, "still avail…") {
 		t.Fatalf("job list omitted readable table records despite reconciliation errors: %q", got)
 	}
 	if strings.Index(got, badWorkerLine) > strings.Index(got, malformedWorkerLine) || strings.Index(got, malformedWorkerLine) > strings.Index(got, goodJobLine) {
 		t.Fatalf("job list records are not sorted newest first: %q", got)
 	}
 	lines := strings.Split(strings.TrimSpace(got), "\n")
-	if len(lines) != 4 || len(lines[1]) < 24+1+16+1+20+1+56 {
+	if len(lines) != 4 || len([]rune(lines[1])) > 120 || !strings.Contains(lines[1], "implementation") || !strings.Contains(lines[1], "running") {
 		t.Fatalf("job list is not a human-readable aligned table: %q", got)
 	}
 }
@@ -1109,7 +1124,7 @@ func TestJobListReconcilesEveryStaleJobWithoutStealingLiveTargets(t *testing.T) 
 		if err != nil || job.Status != want {
 			t.Errorf("job %s after list = %+v err=%v, want status %s", id, job, err, want)
 		}
-		if !strings.Contains(output.String(), id) || !strings.Contains(output.String(), want) {
+		if !strings.Contains(output.String(), id) || !strings.Contains(output.String(), truncateJobListField(want, 18)) {
 			t.Errorf("list output %q does not report %s as %s", output.String(), id, want)
 		}
 	}
