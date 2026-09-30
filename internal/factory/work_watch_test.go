@@ -48,6 +48,14 @@ func (s *workWatchStore) List(context.Context, string) ([]IssueObservation, erro
 	return observations, nil
 }
 
+func (s *workWatchStore) RecordDirection(context.Context, string, string, string) (HumanDirection, bool, error) {
+	return HumanDirection{}, false, errors.New("directions unsupported by watch test store")
+}
+
+func (s *workWatchStore) ListDirections(context.Context, string) ([]HumanDirection, error) {
+	return nil, errors.New("directions unsupported by watch test store")
+}
+
 func (s *workWatchStore) Reconcile(ctx context.Context, key string) (IssueLifecycleState, error) {
 	observations, err := s.List(ctx, key)
 	if err != nil {

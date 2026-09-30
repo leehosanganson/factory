@@ -6,7 +6,7 @@ This section describes Factory's current Go CLI behavior, not the aspirational r
 - [Tidy workflow](tidy.md) — repository review/fix/document/verify, with foreground publishing safeguards and a nonpublishing detached mode.
 - [Detached jobs](jobs.md) — durable lifecycle for detached implementation, tidy, and monitor jobs.
 - [PR monitor](monitor.md) — detached, guarded maintenance of an existing open pull request.
-- [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, and opt-in foreground GitHub issue polling; requests remain queued because no autonomous worker is implemented.
+- [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, opt-in foreground GitHub issue polling, and version-pinned human-direction records; requests remain queued because no autonomous worker is implemented.
 
 ## Shared behavior
 
