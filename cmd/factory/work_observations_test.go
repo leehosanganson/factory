@@ -140,7 +140,7 @@ func TestWorkWatchCLIReconcilesChangesContinuesWhileWaitingAndStopsOnClosure(t *
 	gh := filepath.Join(bin, "gh")
 	script := `#!/bin/sh
 printf '%s\n' "$*" >> "$FACTORY_GH_CALLS"
-count=$(wc -l < "$FACTORY_GH_CALLS")
+count=$(wc -l < "$FACTORY_GH_CALLS" | tr -d '[:space:]')
 case "$count" in
   1) title='Initial'; state='open'; updated='2025-03-01T00:00:00Z' ;;
   2) title='Changed'; state='open'; updated='2025-03-02T00:00:00Z' ;;
