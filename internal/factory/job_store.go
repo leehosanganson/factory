@@ -660,6 +660,14 @@ func (s *JobStore) CreateJob(job JobRecord) error {
 // GetJob reads a job record and rejects unsupported record versions.
 func (s *JobStore) GetJob(id string) (JobRecord, error) {
 	var job JobRecord
+	if err := validateStoredID(id); err != nil {
+		return job, err
+	}
+	if _, err := os.Lstat(filepath.Join(s.root, id)); errors.Is(err, os.ErrNotExist) {
+		return job, fmt.Errorf("job not found: %s", id)
+	} else if err != nil {
+		return job, err
+	}
 	dir, err := s.jobDir(id, false)
 	if err != nil {
 		return job, err
