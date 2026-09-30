@@ -90,6 +90,8 @@ Define the canonical request and durable state transitions shared by CLI and wor
 
 Implement the local durable queue and shared admission/worker path, initially exercising lifecycle transitions without enabling unbounded provider mutations. Add idempotent admission, exclusive ownership/fencing, durable checkpoints, bounded retry/cancellation, and restart recovery. Define operator-visible state and corruption/stuck-work handling.
 
+**Progress:** The first queue-foundation slice is implemented on branch `feature/durable-work-request-queue`: a provider-neutral `WorkRequest`/`WorkQueue` contract and local atomic-JSON queue provide idempotent admission, explicit payload conflicts, exclusive process-bound claims, and generation fencing. This does not yet include CLI intake, a worker, provider adapters, broader request lifecycle/checkpoints, or restart recovery for workflow side effects. See the queue implementation PR for its current review status.
+
 **Acceptance criteria:** CLI and local queue converge on the same canonical job path; duplicate submissions do not create duplicate active requests; restart tests cover every durable transition and interrupted side effect boundary; competing workers cannot authoritatively complete the same request; uncertain work is reconciled or paused, not blindly replayed.
 
 ### Slice 3 — GitHub issue intake and continuous observation
