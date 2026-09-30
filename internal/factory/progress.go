@@ -664,6 +664,30 @@ func splitProgressRecords(data []byte) []string {
 	return records
 }
 
+func sanitizeHumanDirection(text string) string {
+	var clean strings.Builder
+	clean.Grow(len(text))
+	for i := 0; i < len(text); {
+		if text[i] == '\x1b' {
+			i = skipProgressEscape(text, i)
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if r == 0x9b || r == 0x9d || r == 0x9c || r == 0x90 || r == 0x98 || r == 0x9e || r == 0x9f {
+			i = skipProgressC1(text, i, r, size)
+			continue
+		}
+		i += size
+		if r == '\t' || r == '\r' || r == '\n' {
+			r = ' '
+		} else if unicode.IsControl(r) || r == utf8.RuneError && size == 1 {
+			continue
+		}
+		clean.WriteRune(r)
+	}
+	return clean.String()
+}
+
 func sanitizeProgressLine(line string) string {
 	var clean strings.Builder
 	clean.Grow(min(len(line), progressLogLineLimit))

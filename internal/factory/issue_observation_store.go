@@ -14,9 +14,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
-const issueObservationRecordVersion = 1
+const (
+	issueObservationRecordVersion = 1
+	humanDirectionRecordVersion   = 1
+	MaxHumanDirectionBytes        = 16 * 1024
+)
 
 // IssueObservation is one immutable, durable snapshot associated with a work request.
 type IssueObservation struct {
@@ -25,11 +30,26 @@ type IssueObservation struct {
 	ObservedAt       time.Time     `json:"observed_at"`
 }
 
-// IssueObservationStore records immutable issue observations and reconciles their lifecycle.
+// HumanDirection is an immutable instruction pinned to one issue snapshot version.
+type HumanDirection struct {
+	DeduplicationKey string    `json:"deduplication_key"`
+	IssueVersion     string    `json:"issue_version"`
+	Instruction      string    `json:"instruction"`
+	RecordedAt       time.Time `json:"recorded_at"`
+}
+
+// IssueObservationStore persists issue observations, reconciled lifecycle, and version-pinned human directions.
 type IssueObservationStore interface {
 	Record(context.Context, string, IssueSnapshot) (bool, error)
 	List(context.Context, string) ([]IssueObservation, error)
 	Reconcile(context.Context, string) (IssueLifecycleState, error)
+	RecordDirection(context.Context, string, string, string) (HumanDirection, bool, error)
+	ListDirections(context.Context, string) ([]HumanDirection, error)
+}
+
+type humanDirectionRecord struct {
+	RecordVersion int            `json:"record_version"`
+	Direction     HumanDirection `json:"direction"`
 }
 
 type issueObservationRecord struct {
@@ -172,6 +192,170 @@ func (s *LocalIssueObservationStore) List(ctx context.Context, deduplicationKey 
 	return s.listLocked(ctx, deduplicationKey)
 }
 
+func (s *LocalIssueObservationStore) RecordDirection(ctx context.Context, deduplicationKey, issueVersion, instruction string) (HumanDirection, bool, error) {
+	if err := validateWorkDeduplicationKey(deduplicationKey); err != nil {
+		return HumanDirection{}, false, err
+	}
+	if strings.TrimSpace(issueVersion) == "" {
+		return HumanDirection{}, false, fmt.Errorf("issue version must not be empty")
+	}
+	if strings.TrimSpace(instruction) == "" {
+		return HumanDirection{}, false, fmt.Errorf("instruction must not be empty")
+	}
+	if !utf8.ValidString(instruction) {
+		return HumanDirection{}, false, fmt.Errorf("instruction must be valid UTF-8")
+	}
+	if len([]byte(instruction)) > MaxHumanDirectionBytes {
+		return HumanDirection{}, false, fmt.Errorf("instruction exceeds %d bytes", MaxHumanDirectionBytes)
+	}
+	if err := checkWorkContext(ctx); err != nil {
+		return HumanDirection{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ensureRealDirectory(filepath.Dir(s.root), s.root); err != nil {
+		return HumanDirection{}, false, err
+	}
+	lockPath := filepath.Join(s.root, "observations.lock")
+	if err := ensureRegularIfExists(lockPath); err != nil {
+		return HumanDirection{}, false, err
+	}
+	lock, err := acquireFileLock(lockPath, 30*time.Second)
+	if err != nil {
+		return HumanDirection{}, false, err
+	}
+	defer releaseFileLock(lock)
+	if err := checkWorkContext(ctx); err != nil {
+		return HumanDirection{}, false, err
+	}
+
+	path := s.directionPath(deduplicationKey, issueVersion)
+	if err := ensureRegularIfExists(path); err != nil {
+		return HumanDirection{}, false, err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		record, err := readHumanDirectionRecord(path)
+		if err != nil {
+			return HumanDirection{}, false, err
+		}
+		if record.Direction.DeduplicationKey != deduplicationKey || record.Direction.IssueVersion != issueVersion {
+			return HumanDirection{}, false, fmt.Errorf("human direction record key does not match its filename")
+		}
+		if record.Direction.Instruction != instruction {
+			return HumanDirection{}, false, fmt.Errorf("a different human direction is already recorded for issue version %q", issueVersion)
+		}
+		return record.Direction, false, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return HumanDirection{}, false, err
+	}
+
+	observations, err := s.listLocked(ctx, deduplicationKey)
+	if err != nil {
+		return HumanDirection{}, false, err
+	}
+	if len(observations) == 0 {
+		return HumanDirection{}, false, fmt.Errorf("cannot record direction without issue observations")
+	}
+	sort.Slice(observations, func(i, j int) bool {
+		if observations[i].ObservedAt.Equal(observations[j].ObservedAt) {
+			return observations[i].Snapshot.Version < observations[j].Snapshot.Version
+		}
+		return observations[i].ObservedAt.Before(observations[j].ObservedAt)
+	})
+	latest := observations[len(observations)-1]
+	if latest.Snapshot.State != "open" || latest.Snapshot.Version != issueVersion {
+		return HumanDirection{}, false, fmt.Errorf("issue version is not the latest open observation")
+	}
+	lifecyclePath := s.lifecyclePath(deduplicationKey)
+	if err := ensureRegularIfExists(lifecyclePath); err != nil {
+		return HumanDirection{}, false, err
+	}
+	lifecycle, err := readIssueLifecycleRecord(lifecyclePath)
+	if err != nil {
+		return HumanDirection{}, false, fmt.Errorf("read reconciled issue lifecycle: %w", err)
+	}
+	if lifecycle.State.DeduplicationKey != deduplicationKey || lifecycle.State.Status != "waiting_for_human" || lifecycle.State.LatestVersion != issueVersion {
+		return HumanDirection{}, false, fmt.Errorf("issue is not waiting for human direction at version %q", issueVersion)
+	}
+
+	directions, err := s.listDirectionsLocked(ctx, deduplicationKey)
+	if err != nil {
+		return HumanDirection{}, false, err
+	}
+	recordedAt := time.Now().UTC()
+	for _, existing := range directions {
+		if !recordedAt.After(existing.RecordedAt) {
+			recordedAt = existing.RecordedAt.Add(time.Nanosecond)
+		}
+	}
+	direction := HumanDirection{DeduplicationKey: deduplicationKey, IssueVersion: issueVersion, Instruction: instruction, RecordedAt: recordedAt}
+	if err := writeJSONAtomic(s.root, filepath.Base(path), humanDirectionRecord{RecordVersion: humanDirectionRecordVersion, Direction: direction}); err != nil {
+		return HumanDirection{}, false, fmt.Errorf("record human direction: %w", err)
+	}
+	return direction, true, nil
+}
+
+func (s *LocalIssueObservationStore) ListDirections(ctx context.Context, deduplicationKey string) ([]HumanDirection, error) {
+	if err := validateWorkDeduplicationKey(deduplicationKey); err != nil {
+		return nil, err
+	}
+	if err := checkWorkContext(ctx); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ensureRealDirectory(filepath.Dir(s.root), s.root); err != nil {
+		return nil, err
+	}
+	if err := ensureRegularIfExists(filepath.Join(s.root, "observations.lock")); err != nil {
+		return nil, err
+	}
+	lock, err := acquireFileLock(filepath.Join(s.root, "observations.lock"), 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseFileLock(lock)
+	return s.listDirectionsLocked(ctx, deduplicationKey)
+}
+
+func (s *LocalIssueObservationStore) listDirectionsLocked(ctx context.Context, deduplicationKey string) ([]HumanDirection, error) {
+	if err := checkWorkContext(ctx); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return nil, err
+	}
+	directions := make([]HumanDirection, 0)
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "direction-") || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		path := filepath.Join(s.root, entry.Name())
+		if err := ensureRegularIfExists(path); err != nil {
+			return nil, err
+		}
+		record, err := readHumanDirectionRecord(path)
+		if err != nil {
+			return nil, err
+		}
+		direction := record.Direction
+		if s.directionName(direction.DeduplicationKey, direction.IssueVersion) != entry.Name() {
+			return nil, fmt.Errorf("human direction record key does not match its filename: %s", entry.Name())
+		}
+		if direction.DeduplicationKey == deduplicationKey {
+			directions = append(directions, direction)
+		}
+	}
+	sort.Slice(directions, func(i, j int) bool {
+		if directions[i].RecordedAt.Equal(directions[j].RecordedAt) {
+			return directions[i].IssueVersion < directions[j].IssueVersion
+		}
+		return directions[i].RecordedAt.Before(directions[j].RecordedAt)
+	})
+	return directions, nil
+}
+
 func (s *LocalIssueObservationStore) listLocked(ctx context.Context, deduplicationKey string) ([]IssueObservation, error) {
 	if err := checkWorkContext(ctx); err != nil {
 		return nil, err
@@ -183,6 +367,12 @@ func (s *LocalIssueObservationStore) listLocked(ctx context.Context, deduplicati
 	observations := make([]IssueObservation, 0)
 	for _, entry := range entries {
 		if entry.Name() == "observations.lock" {
+			if err := ensureRegularIfExists(filepath.Join(s.root, entry.Name())); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if strings.HasPrefix(entry.Name(), "direction-") && strings.HasSuffix(entry.Name(), ".json") {
 			if err := ensureRegularIfExists(filepath.Join(s.root, entry.Name())); err != nil {
 				return nil, err
 			}
@@ -315,6 +505,42 @@ func (s *LocalIssueObservationStore) Reconcile(ctx context.Context, deduplicatio
 		return IssueLifecycleState{}, fmt.Errorf("persist issue lifecycle state: %w", err)
 	}
 	return state, nil
+}
+
+func (s *LocalIssueObservationStore) directionPath(deduplicationKey, issueVersion string) string {
+	return filepath.Join(s.root, s.directionName(deduplicationKey, issueVersion))
+}
+
+func (s *LocalIssueObservationStore) directionName(deduplicationKey, issueVersion string) string {
+	sum := sha256.Sum256([]byte(deduplicationKey + "\x00" + issueVersion))
+	return "direction-" + hex.EncodeToString(sum[:]) + ".json"
+}
+
+func readHumanDirectionRecord(path string) (humanDirectionRecord, error) {
+	var record humanDirectionRecord
+	if err := ensureRegularIfExists(path); err != nil {
+		return record, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return record, err
+	}
+	if !utf8.Valid(data) {
+		return record, fmt.Errorf("invalid human direction record %s: record is not valid UTF-8", filepath.Base(path))
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&record); err != nil {
+		return record, fmt.Errorf("invalid human direction record %s: %w", filepath.Base(path), err)
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return record, fmt.Errorf("invalid human direction record %s: unexpected trailing data", filepath.Base(path))
+	}
+	direction := record.Direction
+	if record.RecordVersion != humanDirectionRecordVersion || validateWorkDeduplicationKey(direction.DeduplicationKey) != nil || strings.TrimSpace(direction.IssueVersion) == "" || strings.TrimSpace(direction.Instruction) == "" || !utf8.ValidString(direction.Instruction) || len([]byte(direction.Instruction)) > MaxHumanDirectionBytes || direction.RecordedAt.IsZero() {
+		return record, fmt.Errorf("invalid human direction record %s", filepath.Base(path))
+	}
+	return record, nil
 }
 
 func (s *LocalIssueObservationStore) lifecyclePath(deduplicationKey string) string {

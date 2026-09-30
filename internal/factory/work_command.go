@@ -21,7 +21,7 @@ func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) 
 // WorkCommandWithIssueTracker makes the read-only issue lookup dependency explicit.
 func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config, out io.Writer, tracker IssueTracker) (result error) {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key> | refresh <dedup-key> | history <dedup-key> | watch <dedup-key> [--interval <duration>]")
+		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key> | refresh <dedup-key> | history <dedup-key> | watch <dedup-key> [--interval <duration>] | respond <dedup-key> --version <issue-version> --instruction <text> | directions <dedup-key>")
 	}
 	if args[0] == "submit" {
 		request, hasDeduplicationKey, err := parseWorkSubmit(args[1:])
@@ -79,6 +79,61 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 		}
 		for _, item := range items {
 			printWorkItem(out, item)
+		}
+		return nil
+	case "respond":
+		key, version, instruction, err := parseWorkRespond(args[1:])
+		if err != nil {
+			return err
+		}
+		item, err := queue.Get(ctx, key)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("work request %q not found", key)
+			}
+			return fmt.Errorf("get work request: %w", err)
+		}
+		store, err := openIssueObservationStore(cfg.StateDir)
+		if err != nil {
+			return err
+		}
+		direction, recorded, err := store.RecordDirection(ctx, item.Request.DeduplicationKey, version, instruction)
+		if err != nil {
+			return fmt.Errorf("record human direction: %w", err)
+		}
+		if recorded {
+			fmt.Fprintln(out, "Direction: recorded")
+		} else {
+			fmt.Fprintln(out, "Direction: already recorded")
+		}
+		fmt.Fprintf(out, "Issue version: %s\nInstruction: %s\n", sanitizeProgressLine(direction.IssueVersion), sanitizeHumanDirection(direction.Instruction))
+		fmt.Fprintln(out, "No lifecycle, queue, or engineering action was taken.")
+		return nil
+	case "directions":
+		if len(args) != 2 || strings.HasPrefix(args[1], "-") {
+			return fmt.Errorf("usage: factory work directions <dedup-key>")
+		}
+		item, err := queue.Get(ctx, args[1])
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("work request %q not found", args[1])
+			}
+			return fmt.Errorf("get work request: %w", err)
+		}
+		store, err := openIssueObservationStore(cfg.StateDir)
+		if err != nil {
+			return err
+		}
+		directions, err := store.ListDirections(ctx, item.Request.DeduplicationKey)
+		if err != nil {
+			return fmt.Errorf("list human directions: %w", err)
+		}
+		if len(directions) == 0 {
+			fmt.Fprintln(out, "No human directions recorded.")
+			return nil
+		}
+		for _, direction := range directions {
+			fmt.Fprintf(out, "Issue version: %s\nRecorded: %s\nInstruction: %s\n", sanitizeProgressLine(direction.IssueVersion), direction.RecordedAt.UTC().Format(time.RFC3339Nano), sanitizeHumanDirection(direction.Instruction))
 		}
 		return nil
 	case "get", "issue", "refresh", "history", "watch":
@@ -175,6 +230,31 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 	default:
 		return fmt.Errorf("unknown work subcommand %q (try factory work help)", args[0])
 	}
+}
+
+func parseWorkRespond(args []string) (string, string, string, error) {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return "", "", "", fmt.Errorf("usage: factory work respond <dedup-key> --version <issue-version> --instruction <text>")
+	}
+	key := args[0]
+	values := make(map[string]string, 2)
+	for i := 1; i < len(args); i++ {
+		flag := args[i]
+		if (flag != "--version" && flag != "--instruction") || i+1 >= len(args) {
+			return "", "", "", fmt.Errorf("usage: factory work respond <dedup-key> --version <issue-version> --instruction <text>")
+		}
+		if _, exists := values[flag]; exists {
+			return "", "", "", fmt.Errorf("option %s may only be specified once", flag)
+		}
+		i++
+		values[flag] = args[i]
+	}
+	version, versionOK := values["--version"]
+	instruction, instructionOK := values["--instruction"]
+	if !versionOK || !instructionOK {
+		return "", "", "", fmt.Errorf("usage: factory work respond <dedup-key> --version <issue-version> --instruction <text>")
+	}
+	return key, version, instruction, nil
 }
 
 func parseWorkSubmit(args []string) (WorkRequest, bool, error) {
