@@ -98,7 +98,7 @@ Implement the local durable queue and shared admission/worker path, initially ex
 
 Implement the GitHub Issues tracker adapter, CLI submission, issue refresh, durable issue observations, and detection of issue updates and closure. Keep the queue as the durable handoff into the worker. Do not add webhooks, Azure, server mode, or a distributed broker.
 
-**Progress:** The provider-neutral CLI can queue and inspect tracker/code-host references, but GitHub Issues APIs, issue fetching/refresh, issue observations, and a worker are not implemented.
+**Progress:** The provider-neutral CLI can queue and inspect tracker/code-host references. An internal provider-neutral `IssueTracker` contract and read-only `GitHubIssueTracker` can fetch a current GitHub issue snapshot through the authenticated `gh` CLI, including open/closed state, content, update time, and a version fingerprint; pull requests are rejected as non-issues. No CLI refresh, polling, durable issue observations, worker, or PR adapter exists.
 
 **Acceptance criteria:** accepted work survives process restart; issue state continues to refresh while active; changed issue evidence is durably recorded and delivered to reconciliation; closure stops further engineering activity and reports status without closing/merging the PR or deleting the worktree.
 
