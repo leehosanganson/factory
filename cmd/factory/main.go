@@ -294,8 +294,9 @@ func workHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>]", "Queue a request only; providers and a worker are not configured."},
 		{"factory work list", "List persisted work request identities and states."},
 		{"factory work get <dedup-key>", "Show a persisted work request."},
+		{"factory work issue <dedup-key>", "Fetch and show one read-only GitHub issue snapshot for a queued request."},
 	}
-	return selectCommandHelp(all, subcommand, "Submission does not fetch issues, create PRs, or start engineering work.")
+	return selectCommandHelp(all, subcommand, "Issue inspection fetches one GitHub snapshot only; it does not change the queue, start work, or write to GitHub.")
 }
 
 func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCommand, []string) {

@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This document records an agreed product direction and an ordered design/implementation plan. Most of the lifecycle described here remains future work; this is not a release commitment. Today Factory is a Go CLI with the workflows described in the [implemented feature index](../features/README.md), plus a local CLI for durably queuing and inspecting provider-neutral issue work requests. The intake CLI does not fetch issues, run engineering work, or create/update pull requests.
+This document records an agreed product direction and an ordered design/implementation plan. Most of the lifecycle described here remains future work; this is not a release commitment. Today Factory is a Go CLI with the workflows described in the [implemented feature index](../features/README.md), plus a local CLI for durably queuing and inspecting provider-neutral issue work requests. `factory work issue <dedup-key>` can fetch and display one current GitHub snapshot for a queued GitHub request; this is a read-only inspection, not continuous observation or engineering work. The CLI does not create/update pull requests.
 
 The intended system takes a bounded engineering issue, works through changes in a repository, and maintains a pull request for human review. The system continuously observes the source issue while work is active, incorporates relevant changes, and stops for human direction when the requested scope is ambiguous or exceeds policy. It can prepare and update a PR, but people retain authority over merge, release, and deployment.
 
@@ -98,7 +98,7 @@ Implement the local durable queue and shared admission/worker path, initially ex
 
 Implement the GitHub Issues tracker adapter, CLI submission, issue refresh, durable issue observations, and detection of issue updates and closure. Keep the queue as the durable handoff into the worker. Do not add webhooks, Azure, server mode, or a distributed broker.
 
-**Progress:** The provider-neutral CLI can queue and inspect tracker/code-host references. An internal provider-neutral `IssueTracker` contract and read-only `GitHubIssueTracker` can fetch a current GitHub issue snapshot through the authenticated `gh` CLI, including open/closed state, content, update time, and a version fingerprint; pull requests are rejected as non-issues. No CLI refresh, polling, durable issue observations, worker, or PR adapter exists.
+**Progress:** The provider-neutral CLI can queue and inspect tracker/code-host references. `factory work issue <dedup-key>` reads the queued request, rejects missing requests and non-GitHub trackers before network access, fetches one snapshot through the provider-neutral `IssueTracker`, and prints issue title, state, update time, version, and URL with the queued identity. The read does not mutate or persist the work item. The read-only `GitHubIssueTracker` uses the authenticated `gh` CLI; pull requests are rejected as non-issues. No refresh loop, polling, durable issue observations, worker, or PR adapter exists.
 
 **Acceptance criteria:** accepted work survives process restart; issue state continues to refresh while active; changed issue evidence is durably recorded and delivered to reconciliation; closure stops further engineering activity and reports status without closing/merging the PR or deleting the worktree.
 
