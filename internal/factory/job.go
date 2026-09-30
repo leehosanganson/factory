@@ -220,30 +220,40 @@ func parseDetailsID(usage string, args []string) (string, bool, error) {
 }
 
 func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
-	const descriptionWidth = 42
-	const targetPathWidth = 80
-	fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14s %-5s %-24s %-12s %s\n", "ID", "TYPE", "STATUS", descriptionWidth, "DESCRIPTION", "STATUS CALLS", "PI", "ACTIVITY", "PUBLICATION", "TARGET")
+	const typeWidth = 14
+	const statusWidth = 18
+	const descriptionWidth = 12
+	const activityWidth = 12
+	const publicationWidth = 11
+	const targetPathWidth = 11
+	fmt.Fprintf(out, "%-36s %-*s %-*s %-*s %-*s %-*s %-*s\n", "ID", typeWidth, "TYPE", statusWidth, "STATUS", descriptionWidth, "DESCRIPTION", activityWidth, "ACTIVITY", publicationWidth, "PUBLICATION", targetPathWidth, "TARGET")
 	for _, job := range jobs {
 		description := strings.Join(strings.Fields(job.TaskDescription), " ")
-		runes := []rune(description)
-		if len(runes) > descriptionWidth {
-			description = string(runes[:descriptionWidth-1]) + "…"
-		}
+		description = truncateJobListField(description, descriptionWidth)
 		trace := summarizeJobTrace(store, job)
 		publication := ""
 		if job.Type == implementationJobType {
 			publication = job.PublicationStatus
 		}
-		activity := strings.TrimRight(trace.Activity, " ")
-		if len([]rune(activity)) > 24 {
-			activity = string([]rune(activity)[:23]) + "…"
-		}
+		activity := strings.TrimSpace(strings.Join(strings.Fields(trace.Activity), " "))
+		activity = truncateJobListField(activity, activityWidth)
 		targetPath := job.TargetPath
-		if runes := []rune(targetPath); len(runes) > targetPathWidth {
-			targetPath = string(runes[:targetPathWidth-1]) + "…"
+		if len([]rune(targetPath)) > targetPathWidth {
+			targetPath = truncateJobListField(filepath.Base(targetPath), targetPathWidth)
 		}
-		fmt.Fprintf(out, "%-36s %-16s %-16s %-*s %-14d %-5d %-24s %-12s %s\n", job.ID, job.Type, job.Status, descriptionWidth, description, trace.StatusCalls, trace.ActivePi, activity, publication, targetPath)
+		jobType := truncateJobListField(job.Type, typeWidth)
+		status := truncateJobListField(job.Status, statusWidth)
+		publication = truncateJobListField(publication, publicationWidth)
+		fmt.Fprintf(out, "%-36s %-*s %-*s %-*s %-*s %-*s %-*s\n", job.ID, typeWidth, jobType, statusWidth, status, descriptionWidth, description, activityWidth, activity, publicationWidth, publication, targetPathWidth, targetPath)
 	}
+}
+
+func truncateJobListField(value string, width int) string {
+	runes := []rune(value)
+	if len(runes) > width {
+		return string(runes[:width-1]) + "…"
+	}
+	return value
 }
 
 func writeJobSummary(out io.Writer, store *JobStore, job JobRecord, details bool) {
