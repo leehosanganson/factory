@@ -350,6 +350,11 @@ func managedRunByID(root, id string) (string, State, error) {
 		return "", zero, fmt.Errorf("invalid run ID %q", id)
 	}
 	dir := filepath.Join(root, id)
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return "", zero, fmt.Errorf("run not found: %s", id)
+	} else if err != nil {
+		return "", zero, err
+	}
 	if err := ensureRealDirectory(root, dir); err != nil {
 		return "", zero, err
 	}

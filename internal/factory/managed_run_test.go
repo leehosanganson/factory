@@ -417,6 +417,25 @@ func TestRunListEmptyIsHumanReadable(t *testing.T) {
 	}
 }
 
+func TestManagedRunByIDReportsMissingWithoutMaskingInvalidIDs(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "runs")
+	if _, _, err := managedRunByID(root, "missing"); err == nil || err.Error() != "run not found: missing" {
+		t.Fatalf("missing run error = %v, want clear not-found result", err)
+	}
+	if _, _, err := managedRunByID(root, "../outside"); err == nil || !strings.Contains(err.Error(), "invalid run ID") {
+		t.Fatalf("invalid run ID error = %v, want validation result", err)
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "unsafe")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := managedRunByID(root, "unsafe"); err == nil || !strings.Contains(err.Error(), "state path is not a real directory") {
+		t.Fatalf("symlinked run path error = %v, want unsafe path rejection", err)
+	}
+}
+
 func TestRunCommandsRejectNonManagedRun(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "runs")
 	dir, _, err := createRun(root, t.TempDir(), "ordinary run")
