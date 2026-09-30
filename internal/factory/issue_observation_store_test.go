@@ -43,6 +43,49 @@ func TestLocalIssueObservationStoreReopensAndPreservesVersionHistory(t *testing.
 	}
 }
 
+func TestLocalIssueObservationStorePreservesRapidRecordChronology(t *testing.T) {
+	store, err := NewLocalIssueObservationStore(filepath.Join(t.TempDir(), "observations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := "rapid-records"
+	versions := []string{"z-open-baseline", "y-open-update", "a-closed"}
+	states := []string{"open", "open", "closed"}
+	wantStatuses := []string{"baseline", "waiting_for_human", "stopped"}
+	providerUpdatedAt := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	for i, version := range versions {
+		if recorded, err := store.Record(ctx, key, testIssueSnapshot(version, states[i], version, providerUpdatedAt)); err != nil || !recorded {
+			t.Fatalf("Record(%s) = %v, %v; want newly recorded", version, recorded, err)
+		}
+		state, err := store.Reconcile(ctx, key)
+		if err != nil || state.Status != wantStatuses[i] {
+			t.Fatalf("Reconcile() after %s = %+v, %v; want %s", version, state, err, wantStatuses[i])
+		}
+	}
+
+	observations, err := store.List(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != len(versions) {
+		t.Fatalf("List() returned %d observations; want %d", len(observations), len(versions))
+	}
+	observedAtByVersion := make(map[string]time.Time, len(observations))
+	for _, observation := range observations {
+		observedAtByVersion[observation.Snapshot.Version] = observation.ObservedAt
+	}
+	for i := 1; i < len(versions); i++ {
+		if !observedAtByVersion[versions[i-1]].Before(observedAtByVersion[versions[i]]) {
+			t.Errorf("ObservedAt timestamps are not strictly increasing for record order: %s then %s", observedAtByVersion[versions[i-1]], observedAtByVersion[versions[i]])
+		}
+	}
+	state, err := store.Reconcile(ctx, key)
+	if err != nil || state.Status != "stopped" || state.BaselineVersion != "z-open-baseline" || state.LatestVersion != "a-closed" {
+		t.Fatalf("final lifecycle = %+v, %v; want record-order baseline and terminal close", state, err)
+	}
+}
+
 func TestLocalIssueObservationStoreDuplicateVersionIsIdempotentAndConflictFails(t *testing.T) {
 	store, err := NewLocalIssueObservationStore(filepath.Join(t.TempDir(), "observations"))
 	if err != nil {
@@ -52,8 +95,16 @@ func TestLocalIssueObservationStoreDuplicateVersionIsIdempotentAndConflictFails(
 	if recorded, err := store.Record(context.Background(), "request-1", snapshot); err != nil || !recorded {
 		t.Fatalf("first Record() = %v, %v; want newly recorded", recorded, err)
 	}
+	beforeDuplicate, err := store.List(context.Background(), "request-1")
+	if err != nil || len(beforeDuplicate) != 1 {
+		t.Fatalf("List() before duplicate = %+v, %v", beforeDuplicate, err)
+	}
 	if recorded, err := store.Record(context.Background(), "request-1", snapshot); err != nil || recorded {
 		t.Fatalf("duplicate Record() = %v, %v; want idempotent duplicate", recorded, err)
+	}
+	afterDuplicate, err := store.List(context.Background(), "request-1")
+	if err != nil || len(afterDuplicate) != 1 || !afterDuplicate[0].ObservedAt.Equal(beforeDuplicate[0].ObservedAt) {
+		t.Fatalf("duplicate changed observation timestamp: before=%+v after=%+v err=%v", beforeDuplicate, afterDuplicate, err)
 	}
 	changed := snapshot
 	changed.Title = "different contents with a reused version"

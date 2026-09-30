@@ -10,6 +10,7 @@ import (
 
 type workWatchStore struct {
 	recorded map[string]IssueSnapshot
+	order    []string
 	calls    int
 	err      error
 }
@@ -26,11 +27,99 @@ func (s *workWatchStore) Record(_ context.Context, _ string, snapshot IssueSnaps
 		return false, nil
 	}
 	s.recorded[snapshot.Version] = snapshot
+	s.order = append(s.order, snapshot.Version)
 	return true, nil
 }
 
 func (s *workWatchStore) List(context.Context, string) ([]IssueObservation, error) {
-	return nil, nil
+	observations := make([]IssueObservation, 0, len(s.recorded))
+	seen := make(map[string]bool)
+	for _, version := range s.order {
+		if snapshot, ok := s.recorded[version]; ok && !seen[version] {
+			observations = append(observations, IssueObservation{Snapshot: snapshot, ObservedAt: snapshot.UpdatedAt})
+			seen[version] = true
+		}
+	}
+	for version, snapshot := range s.recorded {
+		if !seen[version] {
+			observations = append(observations, IssueObservation{Snapshot: snapshot, ObservedAt: snapshot.UpdatedAt})
+		}
+	}
+	return observations, nil
+}
+
+func (s *workWatchStore) Reconcile(ctx context.Context, key string) (IssueLifecycleState, error) {
+	observations, err := s.List(ctx, key)
+	if err != nil {
+		return IssueLifecycleState{}, err
+	}
+	if len(observations) == 0 {
+		return IssueLifecycleState{}, errors.New("no observations")
+	}
+	state := IssueLifecycleState{Status: "baseline", LatestVersion: observations[0].Snapshot.Version}
+	for _, observation := range observations {
+		if observation.Snapshot.State == "closed" {
+			state.Status = "stopped"
+		} else if observation.Snapshot.Version != state.LatestVersion && state.Status != "stopped" {
+			state.Status = "waiting_for_human"
+		}
+		state.LatestVersion = observation.Snapshot.Version
+	}
+	return state, nil
+}
+
+func TestWorkWatchDoesNotFetchAfterPersistedClosedObservation(t *testing.T) {
+	item := WorkItem{Request: WorkRequest{DeduplicationKey: "test-request", Repository: "acme/widget", IssueID: "42"}}
+	store := &workWatchStore{recorded: map[string]IssueSnapshot{
+		"open-version":   testIssueSnapshot("open-version", "open", "Open", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)),
+		"closed-version": testIssueSnapshot("closed-version", "closed", "Done", time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)),
+	}, order: []string{"open-version", "closed-version"}}
+	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+		t.Fatal("terminal watch fetched from provider")
+		return IssueSnapshot{}, nil
+	})
+	var out strings.Builder
+	if err := watchIssue(context.Background(), item, tracker, store, time.Second, &out, func(context.Context, time.Duration) error {
+		t.Fatal("terminal watch waited for another poll")
+		return nil
+	}); err != nil {
+		t.Fatalf("watch persisted terminal state: %v", err)
+	}
+	if got := out.String(); got != "Lifecycle: stopped\n" {
+		t.Fatalf("terminal watch output = %q, want explicit stopped lifecycle only", got)
+	}
+	if store.calls != 0 || len(store.recorded) != 2 {
+		t.Fatalf("terminal watch changed observations: record calls=%d observations=%d", store.calls, len(store.recorded))
+	}
+}
+
+func TestWorkWatchResumesPollingFromPersistedOpenBaseline(t *testing.T) {
+	item := WorkItem{Request: WorkRequest{DeduplicationKey: "test-request", Repository: "acme/widget", IssueID: "42"}}
+	baseline := testIssueSnapshot("open-version-1", "open", "Open", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
+	updated := testIssueSnapshot("open-version-2", "open", "Updated", time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC))
+	store := &workWatchStore{recorded: map[string]IssueSnapshot{baseline.Version: baseline}, order: []string{baseline.Version}}
+	fetches := 0
+	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+		fetches++
+		return updated, nil
+	})
+	waits := 0
+	var out strings.Builder
+	err := watchIssue(context.Background(), item, tracker, store, time.Second, &out, func(context.Context, time.Duration) error {
+		waits++
+		return context.Canceled
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("open-baseline watch error = %v, want context.Canceled", err)
+	}
+	if fetches != 1 || waits != 1 || store.calls != 1 {
+		t.Fatalf("open-baseline watch fetches/waits/records = %d/%d/%d, want 1/1/1", fetches, waits, store.calls)
+	}
+	for _, want := range []string{"Title: Updated", "Observation: newly recorded", "Lifecycle: waiting_for_human"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("open-baseline watch output missing %q: %s", want, out.String())
+		}
+	}
 }
 
 func TestWorkWatchRecordsUpdatesAndStopsAfterClosedObservation(t *testing.T) {
@@ -67,7 +156,7 @@ func TestWorkWatchRecordsUpdatesAndStopsAfterClosedObservation(t *testing.T) {
 	if fetches != 3 || waits != 2 || store.calls != 3 || len(store.recorded) != 3 {
 		t.Fatalf("watch fetches/waits/records = %d/%d/%d, versions=%d", fetches, waits, store.calls, len(store.recorded))
 	}
-	for _, want := range []string{"Title: Initial", "Title: Updated", "Title: Done", "Observation: newly recorded"} {
+	for _, want := range []string{"Title: Initial", "Title: Updated", "Title: Done", "Observation: newly recorded", "Lifecycle: baseline", "Lifecycle: waiting_for_human", "Lifecycle: stopped"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("watch output missing %q: %s", want, out.String())
 		}

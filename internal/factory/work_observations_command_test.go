@@ -148,7 +148,7 @@ func TestWorkHistoryListsSnapshotsWithoutFetchingOrChangingQueue(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Title: Earlier title", "State: open", "Updated: 2025-02-01T00:00:00Z", "Version: version-1", "URL: https://github.com/acme/widget/issues/42",
-		"Title: Latest title", "State: closed", "Updated: 2025-02-02T00:00:00Z", "Version: version-2",
+		"Title: Latest title", "State: closed", "Updated: 2025-02-02T00:00:00Z", "Version: version-2", "Lifecycle: stopped",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("history output missing %q: %s", want, out.String())

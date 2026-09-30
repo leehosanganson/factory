@@ -41,6 +41,20 @@ func watchIssue(ctx context.Context, item WorkItem, tracker IssueTracker, store 
 	if interval <= 0 {
 		return fmt.Errorf("watch interval must be positive")
 	}
+	observations, err := store.List(ctx, item.Request.DeduplicationKey)
+	if err != nil {
+		return fmt.Errorf("list issue observations: %w", err)
+	}
+	if len(observations) > 0 {
+		state, err := store.Reconcile(ctx, item.Request.DeduplicationKey)
+		if err != nil {
+			return fmt.Errorf("reconcile issue lifecycle: %w", err)
+		}
+		if state.Status == "stopped" {
+			fmt.Fprintln(out, "Lifecycle: stopped")
+			return nil
+		}
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -53,13 +67,18 @@ func watchIssue(ctx context.Context, item WorkItem, tracker IssueTracker, store 
 		if err != nil {
 			return fmt.Errorf("record issue observation: %w", err)
 		}
+		state, err := store.Reconcile(ctx, item.Request.DeduplicationKey)
+		if err != nil {
+			return fmt.Errorf("reconcile issue lifecycle: %w", err)
+		}
 		printIssueSnapshot(out, snapshot)
 		if recorded {
 			fmt.Fprintln(out, "Observation: newly recorded")
 		} else {
 			fmt.Fprintln(out, "Observation: duplicate")
 		}
-		if snapshot.State == "closed" {
+		fmt.Fprintf(out, "Lifecycle: %s\n", state.Status)
+		if state.Status == "stopped" {
 			return nil
 		}
 		if err := wait(ctx, interval); err != nil {

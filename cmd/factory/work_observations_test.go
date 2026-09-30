@@ -106,7 +106,7 @@ func TestWorkWatchCLIRecordsClosedSnapshotAndExits(t *testing.T) {
 	if err := run([]string{"work", "watch", request.DeduplicationKey, "--interval", "1ms"}, nil, &out, &errOut); err != nil {
 		t.Fatalf("watch should exit successfully for a closed issue: %v", err)
 	}
-	for _, want := range []string{"Title: Widget fixed", "State: closed", "Observation: newly recorded"} {
+	for _, want := range []string{"Title: Widget fixed", "State: closed", "Observation: newly recorded", "Lifecycle: stopped"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("watch output missing %q: %s", want, out.String())
 		}
@@ -118,6 +118,83 @@ func TestWorkWatchCLIRecordsClosedSnapshotAndExits(t *testing.T) {
 	observations, err := store.List(context.Background(), request.DeduplicationKey)
 	if err != nil || len(observations) != 1 || observations[0].Snapshot.State != "closed" {
 		t.Fatalf("watch history = %+v, %v; want one closed observation", observations, err)
+	}
+	queue, err = factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	after, err := queue.Get(context.Background(), request.DeduplicationKey)
+	if err != nil || after != before {
+		t.Fatalf("watch changed queued request: before=%+v after=%+v err=%v", before, after, err)
+	}
+}
+
+func TestWorkWatchCLIReconcilesChangesContinuesWhileWaitingAndStopsOnClosure(t *testing.T) {
+	state, config, bin := t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	t.Setenv("XDG_CONFIG_HOME", config)
+	calls := filepath.Join(t.TempDir(), "gh-calls")
+	t.Setenv("FACTORY_GH_CALLS", calls)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	gh := filepath.Join(bin, "gh")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FACTORY_GH_CALLS"
+count=$(wc -l < "$FACTORY_GH_CALLS" | tr -d '[:space:]')
+case "$count" in
+  1) title='Initial'; state='open'; updated='2025-03-01T00:00:00Z' ;;
+  2) title='Changed'; state='open'; updated='2025-03-02T00:00:00Z' ;;
+  3) title='Changed again'; state='open'; updated='2025-03-03T00:00:00Z' ;;
+  *) title='Closed'; state='closed'; updated='2025-03-04T00:00:00Z' ;;
+esac
+printf '{"id":101,"number":42,"title":"%s","body":"details","state":"%s","html_url":"https://github.com/acme/widget/issues/42","updated_at":"%s"}' "$title" "$state" "$updated"
+`
+	if err := os.WriteFile(gh, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := factory.WorkRequest{TrackerProvider: "github", IssueID: "42", CodeHostProvider: "github", Repository: "acme/widget", DeduplicationKey: "watch-reconciliation-integration"}
+	if err := queue.Enqueue(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	before, err := queue.Get(context.Background(), request.DeduplicationKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := queue.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"work", "watch", request.DeduplicationKey, "--interval", "1ms"}, nil, &out, &errOut); err != nil {
+		t.Fatalf("watch should stop successfully after closure: %v; stderr=%s", err, errOut.String())
+	}
+	for _, want := range []string{"Lifecycle: baseline", "Lifecycle: waiting_for_human", "Title: Changed again", "Lifecycle: stopped"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("watch output missing %q: %s", want, out.String())
+		}
+	}
+	callData, err := os.ReadFile(calls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(callData)); got != "api --method GET repos/acme/widget/issues/42\napi --method GET repos/acme/widget/issues/42\napi --method GET repos/acme/widget/issues/42\napi --method GET repos/acme/widget/issues/42" {
+		t.Fatalf("provider calls = %q; want four read-only GETs, continuing while waiting", got)
+	}
+	store, err := factory.NewLocalIssueObservationStore(filepath.Join(state, "factory", "work-observations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations, err := store.List(context.Background(), request.DeduplicationKey)
+	if err != nil || len(observations) != 4 {
+		t.Fatalf("watch history = %d observations, %v; want baseline, two changes, and closure", len(observations), err)
+	}
+	lifecycle, err := store.Reconcile(context.Background(), request.DeduplicationKey)
+	if err != nil || lifecycle.Status != "stopped" || lifecycle.BaselineVersion == "" {
+		t.Fatalf("persisted lifecycle = %+v, %v", lifecycle, err)
 	}
 	queue, err = factory.NewLocalWorkQueue(filepath.Join(state, "factory", "work-requests"))
 	if err != nil {
