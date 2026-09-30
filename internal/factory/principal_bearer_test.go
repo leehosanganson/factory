@@ -153,6 +153,19 @@ func TestLoadPrincipalBearerVerifierRejectsUnsafeFiles(t *testing.T) {
 			t.Fatal("symlink verifier file was accepted")
 		}
 	})
+	t.Run("wrong owner", func(t *testing.T) {
+		path := writePrincipalBearerConfig(t, valid, 0o600)
+		wrongUID := 1
+		if os.Geteuid() == wrongUID {
+			wrongUID = 2
+		}
+		if err := os.Chown(path, wrongUID, -1); err != nil {
+			t.Skipf("cannot set verifier file to another owner: %v", err)
+		}
+		if _, err := LoadPrincipalBearerVerifier(path); err == nil {
+			t.Fatal("verifier file owned by another UID was accepted")
+		}
+	})
 	t.Run("non-regular file", func(t *testing.T) {
 		if _, err := LoadPrincipalBearerVerifier(t.TempDir()); err == nil {
 			t.Fatal("directory was accepted as a verifier file")
