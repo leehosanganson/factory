@@ -296,9 +296,10 @@ func workHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory work get <dedup-key>", "Show a persisted work request."},
 		{"factory work issue <dedup-key>", "Fetch and show one ephemeral GitHub issue snapshot for a queued request."},
 		{"factory work refresh <dedup-key>", "Fetch one GitHub issue snapshot and durably record it if its version is new."},
-		{"factory work history <dedup-key>", "List durable issue snapshots recorded by explicit refreshes."},
+		{"factory work history <dedup-key>", "List durable issue snapshots recorded by explicit refreshes or watches."},
+		{"factory work watch <dedup-key> [--interval <duration>]", "Poll a GitHub issue in the foreground and record each snapshot until it closes."},
 	}
-	return selectCommandHelp(all, subcommand, "Issue reads do not change the queue or start work; they are explicit and one-shot, do not poll, and do not write to GitHub.")
+	return selectCommandHelp(all, subcommand, "Issue reads do not change the queue or start work. Watch is opt-in foreground polling, not an autonomous worker; no command performs PR engineering or writes to GitHub.")
 }
 
 func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCommand, []string) {
