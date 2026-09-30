@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"syscall"
 )
 
 const principalBearerConfigLimit = 1 << 20
@@ -45,35 +46,28 @@ func LoadPrincipalBearerVerifier(path string) (*PrincipalBearerVerifier, error) 
 	if path == "" {
 		return nil, fmt.Errorf("principal bearer verifier path must not be empty")
 	}
-	info, err := os.Lstat(path)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return nil, fmt.Errorf("inspect principal bearer verifier file: %w", err)
+		return nil, fmt.Errorf("open principal bearer verifier file: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("principal bearer verifier must be a regular, non-symlink file")
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat principal bearer verifier file: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("principal bearer verifier must be a regular file")
 	}
 	if info.Mode().Perm()&^0o600 != 0 || info.Mode().Perm()&0o400 == 0 {
 		return nil, fmt.Errorf("principal bearer verifier file must be owner-readable and inaccessible to group and others")
 	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) {
+		return nil, fmt.Errorf("principal bearer verifier file must be owned by the effective user")
+	}
 	if info.Size() > principalBearerConfigLimit {
 		return nil, fmt.Errorf("principal bearer verifier file exceeds %d bytes", principalBearerConfigLimit)
-	}
-
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open principal bearer verifier file: %w", err)
-	}
-	defer file.Close()
-	openedInfo, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat principal bearer verifier file: %w", err)
-	}
-	pathInfo, err := os.Lstat(path)
-	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) || !os.SameFile(openedInfo, pathInfo) {
-		return nil, fmt.Errorf("principal bearer verifier file changed while opening")
-	}
-	if openedInfo.Mode().Perm()&^0o600 != 0 || openedInfo.Mode().Perm()&0o400 == 0 {
-		return nil, fmt.Errorf("principal bearer verifier file must be owner-readable and inaccessible to group and others")
 	}
 
 	data, err := io.ReadAll(io.LimitReader(file, principalBearerConfigLimit+1))
