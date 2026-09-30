@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -169,6 +170,15 @@ func TestLoadPrincipalBearerVerifierRejectsUnsafeFiles(t *testing.T) {
 	t.Run("non-regular file", func(t *testing.T) {
 		if _, err := LoadPrincipalBearerVerifier(t.TempDir()); err == nil {
 			t.Fatal("directory was accepted as a verifier file")
+		}
+	})
+	t.Run("FIFO", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "verifier.fifo")
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Skipf("cannot create FIFO: %v", err)
+		}
+		if _, err := LoadPrincipalBearerVerifier(path); err == nil {
+			t.Fatal("FIFO was accepted as a verifier file")
 		}
 	})
 	t.Run("group-readable", func(t *testing.T) {

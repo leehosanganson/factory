@@ -46,7 +46,7 @@ func LoadPrincipalBearerVerifier(path string) (*PrincipalBearerVerifier, error) 
 	if path == "" {
 		return nil, fmt.Errorf("principal bearer verifier path must not be empty")
 	}
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open principal bearer verifier file: %w", err)
 	}
