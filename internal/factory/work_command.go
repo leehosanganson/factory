@@ -125,6 +125,11 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 			for _, observation := range observations {
 				printIssueSnapshot(out, observation.Snapshot)
 			}
+			state, err := store.Reconcile(ctx, item.Request.DeduplicationKey)
+			if err != nil {
+				return fmt.Errorf("reconcile issue lifecycle: %w", err)
+			}
+			fmt.Fprintf(out, "Lifecycle: %s\n", state.Status)
 			return nil
 		}
 		if args[0] == "watch" {
@@ -160,6 +165,11 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 			} else {
 				fmt.Fprintln(out, "Observation: duplicate")
 			}
+			state, err := store.Reconcile(ctx, item.Request.DeduplicationKey)
+			if err != nil {
+				return fmt.Errorf("reconcile issue lifecycle: %w", err)
+			}
+			fmt.Fprintf(out, "Lifecycle: %s\n", state.Status)
 		}
 		return nil
 	default:
