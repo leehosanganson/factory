@@ -42,6 +42,9 @@ func TestJobTraceCountsStatusAttemptsAndTracksOnlyLivePiSubprocesses(t *testing.
 			t.Fatal(err)
 		}
 	}
+	if err := store.AppendSessionEventDetails("trace-job", "workflow", SessionEvent{Type: "stage.updated", Message: "working\x1b]0;hidden title\x07"}); err != nil {
+		t.Fatal(err)
+	}
 	observer := jobProcessObserver(store, "trace-job", "workflow")
 	observer("/usr/bin/pi", 0, true)
 	observer("custom-agent", 12345, true)
@@ -78,7 +81,7 @@ func TestJobTraceCountsStatusAttemptsAndTracksOnlyLivePiSubprocesses(t *testing.
 	if err := JobCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &cli); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cli.String(), "ACTIVITY") || !strings.Contains(cli.String(), "status.comp…") {
+	if !strings.Contains(cli.String(), "ACTIVITY") || !strings.Contains(cli.String(), "status.comp…") || strings.Contains(cli.String(), "\x1b") || strings.Contains(cli.String(), "hidden title") {
 		t.Fatalf("job list omitted compact trace activity: %q", cli.String())
 	}
 	observer("pi", currentProcessID(), false)

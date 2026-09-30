@@ -181,6 +181,33 @@ func TestJobDetailsExposePersistedImplementationWorktree(t *testing.T) {
 	}
 }
 
+func TestJobListSanitizesTerminalControlSequencesInPersistedText(t *testing.T) {
+	state := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := JobRecord{
+		ID: "terminal-control", Type: tidyJobType, Status: "complete",
+		TaskDescription: "task\x1b[31mRED\x1b[0m", TargetPath: t.TempDir(),
+	}
+	if err := store.CreateJob(job); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := JobCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	persisted, err := store.GetJob(job.ID)
+	if err != nil || persisted.TaskDescription != job.TaskDescription {
+		t.Fatalf("sanitizing output mutated persisted description: job=%+v err=%v", persisted, err)
+	}
+	if strings.Contains(text, "\x1b") || !strings.Contains(text, "taskRED") {
+		t.Fatalf("job list did not neutralize persisted ANSI control text: %q", text)
+	}
+}
+
 func TestJobGetDefaultUsesBoundedTableAndDetailsRemainComplete(t *testing.T) {
 	state := t.TempDir()
 	target := filepath.Join(string(filepath.Separator), "repo")

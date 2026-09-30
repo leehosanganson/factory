@@ -228,14 +228,14 @@ func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {
 	const targetPathWidth = 11
 	fmt.Fprintf(out, "%-36s %-*s %-*s %-*s %-*s %-*s %-*s\n", "ID", typeWidth, "TYPE", statusWidth, "STATUS", descriptionWidth, "DESCRIPTION", activityWidth, "ACTIVITY", publicationWidth, "PUBLICATION", targetPathWidth, "TARGET")
 	for _, job := range jobs {
-		description := strings.Join(strings.Fields(job.TaskDescription), " ")
+		description := strings.Join(strings.Fields(terminalSafeText(job.TaskDescription)), " ")
 		description = truncateJobListField(description, descriptionWidth)
 		trace := summarizeJobTrace(store, job)
 		publication := ""
 		if job.Type == implementationJobType {
 			publication = job.PublicationStatus
 		}
-		activity := strings.TrimSpace(strings.Join(strings.Fields(trace.Activity), " "))
+		activity := strings.TrimSpace(strings.Join(strings.Fields(terminalSafeText(trace.Activity)), " "))
 		activity = truncateJobListField(activity, activityWidth)
 		targetPath := job.TargetPath
 		if len([]rune(targetPath)) > targetPathWidth {
