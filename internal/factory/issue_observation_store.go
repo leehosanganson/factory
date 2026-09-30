@@ -116,7 +116,6 @@ func (s *LocalIssueObservationStore) Record(ctx context.Context, deduplicationKe
 	}
 	defer releaseFileLock(lock)
 
-	observation := IssueObservation{DeduplicationKey: deduplicationKey, Snapshot: snapshot, ObservedAt: time.Now().UTC()}
 	path := s.recordPath(deduplicationKey, snapshot.Version)
 	if err := ensureRegularIfExists(path); err != nil {
 		return false, err
@@ -136,6 +135,21 @@ func (s *LocalIssueObservationStore) Record(ctx context.Context, deduplicationKe
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, err
 	}
+	observations, err := s.listLocked(ctx, deduplicationKey)
+	if err != nil {
+		return false, err
+	}
+	observedAt := time.Now().UTC()
+	var latestObservedAt time.Time
+	for _, existing := range observations {
+		if existing.ObservedAt.After(latestObservedAt) {
+			latestObservedAt = existing.ObservedAt
+		}
+	}
+	if !observedAt.After(latestObservedAt) {
+		observedAt = latestObservedAt.Add(time.Nanosecond)
+	}
+	observation := IssueObservation{DeduplicationKey: deduplicationKey, Snapshot: snapshot, ObservedAt: observedAt}
 	record := issueObservationRecord{RecordVersion: issueObservationRecordVersion, Observation: observation}
 	if err := writeJSONAtomic(s.root, filepath.Base(path), record); err != nil {
 		return false, fmt.Errorf("record issue observation: %w", err)
