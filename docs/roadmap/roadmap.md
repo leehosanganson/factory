@@ -53,7 +53,7 @@ Any fleet design depends on durable shared job state and safe worker ownership f
 
 ## Possible future integrations
 
-- **Issue-driven requests:** scheduled or event-driven GitHub/Azure DevOps issue intake could filter, deduplicate, retain provenance, and explain accepted/skipped requests. Polling or webhooks are design choices, not existing features.
+- **Autonomous issue-to-PR engineering:** the [issue-to-PR design](autonomous-issue-to-pr-design.md) records the agreed GitHub Issues + GitHub PR MVP, separate provider-neutral tracker/code-host interfaces, durable local queue and shared worker path, continuous issue reconciliation, safety requirements, and ordered implementation gates. Azure DevOps (both Azure Boards and Azure Repos PRs), server hosting, provider events, and an external distributed broker are outside MVP scope. This is a future design, not implemented behavior or a dated commitment.
 - **CI/CD and deployment:** integrations could carry verified artifacts and approvals across CI and deployment systems, then record deployment outcomes. Factory does not currently deploy software.
 - **Web application:** a UI could build on stable APIs for instances, workflows, jobs, stages, logs, approvals, provenance, and outcomes. It should not introduce a separate execution or persistence authority.
 
@@ -64,6 +64,8 @@ Any fleet design depends on durable shared job state and safe worker ownership f
 3. Add container or other deployment packaging and validate restart behavior without equating process restart with safe replay.
 4. Introduce shared coordination and test horizontal scaling, partitions, stale workers, and reconciliation.
 5. Add fleet control only after worker contracts and ownership are proven.
-6. Explore reusable task definitions, job composition/chains, issue intake, CI/CD/deployment feedback, and a web interface against the same durable APIs.
+6. Explore reusable task definitions, job composition/chains, CI/CD/deployment feedback, and a web interface against the same durable APIs.
+
+Issue-to-PR automation has a separate proposed sequence in the [autonomous issue-to-PR design](autonomous-issue-to-pr-design.md). Its GitHub MVP is based on a durable single-host queue and does not depend on server or fleet milestones above.
 
 At each step, use observed user and operational feedback to revisit intent, document evidence and friction, and adjust the direction. These stages are a planning aid, not a schedule or promise; sequence and scope may change as evidence and product priorities evolve.
