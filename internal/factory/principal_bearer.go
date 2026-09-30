@@ -132,7 +132,7 @@ func LoadPrincipalBearerVerifier(path string) (*PrincipalBearerVerifier, error) 
 
 func rejectDuplicateJSONFields(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
-	if err := consumeJSONValue(decoder); err != nil {
+	if err := consumeJSONValue(decoder, principalBearerJSONFields("")); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
@@ -141,7 +141,7 @@ func rejectDuplicateJSONFields(data []byte) error {
 	return nil
 }
 
-func consumeJSONValue(decoder *json.Decoder) error {
+func consumeJSONValue(decoder *json.Decoder, allowedFields map[string]struct{}) error {
 	token, err := decoder.Token()
 	if err != nil {
 		return err
@@ -166,7 +166,12 @@ func consumeJSONValue(decoder *json.Decoder) error {
 				return fmt.Errorf("duplicate JSON field")
 			}
 			keys[key] = struct{}{}
-			if err := consumeJSONValue(decoder); err != nil {
+			if allowedFields != nil {
+				if _, exists := allowedFields[key]; !exists {
+					return fmt.Errorf("unexpected JSON field")
+				}
+			}
+			if err := consumeJSONValue(decoder, principalBearerJSONFields(key)); err != nil {
 				return err
 			}
 		}
@@ -174,7 +179,7 @@ func consumeJSONValue(decoder *json.Decoder) error {
 		return err
 	case '[':
 		for decoder.More() {
-			if err := consumeJSONValue(decoder); err != nil {
+			if err := consumeJSONValue(decoder, allowedFields); err != nil {
 				return err
 			}
 		}
@@ -182,6 +187,17 @@ func consumeJSONValue(decoder *json.Decoder) error {
 		return err
 	default:
 		return fmt.Errorf("invalid JSON delimiter")
+	}
+}
+
+func principalBearerJSONFields(parent string) map[string]struct{} {
+	switch parent {
+	case "":
+		return map[string]struct{}{"version": {}, "principals": {}}
+	case "principals":
+		return map[string]struct{}{"id": {}, "token_sha256": {}}
+	default:
+		return nil
 	}
 }
 

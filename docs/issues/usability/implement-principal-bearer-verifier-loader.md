@@ -8,7 +8,7 @@
 - **Acceptance criteria:**
   1. Valid configuration loads and a matching raw token returns only its configured principal ID.
   2. Empty/wrong tokens never authenticate; raw tokens are not retained or emitted in JSON/error messages.
-  3. Missing, oversized, malformed, trailing-data, unknown-field, duplicate, invalid-ID/digest, symlink/non-regular, unreadable, or group/other-readable files fail closed.
+  3. Missing, oversized, malformed, trailing-data, unknown-field, duplicate, invalid-ID/digest, symlink/non-regular, unreadable, or group/other-readable files fail closed. JSON object field names must match the v1 schema's exact spelling and case; case variants and case-variant duplicates are rejected.
   4. `PrincipalID` uses `crypto/subtle` constant-time digest comparison; behavioral tests exercise matching and non-matching cases.
   5. Existing CLI behavior remains unchanged; `make test`, `make vet`, and `make build` pass.
 - **Status:** Implemented as a server-independent loader and immutable verifier in `internal/factory`; loading a changed file requires creating a new verifier at process startup/restart. No CLI startup integration or HTTP surface was added.
