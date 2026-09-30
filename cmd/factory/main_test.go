@@ -143,6 +143,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "factory job show"}},
 		{name: "job watch help", args: []string{"job", "watch", "--help"}, want: []string{"factory job watch <id>...", "Refresh selected job status and latest activity", "monitor phase", "check freshness", "recent events"}, omit: []string{"factory job logs", "factory job stop"}},
 		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"Gated runs", "factory run events"}, omit: []string{"factory job", "Monitor management", "Example:"}},
+		{name: "run list limit", args: []string{"run", "list", "--help"}, want: []string{"factory run list [--limit <n>]", "newest positive number"}, omit: []string{"factory run get"}},
 		{name: "run get canonical", args: []string{"run", "get", "--help"}, want: []string{"factory run get", "--details", "metadata"}, omit: []string{"factory run show"}},
 		{name: "monitor canonical", args: []string{"monitor", "get", "--help"}, want: []string{"factory monitor get", "--details", "proposals", "latest PR check", "recent events"}, omit: []string{"factory monitor describe"}},
 		{name: "monitor list", args: []string{"monitor", "list", "--help"}, want: []string{"factory monitor list [--limit <n>]", "newest positive number"}, omit: []string{"factory monitor get"}},
