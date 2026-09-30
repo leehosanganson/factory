@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"time"
 )
 
@@ -174,7 +175,12 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 		if err != nil {
 			return err
 		}
-		var rows []string
+		type runRow struct {
+			updatedAt time.Time
+			id        string
+			text      string
+		}
+		var rows []runRow
 		for _, entry := range entries {
 			if !entry.IsDir() {
 				continue
@@ -194,15 +200,25 @@ func RunCommand(ctx context.Context, args []string, cfg Config, out io.Writer) e
 					return err
 				}
 			}
-			rows = append(rows, fmt.Sprintf("%-32s %-16s %-20s %s", state.ID, state.Status, life, state.Stage))
+			rows = append(rows, runRow{
+				updatedAt: state.UpdatedAt,
+				id:        state.ID,
+				text:      fmt.Sprintf("%-32s %-16s %-20s %-25s %s", state.ID, state.Status, life, state.UpdatedAt.Format(time.RFC3339), state.Stage),
+			})
 		}
+		sort.Slice(rows, func(i, j int) bool {
+			if rows[i].updatedAt.Equal(rows[j].updatedAt) {
+				return rows[i].id < rows[j].id
+			}
+			return rows[i].updatedAt.After(rows[j].updatedAt)
+		})
 		if len(rows) == 0 {
 			fmt.Fprintln(out, "No gated runs.")
 			return nil
 		}
-		fmt.Fprintf(out, "%-32s %-16s %-20s %s\n", "ID", "STATUS", "LIVENESS", "STAGE")
+		fmt.Fprintf(out, "%-32s %-16s %-20s %-25s %s\n", "ID", "STATUS", "LIVENESS", "UPDATED", "STAGE")
 		for _, row := range rows {
-			fmt.Fprintln(out, row)
+			fmt.Fprintln(out, row.text)
 		}
 		return nil
 	case "get":

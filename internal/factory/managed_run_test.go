@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -59,7 +60,7 @@ func TestRunCommandListsShowsEventsAndCooperativelyStopsOnlyManagedRuns(t *testi
 
 	var out bytes.Buffer
 	cfg := Config{StateDir: stateRoot}
-	if err := RunCommand(context.Background(), []string{"list"}, cfg, &out); err != nil || !strings.Contains(out.String(), "ID") || !strings.Contains(out.String(), "LIVENESS") || !strings.Contains(out.String(), state.ID) || !strings.Contains(out.String(), "heartbeat_fresh") {
+	if err := RunCommand(context.Background(), []string{"list"}, cfg, &out); err != nil || !strings.Contains(out.String(), "ID") || !strings.Contains(out.String(), "LIVENESS") || !strings.Contains(out.String(), "UPDATED") || !strings.Contains(out.String(), state.ID) || !strings.Contains(out.String(), "heartbeat_fresh") {
 		t.Fatalf("list output=%q err=%v", out.String(), err)
 	}
 	out.Reset()
@@ -273,6 +274,70 @@ func TestManagedWorkflowRequiresApprovalGate(t *testing.T) {
 	workflow := Workflow{Managed: true, Config: Config{}, Workdir: t.TempDir(), In: strings.NewReader(""), Out: io.Discard}
 	if err := workflow.Run("task"); err == nil || !strings.Contains(err.Error(), "reserved for gated") {
 		t.Fatalf("ungated managed workflow error = %v", err)
+	}
+}
+
+func TestRunListOrdersByUpdatedAtDescendingAndIDForTies(t *testing.T) {
+	stateRoot := filepath.Join(t.TempDir(), "state")
+	runsRoot, err := StateRoot(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	for _, tc := range []struct {
+		id        string
+		updatedAt time.Time
+		managed   bool
+	}{
+		{id: "older", updatedAt: updatedAt.Add(-time.Hour), managed: true},
+		{id: "tie-b", updatedAt: updatedAt, managed: true},
+		{id: "tie-a", updatedAt: updatedAt, managed: true},
+		{id: "newest", updatedAt: updatedAt.Add(time.Hour), managed: true},
+		{id: "unmanaged", updatedAt: updatedAt.Add(2 * time.Hour)},
+	} {
+		dir := filepath.Join(runsRoot, tc.id)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		state := State{
+			ID: tc.id, Status: "complete", Managed: tc.managed,
+			StageHistoryVersion: 1, Stages: []StageRecord{}, UpdatedAt: tc.updatedAt,
+		}
+		data, err := json.MarshalIndent(state, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "state.json"), append(data, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var out bytes.Buffer
+	if err := RunCommand(context.Background(), []string{"list"}, Config{StateDir: stateRoot}, &out); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != 5 || !strings.HasPrefix(lines[0], "ID") {
+		t.Fatalf("run list output = %q", out.String())
+	}
+	if !strings.Contains(lines[0], "UPDATED") {
+		t.Fatalf("run list header omitted update column: %q", lines[0])
+	}
+	updatedAtByID := map[string]time.Time{
+		"newest": updatedAt.Add(time.Hour), "tie-a": updatedAt,
+		"tie-b": updatedAt, "older": updatedAt.Add(-time.Hour),
+	}
+	var got []string
+	for _, line := range lines[1:] {
+		fields := strings.Fields(line)
+		got = append(got, fields[0])
+		if fields[3] != updatedAtByID[fields[0]].Format(time.RFC3339) {
+			t.Errorf("run %s updated column = %q, want %q", fields[0], fields[3], updatedAtByID[fields[0]].Format(time.RFC3339))
+		}
+	}
+	want := []string{"newest", "tie-a", "tie-b", "older"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("run list order = %v, want %v; output: %s", got, want, out.String())
 	}
 }
 
