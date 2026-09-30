@@ -13,7 +13,7 @@ import (
 )
 
 // WorkCommand manages locally queued issue work requests. Issue snapshots are
-// fetched only by the explicit issue subcommand; no command starts engineering.
+// fetched only by explicit issue and refresh subcommands; no command starts engineering.
 func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
 	return WorkCommandWithIssueTracker(ctx, args, cfg, out, NewGitHubIssueTracker())
 }
@@ -21,7 +21,7 @@ func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) 
 // WorkCommandWithIssueTracker makes the read-only issue lookup dependency explicit.
 func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config, out io.Writer, tracker IssueTracker) (result error) {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key>")
+		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key> | refresh <dedup-key> | history <dedup-key>")
 	}
 	if args[0] == "submit" {
 		request, hasDeduplicationKey, err := parseWorkSubmit(args[1:])
@@ -81,7 +81,7 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 			printWorkItem(out, item)
 		}
 		return nil
-	case "get", "issue":
+	case "get", "issue", "refresh", "history":
 		if len(args) != 2 || strings.HasPrefix(args[1], "-") {
 			return fmt.Errorf("usage: factory work %s <dedup-key>", args[0])
 		}
@@ -96,17 +96,54 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 		if args[0] == "get" {
 			return nil
 		}
-		if item.Request.TrackerProvider != "github" {
-			return fmt.Errorf("cannot inspect issue for tracker %q: only github is supported", item.Request.TrackerProvider)
+		if args[0] != "history" && item.Request.TrackerProvider != "github" {
+			return fmt.Errorf("cannot %s issue for tracker %q: only github is supported", args[0], item.Request.TrackerProvider)
+		}
+		if args[0] == "history" {
+			store, err := openIssueObservationStore(cfg.StateDir)
+			if err != nil {
+				return err
+			}
+			observations, err := store.List(ctx, item.Request.DeduplicationKey)
+			if err != nil {
+				return fmt.Errorf("list issue history: %w", err)
+			}
+			if len(observations) == 0 {
+				fmt.Fprintln(out, "No issue observations recorded.")
+				return nil
+			}
+			for _, observation := range observations {
+				printIssueSnapshot(out, observation.Snapshot)
+			}
+			return nil
+		}
+		operation := args[0]
+		if operation == "issue" {
+			operation = "inspect"
 		}
 		if tracker == nil {
-			return fmt.Errorf("inspect issue: issue tracker is unavailable")
+			return fmt.Errorf("%s issue: issue tracker is unavailable", operation)
 		}
 		snapshot, err := tracker.GetIssue(ctx, item.Request.Repository, item.Request.IssueID)
 		if err != nil {
-			return fmt.Errorf("inspect issue: %w", err)
+			return fmt.Errorf("%s issue: %w", operation, err)
 		}
 		printIssueSnapshot(out, snapshot)
+		if args[0] == "refresh" {
+			store, err := openIssueObservationStore(cfg.StateDir)
+			if err != nil {
+				return err
+			}
+			recorded, err := store.Record(ctx, item.Request.DeduplicationKey, snapshot)
+			if err != nil {
+				return fmt.Errorf("record issue observation: %w", err)
+			}
+			if recorded {
+				fmt.Fprintln(out, "Observation: newly recorded")
+			} else {
+				fmt.Fprintln(out, "Observation: duplicate")
+			}
+		}
 		return nil
 	default:
 		return fmt.Errorf("unknown work subcommand %q (try factory work help)", args[0])
@@ -166,6 +203,28 @@ func openWorkQueue(stateDir string) (*LocalWorkQueue, error) {
 		return nil, fmt.Errorf("open work request queue: %w", err)
 	}
 	return queue, nil
+}
+
+func openIssueObservationStore(stateDir string) (*LocalIssueObservationStore, error) {
+	base := stateDir
+	if base == "" {
+		base = os.Getenv("XDG_STATE_HOME")
+		if base == "" {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return nil, fmt.Errorf("find home directory: %w", err)
+			}
+			base = filepath.Join(home, ".local", "state")
+		}
+	}
+	if !filepath.IsAbs(base) {
+		return nil, fmt.Errorf("state directory must be absolute")
+	}
+	store, err := NewLocalIssueObservationStore(filepath.Join(base, "factory", "work-observations"))
+	if err != nil {
+		return nil, fmt.Errorf("open issue observation store: %w", err)
+	}
+	return store, nil
 }
 
 func printWorkItem(out io.Writer, item WorkItem) {
