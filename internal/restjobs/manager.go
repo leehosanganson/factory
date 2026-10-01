@@ -28,13 +28,18 @@ var (
 )
 
 const (
-	maxRecordsLimit = 100_000
-	maxQueueLimit   = 100_000
-	maxEventsLimit  = 10_000
-	maxKeyBytes     = 256
-	maxAliasBytes   = 256
-	maxTaskBytes    = 65_536
-	maxEventBytes   = 4_096
+	maxRecordsLimit    = 1000
+	maxConcurrentLimit = 100_000
+	maxQueueLimit      = 100_000
+	maxEventsLimit     = 200
+	maxKeyBytes        = 256
+	maxAliasBytes      = 256
+	maxTaskBytes       = 256 << 10
+	maxEventBytes      = 4_096
+
+	defaultRegistryBytes = 256 << 20
+	recordOverheadBytes  = 256
+	eventOverheadBytes   = 64
 )
 
 // Status is a stable lifecycle value suitable for JSON serialization.
@@ -62,13 +67,14 @@ type Request struct {
 }
 
 // Config contains operator-selected process-local capacity and payload bounds.
-// A zero MaxTaskBytes uses the default of 65,536 bytes.
+// Zero MaxRecords, MaxEventsPerJob, MaxTaskBytes, and RegistryBytes use bounded defaults.
 type Config struct {
 	QueueCapacity     int
 	MaxConcurrentJobs int
 	MaxRecords        int
 	MaxEventsPerJob   int
 	MaxTaskBytes      int
+	RegistryBytes     int64
 }
 
 // Snapshot is a copy of the public job state and is safe to serialize after the
@@ -113,23 +119,25 @@ type Manager interface {
 }
 
 type job struct {
-	snapshot  Snapshot
-	sequence  uint64
-	events    []Event
-	truncated bool
+	snapshot       Snapshot
+	sequence       uint64
+	events         []Event
+	truncated      bool
+	accountedBytes uint64
 }
 
 // LocalManager is an in-memory bounded registry and pending queue.
 type LocalManager struct {
-	mu           sync.Mutex
-	config       Config
-	jobs         map[string]*job
-	idempotency  map[string]string
-	queue        []string
-	running      int
-	nextSequence uint64
-	notify       chan struct{}
-	closed       bool
+	mu            sync.Mutex
+	config        Config
+	jobs          map[string]*job
+	idempotency   map[string]string
+	queue         []string
+	running       int
+	nextSequence  uint64
+	registryBytes uint64
+	notify        chan struct{}
+	closed        bool
 }
 
 var _ Manager = (*LocalManager)(nil)
@@ -137,14 +145,24 @@ var _ Manager = (*LocalManager)(nil)
 // NewManager creates a process-local manager with validated positive capacity
 // bounds. Queue capacity may not exceed the record cap.
 func NewManager(config Config) (*LocalManager, error) {
+	if config.MaxRecords == 0 {
+		config.MaxRecords = maxRecordsLimit
+	}
+	if config.MaxEventsPerJob == 0 {
+		config.MaxEventsPerJob = maxEventsLimit
+	}
 	if config.MaxTaskBytes == 0 {
 		config.MaxTaskBytes = maxTaskBytes
 	}
+	if config.RegistryBytes == 0 {
+		config.RegistryBytes = defaultRegistryBytes
+	}
 	if config.QueueCapacity < 1 || config.QueueCapacity > maxQueueLimit ||
-		config.MaxConcurrentJobs < 1 || config.MaxConcurrentJobs > maxRecordsLimit ||
+		config.MaxConcurrentJobs < 1 || config.MaxConcurrentJobs > maxConcurrentLimit ||
 		config.MaxRecords < 1 || config.MaxRecords > maxRecordsLimit ||
 		config.MaxEventsPerJob < 1 || config.MaxEventsPerJob > maxEventsLimit ||
 		config.MaxTaskBytes < 1 || config.MaxTaskBytes > maxTaskBytes ||
+		config.RegistryBytes < 1 || config.RegistryBytes > defaultRegistryBytes ||
 		config.QueueCapacity > config.MaxRecords || config.MaxConcurrentJobs > config.MaxRecords {
 		return nil, fmt.Errorf("%w: capacity bounds are outside supported limits", ErrInvalidInput)
 	}
@@ -183,23 +201,28 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 	if len(m.queue) >= m.config.QueueCapacity {
 		return Snapshot{}, false, ErrQueueFull
 	}
-	needsEviction := len(m.jobs) >= m.config.MaxRecords
-	if needsEviction && !m.hasTerminalLocked() {
-		return Snapshot{}, false, ErrRegistryFull
-	}
 	id, err := newJobID()
 	if err != nil {
 		return Snapshot{}, false, fmt.Errorf("create job ID: %w", err)
-	}
-	if needsEviction {
-		m.evictOldestTerminalLocked()
 	}
 	now := time.Now().UTC()
 	m.nextSequence++
 	created := Snapshot{ID: id, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}
 	entry := &job{snapshot: created, sequence: m.nextSequence}
-	m.appendEventLocked(entry, "queued", "Job admitted")
+	initialEvent := Event{Type: "queued", Message: "Job admitted"}
+	recordCharge := recordBytes(normalized, key)
+	initialCharge := eventBytes(initialEvent)
+	if !m.makeRoomLocked(recordCharge + initialCharge) {
+		return Snapshot{}, false, ErrRegistryFull
+	}
+	entry.accountedBytes = recordCharge
+	m.registryBytes += recordCharge
 	m.jobs[id] = entry
+	if !m.appendEventLocked(entry, initialEvent.Type, initialEvent.Message) {
+		delete(m.jobs, id)
+		m.registryBytes -= recordCharge
+		return Snapshot{}, false, ErrRegistryFull
+	}
 	m.idempotency[key] = id
 	m.queue = append(m.queue, id)
 	m.signalLocked()
@@ -268,9 +291,11 @@ func (m *LocalManager) Close() {
 		if entry == nil || entry.snapshot.Status != StatusQueued {
 			continue
 		}
+		if !m.appendEventLocked(entry, string(StatusCanceled), "Manager closed before job started") {
+			entry.truncated = true
+		}
 		entry.snapshot.Status = StatusCanceled
 		entry.snapshot.UpdatedAt = now
-		m.appendEventLocked(entry, string(StatusCanceled), "Manager closed before job started")
 	}
 	m.queue = nil
 	m.signalLocked()
@@ -284,16 +309,18 @@ func (m *LocalManager) claimLocked() (Snapshot, error) {
 		return Snapshot{}, ErrNoWorkerSlots
 	}
 	id := m.queue[0]
-	m.queue[0] = ""
-	m.queue = m.queue[1:]
 	entry := m.jobs[id]
 	if entry == nil || entry.snapshot.Status != StatusQueued {
 		return Snapshot{}, fmt.Errorf("queued job invariant violated")
 	}
+	if !m.appendEventLocked(entry, "running", "Job started") {
+		entry.truncated = true
+	}
+	m.queue[0] = ""
+	m.queue = m.queue[1:]
 	entry.snapshot.Status = StatusRunning
 	entry.snapshot.UpdatedAt = time.Now().UTC()
 	m.running++
-	m.appendEventLocked(entry, "running", "Job started")
 	return cloneSnapshot(entry.snapshot), nil
 }
 
@@ -334,7 +361,9 @@ func (m *LocalManager) AddEvent(id, eventType, message string) error {
 	if entry == nil {
 		return ErrNotFound
 	}
-	m.appendEventLocked(entry, eventType, message)
+	if !m.appendEventLocked(entry, eventType, message) {
+		return ErrRegistryFull
+	}
 	return nil
 }
 
@@ -353,10 +382,12 @@ func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	if entry.snapshot.Status != StatusRunning {
 		return ErrInvalidTransition
 	}
+	if !m.appendEventLocked(entry, string(terminalStatus), "Job finished") {
+		entry.truncated = true
+	}
 	entry.snapshot.Status = terminalStatus
 	entry.snapshot.UpdatedAt = time.Now().UTC()
 	m.running--
-	m.appendEventLocked(entry, string(terminalStatus), "Job finished")
 	m.signalLocked()
 	return nil
 }
@@ -366,31 +397,147 @@ func (m *LocalManager) signalLocked() {
 	m.notify = make(chan struct{})
 }
 
-func (m *LocalManager) appendEventLocked(entry *job, eventType, message string) {
+// appendEventLocked evicts oldest terminal jobs, then oldest events, to reserve
+// the logical bytes needed for an event. Callers keep lifecycle state transitions
+// independent of event availability and mark omitted history as truncated.
+func (m *LocalManager) appendEventLocked(entry *job, eventType, message string) bool {
 	event := Event{At: time.Now().UTC(), Type: eventType, Message: message}
-	if len(entry.events) == m.config.MaxEventsPerJob {
-		copy(entry.events, entry.events[1:])
-		entry.events[len(entry.events)-1] = event
-		entry.truncated = true
-		return
+	charge := eventBytes(event)
+	limit := uint64(m.config.RegistryBytes)
+	if m.registryBytes > limit {
+		return false
 	}
-	entry.events = append(entry.events, event)
-}
 
-func (m *LocalManager) hasTerminalLocked() bool {
-	for _, entry := range m.jobs {
-		if entry.snapshot.Status.Terminal() {
-			return true
+	replacedCharge := uint64(0)
+	if len(entry.events) == m.config.MaxEventsPerJob {
+		replacedCharge = eventBytes(entry.events[0])
+	}
+	needed := uint64(0)
+	if charge > replacedCharge {
+		needed = charge - replacedCharge
+	}
+	available := limit - m.registryBytes
+	if needed > available {
+		var reclaimable uint64
+		for _, existing := range m.jobs {
+			if existing == entry && replacedCharge > 0 {
+				continue
+			}
+			if existing != entry && existing.snapshot.Status.Terminal() {
+				reclaimable += existing.accountedBytes
+				continue
+			}
+			for _, oldEvent := range existing.events {
+				reclaimable += eventBytes(oldEvent)
+			}
+		}
+		if needed-available > reclaimable {
+			return false
 		}
 	}
-	return false
+	for needed > limit-m.registryBytes {
+		var excludedFirst *job
+		if replacedCharge > 0 {
+			excludedFirst = entry
+		}
+		oldestTerminal := m.oldestTerminalLocked(entry)
+		oldestEvent := m.oldestEventLocked(excludedFirst, replacedCharge > 0)
+		if oldestTerminal != nil {
+			m.removeJobLocked(oldestTerminal)
+			continue
+		}
+		if oldestEvent == nil {
+			return false
+		}
+		m.removeOldestEventLocked(oldestEvent)
+	}
+	if replacedCharge > 0 {
+		m.removeOldestEventLocked(entry)
+	}
+	entry.events = append(entry.events, event)
+	m.registryBytes += charge
+	entry.accountedBytes += charge
+	return true
 }
 
-func (m *LocalManager) evictOldestTerminalLocked() bool {
+func (m *LocalManager) oldestEventLocked(excludedFirst *job, skipFirst bool) *job {
+	var oldest *job
+	var oldestEvent time.Time
+	for _, entry := range m.jobs {
+		first := 0
+		if entry == excludedFirst && skipFirst {
+			first = 1
+		}
+		if first >= len(entry.events) {
+			continue
+		}
+		eventAt := entry.events[first].At
+		if oldest == nil || eventAt.Before(oldestEvent) || (eventAt.Equal(oldestEvent) && entry.sequence < oldest.sequence) {
+			oldest = entry
+			oldestEvent = eventAt
+		}
+	}
+	return oldest
+}
+
+func (m *LocalManager) oldestTerminalLocked(excluded *job) *job {
+	var oldest *job
+	for _, entry := range m.jobs {
+		if entry == excluded || !entry.snapshot.Status.Terminal() {
+			continue
+		}
+		if oldest == nil || entry.sequence < oldest.sequence {
+			oldest = entry
+		}
+	}
+	return oldest
+}
+
+func (m *LocalManager) removeJobLocked(entry *job) {
+	m.registryBytes -= entry.accountedBytes
+	delete(m.jobs, entry.snapshot.ID)
+	for key, id := range m.idempotency {
+		if id == entry.snapshot.ID {
+			delete(m.idempotency, key)
+		}
+	}
+}
+
+func (m *LocalManager) makeRoomLocked(needed uint64) bool {
+	limit := uint64(m.config.RegistryBytes)
+	if m.registryBytes > limit || needed > limit {
+		return false
+	}
+	for len(m.jobs) >= m.config.MaxRecords || needed > limit-m.registryBytes {
+		if !m.evictOldestTerminalExceptLocked(nil) {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *LocalManager) removeOldestEventLocked(entry *job) {
+	m.registryBytes -= eventBytes(entry.events[0])
+	entry.accountedBytes -= eventBytes(entry.events[0])
+	copy(entry.events, entry.events[1:])
+	entry.events[len(entry.events)-1] = Event{}
+	entry.events = entry.events[:len(entry.events)-1]
+	entry.truncated = true
+}
+
+func recordBytes(request Request, key string) uint64 {
+	return uint64(recordOverheadBytes) + uint64(len(request.Task)) + uint64(len(request.Repository)) + uint64(len(key))
+}
+
+func eventBytes(event Event) uint64 {
+	return uint64(eventOverheadBytes) + uint64(len(event.Type)) + uint64(len(event.Message))
+}
+
+func (m *LocalManager) evictOldestTerminalExceptLocked(protected *job) bool {
 	var oldestID string
 	var oldest *job
 	for id, entry := range m.jobs {
-		if !entry.snapshot.Status.Terminal() {
+		if !entry.snapshot.Status.Terminal() || entry == protected {
 			continue
 		}
 		if oldest == nil || entry.sequence < oldest.sequence {
@@ -400,6 +547,7 @@ func (m *LocalManager) evictOldestTerminalLocked() bool {
 	if oldest == nil {
 		return false
 	}
+	m.registryBytes -= oldest.accountedBytes
 	delete(m.jobs, oldestID)
 	for key, id := range m.idempotency {
 		if id == oldestID {
