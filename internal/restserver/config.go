@@ -17,6 +17,7 @@ import (
 const configFileLimit = 1 << 20
 
 const (
+	defaultListenAddress    = "127.0.0.1:8080"
 	defaultRequestBodyBytes = 128 << 10
 	defaultTaskBytes        = 64 << 10
 	defaultQueueCapacity    = 32
@@ -60,11 +61,12 @@ type Limits struct {
 	HarnessOutput    int    `json:"harness_output_bytes"`
 }
 
-// DefaultConfig returns conservative resource limits. Required deployment-specific
-// settings (listener, aliases, harness, and key path) remain empty.
+// DefaultConfig returns conservative resource limits and a loopback-only listener.
+// Aliases, harness, and key path remain deployment-specific.
 func DefaultConfig() Config {
 	return Config{
-		Mode: "local_process",
+		Mode:          "local_process",
+		ListenAddress: defaultListenAddress,
 		Limits: Limits{
 			RequestBodyBytes: defaultRequestBodyBytes,
 			TaskBytes:        defaultTaskBytes,
@@ -292,7 +294,7 @@ func validateRequiredConfigFields(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return errors.New("invalid root object")
 	}
-	for _, field := range []string{"mode", "listen_address", "repositories", "harness", "api_key_file"} {
+	for _, field := range []string{"mode", "repositories", "harness", "api_key_file"} {
 		if _, ok := fields[field]; !ok {
 			return fmt.Errorf("required field %q is missing", field)
 		}

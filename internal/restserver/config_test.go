@@ -10,10 +10,13 @@ import (
 )
 
 func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
-	path := writeConfig(t, `{"mode":"local_process","listen_address":"127.0.0.1:8080","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["-p","{system_prompt}","{task}"]},"api_key_file":"/run/secrets/api-key"}`)
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["-p","{system_prompt}","{task}"]},"api_key_file":"/run/secrets/api-key"}`)
 	config, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if config.ListenAddress != "127.0.0.1:8080" {
+		t.Fatalf("default listener = %q, want loopback-only default", config.ListenAddress)
 	}
 	if config.Limits.RequestBodyBytes != 128<<10 || config.Limits.TaskBytes != 64<<10 || config.Limits.QueueCapacity != 32 || config.Limits.Workers != 2 || config.Limits.HarnessOutput != 1<<20 {
 		t.Fatalf("unexpected defaults: %+v", config.Limits)
@@ -25,10 +28,13 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 }
 
 func TestLoadConfigAcceptsBoundedOverrides(t *testing.T) {
-	path := writeConfig(t, `{"mode":"local_process","listen_address":"localhost:65535","repositories":{"repo_1":"/tmp/checkout"},"harness":{"executable":"/usr/bin/pi","args":["{task}","{system_prompt}"]},"api_key_file":"/tmp/key","limits":{"request_body_bytes":2097152,"task_bytes":1048576,"queue_capacity":1024,"workers":64,"job_timeout":"24h","harness_output_bytes":16777216}}`)
+	path := writeConfig(t, `{"mode":"local_process","listen_address":"0.0.0.0:65535","repositories":{"repo_1":"/tmp/checkout"},"harness":{"executable":"/usr/bin/pi","args":["{task}","{system_prompt}"]},"api_key_file":"/tmp/key","limits":{"request_body_bytes":2097152,"task_bytes":1048576,"queue_capacity":1024,"workers":64,"job_timeout":"24h","harness_output_bytes":16777216}}`)
 	config, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if config.ListenAddress != "0.0.0.0:65535" {
+		t.Fatalf("explicit listener override = %q", config.ListenAddress)
 	}
 	if config.Limits.RequestBodyBytes != maxRequestBodyBytes || config.Limits.Workers != maxWorkers {
 		t.Fatalf("configured upper-bound settings were not retained: %+v", config.Limits)
