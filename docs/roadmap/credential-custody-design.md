@@ -36,16 +36,29 @@ The decrypted payload is held only as long as needed for the GitHub operation. G
 
 ## OAuth lifecycle
 
+The provider-specific facts below describe GitHub's **GitHub App user access token web application flow**, not the similarly named OAuth App flow. See GitHub's documentation for [generating a user access token](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app) and [callback URLs](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/about-the-user-authorization-callback-url). The docs identify `https://github.com/login/oauth/authorize` and require `client_id`; they recommend `redirect_uri`, random `state`, and PKCE. If the authorization request includes PKCE parameters, `code_challenge` and `code_challenge_method` must be paired, the method must be `S256`, and token exchange must include the corresponding `code_verifier`. The callback URL docs allow up to 10 registered URLs and say the first is used when the request omits `redirect_uri`. The GitHub App parameter table says an explicit `redirect_uri` must match a registered callback URL and cannot contain additional parameters. The token-exchange parameter table marks `client_id`, `client_secret`, and `code` required; it says any `redirect_uri` must be registered.
+
+These provider recommendations do not themselves choose Factory's PKCE policy. Whether Factory adopts PKCE, how a verifier would be durably bound to state, and GitHub App web-flow denial/error callback behavior remain open. Do not infer those details from OAuth App documentation. GitHub's GitHub App web-flow parameter table does not list `response_type`; that omission does not establish whether the parameter is accepted or rejected. The fetched GitHub App web-flow docs also do not establish an authorization-code expiry. Factory's proposed 10-minute state TTL is its own state-retention policy, not a claim about code lifetime.
+
 1. An authenticated principal requests OAuth initiation.
 2. Generate 256-bit cryptographically random state, persist only its digest with principal ID, explicit callback URI/config version, creation/expiry (10 minutes), and unused status. Do not encode the principal ID into externally visible state.
-3. Return `302 Found` to the configured GitHub App authorization URL. Use `Cache-Control: no-store`; apply strict referrer policy. Do not use untrusted host or forwarding headers to construct callback URL.
+3. Return `302 Found` to the configured GitHub App authorization URL, including required `client_id` and an explicit configured, registered `redirect_uri`; the exact URL construction and GitHub App registration remain deployment gates. Use `Cache-Control: no-store`; apply strict referrer policy. Do not use untrusted host or forwarding headers to construct callback URL.
 4. At public callback, atomically consume valid unexpired state before exchanging its code. Consumption is durable and single-use: concurrent/replayed callbacks cannot both succeed, and a failure after consumption requires a fresh authorization flow rather than replay. Redact query `code` and `state` at both proxy and application logs.
 5. Exchange the code server-side; fetch/verify the GitHub user identity and validate the grant's granted permissions. Encrypt and atomically persist the grant for the bound principal; only report a minimal success/failure page. Never return tokens to a browser, redirect, durable work record, or logs.
 6. If code exchange fails before a new grant is persisted, that callback creates no grant; any existing grant remains unchanged. Tell the user to start a fresh authorization flow and never replay a consumed code/state pair. If grant persistence succeeds but the callback response is lost, treat the valid persisted grant as linked and do not overwrite it or exchange the consumed callback again. If persistence outcome is uncertain, inspect the grant record before taking another linking action: a valid record for the bound principal is linked; confirmed absence from an otherwise healthy, readable store requires a fresh authorization flow; an unreadable, corrupt, key-inaccessible, or otherwise uncertain record fails closed for operator reconciliation and must not be treated as absence.
 
 At most one active grant is allowed per principal. V1 does not auto-replace a grant from a callback. If one already exists, reject linking with a safe conflict and require an explicit operator-controlled unlink/revoke path. Do not remove a grant while accepted work references it; operator revoke first marks it unavailable for new admission/resume, then active work is paused and reconciled before ciphertext removal. There is no public API unlink/cancel route in v1.
 
-Reference: [GitHub refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens) documents token expiration and replacement of the old refresh/access token when a refresh token is used.
+References:
+
+- [GitHub refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens) documents token expiration and replacement of the old refresh/access token when a refresh token is used.
+- [GitHub App user access token permissions](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
+- [GitHub App authentication on behalf of a user](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user)
+- [GitHub App installation authentication and HTTPS Git access](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
+- [GitHub REST endpoints for Git references](https://docs.github.com/en/rest/git/refs)
+- [GitHub REST endpoints for pull requests](https://docs.github.com/en/rest/pulls/pulls)
+- [GitHub REST endpoints for issues](https://docs.github.com/en/rest/issues/issues)
+- [Fine-grained token permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)
 
 ## Expiry, refresh, revocation, and use
 
@@ -57,8 +70,8 @@ Reference: [GitHub refreshing user access tokens](https://docs.github.com/en/app
 
 ## Open implementation gates
 
-1. Verify the exact permissions for the chosen issue GET endpoint and all repository/PR/Git transport calls from GitHub's endpoint-specific docs; current source evidence confirms Contents: write for git reference creation, Pull requests: write for PR create/update, Metadata: read for repository lookup, and App/user intersection semantics. GitHub's fetched issue endpoint page omitted the endpoint permission section, so the issue-read mapping is not yet verified.
-2. Select and test the GitHub App authorization URL and callback parameters/installation selection behavior. Do not infer it from a generic OAuth App flow.
+1. Verify the exact permissions for all selected issue, repository, PR, and Git transport calls; current source evidence confirms Issues: read for issue retrieval, Contents: write for Git reference creation, Pull requests: write/read for PR creation/retrieval, and App/user permission intersection. Delegated user-token HTTPS Git transport remains unverified; do not infer it from REST token support.
+2. Resolve and test the GitHub App authorization URL configuration and callback behavior, including whether to adopt PKCE and how its verifier is bound to one-time state, user-denial/provider-error handling, and installation selection. Use the dedicated GitHub App web-flow docs rather than importing OAuth App callback behavior. Preserve as unknowns the undocumented status of `response_type` and authorization-code expiry; do not invent a Factory policy based on those gaps.
 3. Specify mounted key-file ownership/permission rules for a non-root container and secret rotation injection/rollback.
 4. Define GitHub token refresh concurrency and outcome reconciliation against its rotating refresh-token behavior; a lost response after consumption may require reauthorization rather than retry.
 5. Define which source issue and target repository combinations are supported, including cross-repository issue-to-code requests.
