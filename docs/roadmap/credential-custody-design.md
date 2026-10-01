@@ -55,7 +55,7 @@ At most one active grant is allowed per principal. V1 does not auto-replace a gr
 
 ## Open implementation gates
 
-1. Verify the exact permissions for the chosen issue GET endpoint and all repository/PR/Git transport calls from GitHub's endpoint-specific docs; current source evidence confirms Contents: write for git reference creation, Pull requests: write for PR create/update, Metadata: read for repository lookup, and App/user intersection semantics. Issue-read mapping is not yet verified.
+1. Verify the exact permissions for the chosen issue GET endpoint and all repository/PR/Git transport calls from GitHub's endpoint-specific docs; current source evidence confirms Contents: write for git reference creation, Pull requests: write for PR create/update, Metadata: read for repository lookup, and App/user intersection semantics. GitHub's fetched issue endpoint page omitted the endpoint permission section, so the issue-read mapping is not yet verified.
 2. Select and test the GitHub App authorization URL and callback parameters/installation selection behavior. Do not infer it from a generic OAuth App flow.
 3. Specify mounted key-file ownership/permission rules for a non-root container and secret rotation injection/rollback.
 4. Define GitHub token refresh concurrency and outcome reconciliation against its current refresh-token rotation behavior.
