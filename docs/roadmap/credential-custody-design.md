@@ -45,7 +45,15 @@ The decrypted payload is held only as long as needed for the GitHub operation. G
 
 At most one active grant is allowed per principal. V1 does not auto-replace a grant from a callback. If one already exists, reject linking with a safe conflict and require an explicit operator-controlled unlink/revoke path. Do not remove a grant while accepted work references it; operator revoke first marks it unavailable for new admission/resume, then active work is paused and reconciled before ciphertext removal. There is no public API unlink/cancel route in v1.
 
-Reference: [GitHub refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens) documents token expiration and replacement of the old refresh/access token when a refresh token is used.
+References:
+
+- [GitHub refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens) documents token expiration and replacement of the old refresh/access token when a refresh token is used.
+- [GitHub App user access token permissions](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
+- [GitHub App authentication on behalf of a user](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user)
+- [GitHub App installation authentication and HTTPS Git access](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
+- [GitHub REST endpoints for Git references](https://docs.github.com/en/rest/git/refs)
+- [GitHub REST endpoints for pull requests](https://docs.github.com/en/rest/pulls/pulls)
+- [GitHub REST endpoints for issues](https://docs.github.com/en/rest/issues/issues)
 
 ## Expiry, refresh, revocation, and use
 
@@ -57,7 +65,7 @@ Reference: [GitHub refreshing user access tokens](https://docs.github.com/en/app
 
 ## Open implementation gates
 
-1. Verify the exact permissions for the chosen issue GET endpoint and all repository/PR/Git transport calls from GitHub's endpoint-specific docs; current source evidence confirms Contents: write for git reference creation, Pull requests: write for PR create/update, Metadata: read for repository lookup, and App/user intersection semantics. GitHub's fetched issue endpoint page omitted the endpoint permission section, so the issue-read mapping is not yet verified.
+1. Complete endpoint-specific permission verification before selecting or registering an App permission set. The fetched Git references documentation accepts GitHub App user access tokens for reference creation and requires Contents: write. The pull-request endpoint documentation accepts GitHub App user access tokens for pull-request creation, requiring Pull requests: write, and retrieval, requiring Pull requests: read. GitHub's user-authentication documentation says user access is limited to the intersection of the user's and App's permissions and accessible resources. The fetched Get an issue page omitted its fine-grained permission section, so issue-read permission remains unverified. GitHub's cited HTTPS Git-authentication guidance explicitly covers installation access tokens and Contents permission, not the delegated user access token planned here; user-token HTTPS clone/push support and exact authorization behavior therefore remain unverified. Do not infer transport support from REST token acceptance or select a final permission set until these gaps are verified.
 2. Select and test the GitHub App authorization URL and callback parameters/installation selection behavior. Do not infer it from a generic OAuth App flow.
 3. Specify mounted key-file ownership/permission rules for a non-root container and secret rotation injection/rollback.
 4. Define GitHub token refresh concurrency and outcome reconciliation against its rotating refresh-token behavior; a lost response after consumption may require reauthorization rather than retry.
