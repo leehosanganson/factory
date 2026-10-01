@@ -1,0 +1,141 @@
+package restserver
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","listen_address":"127.0.0.1:8080","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["-p","{system_prompt}","{task}"]},"api_key_file":"/run/secrets/api-key"}`)
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Limits.RequestBodyBytes != 128<<10 || config.Limits.TaskBytes != 64<<10 || config.Limits.QueueCapacity != 32 || config.Limits.Workers != 2 || config.Limits.HarnessOutput != 1<<20 {
+		t.Fatalf("unexpected defaults: %+v", config.Limits)
+	}
+	timeout, err := time.ParseDuration(config.Limits.JobTimeout)
+	if err != nil || timeout != 30*time.Minute {
+		t.Fatalf("default timeout = %q, %v", config.Limits.JobTimeout, err)
+	}
+}
+
+func TestLoadConfigAcceptsBoundedOverrides(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","listen_address":"localhost:65535","repositories":{"repo_1":"/tmp/checkout"},"harness":{"executable":"/usr/bin/pi","args":["{task}","{system_prompt}"]},"api_key_file":"/tmp/key","limits":{"request_body_bytes":2097152,"task_bytes":1048576,"queue_capacity":1024,"workers":64,"job_timeout":"24h","harness_output_bytes":16777216}}`)
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Limits.RequestBodyBytes != maxRequestBodyBytes || config.Limits.Workers != maxWorkers {
+		t.Fatalf("configured upper-bound settings were not retained: %+v", config.Limits)
+	}
+}
+
+func TestLoadConfigRejectsStrictSchemaViolations(t *testing.T) {
+	valid := `"mode":"local_process","listen_address":"127.0.0.1:8080","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"api_key_file":"/run/key"`
+	cases := []struct {
+		name string
+		json string
+	}{
+		{"malformed", `{"mode":`},
+		{"trailing value", `{` + valid + `} {}`},
+		{"trailing garbage", `{` + valid + `} junk`},
+		{"unknown root field", `{` + valid + `,"pat_file":"/secret"}`},
+		{"unknown nested field", `{` + strings.Replace(valid, `"executable":"pi"`, `"executable":"pi","shell":true`, 1) + `}`},
+		{"duplicate field", `{` + valid + `,"mode":"local_process"}`},
+		{"case-variant field", `{` + valid + `,"Mode":"docker"}`},
+		{"missing required field", `{"mode":"local_process"}`},
+		{"null nested value", `{` + strings.Replace(valid, `"executable":"pi"`, `"executable":null`, 1) + `}`},
+		{"invalid repository alias", `{` + strings.Replace(valid, `"widget":"/srv/widget"`, `"../widget":"/srv/widget"`, 1) + `}`},
+		{"null optional limit", `{` + valid + `,"limits":{"workers":null}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := LoadConfig(writeConfig(t, tc.json)); err == nil {
+				t.Fatal("invalid config was accepted")
+			}
+		})
+	}
+}
+
+func TestConfigValidateRejectsUnsupportedAuthorityAndUnsafeValues(t *testing.T) {
+	base := validConfig()
+	cases := []struct {
+		name   string
+		change func(*Config)
+	}{
+		{"docker mode", func(c *Config) { c.Mode = "docker" }},
+		{"missing listener", func(c *Config) { c.ListenAddress = "" }},
+		{"invalid listener port", func(c *Config) { c.ListenAddress = "localhost:65536" }},
+		{"missing repositories", func(c *Config) { c.Repositories = nil }},
+		{"invalid alias", func(c *Config) { c.Repositories = map[string]string{"../repo": "/srv/repo"} }},
+		{"relative checkout", func(c *Config) { c.Repositories["widget"] = "relative/repo" }},
+		{"missing harness", func(c *Config) { c.Harness.Executable = " " }},
+		{"placeholder in executable", func(c *Config) { c.Harness.Executable = "pi {task}" }},
+		{"missing task placeholder", func(c *Config) { c.Harness.Args = []string{"{system_prompt}"} }},
+		{"duplicate task placeholder", func(c *Config) { c.Harness.Args = []string{"{task}", "{task}", "{system_prompt}"} }},
+		{"unknown placeholder", func(c *Config) { c.Harness.Args = []string{"{task}", "{system_prompt}", "{workspace}"} }},
+		{"nul argument", func(c *Config) { c.Harness.Args = []string{"{task}\x00", "{system_prompt}"} }},
+		{"relative key file", func(c *Config) { c.APIKeyFile = "key" }},
+		{"body limit below range", func(c *Config) { c.Limits.RequestBodyBytes = 0 }},
+		{"body limit over ceiling", func(c *Config) { c.Limits.RequestBodyBytes = maxRequestBodyBytes + 1 }},
+		{"task limit below range", func(c *Config) { c.Limits.TaskBytes = 0 }},
+		{"task larger than body", func(c *Config) { c.Limits.TaskBytes = c.Limits.RequestBodyBytes + 1 }},
+		{"queue limit below range", func(c *Config) { c.Limits.QueueCapacity = 0 }},
+		{"queue limit over ceiling", func(c *Config) { c.Limits.QueueCapacity = maxQueueCapacity + 1 }},
+		{"zero worker count", func(c *Config) { c.Limits.Workers = 0 }},
+		{"worker count over ceiling", func(c *Config) { c.Limits.Workers = maxWorkers + 1 }},
+		{"invalid timeout", func(c *Config) { c.Limits.JobTimeout = "not-a-duration" }},
+		{"zero timeout", func(c *Config) { c.Limits.JobTimeout = "0s" }},
+		{"timeout over ceiling", func(c *Config) { c.Limits.JobTimeout = (maxJobTimeout + time.Second).String() }},
+		{"output limit below range", func(c *Config) { c.Limits.HarnessOutput = 0 }},
+		{"output over ceiling", func(c *Config) { c.Limits.HarnessOutput = maxHarnessOutput + 1 }},
+		{"nul checkout path", func(c *Config) { c.Repositories["widget"] = "/srv/widget\x00" }},
+		{"nul key path", func(c *Config) { c.APIKeyFile = "/run/key\x00" }},
+		{"host with whitespace", func(c *Config) { c.ListenAddress = "bad host:8080" }},
+		{"empty harness arguments", func(c *Config) { c.Harness.Args = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := base
+			config.Repositories = map[string]string{"widget": "/srv/widget"}
+			tc.change(&config)
+			if err := config.Validate(); err == nil {
+				t.Fatal("invalid config was accepted")
+			}
+		})
+	}
+}
+
+func TestConfigJSONRoundTripDoesNotExposeSecretMaterial(t *testing.T) {
+	config := validConfig()
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "api-key-value") {
+		t.Fatalf("config JSON exposed secret value: %s", encoded)
+	}
+}
+
+func validConfig() Config {
+	config := DefaultConfig()
+	config.ListenAddress = "127.0.0.1:8080"
+	config.Repositories = map[string]string{"widget": "/srv/widget"}
+	config.Harness = HarnessConfig{Executable: "pi", Args: []string{"-p", "{system_prompt}", "{task}"}}
+	config.APIKeyFile = "/run/secrets/api-key"
+	return config
+}
+
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
