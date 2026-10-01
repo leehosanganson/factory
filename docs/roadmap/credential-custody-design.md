@@ -2,9 +2,9 @@
 
 ## Status — future proposal; deferred from REST MVP
 
-**GitHub App OAuth linking and encrypted user-grant custody are future/deferred and are not prerequisites for the proposed shared-PAT REST MVP.** The MVP direction instead uses one shared bearer API key and one shared fine-grained GitHub PAT. This document's technical material is retained as a future proposal only; none of its OAuth handlers, encrypted grant storage, remote work admission, or worker execution is implemented. Its earlier per-principal/App-grant assumptions do not describe the selected MVP. See the [proposed REST server contract](rest-api-contract.md) for current planned direction. If OAuth custody is revisited, an encryption key may be supplied through an environment variable or a configured secret-file path; key bytes must not be placed in ordinary config. The exact provisioning mechanism remains a future deployment gate; the mounted-file details below are a proposal, not a selected MVP requirement. The specific choices in this future design require review before any OAuth implementation. A Factory API bearer credential and a future GitHub App user grant would have separate roles.
+**GitHub App OAuth linking and encrypted user-grant custody are future proposals, not part of the proposed REST MVP.** The MVP uses one shared bearer API key; it does not select or require a GitHub credential and does not perform branch pushes or PR create/update. Shared PAT use and those writes are deferred until a separately designed, restart-safe, cross-process reconciliation gate can resolve uncertain side effects. This document's technical material is retained as a future proposal only; none of its OAuth handlers, encrypted grant storage, remote work admission, or worker execution is implemented. See the [proposed REST server contract](rest-api-contract.md) for current planned direction. If OAuth custody is revisited, an encryption key may be supplied through an environment variable or a configured secret-file path; key bytes must not be placed in ordinary config. The exact provisioning mechanism remains a future deployment gate. The specific choices in this future design require review before any OAuth implementation. A Factory API bearer credential and a future GitHub App user grant would have separate roles.
 
-> **Scope:** The sections below preserve the earlier per-principal GitHub App OAuth proposal for possible future use. They do not describe the shared-PAT REST MVP contract.
+> **Scope:** The sections below preserve an earlier per-principal GitHub App OAuth proposal for possible future use; they do not describe the REST MVP.
 
 ## Security and identity model
 
@@ -83,4 +83,4 @@ References:
 6. Define which source issue and target repository combinations are supported, including cross-repository issue-to-code requests.
 7. Specify accepted-work behavior on grant unlink, user access loss, app uninstall, permission reduction, and encryption-key loss.
 
-No GitHub App OAuth linking or grant-custody implementation should proceed until these OAuth-specific gates have an approved, testable resolution. They are not gates for the proposed shared-PAT REST MVP.
+No GitHub App OAuth linking or grant-custody implementation should proceed until these OAuth-specific gates have an approved, testable resolution. Shared-PAT use and branch/PR writes are separately deferred from the proposed REST MVP pending its restart-safe reconciliation gate.

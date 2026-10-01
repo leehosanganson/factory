@@ -12,12 +12,12 @@ Execute(ctx context.Context, job Job) (Result, error)
 
 The server supplies the admitted job and cancellation context; the selected executor runs it and reports its outcome. The executor is not a general-purpose caller-controlled command runner.
 
-The MVP uses a local-process executor: one configured subprocess per job, with a distinct isolated workspace and session for each job. The server runs with bounded concurrency, and jobs use the same API and status semantics regardless of backend. Docker Compose runs the Factory Server for local testing and defaults to this local-process executor; it is neither Docker-per-job execution nor a security sandbox.
+The proposed MVP uses a local-process executor: one configured harness subprocess per job, with a distinct workspace and session for each job. Every subprocess runs with the configured server account's local-process authority. Every shared API-key holder is trusted with that authority; this is not a sandbox and makes no claim of isolation against malicious callers. Docker Compose runs the single Factory Server with its local executor; it is not Docker-per-job execution or a security sandbox.
 
-Future alternatives may run one ephemeral Docker container or one Kubernetes Pod per job. These are possible backends, not part of the MVP, and must retain per-job isolation and the same externally visible job semantics.
+Future alternatives may run one ephemeral Docker container or one Kubernetes Pod per job. These are not part of the MVP, are selected only through server-operator configuration, and must retain the same API/job contract. They do not by themselves establish isolation from malicious API-key holders.
 
 ## State and lifecycle boundaries
 
-Job status and history are process-memory-only in the MVP. PostgreSQL and durable job recovery are deferred. Graceful shutdown stops admission, cancels active work, and cleans up a job's workspace only when safe. If a Git push or PR result is uncertain, preserve workspace/evidence for reconciliation rather than risking evidence loss or repeating an external side effect. Concurrency and resource bounds are operator configuration.
+Job status and history are process-memory-only in the MVP. PostgreSQL and durable job recovery are deferred. Clients resubmit after process restart, but external side effects must not be blindly retried. Branch push and PR create/update are not part of the MVP; enabling them requires a separately designed, restart-safe, cross-process reconciliation gate for uncertain outcomes. Graceful shutdown stops admission, cancels active work, and cleans up a job's workspace only when safe. Preserve workspace/evidence if an external side effect is uncertain. Concurrency and resource bounds are operator configuration.
 
-Execution does not authorize merge, release, or deployment; those actions remain human-only. Neither local subprocesses nor Compose should be described as a sandbox.
+Merge, release, and deployment are unavailable through the proposed server. Neither local subprocesses nor Compose should be described as a sandbox.
