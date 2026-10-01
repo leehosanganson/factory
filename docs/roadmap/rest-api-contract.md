@@ -44,7 +44,23 @@ Request:
 
 The issue repository and target repository may differ; the example uses the same repository for both.
 
-`issue.repository` and `repository` are canonical `owner/repo` identities and may differ: the issue is the source of work and `repository` is the target code repository. `number` is a positive integer. `instruction` is optional. Reject ambiguous casing/whitespace or noncanonical identities rather than silently changing which repository the caller selected. The issue remains the work's source of truth; the instruction is supplemental direction, not a general task payload. Reject issue references that resolve to pull requests. Before accepting, verify that the linked user's grant can read the source issue and that both the user and App installation authorize the target repository for the required operations. Authorization failures and unavailable/ambiguous authorization checks fail closed without a queue write.
+`issue.repository` and `repository` are canonical `owner/repo` identities and may differ: the issue is the source of work and `repository` is the target code repository. `number` is a positive integer. `instruction` is optional. Reject ambiguous casing/whitespace or noncanonical identities rather than silently changing which repository the caller selected. The issue remains the work's source of truth; the instruction is supplemental direction, not a general task payload. Reject issue references that resolve to pull requests. Apply the source/target authorization test matrix below before acceptance; authorization failures and unavailable/ambiguous authorization checks fail closed without a queue write.
+
+Before durable acceptance, authorization must be confirmed for the source issue read and every target-repository operation needed by the intended work. The linked GitHub App user grant is the authority; the client supplies neither a principal identity nor an installation ID. User and App access are intersected per resource and operation. A source and target in different accessible installations are not rejected just for being cross-installation, but must pass the same checks. If either check is denied, unavailable, or ambiguous, reject without enqueueing. Recheck current access before provider write operations; if access is then missing or cannot be confirmed, pause/fail the work without broadening credentials or proceeding with the write.
+
+The following cases define the authorization boundary to test before enabling admission or provider writes. `Confirmed` means a current provider response establishes the named access and required permission; cached metadata alone is insufficient.
+
+| Source issue read | Target repository operations | Same or different installation | Expected outcome |
+| --- | --- | --- | --- |
+| Confirmed for the linked user grant and App | Confirmed for the linked user grant and App | Same installation | Eligible to continue other admission checks; enqueue only after all pass. |
+| Confirmed for the linked user grant and App | Confirmed for the linked user grant and App | Different accessible installations | Eligible to continue other admission checks; do not reject solely for crossing installations. |
+| Denied or not readable | Any result | Either | Reject before queue write; do not return accepted. |
+| Any result | Denied for user, App, or a required operation | Either | Reject before queue write; do not return accepted. |
+| Unavailable, stale-only, malformed, or ambiguous | Any result | Either | Fail closed with safe unavailable/authorization error; no queue write. |
+| Any result | Unavailable, stale-only, malformed, or ambiguous | Either | Fail closed with safe unavailable/authorization error; no queue write. |
+| Initially confirmed | Access removed or no longer confirmable at pre-write recheck | Either | Do not perform the write; pause/fail safely and preserve human/operator recovery path. |
+
+Tests must also prove that caller-supplied principal, user, account, or installation identifiers cannot change the linked grant or bypass either side's check; retries after an authorization rejection do not leave a partial queue record; and access through one installation does not imply access through another. These are future implementation acceptance criteria, not current server behavior.
 
 The request fingerprint for idempotency includes the authenticated principal, normalized issue identity, target repository, and exact instruction bytes (or explicit absence). On the same principal and key:
 
