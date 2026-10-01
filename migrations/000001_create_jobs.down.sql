@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS job_history;
+DROP TABLE IF EXISTS jobs;
