@@ -54,6 +54,7 @@ References:
 - [GitHub REST endpoints for Git references](https://docs.github.com/en/rest/git/refs)
 - [GitHub REST endpoints for pull requests](https://docs.github.com/en/rest/pulls/pulls)
 - [GitHub REST endpoints for issues](https://docs.github.com/en/rest/issues/issues)
+- [Fine-grained token permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)
 
 ## Expiry, refresh, revocation, and use
 
@@ -65,7 +66,7 @@ References:
 
 ## Open implementation gates
 
-1. Complete endpoint-specific permission verification before selecting or registering an App permission set. The fetched Git references documentation accepts GitHub App user access tokens for reference creation and requires Contents: write. The pull-request endpoint documentation accepts GitHub App user access tokens for pull-request creation, requiring Pull requests: write, and retrieval, requiring Pull requests: read. GitHub's user-authentication documentation says user access is limited to the intersection of the user's and App's permissions and accessible resources. The fetched Get an issue page omitted its fine-grained permission section, so issue-read permission remains unverified. GitHub's cited HTTPS Git-authentication guidance explicitly covers installation access tokens and Contents permission, not the delegated user access token planned here; user-token HTTPS clone/push support and exact authorization behavior therefore remain unverified. Do not infer transport support from REST token acceptance or select a final permission set until these gaps are verified.
+1. Complete endpoint-specific permission verification before selecting or registering an App permission set. The Get an issue endpoint documentation accepts GitHub App user access tokens and requires Issues: read; Git reference creation accepts GitHub App user access tokens and requires Contents: write; pull-request creation and retrieval accept GitHub App user access tokens and require Pull requests: write and read, respectively. GitHub's user-authentication documentation says user access is limited to the intersection of the user's and App's permissions and accessible resources. GitHub's cited HTTPS Git-authentication guidance explicitly covers installation access tokens and Contents permission, not the delegated user access token planned here; user-token HTTPS clone/push support and exact authorization behavior therefore remain unverified. Do not infer transport support from REST token acceptance or select a final permission set until Git transport and all selected operations are verified.
 2. Select and test the GitHub App authorization URL and callback parameters/installation selection behavior. Do not infer it from a generic OAuth App flow.
 3. Specify mounted key-file ownership/permission rules for a non-root container and secret rotation injection/rollback.
 4. Define GitHub token refresh concurrency and outcome reconciliation against its rotating refresh-token behavior; a lost response after consumption may require reauthorization rather than retry.
