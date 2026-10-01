@@ -33,9 +33,11 @@ A proposed `POST /v1/jobs` request contains:
 - Issue URLs are not accepted in the initial contract. The task description—not an issue—is the requested work; the issue is supplemental context only and does not start autonomous polling, reconciliation, or issue tracking.
 - The request must not accept arbitrary shell, command, or executable fields.
 - Bound request body and task sizes before decoding/processing. Reject malformed JSON, unknown fields, unsupported media types, invalid UTF-8, and blank task descriptions. Exact limits are implementation choices to specify before deployment.
-- Admission validates and creates the job in the process-local job registry and bounded in-memory queue before returning acceptance. Use an idempotency key or equivalent duplicate-submission protection while the process is alive; exact response details remain implementation choices. Do not acknowledge a job if the process cannot accept it into its bounded in-memory capacity.
+- Admission validates and creates the job in the process-local registry and bounded in-memory queue before returning acceptance. Require a client-generated `Idempotency-Key` header. Repeating the same key with an identical normalized request while retained returns the existing job; reusing a key with a different request returns `409 Conflict`. Idempotency keys are forgotten when the process exits or their terminal record is evicted.
+- Configure a maximum total registry record count and a maximum event count per job. Never evict queued or active jobs. At the record cap, evict the oldest terminal job records as needed; if all retained records are queued/active and the cap is reached, reject admission. Eviction makes prior status/history return `404` and forgets its idempotency key. When an individual job exceeds its event cap, drop oldest events and mark its history as truncated.
+- If the bounded pending queue has no capacity, return `503 Service Unavailable` with a stable capacity error and do not create a job record. A later client retry must reuse its `Idempotency-Key`.
 
-A successful admission may return `202 Accepted` with an opaque job ID, initial status, and links to status/history. Proposed read endpoints are `GET /v1/jobs/{id}` and `GET /v1/jobs/{id}/history`. Since API credentials are shared, any valid key holder can inspect any job; responses must still be bounded and sanitized and must not expose credentials, sensitive filesystem paths, or unfiltered agent output.
+A successful admission may return `202 Accepted` with an opaque job ID, initial status, and links to status/history; an idempotent replay returns that same job rather than queueing another. Proposed read endpoints are `GET /v1/jobs/{id}` and `GET /v1/jobs/{id}/history`. Since API credentials are shared, any valid key holder can inspect any retained job; responses must still be bounded and sanitized and must not expose credentials, sensitive filesystem paths, or unfiltered agent output. Status/history for evicted jobs returns `404`. History responses report whether older events were truncated.
 
 ## Process-local jobs and lifecycle
 
@@ -67,7 +69,7 @@ These slices are dependency-ordered; they are planning gates, not claims of exis
 
 - Return safe generic errors without stack traces, API keys, PATs, authorization headers, raw provider payloads, or sensitive filesystem paths. Never log API-key or PAT values. Define stable response schemas and status codes during implementation.
 - Rate limiting is deferred. This proposal does not promise rate limits, `429`, or a `Retry-After` contract. Request/body input bounds and bounded in-memory job/history capacity remain necessary and do not constitute rate limiting.
-- Concurrency, queue capacity, timeouts, memory/history limits, harness executable/arguments, and resource bounds are server configuration, not caller-controlled job fields. The configured coding harness is launched once per job; process-pool/session reuse is not part of this direction.
+- Concurrency, queue capacity, total retained job count, per-job event count, timeouts, harness executable/arguments, and resource bounds are server configuration, not caller-controlled job fields. The configured coding harness is launched once per job; process-pool/session reuse is not part of this direction.
 - PostgreSQL-backed persistence, database migrations, backup/restore, and durable restart recovery are explicitly deferred. Revisit them only if product requirements change to require jobs or history to survive process exit.
 
 ## Explicit human boundary
