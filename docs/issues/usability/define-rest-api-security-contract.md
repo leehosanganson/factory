@@ -11,7 +11,7 @@
   2. Identity comes only from the bearer verifier; submit/status/history are isolated by authenticated principal and client-supplied identity is ignored/rejected.
   3. Idempotency is scoped to principal; exact retries return the same durable request, mismatched payload reuse conflicts, and no acknowledgment precedes durable queue persistence.
   4. History is capped at 100 events with a truncation indicator; request bodies, instruction size, and error responses are bounded; secrets and unnecessary issue/agent payloads are excluded.
-  5. OAuth initiation is authenticated; public callback uses 256-bit random state bound to the principal, a 10-minute expiry, atomic single-use consumption, and explicit HTTPS callback URL; code-exchange failure is recoverable only by starting fresh, without unsafe replay. Relinking semantics and external-key rotation are documented.
-  6. GitHub permission entries are explicitly described as the minimum candidate set and require operation-level verification before implementation; merge/release/deploy are denied.
+  5. OAuth initiation is authenticated; public callback uses 256-bit random state bound to the principal, a 10-minute expiry, atomic single-use consumption, and explicit HTTPS callback URL; code-exchange failure is recoverable only by starting fresh, without unsafe replay. Relinking semantics, grant revocation, refresh failure, and external-key rotation are documented.
+  6. GitHub permission entries are explicitly described as the minimum candidate set and require operation-level verification before implementation; merge/release/deploy are denied. Request source issue access is distinct from target repository authorization.
   7. Docs-only change preserves the separate design worktree; all described server behavior is labeled planned, not implemented; links resolve and `git diff --check` passes.
-- **Status:** Recorded before implementation.
+- **Status:** Contract drafted and published for review in PR #44; owner-authored follow-up additions clarify credential lifecycle and atomic persistence. No server behavior is implemented.
