@@ -1,0 +1,6 @@
+# REST jobs manager lifecycle session
+
+- **Scope:** Added manager shutdown and blocking claim lifecycle support, plus configurable task-byte validation, on a branch based on freshly fetched `origin/main` (`5bec93e`, after merged PR #71). No REST handler/server config, worker, CLI, workflow, or contract behavior was changed.
+- **Lifecycle contract:** `Close()` is idempotent, atomically rejects future `Admit` and claims with `ErrManagerClosed`, transitions all queued jobs to `canceled` with a cancellation history event, and does not mutate running jobs or release their concurrency slots. Their workers can call `Finish` after close, which releases the slot. `WaitClaim(ctx)` blocks until queue work and a worker slot are available, then claims it; it returns `ctx.Err()` on context cancellation or `ErrManagerClosed` after shutdown.
+- **Observed workflow:** The manager already owned process-local admission and history, and its mutex provided a compact place to serialize admission, close, and claiming. Notification-channel rotation lets waiters sleep until admission, a released slot, or close instead of polling.
+- **Friction:** None observed. This is a session observation, not a user-reported finding.

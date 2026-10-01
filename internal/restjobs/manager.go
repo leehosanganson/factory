@@ -3,6 +3,7 @@
 package restjobs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -23,6 +24,7 @@ var (
 	ErrInvalidTransition   = errors.New("invalid job status transition")
 	ErrNoQueuedJobs        = errors.New("no queued jobs")
 	ErrNoWorkerSlots       = errors.New("no worker slots available")
+	ErrManagerClosed       = errors.New("job manager is closed")
 )
 
 const (
@@ -59,12 +61,14 @@ type Request struct {
 	Issue      *int   `json:"issue,omitempty"`
 }
 
-// Config contains operator-selected process-local capacity bounds.
+// Config contains operator-selected process-local capacity and payload bounds.
+// A zero MaxTaskBytes uses the default of 65,536 bytes.
 type Config struct {
 	QueueCapacity     int
 	MaxConcurrentJobs int
 	MaxRecords        int
 	MaxEventsPerJob   int
+	MaxTaskBytes      int
 }
 
 // Snapshot is a copy of the public job state and is safe to serialize after the
@@ -93,10 +97,15 @@ type History struct {
 
 // Manager is the executor-independent seam for admission and job inspection.
 // ClaimNext and Finish provide explicit synchronous lifecycle control; no
-// goroutines or workers are started by this package.
+// goroutines or workers are started by this package. WaitClaim blocks until a
+// job and worker slot are available, context cancellation, or Close. Close
+// stops admission, cancels queued jobs, and leaves running jobs for workers to
+// finish.
 type Manager interface {
 	Admit(idempotencyKey string, request Request) (Snapshot, bool, error)
 	ClaimNext() (Snapshot, error)
+	WaitClaim(ctx context.Context) (Snapshot, error)
+	Close()
 	Get(id string) (Snapshot, error)
 	History(id string) (History, error)
 	AddEvent(id, eventType, message string) error
@@ -119,6 +128,8 @@ type LocalManager struct {
 	queue        []string
 	running      int
 	nextSequence uint64
+	notify       chan struct{}
+	closed       bool
 }
 
 var _ Manager = (*LocalManager)(nil)
@@ -126,10 +137,14 @@ var _ Manager = (*LocalManager)(nil)
 // NewManager creates a process-local manager with validated positive capacity
 // bounds. Queue capacity may not exceed the record cap.
 func NewManager(config Config) (*LocalManager, error) {
+	if config.MaxTaskBytes == 0 {
+		config.MaxTaskBytes = maxTaskBytes
+	}
 	if config.QueueCapacity < 1 || config.QueueCapacity > maxQueueLimit ||
 		config.MaxConcurrentJobs < 1 || config.MaxConcurrentJobs > maxRecordsLimit ||
 		config.MaxRecords < 1 || config.MaxRecords > maxRecordsLimit ||
 		config.MaxEventsPerJob < 1 || config.MaxEventsPerJob > maxEventsLimit ||
+		config.MaxTaskBytes < 1 || config.MaxTaskBytes > maxTaskBytes ||
 		config.QueueCapacity > config.MaxRecords || config.MaxConcurrentJobs > config.MaxRecords {
 		return nil, fmt.Errorf("%w: capacity bounds are outside supported limits", ErrInvalidInput)
 	}
@@ -137,6 +152,7 @@ func NewManager(config Config) (*LocalManager, error) {
 		config:      config,
 		jobs:        make(map[string]*job),
 		idempotency: make(map[string]string),
+		notify:      make(chan struct{}),
 	}, nil
 }
 
@@ -144,13 +160,16 @@ func NewManager(config Config) (*LocalManager, error) {
 // replay/capacity rules and enqueuing a new record. replay is true when an
 // identical retained request already exists for the key.
 func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot Snapshot, replay bool, err error) {
-	key, normalized, err := normalizeAdmission(idempotencyKey, request)
+	key, normalized, err := normalizeAdmission(idempotencyKey, request, m.config.MaxTaskBytes)
 	if err != nil {
 		return Snapshot{}, false, err
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return Snapshot{}, false, ErrManagerClosed
+	}
 	if id, ok := m.idempotency[key]; ok {
 		existing := m.jobs[id]
 		if existing == nil {
@@ -183,6 +202,7 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 	m.jobs[id] = entry
 	m.idempotency[key] = id
 	m.queue = append(m.queue, id)
+	m.signalLocked()
 	return cloneSnapshot(created), false, nil
 }
 
@@ -191,6 +211,72 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 func (m *LocalManager) ClaimNext() (Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return Snapshot{}, ErrManagerClosed
+	}
+	return m.claimLocked()
+}
+
+// WaitClaim blocks without polling until a queued job and worker slot are
+// available. A closed manager returns ErrManagerClosed; cancellation returns
+// ctx.Err().
+func (m *LocalManager) WaitClaim(ctx context.Context) (Snapshot, error) {
+	if ctx == nil {
+		return Snapshot{}, ErrInvalidInput
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return Snapshot{}, err
+		}
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return Snapshot{}, ErrManagerClosed
+		}
+		if err := ctx.Err(); err != nil {
+			m.mu.Unlock()
+			return Snapshot{}, err
+		}
+		if len(m.queue) > 0 && m.running < m.config.MaxConcurrentJobs {
+			snapshot, err := m.claimLocked()
+			m.mu.Unlock()
+			return snapshot, err
+		}
+		changed := m.notify
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Snapshot{}, ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+// Close is idempotent. It atomically stops admission and claims, marks all
+// queued jobs canceled with history events, and leaves running jobs unchanged
+// so their workers can finish them.
+func (m *LocalManager) Close() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return
+	}
+	m.closed = true
+	now := time.Now().UTC()
+	for _, id := range m.queue {
+		entry := m.jobs[id]
+		if entry == nil || entry.snapshot.Status != StatusQueued {
+			continue
+		}
+		entry.snapshot.Status = StatusCanceled
+		entry.snapshot.UpdatedAt = now
+		m.appendEventLocked(entry, string(StatusCanceled), "Manager closed before job started")
+	}
+	m.queue = nil
+	m.signalLocked()
+}
+
+func (m *LocalManager) claimLocked() (Snapshot, error) {
 	if len(m.queue) == 0 {
 		return Snapshot{}, ErrNoQueuedJobs
 	}
@@ -271,7 +357,13 @@ func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	entry.snapshot.UpdatedAt = time.Now().UTC()
 	m.running--
 	m.appendEventLocked(entry, string(terminalStatus), "Job finished")
+	m.signalLocked()
 	return nil
+}
+
+func (m *LocalManager) signalLocked() {
+	close(m.notify)
+	m.notify = make(chan struct{})
 }
 
 func (m *LocalManager) appendEventLocked(entry *job, eventType, message string) {
@@ -317,7 +409,7 @@ func (m *LocalManager) evictOldestTerminalLocked() bool {
 	return true
 }
 
-func normalizeAdmission(key string, request Request) (string, Request, error) {
+func normalizeAdmission(key string, request Request, maxTaskBytes int) (string, Request, error) {
 	key = strings.TrimSpace(key)
 	request.Repository = strings.TrimSpace(request.Repository)
 	request.Task = strings.TrimSpace(request.Task)
