@@ -1,11 +1,13 @@
 package restjobs
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func testManager(t *testing.T, config Config) *LocalManager {
@@ -36,6 +38,8 @@ func TestNewManagerRejectsInvalidBounds(t *testing.T) {
 		{"unbounded queue", Config{QueueCapacity: maxQueueLimit + 1, MaxConcurrentJobs: 1, MaxRecords: maxQueueLimit + 1, MaxEventsPerJob: 1}},
 		{"unbounded records", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: maxRecordsLimit + 1, MaxEventsPerJob: 1}},
 		{"unbounded history", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: maxEventsLimit + 1}},
+		{"zero task limit", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, MaxTaskBytes: -1}},
+		{"task limit exceeds maximum", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, MaxTaskBytes: maxTaskBytes + 1}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,6 +47,25 @@ func TestNewManagerRejectsInvalidBounds(t *testing.T) {
 				t.Fatalf("NewManager() error = %v, want ErrInvalidInput", err)
 			}
 		})
+	}
+}
+
+func TestTaskByteLimitIsConfigurableAndDefaultsToMaximum(t *testing.T) {
+	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 12}
+	manager := testManager(t, config)
+	if _, _, err := manager.Admit("at-limit", Request{Repository: "widget", Task: stringsOf('t', 12)}); err != nil {
+		t.Fatalf("Admit() at configured byte limit: %v", err)
+	}
+	if _, _, err := manager.Admit("over-limit", Request{Repository: "widget", Task: stringsOf('t', 13)}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("Admit() over configured byte limit = %v, want ErrInvalidInput", err)
+	}
+	if _, _, err := manager.Admit("multibyte-over-limit", Request{Repository: "widget", Task: "ééééééé"}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("Admit() over configured byte limit with multibyte text = %v, want ErrInvalidInput", err)
+	}
+
+	defaulted := testManager(t, testConfig())
+	if _, _, err := defaulted.Admit("default-limit", Request{Repository: "widget", Task: stringsOf('t', maxTaskBytes)}); err != nil {
+		t.Fatalf("Admit() at default byte limit: %v", err)
 	}
 }
 
@@ -344,6 +367,231 @@ func TestClaimNextEnforcesConfiguredConcurrency(t *testing.T) {
 	claimed, err = manager.ClaimNext()
 	if err != nil || claimed.ID != second.ID || claimed.Status != StatusRunning {
 		t.Fatalf("ClaimNext() after slot released = (%+v, %v)", claimed, err)
+	}
+}
+
+func TestWaitClaimWakesAfterAdmission(t *testing.T) {
+	manager := testManager(t, testConfig())
+	result := make(chan struct {
+		snapshot Snapshot
+		err      error
+	}, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		snapshot, err := manager.WaitClaim(context.Background())
+		result <- struct {
+			snapshot Snapshot
+			err      error
+		}{snapshot, err}
+	}()
+	<-started
+	select {
+	case got := <-result:
+		t.Fatalf("WaitClaim returned before admission: (%+v, %v)", got.snapshot, got.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	admitted, _, err := manager.Admit("wait", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil || got.snapshot.ID != admitted.ID || got.snapshot.Status != StatusRunning {
+			t.Fatalf("WaitClaim() = (%+v, %v), want admitted running job", got.snapshot, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaim did not wake after admission")
+	}
+}
+
+func TestWaitClaimWakesWhenFinishReleasesWorkerSlot(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4})
+	first, _, err := manager.Admit("first", Request{Repository: "widget", Task: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := manager.Admit("queued", Request{Repository: "widget", Task: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan struct {
+		snapshot Snapshot
+		err      error
+	}, 1)
+	go func() {
+		snapshot, err := manager.WaitClaim(context.Background())
+		result <- struct {
+			snapshot Snapshot
+			err      error
+		}{snapshot, err}
+	}()
+	select {
+	case got := <-result:
+		t.Fatalf("WaitClaim bypassed full worker capacity: (%+v, %v)", got.snapshot, got.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := manager.Finish(first.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil || got.snapshot.ID != queued.ID || got.snapshot.Status != StatusRunning {
+			t.Fatalf("WaitClaim() after slot release = (%+v, %v), want queued running job", got.snapshot, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaim did not wake after Finish released a worker slot")
+	}
+}
+
+func TestWaitClaimReturnsOnContextCancellation(t *testing.T) {
+	manager := testManager(t, testConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err := manager.WaitClaim(ctx)
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("WaitClaim returned before cancellation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitClaim() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaim did not return after context cancellation")
+	}
+}
+
+func TestWaitClaimWakesOnClose(t *testing.T) {
+	manager := testManager(t, testConfig())
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err := manager.WaitClaim(context.Background())
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("WaitClaim returned before close: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	manager.Close()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrManagerClosed) {
+			t.Fatalf("WaitClaim() error = %v, want ErrManagerClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaim did not return after manager close")
+	}
+}
+
+func TestCloseCancelsQueuedJobsButLeavesRunningForFinish(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 3, MaxConcurrentJobs: 1, MaxRecords: 3, MaxEventsPerJob: 4})
+	active, _, err := manager.Admit("active", Request{Repository: "widget", Task: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, err = manager.ClaimNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := manager.Admit("queued", Request{Repository: "widget", Task: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Close()
+	manager.Close()
+
+	gotQueued, err := manager.Get(queued.ID)
+	if err != nil || gotQueued.Status != StatusCanceled {
+		t.Fatalf("queued job after Close() = (%+v, %v), want canceled", gotQueued, err)
+	}
+	history, err := manager.History(queued.ID)
+	if err != nil || len(history.Events) != 2 || history.Events[1].Type != string(StatusCanceled) {
+		t.Fatalf("queued job history after Close() = (%+v, %v), want canceled event", history, err)
+	}
+	gotActive, err := manager.Get(active.ID)
+	if err != nil || gotActive.Status != StatusRunning || manager.running != 1 {
+		t.Fatalf("active job after Close() = (%+v, %v), running=%d; want running count 1", gotActive, err, manager.running)
+	}
+	if _, err := manager.ClaimNext(); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("ClaimNext() after Close() = %v, want ErrManagerClosed", err)
+	}
+	if _, _, err := manager.Admit("after-close", Request{Repository: "widget", Task: "task"}); !errors.Is(err, ErrManagerClosed) {
+		t.Fatalf("Admit() after Close() = %v, want ErrManagerClosed", err)
+	}
+	if err := manager.Finish(active.ID, StatusSucceeded); err != nil {
+		t.Fatalf("Finish(active) after Close(): %v", err)
+	}
+	if manager.running != 0 {
+		t.Fatalf("running count after Finish() = %d, want 0", manager.running)
+	}
+	finished, err := manager.Get(active.ID)
+	if err != nil || finished.Status != StatusSucceeded {
+		t.Fatalf("active job after Finish() = (%+v, %v), want succeeded", finished, err)
+	}
+}
+
+func TestAdmissionRacingCloseHasDeterministicOutcome(t *testing.T) {
+	const attempts = 64
+	for i := 0; i < attempts; i++ {
+		manager := testManager(t, testConfig())
+		start := make(chan struct{})
+		type admissionResult struct {
+			snapshot Snapshot
+			err      error
+		}
+		result := make(chan admissionResult, 1)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			snapshot, _, err := manager.Admit("race", Request{Repository: "widget", Task: "task"})
+			result <- admissionResult{snapshot: snapshot, err: err}
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			manager.Close()
+		}()
+		close(start)
+		wg.Wait()
+		close(result)
+		outcome := <-result
+		if outcome.err != nil && !errors.Is(outcome.err, ErrManagerClosed) {
+			t.Fatalf("racing Admit() error = %v, want nil or ErrManagerClosed", outcome.err)
+		}
+		if outcome.err == nil {
+			got, err := manager.Get(outcome.snapshot.ID)
+			if err != nil || got.Status != StatusCanceled {
+				t.Fatalf("admitted job after racing Close() = (%+v, %v), want canceled", got, err)
+			}
+		} else if len(manager.jobs) != 0 {
+			t.Fatalf("closed manager retained %d job(s) after rejected admission", len(manager.jobs))
+		}
+		if len(manager.queue) != 0 {
+			t.Fatalf("queue after racing Close() = %d, want empty", len(manager.queue))
+		}
+		if _, _, err := manager.Admit("late", Request{Repository: "widget", Task: "late"}); !errors.Is(err, ErrManagerClosed) {
+			t.Fatalf("late Admit() error = %v, want ErrManagerClosed", err)
+		}
 	}
 }
 
