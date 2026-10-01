@@ -1,5 +1,6 @@
 # REST server MVP direction shift
 
+- **Status:** Superseded by the REST MVP safety decision recorded in the roadmap and contract; retained as a historical record of the earlier direction.
 - **Type:** Documentation decision record; not a user-reported usability finding.
 - **Decision recorded:** The proposed remote REST MVP is a single-host Factory server that accepts task descriptions for configured repository aliases, authenticates API callers with one shared bearer key, and uses one shared fine-grained GitHub PAT for outbound GitHub operations. All key holders have identical access. OAuth/GitHub App per-user grant custody is deferred, not an MVP prerequisite. Successful workflows may push a branch and create/update a PR; merge, release, and deployment remain human-only.
 - **Data/recovery direction:** PostgreSQL is proposed for accepted requests and durable job metadata/status/history; a persistent mounted filesystem is proposed for checkouts, worktrees, logs, and artifacts. Database acceptance/state updates should be atomic. Restarted jobs with uncertain execution or external side effects require inspection, not blind Pi restart or Git/PR replay. Process and agent memory are not recoverable.
