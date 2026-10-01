@@ -1,154 +1,53 @@
-# REST MVP API and security contract
+# Proposed REST server MVP contract
 
-## Status
+## Status and scope
 
-This is a proposed contract for the agreed, containerized, single-host REST MVP. None of these routes, OAuth handlers, remote admission, or worker behavior is implemented. It selects bounded API defaults; it does not authorize provider writes or automated execution before their prerequisites are implemented and reviewed.
+**Proposed, not implemented.** Factory currently has no REST server, SQL-backed remote job state, or shared-PAT server integration. This document records a planned single-host service that uses existing Factory business logic to start supported Factory/pi implementation jobs. It is not an implementation claim or delivery commitment.
 
-## Boundaries
+The service accepts bounded task requests for configured repository aliases. It does not expose arbitrary shell commands or a generic command runner. On successful workflow completion, automatically pushing the branch and creating or updating a pull request is in scope. Merge, release, and deployment remain human-only.
 
-- API version 1 uses `/v1`; no generic command, shell, repository URL, or arbitrary-work endpoint is provided.
-- A work request must identify a GitHub issue and target repository. An optional, bounded `instruction` may add context to that issue request; it cannot replace the issue, override Factory policy, grant credentials, or request arbitrary commands.
-- Work is submitted and inspected as the authenticated Factory principal. The client cannot set or override principal identity.
-- Admission uses the existing canonical provider-neutral request and durable single-host `WorkQueue` path. A `202 Accepted` is returned only after the request and principal ownership have been durably persisted. API handlers do not run coding work inline.
-- The API uses the per-principal bearer verifier. GitHub calls use only that principal's linked GitHub App user grant; they do not fall back to broader service credentials. Work is eligible only when the linked grant can read the source issue and both the user and App installation authorize the target repository.
-- Merge, release, and deployment are never available to the worker. Cancellation and human-direction routes are not in v1.
+## Authentication and GitHub authority
 
-## Limits and common errors
+- API requests use one configured shared bearer API key. All holders have identical access to every endpoint and job; there is no per-caller identity, isolation, or ownership boundary. Do not accept caller-supplied principal identities. The API-key provisioning and rotation mechanism remains to be specified; it must not be persisted in PostgreSQL or exposed to Pi.
+- Outbound GitHub operations use one shared fine-grained personal access token (PAT); a dedicated bot/service account is recommended. The PAT owner's GitHub authority applies to all server requests. OAuth and GitHub App authorization are deferred and may be revisited later.
+- Never store raw PAT bytes in PostgreSQL, job records, logs, prompts, or Pi child-process environment. PAT provisioning details remain a design gate: an environment variable or configured secret-file path is the current preference, but the exact safe loading, permissions, rotation, and injection contract is unspecified. Do not put secret bytes in ordinary configuration. The current `Runner` starts Pi with the parent process environment; server integration must ensure the PAT is not inherited by Pi, while narrowly provisioning it only to Factory-owned Git/GitHub operations that require it. This process-environment boundary needs an implementation test before the PAT path is usable.
+- Select only the least GitHub permissions required by the actual clone/fetch, branch push, and PR create/update operations. Verify and test the chosen permissions and Git transport behavior before production use. Do not grant merge permissions.
+- Encryption-key design in the [credential-custody proposal](credential-custody-design.md) concerns future OAuth grant custody. OAuth is deferred, so that encryption key is not an MVP prerequisite for the shared-PAT flow. If needed in future, an encryption key may be provided through an environment variable or configured secret-file path, never as secret bytes in ordinary configuration.
 
-- Require `Content-Type: application/json` for JSON request bodies. Reject unsupported media types, malformed JSON, unknown fields, duplicate JSON object keys, and trailing values.
-- Recommended initial cap: 64 KiB per JSON request body before decoding; cap `instruction` at 16 KiB UTF-8 bytes. Reject invalid UTF-8 and blank-after-trimming instructions; preserve the original accepted text rather than silently rewriting its meaning.
-- Require `Idempotency-Key` on `POST /v1/work`: 1–128 visible ASCII characters. Scope the key to the authenticated principal. Retain the key or a stable digest of it with the durable request for as long as that request is retained.
-- Return a JSON error object with stable `code`, safe human-readable `message`, and server-generated `request_id`. Never return stack traces, provider response bodies, bearer/OAuth tokens, filesystem paths, raw authorization headers, or unfiltered issue/agent payloads.
-- Use `400` for malformed/invalid request data, `401` for missing/invalid bearer credentials, `403` for an authenticated principal without a linked/usable grant or insufficient repository access, `404` for a missing or non-owned work ID (do not reveal that another principal's work exists), `409` for idempotency-key/payload conflict, `413` for oversized bodies, `415` for unsupported media type, `429` for configured rate limiting, and `500`/`503` for safe generic internal/unavailable errors. Durable enqueue errors never produce an accepted response.
-- Require configured per-principal and global rate limits for submissions and reads; exact numeric defaults remain a deployment/capacity decision and must be load-tested before production. Return `429` with a bounded `Retry-After`; do not reveal another principal's quota state. Configuration must enforce an operator-set maximum and reject unbounded/disabled limits in production mode.
-- Concurrency, polling frequency, and outbound timeouts are server-configured bounded values. Limits must not be caller-controlled in the work payload.
+## Request and admission
 
-## Routes
-
-### `POST /v1/work`
-
-Requires a valid Factory bearer token and `Idempotency-Key`.
-
-Request:
+A proposed `POST /v1/jobs` request contains:
 
 ```json
 {
-  "issue": {
-    "repository": "acme/widget",
-    "number": 42
-  },
-  "repository": "acme/widget",
-  "instruction": "Add a bounded note to the README; do not change code."
+  "repository": "widget",
+  "task": "Add a bounded note to the README; do not change code.",
+  "issue": 42
 }
 ```
 
-The issue repository and target repository may differ; the example uses the same repository for both.
+- `repository` is a configured repository alias, not an arbitrary repository URL. Server configuration maps each alias to an approved local checkout and its GitHub repository identity; callers cannot submit filesystem paths. `task` is a required nonblank task description. `issue` is optional supplemental GitHub issue context and may be an issue number or URL.
+- The request must not accept arbitrary shell, command, or executable fields. The task description—not an issue—is the requested work.
+- Exact validation and source semantics for optional issue numbers/URLs are an unresolved implementation gate. A number naturally refers to an issue in the alias's configured repository. A URL must not cause autonomous issue polling, reconciliation, or tracking unless that behavior is explicitly designed and approved; reject unsupported or ambiguous forms rather than guessing.
+- Bound request body and task sizes before decoding/processing. Reject malformed JSON, unknown fields, unsupported media types, invalid UTF-8, and blank task descriptions. Exact limits are implementation choices to specify before deployment.
+- Admission records the accepted request, durable job metadata/status, and initial history atomically in PostgreSQL before returning acceptance. Use an idempotency key or equivalent duplicate-submission protection; exact retention and replay response details remain implementation choices. Do not acknowledge a job if its durable acceptance transaction fails.
 
-`issue.repository` and `repository` are canonical `owner/repo` identities and may differ: the issue is the source of work and `repository` is the target code repository. `number` is a positive integer. `instruction` is optional. Reject ambiguous casing/whitespace or noncanonical identities rather than silently changing which repository the caller selected. The issue remains the work's source of truth; the instruction is supplemental direction, not a general task payload. Reject issue references that resolve to pull requests. Before admission, use the linked GitHub App user access token for the source issue read and verify that both the user and App installation authorize the target repository for the operations required by the planned work. Check the two sides independently; a user-access result is not proof of installation access, and an installation-access result is not proof of user access. Apply the source/target authorization test matrix below; authorization failures and unavailable/ambiguous checks fail closed without a queue write.
+A successful admission may return `202 Accepted` with an opaque job ID, initial status, and links to status/history. Proposed read endpoints are `GET /v1/jobs/{id}` and `GET /v1/jobs/{id}/history`. Since API credentials are shared, any valid key holder can inspect any job; responses must still be bounded and sanitized and must not expose credentials, raw prompts beyond the submitted task where unnecessary, or unfiltered agent output.
 
-Before durable acceptance, authorization must be confirmed for the source issue read and every target-repository operation needed by the intended work. The linked GitHub App user grant is the authority; the client supplies neither a principal identity nor an installation ID. User and App access are intersected per resource and operation. A source and target in different accessible installations are not rejected just for being cross-installation, but must pass the same checks. If either check is denied, unavailable, or ambiguous, reject without enqueueing. Recheck current access before provider write operations; if access is then missing or cannot be confirmed, pause/fail the work without broadening credentials or proceeding with the write.
+## Persistence and recovery
 
-The following cases define the authorization boundary to test before enabling admission or provider writes. GitHub's `GET /user/installations/{installation_id}/repositories` endpoint lists repositories the authenticated user has explicit permission to access for an installation and reports the user's permissions. Separately, `GET /installation/repositories` lists repositories an App installation can access. These are distinct user-side and installation-side checks. `Confirmed` means a current provider response establishes the named access and required permission; cached metadata alone is insufficient.
+- PostgreSQL stores accepted requests and durable job metadata, status, and history. Acceptance and each durable state/history update are atomic in the database.
+- The current detached-job store is file-backed. Reusing Factory business logic does not by itself make job state PostgreSQL-backed; the server needs a deliberate service/store integration so the API request, job identity, and lifecycle have one durable authority rather than divergent SQL and file records. Preserve the existing CLI behavior unless a separate change is approved.
+- A persistent mounted filesystem holds repository checkouts, worktrees, logs, and artifacts. Database records and filesystem data have separate responsibilities; do not claim database persistence alone recovers workspace or process memory.
+- On restart, retain database records and mark jobs whose execution/side-effect outcome is uncertain as interrupted or requiring inspection. Preserve their workspaces and evidence where available. Do not blindly restart Pi, replay an uncertain Git push, or repeat an uncertain PR side effect. Inspect/reconcile before an operator-authorized continuation policy is defined.
+- Process or agent memory is not recoverable and must not be described as durable.
 
-| Source issue read | Target repository operations | Same or different installation | Expected outcome |
-| --- | --- | --- | --- |
-| Confirmed for the linked user grant and App | Confirmed for the linked user grant and App | Same installation | Eligible to continue other admission checks; enqueue only after all pass. |
-| Confirmed for the linked user grant and App | Confirmed for the linked user grant and App | Different accessible installations | Eligible to continue other admission checks; do not reject solely for crossing installations. |
-| Denied or not readable | Any result | Either | Reject before queue write; do not return accepted. |
-| Any result | Denied for user, App, or a required operation | Either | Reject before queue write; do not return accepted. |
-| Unavailable, stale-only, malformed, or ambiguous | Any result | Either | Fail closed with safe unavailable/authorization error; no queue write. |
-| Any result | Unavailable, stale-only, malformed, or ambiguous | Either | Fail closed with safe unavailable/authorization error; no queue write. |
-| Initially confirmed | Access removed or no longer confirmable at pre-write recheck | Either | Do not perform the write; pause/fail safely and preserve human/operator recovery path. |
+## Limits, errors, and deferred controls
 
-Tests must also prove that caller-supplied principal, user, account, or installation identifiers cannot change the linked grant or bypass either side's check; retries after an authorization rejection do not leave a partial queue record; and access through one installation does not imply access through another. These are future implementation acceptance criteria, not current server behavior.
+- Return safe generic errors without stack traces, API keys, PATs, authorization headers, raw provider payloads, or sensitive filesystem paths. Never log API-key or PAT values. Define stable response schemas and status codes during implementation.
+- Rate limiting is deferred. This proposal does not promise rate limits, `429`, or a `Retry-After` contract. Request/body input bounds remain necessary and do not constitute rate limiting.
+- Concurrency, timeouts, and resource bounds are server configuration, not caller-controlled job fields. Their defaults require implementation and deployment decisions.
 
-The request fingerprint for idempotency includes the authenticated principal, normalized issue identity, target repository, and exact instruction bytes (or explicit absence). On the same principal and key:
+## Explicit human boundary
 
-- same fingerprint: return the existing request identity and current status, without another queue item or worker;
-- different fingerprint: return `409 idempotency_conflict`, without mutation;
-- first request: validate authorization, persist canonical request, caller principal, idempotency identity/fingerprint, and accepted timestamp atomically through the admission boundary; only after durable success return `202`.
-
-A durable outbox or equivalent atomic mechanism is required if request data and ownership/idempotency metadata cannot be persisted atomically with the existing queue. Do not acknowledge acceptance if only some of those records were written.
-
-Accepted response (`202`):
-
-```json
-{
-  "id": "opaque-stable-id",
-  "status": "queued",
-  "created_at": "2026-10-01T12:00:00Z",
-  "status_url": "/v1/work/opaque-stable-id",
-  "history_url": "/v1/work/opaque-stable-id/history"
-}
-```
-
-A same-key exact retry returns the same ID and URLs; return `200` for an idempotent replay and include `idempotent_replay: true`. It is not a fresh acceptance. An authorization or queue failure is a rejection, never a `202`. The idempotency mapping, principal ownership, canonical request, and outbox/accepted event must commit atomically in the single-host store before acknowledgment. Use one versioned work record containing those fields where feasible; if multiple files are required, use a recoverable transaction/journal with startup reconciliation, and never make partially committed data visible as accepted.
-
-### `GET /v1/work/{id}`
-
-Requires a valid Factory bearer token. Return `404` both when the ID is absent and when it belongs to another principal. The response is a bounded, sanitized projection; it does not return the whole durable record, prompt, issue body, agent transcript, or credentials.
-
-```json
-{
-  "id": "opaque-stable-id",
-  "status": "waiting_for_human",
-  "issue": { "repository": "acme/widget", "number": 42, "url": "https://github.com/acme/widget/issues/42" },
-  "repository": "acme/widget",
-  "pull_request": null,
-  "created_at": "2026-10-01T12:00:00Z",
-  "updated_at": "2026-10-01T12:04:00Z",
-  "latest_activity_at": "2026-10-01T12:04:00Z",
-  "verification": null,
-  "reason": { "code": "issue_changed", "message": "The issue changed and needs review." }
-}
-```
-
-Statuses are a versioned API enum, not raw internal queue strings. The initial vocabulary is `queued`, `running`, `waiting_for_human`, `paused`, `succeeded`, `failed`, `cancelled`, and `stopped`. A PR existing does not mean work succeeded; only a recorded terminal outcome with explicit verification result may report `succeeded`. `reason` is absent when no safe reason is available; it never includes raw provider errors or sensitive content. `verification` is a bounded summary with result and limitations, not a claim of independent correctness.
-
-### `GET /v1/work/{id}/history`
-
-Requires a valid bearer token and ownership of the request; missing and non-owned IDs both return `404`. Return at most the latest 100 sanitized events in chronological order. When more events exist, return the latest 100 and set `truncated: true`; otherwise `false`. Include stable opaque event IDs and timestamps. Do not expose raw issue bodies, comments, instructions, agent output, credentials, or provider response payloads. A later API version can add cursor pagination if real usage requires it; clients must not assume an unbounded history.
-
-```json
-{
-  "work_id": "opaque-stable-id",
-  "events": [
-    { "id": "opaque-event-id", "at": "2026-10-01T12:00:00Z", "type": "accepted", "summary": "Work request accepted." },
-    { "id": "opaque-event-id-2", "at": "2026-10-01T12:04:00Z", "type": "paused", "summary": "The issue changed and needs review." }
-  ],
-  "truncated": false
-}
-```
-
-## GitHub App authorization and permissions
-
-- A Factory principal is authenticated by its configured bearer-token verifier and is linked to at most one active GitHub App user grant. Do not use client-provided owner names, account IDs, installation IDs, or GitHub usernames to choose the acting principal/grant. No single installation is selected as a principal-level authorization authority; authorization checks each requested repository against the linked user's and App installations. Cross-installation issue-to-target behavior is subject to implementation tests.
-- Repository authorization is checked against the actual delegated grant and the App installation. The user access token has only permissions and resource access common to the user and the App; user access to a repository alone is insufficient if the App installation lacks it. GitHub exposes distinct repository-list endpoints: `GET /user/installations/{installation_id}/repositories` reports repositories the authenticated user can access for an installation, including user permissions; `GET /installation/repositories` reports repositories the App installation can access. Treat these as separate evidence about each side of the authorization intersection, not interchangeable proofs.
-- Candidate minimum permissions for the intended read/prepare flow are **Metadata: read** for repository lookup, **Issues: read** for issue retrieval, **Contents: write** for Git-reference creation and branch/code writes, and **Pull requests: write** for PR creation/update. Endpoint-specific documentation lists **Pull requests: read** (or **Contents: read**) for PR retrieval, and **Pull requests: write** for PR creation/update; the combined App permission must satisfy every selected operation. The `GET /repos/{owner}/{repo}/issues/{issue_number}` endpoint documentation lists GitHub App user access tokens as supported and specifies Issues: read; the fine-grained permission map independently confirms Issues: read. The PR endpoint documentation lists GitHub App user access tokens as supported for PR retrieval and creation, specifying Pull requests: read (or Contents: read) for retrieval and Pull requests: write for creation. GitHub's Git-reference endpoint lists them as supported for reference creation (Contents: write). Validate the combined App permission level against each selected operation before App registration or implementation. These are operation-specific minimums, not a final App permission set. GitHub's installation-authentication docs show an installation access token as the HTTP password for HTTPS clone and require Contents permission; they do not document delegated user-token HTTPS clone/push support. The separate user-authorization guide describes user tokens for API requests, not Git transport. User-token Git support therefore remains unverified, not known unsupported. Do not infer Git transport support from REST token acceptance. Do not grant issue write, administration, Actions/workflow write, or broader organization permissions unless a documented required operation proves they are necessary. If a request would modify `.github/workflows` or another operation needing an ungranted permission, fail or pause; do not expand the App grant automatically. Never expose a merge operation to the worker.
-- App user access token permissions/resources are bounded by both the App and user grants. No single installation is selected as the authority for a Factory principal; clients cannot provide an installation ID to broaden or redirect authorization. Before admitting work, validate the source issue and target repository against the linked user grant and App installations. Cross-installation issue-to-target requests remain subject to explicit implementation tests and fail closed unless both sides are authorized. Revocation or a failed refresh marks the grant unusable; it is not deleted automatically while work may reference it. Paused requests require successful reauthorization before resuming; retained ciphertext can be securely replaced by an operator revoke action only after no active work depends on it.
-- The deployment key is supplied outside the durable state volume as exactly 32 random bytes. Each envelope carries a non-secret key ID and format version; use AES-256-GCM with a fresh nonce and authenticate principal ID plus record format as AAD. Support an active key and explicitly configured prior decryption keys during rotation; re-encrypt records under the active key through an atomic migration before retiring old keys. Missing keys, invalid tags, unknown versions, or unknown key IDs fail closed and never fall back to plaintext. These cryptographic and rotation details must be reviewed against the deployment secret-injection mechanism before implementation.
-
-References:
-
-- [GitHub fine-grained token permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)
-- [Create a pull request](https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request)
-- [Create a Git reference](https://docs.github.com/en/rest/git/refs#create-a-reference)
-- [Create or update repository contents](https://docs.github.com/en/rest/repos/contents#create-or-update-file-contents)
-- [GitHub App user access token permissions](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app)
-- [GitHub fine-grained permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)
-- [Get an issue](https://docs.github.com/en/rest/issues/issues#get-an-issue)
-- [List repositories accessible to an app installation](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation)
-- [List repositories accessible to a user access token](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-user-access-token)
-
-## OAuth linking
-
-- `POST /v1/oauth/github/authorization` requires Factory bearer authentication. It creates 256 bits of cryptographically random state, stores it server-side bound to the authenticated principal with a 10-minute expiry and single-use status, then returns `302 Found` to GitHub's App authorization URL. State is opaque and contains no principal ID or credential. Apply `Cache-Control: no-store` and a restrictive `Referrer-Policy` to authorization and callback responses. The browser-mediated flow is intended for a first-party trusted UI/client; a raw bearer credential should not be exposed to an untrusted browser environment.
-- `GET /v1/oauth/github/callback` is public because GitHub redirects the browser to it. It accepts only the provider's `code` and `state`; state is validated, atomically consumed once, checked for expiry and principal binding, and cannot select a different Factory principal. Callback URL is an explicit configured public HTTPS URL; do not derive it from Host, `Forwarded`, or `X-Forwarded-*` headers. A failed code exchange requires the client to start a fresh authorization flow; the same state/code pair is not replayed. If grant persistence succeeds but the callback response is lost, a valid persisted grant remains linked and must not be overwritten or exchanged again. For uncertain persistence, a confirmed absence in a healthy readable grant store requires a fresh flow; corrupt, unreadable, key-inaccessible, or otherwise uncertain grant state fails closed for operator reconciliation and is never treated as absence. Report only safe recovery instructions.
-- Exchange the code server-side; never return access/refresh tokens to the browser or place them in work records, logs, redirects, or error messages. Encrypt refreshable grant material at rest with an external deployment key. Validate the returned user identity via GitHub and bind the grant to the state principal. A new link is rejected with `409 grant_already_linked` when the principal already has an active grant; v1 relinking requires an explicit local-operator revoke/unlink first. Do not silently replace credentials based on a new OAuth callback. Fail closed on invalid, expired, reused, or revoked state/grants.
-- Redact OAuth `code` and `state` query parameters from proxy and application access logs. Return a minimal static success/failure page with no reflected provider data; do not place access/refresh tokens or authorization codes in a redirect. Use `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, and a restrictive content security policy.
-
-## Operational route behavior and exclusions
-
-Readiness/health endpoints are separate from work data, disclose no principal or job information, and must not imply that GitHub authorization or work processing is usable when dependencies are unavailable. Their exact paths and readiness dependencies are a container-shell gate.
-
-V1 deliberately has no endpoint to submit instructions to already accepted work, cancel work, inspect arbitrary provider payloads, or execute a command. Such operations require separate authorization and state-transition contracts. The API is not implemented until the separate credential-custody, admission, and container gates are met; this document alone does not enable accepting remote work.
+The worker may push its implementation branch and create/update a PR after a successful workflow. It must never merge a PR, release artifacts, or deploy software. A PR or successful process exit is not an independent correctness verdict; verification evidence and limitations should remain reviewable by a human.
