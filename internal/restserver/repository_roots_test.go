@@ -10,13 +10,13 @@ import (
 
 func TestValidateRepositoryRootsAcceptsExactGitRootAndLinkedWorktree(t *testing.T) {
 	requireGit(t)
-	root := initGitRepository(t, filepath.Join(t.TempDir(), "repo"))
+	root := initGitRepository(t, filepath.Join(canonicalTempDir(t), "repo"))
 	config := Config{Repositories: map[string]string{"main": root}}
 	if err := config.ValidateRepositoryRoots(); err != nil {
 		t.Fatalf("valid Git root rejected: %v", err)
 	}
 
-	linked := filepath.Join(t.TempDir(), "linked")
+	linked := filepath.Join(canonicalTempDir(t), "linked")
 	command := exec.Command("git", "-C", root, "worktree", "add", "-b", "linked-test", linked)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("create linked worktree: %v\n%s", err, output)
@@ -32,7 +32,7 @@ func TestValidateRepositoryRootsAcceptsExactGitRootAndLinkedWorktree(t *testing.
 
 func TestValidateRepositoryRootsRejectsInvalidRootsWithoutLeakingPaths(t *testing.T) {
 	requireGit(t)
-	temp := t.TempDir()
+	temp := canonicalTempDir(t)
 	valid := initGitRepository(t, filepath.Join(temp, "repo"))
 	nonGit := filepath.Join(temp, "not-git")
 	if err := os.Mkdir(nonGit, 0o700); err != nil {
@@ -82,7 +82,7 @@ func TestValidateRepositoryRootsRejectsInvalidRootsWithoutLeakingPaths(t *testin
 
 func TestValidateRepositoryRootsRejectsBareRepository(t *testing.T) {
 	requireGit(t)
-	bare := filepath.Join(t.TempDir(), "bare.git")
+	bare := filepath.Join(canonicalTempDir(t), "bare.git")
 	command := exec.Command("git", "init", "--bare", bare)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("initialize bare repository: %v\n%s", err, output)
@@ -91,6 +91,15 @@ func TestValidateRepositoryRootsRejectsBareRepository(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `repository "bare"`) {
 		t.Fatalf("bare repository validation error = %v", err)
 	}
+}
+
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temporary directory: %v", err)
+	}
+	return root
 }
 
 func initGitRepository(t *testing.T, root string) string {
