@@ -1,0 +1,14 @@
+# Implement a durable single-use OAuth state store
+
+- **Type:** Approved implementation opportunity; not a user-reported usability finding.
+- **Context:** The agreed server direction requires OAuth callback state to be unpredictable, short-lived, single-use, and bound to the initiating Factory principal. The existing principal bearer verifier is server-independent, but no durable state primitive existed for a future callback.
+- **Desired outcome:** A server-independent one-host store can issue opaque OAuth state tokens and atomically consume them once to recover the bound principal, including across process restart.
+- **Scope:** Generate 32 bytes using `crypto/rand`, return unpadded base64url token, persist only its SHA-256 digest with principal ID and UTC creation/expiry timestamps, and enforce a fixed 10-minute TTL. Use a private state directory and atomic JSON conventions with cross-process locking. Unknown, malformed, expired, reused, corrupt, symlinked, and special-file states fail closed. Atomically remove the state record and durably sync the directory before returning the principal; expired records are cleaned during state creation.
+- **Non-goals:** HTTP routes/handlers, GitHub provider calls, OAuth code exchange, credential storage or encryption, API work admission, workers, multi-host/distributed locking, and any edits to the separate `/tmp/factory-rest-server-mvp-plan` checkout.
+- **Acceptance criteria:**
+  1. Issued tokens decode to exactly 32 random bytes; on-disk state contains only the token digest, principal binding, creation/expiry timestamps, and record version, never the raw token. Successfully consumed records are removed rather than retained as tombstones.
+  2. State survives store/process restart, expires at the exact 10-minute boundary, and cannot be consumed more than once across independent store instances or processes.
+  3. Consume removes the matching record and durably syncs the directory before returning the principal; persistence, lock, decode, validation, or filesystem failures never return an authenticated principal. Lock acquisition honors request cancellation and is bounded to 30 seconds.
+  4. Malformed records and symlink/special paths fail closed without following links or blocking on special files; directory and files remain private and atomic replacement is used.
+  5. Behavioral tests cover valid issue/consume, digest-only persistence, restart, TTL boundary, replay, parallel cross-instance/process consumption, corruption and unsafe paths, consume-delete/sync failures, and canceled lock waits; `make test`, `make vet`, and `make build` pass.
+- **Status:** Implemented in `internal/factory` as an isolated store only. Creation removes expired records; consume removes and durably syncs a valid record before returning its principal. Lock waits are cancellation-aware and bounded. No HTTP or provider integration was added.
