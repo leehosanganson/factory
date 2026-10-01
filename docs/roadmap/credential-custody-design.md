@@ -59,6 +59,8 @@ References:
 - [GitHub REST endpoints for pull requests](https://docs.github.com/en/rest/pulls/pulls)
 - [GitHub REST endpoints for issues](https://docs.github.com/en/rest/issues/issues)
 - [Fine-grained token permission map](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens)
+- [List app installations accessible to a user access token](https://docs.github.com/en/rest/apps/installations#list-app-installations-accessible-to-the-user-access-token)
+- [List repositories accessible to a user access token](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-user-access-token)
 
 ## Expiry, refresh, revocation, and use
 
@@ -70,11 +72,12 @@ References:
 
 ## Open implementation gates
 
-1. Verify the exact permissions for all selected issue, repository, PR, and Git transport calls; current source evidence confirms Issues: read for issue retrieval, Contents: write for Git reference creation, Pull requests: write/read for PR creation/retrieval, and App/user permission intersection. Delegated user-token HTTPS Git transport remains unverified; do not infer it from REST token support.
-2. Resolve and test the GitHub App authorization URL configuration and callback behavior, including whether to adopt PKCE and how its verifier is bound to one-time state, user-denial/provider-error handling, and installation selection. Use the dedicated GitHub App web-flow docs rather than importing OAuth App callback behavior. Preserve as unknowns the undocumented status of `response_type` and authorization-code expiry; do not invent a Factory policy based on those gaps.
-3. Specify mounted key-file ownership/permission rules for a non-root container and secret rotation injection/rollback.
-4. Define GitHub token refresh concurrency and outcome reconciliation against its rotating refresh-token behavior; a lost response after consumption may require reauthorization rather than retry.
-5. Define which source issue and target repository combinations are supported, including cross-repository issue-to-code requests.
-6. Specify accepted-work behavior on grant unlink, user access loss, app uninstall, permission reduction, and encryption-key loss.
+1. Verify the exact permissions for all selected issue, repository, PR, and Git transport calls; current source evidence confirms Issues: read for issue retrieval, Contents: write for Git reference creation, Pull requests: write/read for PR creation/retrieval, and App/user permission intersection. GitHub explicitly documents HTTP-based Git access with an installation access token and Contents permission ([installation authentication](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)); its separate guidance for acting on behalf of a user discusses API requests but does not establish user access tokens as Git credentials ([user-authorized App access](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user)). Delegated user-token HTTPS clone/push therefore remains unverified, not known to be unsupported; do not infer it from REST token support.
+2. Determine whether the authorization UX needs installation selection. GitHub documents `GET /user/installations` to list installations accessible to a user access token (no permission required) and `GET /user/installations/{installation_id}/repositories` to list repositories where that user has explicit access for an installation (Metadata: read; the response includes the user's repository permissions). These endpoints provide an authorization-check mechanism, not a decision to let clients select installation IDs or bind a Factory principal to one installation. Choose and test the account/repository selection and cross-repository behavior before implementation.
+3. Resolve and test the GitHub App authorization URL configuration and callback behavior, including whether to adopt PKCE and how its verifier is bound to one-time state, user-denial/provider-error handling, and installation selection. Use the dedicated GitHub App web-flow docs rather than importing OAuth App callback behavior. Preserve as unknowns the undocumented status of `response_type` and authorization-code expiry; do not invent a Factory policy based on those gaps.
+4. Specify mounted key-file ownership/permission rules for a non-root container and secret rotation injection/rollback.
+5. Define GitHub token refresh concurrency and outcome reconciliation against its rotating refresh-token behavior; a lost response after consumption may require reauthorization rather than retry.
+6. Define which source issue and target repository combinations are supported, including cross-repository issue-to-code requests.
+7. Specify accepted-work behavior on grant unlink, user access loss, app uninstall, permission reduction, and encryption-key loss.
 
 No remote work admission or worker execution should be implemented until these gates have an approved, testable resolution.
