@@ -1,0 +1,7 @@
+# REST MVP implementation sequence
+
+Following the process-local-job and server-managed harness direction, the REST contract now breaks implementation into seven dependency-ordered slices: (1) server config and runtime credential boundaries, (2) bounded in-memory job manager, (3) authenticated HTTP routes, (4) isolated per-job harness/workspace lifecycle and shutdown, (5) Factory workflow integration, (6) shared-PAT Git/PR publication with uncertain-side-effect reconciliation, and (7) local Docker Compose plus end-to-end validation without PostgreSQL.
+
+The plan explicitly preserves these constraints: clients such as Hermes send task requests but do not select executables; only one operator-configured harness command/argument template is used; job records/idempotency/history are volatile; graceful shutdown stops intake and cancels jobs; uncertain external effects retain evidence; and merge/release/deploy are unavailable. Local Compose is a testing topology, not a security sandbox.
+
+PR #62, which records the accepted memory-only direction, merged with Ubuntu and macOS checks passing. No server implementation is present yet. An earlier PostgreSQL/golang-migrate branch remains untouched without a PR, per the user's instruction; it is superseded by this current direction.
