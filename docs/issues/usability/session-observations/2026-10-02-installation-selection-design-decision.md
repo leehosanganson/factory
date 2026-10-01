@@ -1,0 +1,8 @@
+# Installation-selection design decision
+
+- **Type:** Product-design decision recorded from explicit user direction; not a user-reported finding.
+- **Decision:** REST MVP authorization follows the linked GitHub App user grant and checks each requested repository against the user's and App's actual access. Clients do not submit/select installation IDs, and a Factory principal is not bound to one selected installation. Cross-installation issue-to-target requests remain an implementation test gate and fail closed unless both source and target are authorized.
+- **Evidence:** GitHub documents endpoints to enumerate installations accessible to the user token and repositories the user can access through an installation. These expose a way to inspect access, not a need to let callers choose an installation.
+- **Scope status:** Updated only the credential-custody design, REST contract, and this decision observation. No OAuth flow, API route, provider call, or runtime behavior was implemented.
+- **References:** [List user-accessible installations](https://docs.github.com/en/rest/apps/installations#list-app-installations-accessible-to-the-user-access-token); [List repositories accessible to a user access token](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-user-access-token); [GitHub App user access token authorization](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user).
+- **Friction:** The surrounding docs distinguished user and App access but left installation selection open. Explicitly separating the no-client-installation-ID rule from cross-installation repository support made the chosen boundary and unresolved test clear.
