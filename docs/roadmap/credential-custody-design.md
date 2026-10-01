@@ -1,8 +1,10 @@
 # GitHub App delegated credential custody design
 
-## Status
+## Status — future proposal; deferred from REST MVP
 
-This is a proposed design gate for the REST MVP; it does not implement OAuth, credential storage, remote work admission, or worker execution. It builds on the [REST API/security contract](rest-api-contract.md), the [principal bearer verifier](../issues/usability/implement-principal-bearer-verifier-loader.md), and the existing single-host local state. The specific choices in this draft require review before code implementation. A Factory principal's API bearer token and its GitHub App user grant are separate credentials with separate roles.
+**GitHub App OAuth linking and encrypted user-grant custody are future/deferred and are not prerequisites for the proposed shared-PAT REST MVP.** The MVP direction instead uses one shared bearer API key and one shared fine-grained GitHub PAT. This document's technical material is retained as a future proposal only; none of its OAuth handlers, encrypted grant storage, remote work admission, or worker execution is implemented. Its earlier per-principal/App-grant assumptions do not describe the selected MVP. See the [proposed REST server contract](rest-api-contract.md) for current planned direction. If OAuth custody is revisited, an encryption key may be supplied through an environment variable or a configured secret-file path; key bytes must not be placed in ordinary config. The exact provisioning mechanism remains a future deployment gate; the mounted-file details below are a proposal, not a selected MVP requirement. The specific choices in this future design require review before any OAuth implementation. A Factory API bearer credential and a future GitHub App user grant would have separate roles.
+
+> **Scope:** The sections below preserve the earlier per-principal GitHub App OAuth proposal for possible future use. They do not describe the shared-PAT REST MVP contract.
 
 ## Security and identity model
 
@@ -81,4 +83,4 @@ References:
 6. Define which source issue and target repository combinations are supported, including cross-repository issue-to-code requests.
 7. Specify accepted-work behavior on grant unlink, user access loss, app uninstall, permission reduction, and encryption-key loss.
 
-No remote work admission or worker execution should be implemented until these gates have an approved, testable resolution.
+No GitHub App OAuth linking or grant-custody implementation should proceed until these OAuth-specific gates have an approved, testable resolution. They are not gates for the proposed shared-PAT REST MVP.
