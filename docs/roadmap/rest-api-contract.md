@@ -4,11 +4,11 @@
 
 **Proposed, not implemented.** Factory currently has no REST server or remote job service. This document records a planned single-host service that uses existing Factory workflow/business logic to run jobs through a server-configured coding harness. It is not an implementation claim or delivery commitment.
 
-The service accepts bounded task requests for configured repository aliases and runs the configured harness as a local subprocess under the server account. Callers cannot select an executable or submit command arguments, shell text, or a generic command. A bounded in-memory queue and configured worker concurrency limit govern execution. Every API-key holder is trusted with the configured server account's local-process authority: this design is not a sandbox and does not claim isolation from malicious callers. Branch push and PR create/update, including shared PAT use, are deferred from this MVP until a separately designed, restart-safe, cross-process reconciliation gate can safely resolve uncertain side effects. Merge, release, and deployment remain unavailable. See the [proposed execution-mode architecture](execution-modes.md) for the server/executor boundary and local-process MVP direction.
+The service accepts bounded task requests for configured repository aliases and runs the configured harness as a local subprocess under the server account. The listener defaults to loopback (`127.0.0.1:8080`); operators may explicitly configure another address. Callers cannot select an executable or submit command arguments, shell text, or a generic command. A bounded in-memory queue and configured worker concurrency limit govern execution. Every API-key holder is trusted with the configured server account's local-process authority: this design is not a sandbox and does not claim isolation from malicious callers. Branch push and PR create/update, including PAT use, are deferred from this MVP until a separately designed, restart-safe, cross-process reconciliation gate can safely resolve uncertain side effects. Merge, release, and deployment remain unavailable. See the [proposed execution-mode architecture](execution-modes.md) for the server/executor boundary and local-process MVP direction.
 
 ## Authentication and GitHub authority
 
-- API requests use one configured shared bearer API key. All holders have identical access to every endpoint and job; there is no per-caller identity, isolation, or ownership boundary. Do not accept caller-supplied principal identities. Key provisioning and rotation remain to be specified; the key must not be exposed to the harness.
+- All `/v1/jobs` routes require one configured shared bearer API key. `/healthz` and `/readyz` are the only unauthenticated routes and return minimal health/readiness information without sensitive details. All key holders share the same trust domain and can inspect every retained job; there is no per-caller identity, isolation, or ownership boundary. Do not accept caller-supplied principal identities. The key must not be exposed to the harness.
 - The MVP does not select or require a GitHub credential and does not perform branch pushes or PR create/update. A future design for those writes must define credential custody and least privilege as part of the restart-safe, cross-process reconciliation gate; OAuth, GitHub App, and shared-PAT approaches are not selected by this contract.
 - The [credential-custody proposal](credential-custody-design.md) describes possible future OAuth grant custody, not an MVP credential requirement.
 
@@ -27,15 +27,51 @@ A proposed `POST /v1/jobs` request contains:
 }
 ```
 
-- `repository` is a configured repository alias, not an arbitrary repository URL. Server configuration maps each alias to an approved local Git checkout root and its GitHub repository identity; callers cannot submit filesystem paths. `task` is a required nonblank task description. `issue` is optional supplemental context and accepts only a positive issue number in the alias's configured repository. Issue URLs are excluded from this MVP.
+- `repository` is a configured repository alias, not an arbitrary repository URL. Server configuration maps each alias to an approved local Git checkout root and its repository identity; callers cannot submit filesystem paths. `task` is a required nonblank task description. `issue` is optional supplemental context and accepts only a positive issue number in the alias's configured repository. Issue URLs are excluded from this MVP.
 - The task description—not an issue—is the requested work; the optional issue number does not start autonomous polling, reconciliation, or issue tracking.
 - The request must not accept arbitrary shell, command, or executable fields.
-- Bound request body and task sizes before decoding/processing. Reject malformed JSON, unknown fields, unsupported media types, invalid UTF-8, and blank task descriptions. Exact limits are implementation choices to specify before deployment.
+- Bound request body and task sizes before decoding/processing. Require `Content-Type: application/json` for job submission. Reject malformed JSON, unknown fields, invalid UTF-8, blank task descriptions, invalid issue numbers, and unknown repository aliases. The implementation uses configured request/task limits; oversized request bodies are rejected before admission.
 - Admission validates and creates the job in the process-local registry and bounded in-memory queue before returning acceptance. Require a client-generated `Idempotency-Key` header. Repeating the same key with an identical normalized request while retained returns the existing job; reusing a key with a different request returns `409 Conflict`. Idempotency keys are forgotten when the process exits or their terminal record is evicted.
 - Configure a maximum total registry record count and a maximum event count per job. Never evict queued or active jobs. At the record cap, evict the oldest terminal job records as needed; if all retained records are queued/active and the cap is reached, reject admission. Eviction makes prior status/history return `404` and forgets its idempotency key. When an individual job exceeds its event cap, drop oldest events and mark its history as truncated.
 - If the bounded pending queue has no capacity, return `503 Service Unavailable` with a stable capacity error and do not create a job record. A later client retry must reuse its `Idempotency-Key`.
 
-A successful admission may return `202 Accepted` with an opaque job ID, initial status, and links to status/history; an idempotent replay returns that same job rather than queueing another. Proposed read endpoints are `GET /v1/jobs/{id}` and `GET /v1/jobs/{id}/history`. Since API credentials are shared, any valid key holder can inspect any retained job; responses must still be bounded and sanitized and must not expose credentials, sensitive filesystem paths, or unfiltered agent output. Status/history for evicted jobs returns `404`. History responses report whether older events were truncated.
+A successful admission returns `202 Accepted` with an opaque job ID, status snapshot, and links to status/history; an idempotent replay returns that same job rather than queueing another. The supported job routes are `POST /v1/jobs`, `GET /v1/jobs/{id}`, and `GET /v1/jobs/{id}/history`. These routes require bearer authentication before route-specific handling. `/healthz` reports process liveness and `/readyz` reports whether configuration is valid and the server is accepting requests; both are unauthenticated, minimal, and disclose no sensitive data. Readiness is not a claim that workers are idle or that an external dependency is healthy.
+
+Representative JSON DTOs (RFC 3339 UTC timestamps; optional `issue` is omitted when absent):
+
+```json
+{
+  "job": {
+    "id": "7ac42bd3-67fb-47be-b4c2-68269438d4bd",
+    "request": {"repository": "widget", "task": "Add a bounded note.", "issue": 42},
+    "status": "queued",
+    "created_at": "2026-10-02T12:00:00Z",
+    "updated_at": "2026-10-02T12:00:00Z"
+  },
+  "replayed": false,
+  "links": {
+    "self": "/v1/jobs/7ac42bd3-67fb-47be-b4c2-68269438d4bd",
+    "history": "/v1/jobs/7ac42bd3-67fb-47be-b4c2-68269438d4bd/history"
+  }
+}
+```
+
+`GET /v1/jobs/{id}` returns the `job` object itself. The submitted repository, task, and optional issue are included in both admission and status responses. Task text is intentionally visible to every key holder: holders share the trusted server-account authority and are not isolated from one another. This is not a per-user/private task store.
+
+```json
+{
+  "job_id": "7ac42bd3-67fb-47be-b4c2-68269438d4bd",
+  "events": [
+    {"at": "2026-10-02T12:00:00Z", "type": "queued", "message": "Job admitted"},
+    {"at": "2026-10-02T12:01:00Z", "type": "running", "message": "Job started"}
+  ],
+  "truncated": false
+}
+```
+
+History fields follow the current `internal/restjobs` model: bounded timestamp, type, and optional message entries, plus a truncation flag. The manager's lifecycle values are `queued`, `running`, `succeeded`, `failed`, and `canceled`; its corresponding built-in event types use those values. Do not add HTTP-only lifecycle states or promise other event types. Each event has a type of at most 64 bytes and an optional message of at most 4,096 bytes; history is bounded per job by server configuration, drops oldest events on overflow, and sets `truncated`. Sanitize messages before exposing them; never include agent output, host paths, executable names, credentials/secrets, or stack traces. Since API credentials are shared, any valid key holder can inspect any retained job. Status/history for unknown or evicted jobs returns `404`; history reports whether older events were truncated.
+
+Path matching is exact. Only `GET /healthz` and `GET /readyz` are supported for probe paths; other methods return `405 Method Not Allowed` with `Allow: GET`. Unsupported methods on recognized job paths return `405` with `Allow`; unknown paths return `404`. All paths under `/v1/jobs`, including unsupported methods and unknown job subpaths, pass bearer authentication before route/method resolution. Do not redirect API routes.
 
 ## Process-local jobs and lifecycle
 
@@ -55,7 +91,7 @@ These slices are dependency-ordered; they are planning gates, not claims of exis
 
 1. **Server configuration and runtime boundaries.** Define server-only configuration for listener, repository aliases, checkout roots, harness executable/argument template, resource limits, and protected API-key file path. Validate exact Git roots and strict API-key file ownership/mode/no-symlink rules. Add startup loading and ensure the coding-harness child environment excludes the API key. No HTTP or job execution yet.
 2. **Volatile job manager.** Implement a concurrency-safe process-local registry, bounded pending queue and worker slots, stable opaque IDs, in-process idempotency, status transitions, and bounded history. Define queue-full/repeated-idempotency behavior and tests for concurrent admission, status/history inspection, and memory/history limits. No database, disk queue, or recovery behavior.
-3. **Authenticated HTTP API.** Add a separately testable `net/http` handler for readiness/health as narrowly specified, `POST /v1/jobs`, `GET /v1/jobs/{id}`, and bounded `GET /v1/jobs/{id}/history`. Require the shared bearer API key on job routes; validate request size/schema/UTF-8/unknown fields and issue-number semantics. Verify authorization, status codes, safe errors, redaction, queue-full handling, and job IDs with handler tests.
+3. **Authenticated HTTP API.** Add a separately testable `net/http` handler for unauthenticated minimal `GET /healthz` and `GET /readyz`, `POST /v1/jobs`, `GET /v1/jobs/{id}`, and bounded `GET /v1/jobs/{id}/history`. Default the listener to loopback. Require the shared bearer API key on every `/v1/jobs` path; validate request size/schema/UTF-8/unknown fields and issue-number semantics. Implement the error envelope and mappings below. Verify authorization, exact method/path behavior, status codes, safe errors, redaction, queue-full handling, and DTOs with handler tests.
 4. **In-process worker and harness lifecycle.** Connect accepted jobs to bounded workers. Each job gets a distinct server-created workspace/session and one server-selected harness subprocess invoked without caller-controlled shell parsing. The process runs with the server account's local-process authority; it is not a sandbox. Implement cancellation propagation, process-group cleanup, graceful shutdown admission stop, bounded worker exit, and safe workspace cleanup. Test competing jobs, cancellation, shutdown, cleanup failure, and workspace handling with fake harness executables.
 5. **Factory workflow integration.** Adapt supported Factory implementation jobs behind an injectable job execution interface while preserving CLI state and behavior. Validate configured checkout root, isolate task workspaces, bound execution time/output, and expose only sanitized status/history—not raw unfiltered logs or host paths. Test supported harness contracts where practical; unsupported differences must fail clearly rather than run caller-supplied commands.
 6. **Safe side-effect design gate (deferred from MVP).** Before enabling shared PAT use, branch push, or PR create/update, design and test restart-safe cross-process reconciliation for uncertain outcomes. Specify credential custody, idempotent association, and operator escalation when state cannot be established. Do not blindly retry external side effects. This is a separate gate, not an MVP implementation slice.
@@ -65,7 +101,9 @@ These slices are dependency-ordered; they are planning gates, not claims of exis
 
 ## Limits, errors, and deferred controls
 
-- Return safe generic errors without stack traces, API keys, authorization headers, raw provider payloads, or sensitive filesystem paths. Never log API-key values. Define stable response schemas and status codes during implementation.
+- Job-route failures use one stable JSON envelope: `{"error":{"code":"invalid_request","message":"Request is invalid."}}`. `message` is safe, generic text; clients branch on `code`, not message. Never return stack traces, API keys, authorization headers, raw provider payloads, sensitive filesystem paths, executable names, or agent output; never log API-key values.
+- Stable code-to-status mapping: `400 malformed_json`, `400 unknown_field`, and `400 invalid_request` (including invalid/unknown repository alias, blank or invalid task, invalid issue, invalid UTF-8, and malformed/missing idempotency key); `401 unauthenticated`; `404 not_found` (unknown/evicted job or unknown path); `409 idempotency_conflict`; `503 queue_full` and `503 registry_full`; `405 method_not_allowed`; `415 unsupported_media_type`; `413 body_too_large`; `500 internal_error`. Do not return validation details that reveal server configuration. Responses for `/healthz` and `/readyz` are minimal and contain no error detail or sensitive data.
+- `GET /healthz` returns `200 {"status":"ok"}` while the process is alive. `GET /readyz` returns `200 {"status":"ready"}` only while configuration is valid and the server is accepting requests; while not ready (including graceful shutdown), it returns `503 {"status":"not_ready"}`. Both are unauthenticated and disclose no job, configuration, host, or dependency details.
 - Rate limiting is deferred. This proposal does not promise rate limits, `429`, or a `Retry-After` contract. Request/body input bounds and bounded in-memory job/history capacity remain necessary and do not constitute rate limiting.
 - Concurrency, queue capacity, total retained job count, per-job event count, timeouts, harness executable/arguments, and resource bounds are server configuration, not caller-controlled job fields. The configured coding harness is launched once per job; process-pool/session reuse is not part of this direction.
 - PostgreSQL-backed persistence, database migrations, backup/restore, and durable restart recovery are explicitly deferred. Revisit them only if product requirements change to require jobs or history to survive process exit.
