@@ -215,6 +215,38 @@ func TestTaskLimitIsEnforcedBeforeAdmission(t *testing.T) {
 	assertError(t, response, 400, "invalid_request")
 }
 
+func TestAPIAndManagerAcceptMaximumTaskBytes(t *testing.T) {
+	const taskLimit = 256 << 10
+	manager := newTestManager(t, restjobs.Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 2, MaxTaskBytes: taskLimit})
+	key, err := restserver.LoadAPIKey(writeAPIKey(t, testAPIKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(manager, key, Config{MaxRequestBodyBytes: 512 << 10, MaxTaskBytes: taskLimit, RepositoryAliases: map[string]struct{}{"widget": {}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(struct {
+		Repository string `json:"repository"`
+		Task       string `json:"task"`
+	}{Repository: "widget", Task: strings.Repeat("x", taskLimit)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := postJob(handler, string(body), "maximum-task")
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("maximum task request status = %d body=%s", response.Code, response.Body.String())
+	}
+	overLimit, err := json.Marshal(struct {
+		Repository string `json:"repository"`
+		Task       string `json:"task"`
+	}{Repository: "widget", Task: strings.Repeat("x", taskLimit+1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertError(t, postJob(handler, string(overLimit), "over-maximum-task"), http.StatusBadRequest, "invalid_request")
+}
+
 func TestStatusHistoryTruncationAndSafeErrors(t *testing.T) {
 	manager := newTestManager(t, managerConfig(4, 4, 3))
 	snapshot, _, err := manager.Admit("status-key", restjobs.Request{Repository: "widget", Task: "task"})

@@ -33,10 +33,12 @@ func TestNewManagerRejectsInvalidBounds(t *testing.T) {
 		{"queue exceeds records", Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1}},
 		{"zero concurrency", Config{QueueCapacity: 1, MaxRecords: 1, MaxEventsPerJob: 1}},
 		{"concurrency exceeds records", Config{QueueCapacity: 1, MaxConcurrentJobs: 2, MaxRecords: 1, MaxEventsPerJob: 1}},
-		{"zero records", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxEventsPerJob: 1}},
-		{"zero history", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1}},
+		{"negative records", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: -1, MaxEventsPerJob: 1}},
+		{"negative history", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: -1}},
 		{"unbounded queue", Config{QueueCapacity: maxQueueLimit + 1, MaxConcurrentJobs: 1, MaxRecords: maxQueueLimit + 1, MaxEventsPerJob: 1}},
 		{"unbounded records", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: maxRecordsLimit + 1, MaxEventsPerJob: 1}},
+		{"unbounded registry", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, RegistryBytes: defaultRegistryBytes + 1}},
+		{"negative registry", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, RegistryBytes: -1}},
 		{"unbounded history", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: maxEventsLimit + 1}},
 		{"zero task limit", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, MaxTaskBytes: -1}},
 		{"task limit exceeds maximum", Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, MaxTaskBytes: maxTaskBytes + 1}},
@@ -51,7 +53,7 @@ func TestNewManagerRejectsInvalidBounds(t *testing.T) {
 }
 
 func TestTaskByteLimitIsConfigurableAndDefaultsToMaximum(t *testing.T) {
-	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 12}
+	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 12, RegistryBytes: defaultRegistryBytes}
 	manager := testManager(t, config)
 	if _, _, err := manager.Admit("at-limit", Request{Repository: "widget", Task: stringsOf('t', 12)}); err != nil {
 		t.Fatalf("Admit() at configured byte limit: %v", err)
@@ -63,7 +65,10 @@ func TestTaskByteLimitIsConfigurableAndDefaultsToMaximum(t *testing.T) {
 		t.Fatalf("Admit() over configured byte limit with multibyte text = %v, want ErrInvalidInput", err)
 	}
 
-	defaulted := testManager(t, testConfig())
+	defaulted := testManager(t, Config{QueueCapacity: 8, MaxConcurrentJobs: 2})
+	if defaulted.config.MaxRecords != 1000 || defaulted.config.MaxEventsPerJob != 200 {
+		t.Fatalf("default record/event limits mismatch REST defaults: %+v", defaulted.config)
+	}
 	if _, _, err := defaulted.Admit("default-limit", Request{Repository: "widget", Task: stringsOf('t', maxTaskBytes)}); err != nil {
 		t.Fatalf("Admit() at default byte limit: %v", err)
 	}
@@ -167,6 +172,272 @@ func TestRegistryEvictsOldestTerminalAndPreservesActiveJobs(t *testing.T) {
 	replacement, replay, err := manager.Admit("oldest", Request{Repository: "widget", Task: "replacement"})
 	if err != nil || replay || replacement.ID == oldest.ID {
 		t.Fatalf("admission with evicted key = (%+v, %t, %v), want a new record", replacement, replay, err)
+	}
+}
+
+func TestRegistryBudgetAcceptsExactAccountingBoundary(t *testing.T) {
+	request := Request{Repository: "repo", Task: "boundary"}
+	key := "boundary-key"
+	budget := recordBytes(request, key) + eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, MaxTaskBytes: 128, RegistryBytes: int64(budget)})
+	if _, _, err := manager.Admit(key, request); err != nil {
+		t.Fatalf("admission at exact logical budget: %v", err)
+	}
+	if manager.registryBytes != budget {
+		t.Fatalf("accounted bytes = %d, want exact budget %d", manager.registryBytes, budget)
+	}
+}
+
+func TestRegistryBudgetRejectsWithoutStoringKeyAndAllowsRetry(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 1000, RegistryBytes: 500})
+	if _, _, err := manager.Admit("first", Request{Repository: "w", Task: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	before := manager.registryBytes
+	if _, _, err := manager.Admit("retry-key", Request{Repository: "w", Task: stringsOf('t', 1100)}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("oversize admission error = %v, want ErrInvalidInput", err)
+	}
+	if _, _, err := manager.Admit("retry-key", Request{Repository: "w", Task: stringsOf('t', 400)}); !errors.Is(err, ErrRegistryFull) {
+		t.Fatalf("budget rejection = %v, want ErrRegistryFull", err)
+	}
+	if _, err := manager.Get("retry-key"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("budget-rejected key was retained: %v", err)
+	}
+	if manager.registryBytes != before {
+		t.Fatalf("budget rejection changed accounting: got %d, want %d", manager.registryBytes, before)
+	}
+
+	// Free space by evicting the oldest terminal record, then reuse the rejected key.
+	firstID := manager.queue[0]
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(firstID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	accepted, replay, err := manager.Admit("retry-key", Request{Repository: "w", Task: "retry now"})
+	if err != nil || replay || accepted.ID == firstID {
+		t.Fatalf("retry after reclaiming budget = (%+v, %v, %v), want new job", accepted, replay, err)
+	}
+}
+
+func TestRegistryBudgetAccountsForAdmissionLifecycleAndEviction(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 128, RegistryBytes: 2000})
+	first, _, err := manager.Admit("first-key", Request{Repository: "repo", Task: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstExpected := recordBytes(first.Request, "first-key") + eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	if manager.registryBytes != firstExpected {
+		t.Fatalf("new admission charge = %d, want %d", manager.registryBytes, firstExpected)
+	}
+	beforeReplay := manager.registryBytes
+	if _, replay, err := manager.Admit("first-key", first.Request); err != nil || !replay || manager.registryBytes != beforeReplay {
+		t.Fatalf("replay altered accounting: replay=%t bytes=%d err=%v", replay, manager.registryBytes, err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	firstExpected += eventBytes(Event{Type: "running", Message: "Job started"})
+	if manager.registryBytes != firstExpected {
+		t.Fatalf("running transition charge = %d, want %d", manager.registryBytes, firstExpected)
+	}
+	if err := manager.Finish(first.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	firstExpected += eventBytes(Event{Type: "succeeded", Message: "Job finished"}) - eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	if manager.registryBytes != firstExpected {
+		t.Fatalf("finish transition charge = %d, want %d", manager.registryBytes, firstExpected)
+	}
+	if err := manager.AddEvent(first.ID, "extra", "history payload"); err != nil {
+		t.Fatal(err)
+	}
+	firstExpected += eventBytes(Event{Type: "extra", Message: "history payload"}) - eventBytes(Event{Type: "running", Message: "Job started"})
+	if manager.registryBytes != firstExpected {
+		t.Fatalf("truncation charge = %d, want %d", manager.registryBytes, firstExpected)
+	}
+	_, _, err = manager.Admit("second-key", Request{Repository: "repo", Task: "second"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEvict := manager.registryBytes
+	third, _, err := manager.Admit("third-key", Request{Repository: "repo", Task: "third"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdCharge := recordBytes(third.Request, "third-key") + eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	if manager.registryBytes != beforeEvict+thirdCharge-(recordBytes(first.Request, "first-key")+eventBytes(Event{Type: "succeeded", Message: "Job finished"})+eventBytes(Event{Type: "extra", Message: "history payload"})) {
+		t.Fatalf("eviction charge incorrect: got %d", manager.registryBytes)
+	}
+	if _, err := manager.Get(first.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("terminal record not evicted: %v", err)
+	}
+	_, _, err = manager.Admit("first-key", Request{Repository: "repo", Task: "key reusable"})
+	if !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("reusing evicted idempotency key before queue capacity: %v", err)
+	}
+	firstQueuedID := manager.queue[0]
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(firstQueuedID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	thirdID := manager.queue[0]
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(thirdID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.Admit("first-key", Request{Repository: "repo", Task: "key reusable"}); err != nil {
+		t.Fatalf("evicted idempotency key was not reusable after capacity freed: %v", err)
+	}
+}
+
+func TestCloseMarksTruncatedWhenCancellationEventCannotFit(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 360})
+	job, _, err := manager.Admit("close-key", Request{Repository: "repo", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Close()
+	closed, err := manager.Get(job.ID)
+	if err != nil || closed.Status != StatusCanceled {
+		t.Fatalf("job state after close = (%+v, %v), want canceled", closed, err)
+	}
+	history, err := manager.History(job.ID)
+	if err != nil || !history.Truncated {
+		t.Fatalf("close did not flag omitted cancellation event: (%+v, %v)", history, err)
+	}
+}
+
+func TestAddEventRejectedWhenNoHistoryBytesCanBeReclaimed(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 2, MaxTaskBytes: 128, RegistryBytes: 650})
+	job, _, err := manager.Admit("key", Request{Repository: "repo", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEvent(job.ID, "large", stringsOf('x', 100)); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := manager.History(job.ID)
+	beforeBytes := manager.registryBytes
+	if err := manager.AddEvent(job.ID, "larger", stringsOf('y', 300)); !errors.Is(err, ErrRegistryFull) {
+		t.Fatalf("non-fitting event = %v, want ErrRegistryFull", err)
+	}
+	after, _ := manager.History(job.ID)
+	if manager.registryBytes != beforeBytes || len(after.Events) != len(before.Events) || after.Events[0].Message != before.Events[0].Message || after.Truncated != before.Truncated {
+		t.Fatalf("failed event altered existing history/accounting: before=%+v after=%+v bytes=%d/%d", before, after, beforeBytes, manager.registryBytes)
+	}
+}
+
+func TestHistoryAppendEvictsOlderTerminalRecordBeforeItsOwnHistory(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 650})
+	terminal, _, err := manager.Admit("terminal", Request{Repository: "repo", Task: "old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(terminal.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	active, _, err := manager.Admit("active", Request{Repository: "repo", Task: "new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEvent(active.ID, "detail", stringsOf('x', 250)); err != nil {
+		t.Fatalf("history append should evict older terminal record: %v", err)
+	}
+	if _, err := manager.Get(terminal.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("older terminal record was not evicted: %v", err)
+	}
+	if manager.registryBytes > uint64(manager.config.RegistryBytes) {
+		t.Fatalf("registry accounting exceeded budget: %d", manager.registryBytes)
+	}
+}
+
+func TestRegistryBudgetReclaimsOldestHistoryAcrossRecords(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 850})
+	first, _, err := manager.Admit("first", Request{Repository: "repo", Task: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := manager.Admit("second", Request{Repository: "repo", Task: "two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEvent(first.ID, "detail", stringsOf('x', 100)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEvent(second.ID, "detail", stringsOf('y', 370)); !errors.Is(err, ErrRegistryFull) {
+		t.Fatalf("event exceeding aggregate budget = %v, want ErrRegistryFull", err)
+	}
+	if manager.registryBytes > uint64(manager.config.RegistryBytes) {
+		t.Fatalf("registry charge exceeded budget: %d > %d", manager.registryBytes, manager.config.RegistryBytes)
+	}
+	firstHistory, err := manager.History(first.ID)
+	if err != nil || !firstHistory.Truncated || len(firstHistory.Events) != 1 || firstHistory.Events[0].Type != "detail" {
+		t.Fatalf("oldest history was not reclaimed/truncated: (%+v, %v)", firstHistory, err)
+	}
+	secondHistory, err := manager.History(second.ID)
+	if err != nil || len(secondHistory.Events) != 1 || secondHistory.Truncated || secondHistory.Events[0].Type != "queued" {
+		t.Fatalf("rejected event was partially retained: (%+v, %v)", secondHistory, err)
+	}
+}
+
+func TestLifecycleTransitionsTruncateHistoryWhenEventCannotFit(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 349})
+	job, _, err := manager.Admit("key", Request{Repository: "repo", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatalf("claim using reclaimed queued event: %v", err)
+	}
+	if err := manager.Finish(job.ID, StatusSucceeded); err != nil {
+		t.Fatalf("finish after bounded event truncation: %v", err)
+	}
+	finished, err := manager.Get(job.ID)
+	if err != nil || finished.Status != StatusSucceeded || manager.running != 0 {
+		t.Fatalf("finished state = (%+v, %v), running=%d", finished, err, manager.running)
+	}
+	history, err := manager.History(job.ID)
+	if err != nil || !history.Truncated {
+		t.Fatalf("lifecycle history was not marked truncated: (%+v, %v)", history, err)
+	}
+}
+
+func TestRegistryBudgetRejectsEventsWithoutCorruptingAccounting(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 3, MaxTaskBytes: 128, RegistryBytes: 500})
+	job, _, err := manager.Admit("key", Request{Repository: "repo", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	before := manager.registryBytes
+	if err := manager.AddEvent(job.ID, "large", stringsOf('x', 300)); !errors.Is(err, ErrRegistryFull) {
+		t.Fatalf("large event = %v, want ErrRegistryFull", err)
+	}
+	if manager.registryBytes != before {
+		t.Fatalf("rejected event changed logical accounting: got %d want %d", manager.registryBytes, before)
+	}
+	if err := manager.Finish(job.ID, StatusSucceeded); err != nil {
+		t.Fatalf("finish within remaining budget: %v", err)
+	}
+	if manager.registryBytes > uint64(manager.config.RegistryBytes) || manager.registryBytes == 0 || manager.registryBytes == before {
+		t.Fatalf("lifecycle transition did not update bounded accounting: got %d before %d", manager.registryBytes, before)
+	}
+	finished, err := manager.Get(job.ID)
+	if err != nil || finished.Status != StatusSucceeded || manager.running != 0 {
+		t.Fatalf("finish state = (%+v, %v), running=%d", finished, err, manager.running)
 	}
 }
 

@@ -18,17 +18,23 @@ const configFileLimit = 1 << 20
 
 const (
 	defaultListenAddress    = "127.0.0.1:8080"
-	defaultRequestBodyBytes = 128 << 10
-	defaultTaskBytes        = 64 << 10
+	defaultRequestBodyBytes = 512 << 10
+	defaultTaskBytes        = 256 << 10
 	defaultQueueCapacity    = 32
 	defaultWorkers          = 2
+	defaultMaxRecords       = 1000
+	defaultMaxEventsPerJob  = 200
+	defaultRegistryBytes    = 256 << 20
 	defaultJobTimeout       = 30 * time.Minute
 	defaultHarnessOutput    = 1 << 20
 
 	maxRequestBodyBytes = 2 << 20
-	maxTaskBytes        = 1 << 20
+	maxTaskBytes        = 256 << 10
 	maxQueueCapacity    = 1024
 	maxWorkers          = 64
+	maxRecords          = 1000
+	maxEventsPerJob     = 200
+	maxRegistryBytes    = 256 << 20
 	maxJobTimeout       = 24 * time.Hour
 	maxHarnessOutput    = 16 << 20
 )
@@ -57,6 +63,9 @@ type Limits struct {
 	TaskBytes        int    `json:"task_bytes"`
 	QueueCapacity    int    `json:"queue_capacity"`
 	Workers          int    `json:"workers"`
+	MaxRecords       int    `json:"max_records"`
+	MaxEventsPerJob  int    `json:"max_events_per_job"`
+	RegistryBytes    int64  `json:"registry_bytes"`
 	JobTimeout       string `json:"job_timeout"`
 	HarnessOutput    int    `json:"harness_output_bytes"`
 }
@@ -72,6 +81,9 @@ func DefaultConfig() Config {
 			TaskBytes:        defaultTaskBytes,
 			QueueCapacity:    defaultQueueCapacity,
 			Workers:          defaultWorkers,
+			MaxRecords:       defaultMaxRecords,
+			MaxEventsPerJob:  defaultMaxEventsPerJob,
+			RegistryBytes:    defaultRegistryBytes,
 			JobTimeout:       defaultJobTimeout.String(),
 			HarnessOutput:    defaultHarnessOutput,
 		},
@@ -204,6 +216,15 @@ func (l Limits) validate() error {
 	if err != nil || timeout <= 0 || timeout > maxJobTimeout {
 		return fmt.Errorf("limits.job_timeout must be positive and no greater than %s", maxJobTimeout)
 	}
+	if l.MaxRecords < 1 || l.MaxRecords > maxRecords {
+		return fmt.Errorf("limits.max_records must be between 1 and %d", maxRecords)
+	}
+	if l.MaxEventsPerJob < 1 || l.MaxEventsPerJob > maxEventsPerJob {
+		return fmt.Errorf("limits.max_events_per_job must be between 1 and %d", maxEventsPerJob)
+	}
+	if l.RegistryBytes < 1 || l.RegistryBytes > maxRegistryBytes {
+		return fmt.Errorf("limits.registry_bytes must be between 1 and %d", maxRegistryBytes)
+	}
 	if l.HarnessOutput < 1 || l.HarnessOutput > maxHarnessOutput {
 		return fmt.Errorf("limits.harness_output_bytes must be between 1 and %d", maxHarnessOutput)
 	}
@@ -279,7 +300,7 @@ func configFieldAllowed(parent, key string) bool {
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "limits":
-		fields = map[string]struct{}{"request_body_bytes": {}, "task_bytes": {}, "queue_capacity": {}, "workers": {}, "job_timeout": {}, "harness_output_bytes": {}}
+		fields = map[string]struct{}{"request_body_bytes": {}, "task_bytes": {}, "queue_capacity": {}, "workers": {}, "max_records": {}, "max_events_per_job": {}, "registry_bytes": {}, "job_timeout": {}, "harness_output_bytes": {}}
 	case "repositories":
 		return aliasPattern.MatchString(key)
 	default:

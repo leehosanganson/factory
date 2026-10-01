@@ -21,7 +21,7 @@ import (
 // callback is not ready.
 const (
 	maxRequestBodyBytes = 2 << 20
-	maxTaskBytes        = 65_536
+	maxTaskBytes        = 256 << 10
 )
 
 // Config bounds requests and exposes only operator-approved repository aliases.

@@ -18,7 +18,7 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 	if config.ListenAddress != "127.0.0.1:8080" {
 		t.Fatalf("default listener = %q, want loopback-only default", config.ListenAddress)
 	}
-	if config.Limits.RequestBodyBytes != 128<<10 || config.Limits.TaskBytes != 64<<10 || config.Limits.QueueCapacity != 32 || config.Limits.Workers != 2 || config.Limits.HarnessOutput != 1<<20 {
+	if config.Limits.RequestBodyBytes != 512<<10 || config.Limits.TaskBytes != 256<<10 || config.Limits.QueueCapacity != 32 || config.Limits.Workers != 2 || config.Limits.MaxRecords != 1000 || config.Limits.MaxEventsPerJob != 200 || config.Limits.RegistryBytes != 256<<20 || config.Limits.HarnessOutput != 1<<20 {
 		t.Fatalf("unexpected defaults: %+v", config.Limits)
 	}
 	timeout, err := time.ParseDuration(config.Limits.JobTimeout)
@@ -28,7 +28,7 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 }
 
 func TestLoadConfigAcceptsBoundedOverrides(t *testing.T) {
-	path := writeConfig(t, `{"mode":"local_process","listen_address":"0.0.0.0:65535","repositories":{"repo_1":"/tmp/checkout"},"harness":{"executable":"/usr/bin/pi","args":["{task}","{system_prompt}"]},"api_key_file":"/tmp/key","limits":{"request_body_bytes":2097152,"task_bytes":1048576,"queue_capacity":1024,"workers":64,"job_timeout":"24h","harness_output_bytes":16777216}}`)
+	path := writeConfig(t, `{"mode":"local_process","listen_address":"0.0.0.0:65535","repositories":{"repo_1":"/tmp/checkout"},"harness":{"executable":"/usr/bin/pi","args":["{task}","{system_prompt}"]},"api_key_file":"/tmp/key","limits":{"request_body_bytes":2097152,"task_bytes":262144,"queue_capacity":1024,"workers":64,"max_records":1000,"max_events_per_job":200,"registry_bytes":268435456,"job_timeout":"24h","harness_output_bytes":16777216}}`)
 	config, err := LoadConfig(path)
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +36,7 @@ func TestLoadConfigAcceptsBoundedOverrides(t *testing.T) {
 	if config.ListenAddress != "0.0.0.0:65535" {
 		t.Fatalf("explicit listener override = %q", config.ListenAddress)
 	}
-	if config.Limits.RequestBodyBytes != maxRequestBodyBytes || config.Limits.Workers != maxWorkers {
+	if config.Limits.RequestBodyBytes != maxRequestBodyBytes || config.Limits.Workers != maxWorkers || config.Limits.TaskBytes != maxTaskBytes || config.Limits.MaxRecords != maxRecords || config.Limits.MaxEventsPerJob != maxEventsPerJob || config.Limits.RegistryBytes != maxRegistryBytes {
 		t.Fatalf("configured upper-bound settings were not retained: %+v", config.Limits)
 	}
 }
@@ -91,6 +91,7 @@ func TestConfigValidateRejectsUnsupportedAuthorityAndUnsafeValues(t *testing.T) 
 		{"body limit over ceiling", func(c *Config) { c.Limits.RequestBodyBytes = maxRequestBodyBytes + 1 }},
 		{"task limit below range", func(c *Config) { c.Limits.TaskBytes = 0 }},
 		{"task larger than body", func(c *Config) { c.Limits.TaskBytes = c.Limits.RequestBodyBytes + 1 }},
+		{"task limit over ceiling", func(c *Config) { c.Limits.TaskBytes = maxTaskBytes + 1 }},
 		{"queue limit below range", func(c *Config) { c.Limits.QueueCapacity = 0 }},
 		{"queue limit over ceiling", func(c *Config) { c.Limits.QueueCapacity = maxQueueCapacity + 1 }},
 		{"zero worker count", func(c *Config) { c.Limits.Workers = 0 }},
@@ -98,6 +99,12 @@ func TestConfigValidateRejectsUnsupportedAuthorityAndUnsafeValues(t *testing.T) 
 		{"invalid timeout", func(c *Config) { c.Limits.JobTimeout = "not-a-duration" }},
 		{"zero timeout", func(c *Config) { c.Limits.JobTimeout = "0s" }},
 		{"timeout over ceiling", func(c *Config) { c.Limits.JobTimeout = (maxJobTimeout + time.Second).String() }},
+		{"record limit below range", func(c *Config) { c.Limits.MaxRecords = 0 }},
+		{"record limit over ceiling", func(c *Config) { c.Limits.MaxRecords = maxRecords + 1 }},
+		{"event limit below range", func(c *Config) { c.Limits.MaxEventsPerJob = 0 }},
+		{"event limit over ceiling", func(c *Config) { c.Limits.MaxEventsPerJob = maxEventsPerJob + 1 }},
+		{"registry budget below range", func(c *Config) { c.Limits.RegistryBytes = 0 }},
+		{"registry budget over ceiling", func(c *Config) { c.Limits.RegistryBytes = maxRegistryBytes + 1 }},
 		{"output limit below range", func(c *Config) { c.Limits.HarnessOutput = 0 }},
 		{"output over ceiling", func(c *Config) { c.Limits.HarnessOutput = maxHarnessOutput + 1 }},
 		{"nul checkout path", func(c *Config) { c.Repositories["widget"] = "/srv/widget\x00" }},
