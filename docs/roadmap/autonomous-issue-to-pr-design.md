@@ -64,6 +64,20 @@ Define what happens when ownership expires while a worker may still be running, 
 
 The local queue's persistence format, atomicity, backup/migration behavior, retention, and corruption handling must be specified before implementation. These choices should keep the worker contract hostable by a future server without claiming that the local store already provides multi-host safety.
 
+#### Single-host state retention and recovery gate
+
+The current CLI stores queue records under `factory/work-requests` and issue observations, lifecycle state, and version-pinned human directions separately under `factory/work-observations`. The queue is a local single-host store; observations are immutable per request/version, and lifecycle state can be rebuilt from observation history when missing or stale. Writes use atomic JSON-file replacement, but these properties do not establish a backup, restore, host-loss, or general corruption-recovery guarantee. The current stores have no documented retention period or automatic pruning/compaction policy; do not infer a service-level guarantee or add automatic deletion based only on record age or terminal status.
+
+Before server deployment or adding a worker that relies on restart recovery, decide and document:
+
+- which queue, observation, lifecycle, human-direction, and future execution records are authoritative, and how their separate stores must be captured consistently;
+- how long each record class and its deduplication/history evidence must be retained, and whether/when operator-managed or automatic deletion is allowed without permitting accidental re-admission or losing recovery evidence;
+- backup frequency, state-volume sizing assumptions, encryption/key dependencies for any future credentials, and a tested restore procedure;
+- how incomplete or older-format restores, malformed/corrupt records, and missing/stale derived state are detected and surfaced, and which cases can be rebuilt versus requiring operator reconciliation;
+- how upgrades and migrations preserve accepted requests, in-flight ownership fencing, and uncertainty around external side effects without blindly replaying them.
+
+The deployment-validation gate must exercise restore on a clean host, verify that accepted and in-flight work is represented correctly, and document any unavoidable data-loss window. Until these decisions and tests exist, preserve durable records and fail visibly on unreadable state; do not claim backup or disaster recovery is implemented.
+
 ### Credentials and trust
 
 Use least-privilege GitHub credentials, scoped to the repositories and issue/PR actions required by policy. Keep credentials out of request records, prompts, logs, worktrees, and artifacts; provide them only to the operations that need them and support safe rotation/revocation. Define how credentials are configured for CLI submission versus background worker execution, and fail closed when authorization is insufficient. Never infer that a local process, agent, or repository is sandboxed merely because Factory orchestrates it.
