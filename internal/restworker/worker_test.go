@@ -1,0 +1,345 @@
+package restworker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/leehosanganson/factory/internal/restjobs"
+)
+
+func newTestManager(t *testing.T, capacity, managerWorkers int) *restjobs.LocalManager {
+	t.Helper()
+	manager, err := restjobs.NewManager(restjobs.Config{
+		QueueCapacity: capacity, MaxConcurrentJobs: managerWorkers,
+		MaxRecords: capacity, MaxEventsPerJob: 16,
+	})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	return manager
+}
+
+func admit(t *testing.T, manager *restjobs.LocalManager, key string) restjobs.Snapshot {
+	t.Helper()
+	job, _, err := manager.Admit(key, restjobs.Request{Repository: "repo", Task: key})
+	if err != nil {
+		t.Fatalf("Admit(%q) error = %v", key, err)
+	}
+	return job
+}
+
+type executorFunc func(context.Context, restjobs.Request) error
+
+func (f executorFunc) Execute(ctx context.Context, request restjobs.Request) error {
+	return f(ctx, request)
+}
+
+func waitForStatus(t *testing.T, manager *restjobs.LocalManager, id string, want restjobs.Status) restjobs.Snapshot {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		job, err := manager.Get(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Status == want {
+			return job
+		}
+		time.Sleep(time.Millisecond)
+	}
+	job, _ := manager.Get(id)
+	t.Fatalf("job status = %q, want %q", job.Status, want)
+	return restjobs.Snapshot{}
+}
+
+func TestWorkerCountBoundsConcurrentExecutions(t *testing.T) {
+	manager := newTestManager(t, 8, 4)
+	for i := range 6 {
+		admit(t, manager, fmt.Sprintf("job-%d", i))
+	}
+	started := make(chan struct{}, 8)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	active, maximum := 0, 0
+	executor := executorFunc(func(ctx context.Context, _ restjobs.Request) error {
+		mu.Lock()
+		active++
+		if active > maximum {
+			maximum = active
+		}
+		mu.Unlock()
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		mu.Lock()
+		active--
+		mu.Unlock()
+		return nil
+	})
+	coordinator, err := New(manager, executor, CoordinatorConfig{Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	<-started
+	select {
+	case <-started:
+		t.Fatal("more than configured worker count started execution")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if maximum > 2 {
+		t.Fatalf("maximum concurrent executions = %d, want <= 2", maximum)
+	}
+}
+
+func TestManagerConcurrencyLimitConstrainsCoordinator(t *testing.T) {
+	manager := newTestManager(t, 3, 1)
+	for i := range 3 {
+		admit(t, manager, fmt.Sprintf("job-%d", i))
+	}
+	started := make(chan struct{}, 3)
+	release := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Request) error {
+		started <- struct{}{}
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}), CoordinatorConfig{Workers: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	select {
+	case <-started:
+		t.Fatal("manager allowed more than one concurrent claim")
+	case <-time.After(30 * time.Millisecond):
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	close(release)
+}
+
+func TestSingleWorkerExecutesFIFO(t *testing.T) {
+	manager := newTestManager(t, 3, 1)
+	var jobs []restjobs.Snapshot
+	for _, key := range []string{"first", "second", "third"} {
+		jobs = append(jobs, admit(t, manager, key))
+	}
+	var mu sync.Mutex
+	var order []string
+	coordinator, err := New(manager, executorFunc(func(_ context.Context, request restjobs.Request) error {
+		mu.Lock()
+		order = append(order, request.Task)
+		mu.Unlock()
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, job := range jobs {
+		waitForStatus(t, manager, job.ID, restjobs.StatusSucceeded)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	want := []string{"first", "second", "third"}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("execution order = %v, want %v", order, want)
+	}
+	history, err := manager.History(jobs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var eventTypes []string
+	for _, event := range history.Events {
+		eventTypes = append(eventTypes, event.Type)
+	}
+	if fmt.Sprint(eventTypes) != fmt.Sprint([]string{"queued", "running", "succeeded"}) {
+		t.Fatalf("lifecycle events = %v, want queued/running/succeeded", eventTypes)
+	}
+}
+
+func TestExecutorErrorFinishesFailedWithoutLeakingError(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "failing")
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Request) error {
+		return errors.New("sensitive executor output")
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, job.ID, restjobs.StatusFailed)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkNoSensitiveEvent(t, manager, job.ID)
+}
+
+func TestExecutorPanicFinishesFailedAndWorkerContinues(t *testing.T) {
+	manager := newTestManager(t, 2, 1)
+	panicked := admit(t, manager, "panic")
+	after := admit(t, manager, "after-panic")
+	coordinator, err := New(manager, executorFunc(func(_ context.Context, request restjobs.Request) error {
+		if request.Task == "panic" {
+			panic("private panic details")
+		}
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForStatus(t, manager, panicked.ID, restjobs.StatusFailed)
+	waitForStatus(t, manager, after.ID, restjobs.StatusSucceeded)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkNoSensitiveEvent(t, manager, panicked.ID)
+}
+
+func TestShutdownCancelsQueuedAndActiveJobs(t *testing.T) {
+	manager := newTestManager(t, 3, 1)
+	active := admit(t, manager, "active")
+	queued := admit(t, manager, "queued")
+	started := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Request) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if got, _ := manager.Get(active.ID); got.Status != restjobs.StatusCanceled {
+		t.Fatalf("active status = %q, want canceled", got.Status)
+	}
+	if got, _ := manager.Get(queued.ID); got.Status != restjobs.StatusCanceled {
+		t.Fatalf("queued status = %q, want canceled", got.Status)
+	}
+}
+
+func TestShutdownWaitContextCanTimeOutThenWaitAgain(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "blocked")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Request) error {
+		close(started)
+		<-release
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := coordinator.Shutdown(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown(short) error = %v, want deadline exceeded", err)
+	}
+	close(release)
+	long, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	if err := coordinator.Shutdown(long); err != nil {
+		t.Fatalf("Shutdown(long) error = %v", err)
+	}
+	if got, _ := manager.Get(job.ID); got.Status != restjobs.StatusCanceled {
+		t.Fatalf("active status after shutdown = %q, want canceled", got.Status)
+	}
+}
+
+func TestShutdownDeadlineDoesNotWaitForeverForNonCooperativeExecutor(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	admit(t, manager, "ignores-cancel")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Request) error {
+		close(started)
+		<-release
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown() error = %v, want deadline exceeded", err)
+	}
+	close(release)
+	cleanup, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	if err := coordinator.Shutdown(cleanup); err != nil {
+		t.Fatalf("cleanup Shutdown() error = %v", err)
+	}
+}
+
+func TestWaitClaimHonorsContextWithoutPolling(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := manager.WaitClaim(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("WaitClaim() error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestNewRejectsMissingDependenciesAndWorkers(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	validExecutor := executorFunc(func(context.Context, restjobs.Request) error { return nil })
+	for _, tc := range []struct {
+		manager  restjobs.Manager
+		executor Executor
+		workers  int
+	}{
+		{nil, validExecutor, 1}, {manager, nil, 1}, {manager, validExecutor, 0},
+	} {
+		if _, err := New(tc.manager, tc.executor, CoordinatorConfig{Workers: tc.workers}); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("New(%+v) error = %v, want ErrInvalidConfig", tc, err)
+		}
+	}
+}
+
+func checkNoSensitiveEvent(t *testing.T, manager *restjobs.LocalManager, id string) {
+	t.Helper()
+	history, err := manager.History(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range history.Events {
+		if event.Message == "sensitive executor output" || event.Message == "private panic details" {
+			t.Fatalf("sensitive execution detail leaked in event: %+v", event)
+		}
+	}
+}
