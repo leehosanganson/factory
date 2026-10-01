@@ -8,9 +8,9 @@ Factory's long-term direction is to manage a durable feedback loop that turns in
 
 The loop should retain context, decisions, evidence, and outcomes at each transition. Feedback from checks, deployments, users, and operations should refine requirements and future work rather than being discarded at job completion. Human direction remains essential for ambiguity, risk, and approval; automation should not be presented as an independent correctness verdict.
 
-## Approved next implementation slice
+## REST server MVP foundation
 
-The detailed containerized REST server MVP design remains under review. The first approved server-related code slice is limited to a startup-loaded, server-independent per-principal bearer-token verifier registry. It must not add HTTP routes, OAuth, remote work admission, or automated execution. See [the REST-server verifier-loader implementation item](../issues/usability/implement-principal-bearer-verifier-loader.md) for scope and acceptance criteria.
+The agreed direction is a containerized, single-host REST service with durable local state, a per-principal bearer credential linked to a GitHub App user grant, and principal-scoped work/history. Repository access must be available to both the user and App installation; merge, release, and deployment remain human-only. This server is not implemented. See the [proposed API/security contract](rest-api-contract.md) for route schemas and security boundaries, and the [credential-custody design](credential-custody-design.md) for OAuth, encrypted grant storage, refresh, and rotation gates.
 
 Today Factory is a Go CLI with sequential implementation stages, a repository-wide tidy workflow, detached PR monitoring, detached jobs, and opt-in parallel implementation within an eligible implementation stage. It does not currently provide a server, fleet coordinator, issue scheduler, deployment engine, generic arbitrary-command `run`, reusable workflow/task catalog, or chained jobs. The [feature index](../features/README.md) describes implemented behavior.
 
@@ -38,6 +38,10 @@ The intended lifecycle spans requirements through deployment and back to new int
 Factory's present implementation workflow covers requirements, implementation, review, and documentation; tidy covers review/fix/document and local checks; monitor handles bounded existing-PR maintenance. CI/release automation lives in repository GitHub workflows. End-to-end deployment and feedback orchestration are future direction, not present Factory behavior.
 
 The feedback loop should distinguish observations from inferred causes, preserve links to source evidence, and make retries and human decisions visible. It should also allow a workflow to stop safely when evidence is missing or scope changes.
+
+## REST server MVP contract
+
+The agreed REST MVP is a containerized, single-host service with persistent local state, per-principal bearer authentication, and a linked GitHub App user grant. Remote work and history are scoped to the submitting principal; repository access requires both that user's access and the App installation. The worker may prepare/update a PR but cannot merge, release, or deploy. The server is not implemented; the separate REST design worktree contains the detailed MVP plan, while the tracked [proposed API/security contract](rest-api-contract.md) and [credential-custody design](credential-custody-design.md) record reviewable schemas, security boundaries, and implementation gates.
 
 ## Durable Factory servers and horizontal scaling
 
