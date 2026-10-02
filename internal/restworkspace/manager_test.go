@@ -89,6 +89,76 @@ func TestCreateMakesDetachedIsolatedWorktree(t *testing.T) {
 	}
 }
 
+func TestCreateContextCanceledBeforeProvisioningDoesNotRunGit(t *testing.T) {
+	now := time.Now().UTC()
+	var calls int
+	runner := func(context.Context, string, ...string) error {
+		calls++
+		return nil
+	}
+	manager, _, _ := testManager(t, &now, runner)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := manager.CreateContext(ctx, testJobID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateContext() error = %v, want context.Canceled", err)
+	}
+	if calls != 0 {
+		t.Fatalf("Git runner called %d times for an already canceled context", calls)
+	}
+	if _, err := os.Lstat(filepath.Join(manager.root, testJobID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created result directory for canceled creation: %v", err)
+	}
+}
+
+func TestCreateContextCancellationDuringGitRetainsPartialWorktree(t *testing.T) {
+	now := time.Now().UTC()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int
+	runner := func(runCtx context.Context, root string, args ...string) error {
+		calls++
+		if len(args) < 2 || args[0] != "worktree" || args[1] != "add" {
+			return errors.New("unexpected Git command")
+		}
+		if err := runGit(runCtx, root, args...); err != nil {
+			return err
+		}
+		cancel()
+		return runCtx.Err()
+	}
+	manager, _, _ := testManager(t, &now, runner)
+
+	if _, err := manager.CreateContext(ctx, testJobID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateContext() error = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Fatalf("Git runner called %d times, want one worktree add", calls)
+	}
+	jobDir := filepath.Join(manager.root, testJobID)
+	if _, err := os.Lstat(filepath.Join(jobDir, "worktree")); err != nil {
+		t.Fatalf("partial worktree was not retained: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(jobDir, markerName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created success marker for canceled creation: %v", err)
+	}
+}
+
+func TestCreateContextCreatesDetachedWorktree(t *testing.T) {
+	now := time.Now().UTC()
+	manager, _, _ := testManager(t, &now, nil)
+	workspace, err := manager.CreateContext(context.Background(), testJobID)
+	if err != nil {
+		t.Fatalf("CreateContext() error = %v", err)
+	}
+	if err := verifyWorktreeDir(workspace.WorktreePath); err != nil {
+		t.Fatalf("CreateContext() worktree is invalid: %v", err)
+	}
+	if err := manager.MarkSucceeded(testJobID); err != nil {
+		t.Fatalf("MarkSucceeded() after context creation: %v", err)
+	}
+}
+
 func TestMarkSucceededWritesAtomicProtectedMarker(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	manager, _, _ := testManager(t, &now, nil)

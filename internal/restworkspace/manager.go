@@ -134,15 +134,37 @@ func New(config Config) (*Manager, error) {
 // checkout HEAD and private state/output directories. It creates no branch and
 // leaves partial results in place on failure so startup recovery fails closed.
 func (m *Manager) Create(jobID string) (Workspace, error) {
+	return m.CreateContext(context.Background(), jobID)
+}
+
+// CreateContext creates a separate detached worktree at the repository's
+// current checkout HEAD and private state/output directories. It creates no
+// branch and leaves partial results in place on failure so startup recovery
+// fails closed. Cancellation before provisioning starts creates no job files;
+// cancellation during Git work retains any partial results for fail-closed
+// recovery.
+func (m *Manager) CreateContext(ctx context.Context, jobID string) (Workspace, error) {
+	if ctx == nil {
+		return Workspace{}, errors.New("creation context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return Workspace{}, err
+	}
 	if !validJobID(jobID) {
 		return Workspace{}, errors.New("invalid job ID")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Workspace{}, err
+	}
 	if err := m.verifyRepository(); err != nil {
 		return Workspace{}, err
 	}
 	if err := m.verifyRoot(); err != nil {
+		return Workspace{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return Workspace{}, err
 	}
 	jobDir := filepath.Join(m.root, jobID)
@@ -168,7 +190,13 @@ func (m *Manager) Create(jobID string) (Workspace, error) {
 	if err := m.verifyRepository(); err != nil {
 		return Workspace{}, err
 	}
-	if err := m.runGit(context.Background(), m.repoRoot, "worktree", "add", "--detach", workspace.WorktreePath, head); err != nil {
+	if err := ctx.Err(); err != nil {
+		return Workspace{}, err
+	}
+	if err := m.runGit(ctx, m.repoRoot, "worktree", "add", "--detach", workspace.WorktreePath, head); err != nil {
+		return Workspace{}, fmt.Errorf("create detached job worktree: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
 		return Workspace{}, fmt.Errorf("create detached job worktree: %w", err)
 	}
 	// If the configured repository changed while Git was adding the worktree,
