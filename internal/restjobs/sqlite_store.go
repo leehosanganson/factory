@@ -214,6 +214,13 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Snapshot{}, false, errors.New("read SQLite idempotency record")
 	}
+	var retained int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs`).Scan(&retained); err != nil {
+		return Snapshot{}, false, errors.New("check SQLite retained-record capacity")
+	}
+	if retained >= s.config.MaxRecords {
+		return Snapshot{}, false, ErrRegistryFull
+	}
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs WHERE status IN ('queued','running')`).Scan(&count); err != nil {
 		return Snapshot{}, false, errors.New("check SQLite job capacity")

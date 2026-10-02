@@ -30,6 +30,29 @@ func TestSQLiteStoreSatisfiesSharedContract(t *testing.T) {
 	})
 }
 
+func TestSQLiteStoreEnforcesRetainedRecordLimitWithoutEvictingTerminalHistory(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	for _, key := range []string{"one", "two"} {
+		job, _, err := store.Admit(key, Request{Repository: "widget", Task: key})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Finish(job.ID, StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := store.Admit("three", Request{Repository: "widget", Task: "three"}); !errors.Is(err, ErrRegistryFull) {
+		t.Fatalf("third admission error=%v, want ErrRegistryFull", err)
+	}
+}
+
 func TestSQLiteStorePersistsJobHistoryAndIdempotencyAcrossRestart(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())
