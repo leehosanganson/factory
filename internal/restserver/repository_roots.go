@@ -2,12 +2,14 @@ package restserver
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // ValidateRepositoryRoots checks configured repository roots against the local
@@ -22,6 +24,8 @@ func (c Config) ValidateRepositoryRoots() error {
 	return nil
 }
 
+const repositoryRootValidationTimeout = 10 * time.Second
+
 func validateRepositoryRoot(root string) error {
 	if !filepath.IsAbs(root) || strings.TrimSpace(root) == "" || strings.ContainsRune(root, 0) || filepath.Clean(root) != root {
 		return errors.New("root must be an absolute canonical path")
@@ -35,7 +39,9 @@ func validateRepositoryRoot(root string) error {
 		return errors.New("root and its ancestors must not use symlinks")
 	}
 
-	command := exec.Command("git", "-C", root, "rev-parse", "--show-toplevel")
+	ctx, cancel := context.WithTimeout(context.Background(), repositoryRootValidationTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--show-toplevel")
 	var output bytes.Buffer
 	command.Stdout = &output
 	if err := command.Run(); err != nil {

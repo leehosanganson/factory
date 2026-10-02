@@ -14,6 +14,8 @@ import (
 	"unicode"
 
 	"github.com/leehosanganson/factory/internal/factory"
+	"github.com/leehosanganson/factory/internal/restserver"
+	serverruntime "github.com/leehosanganson/factory/internal/restserver/runtime"
 )
 
 var version = "dev"
@@ -47,13 +49,25 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "--gate" {
+		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
 		case "version":
 			fmt.Fprintln(out, version)
 			return nil
+		case "server":
+			configPath, err := parseServerOptions(args[1:])
+			if err != nil {
+				return err
+			}
+			config, err := restserver.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			ctx, stop := foregroundContext()
+			defer stop()
+			return serverruntime.Run(ctx, config)
 		case "help":
 			printRootHelp(out)
 			return nil
@@ -182,6 +196,9 @@ func commandHelpRequested(args []string) bool {
 	if len(args) < 2 {
 		return false
 	}
+	if args[0] == "server" {
+		return len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help")
+	}
 	switch args[0] {
 	case "implement", "tidy", "job", "run", "monitor", "work":
 		for _, arg := range args[1:] {
@@ -226,6 +243,10 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "work":
 		title = "Issue work requests"
 		commands, paragraphs = workHelp(subcommand)
+	case "server":
+		title = "REST API server"
+		commands = []helpCommand{{"factory server --config <absolute-path>", "Start the local REST job service using a server-only JSON config."}}
+		paragraphs = []string{"The REST API uses a shared API key and executes the configured Factory workflow locally. It does not publish branches or pull requests. See docs/features/rest-server.md."}
 	}
 	width := detectHelpWidth(out)
 	_, noColor := os.LookupEnv("NO_COLOR")
@@ -326,6 +347,13 @@ func selectCommandHelp(all []helpCommand, subcommand, example string) ([]helpCom
 		return all, []string{example}
 	}
 	return selected, nil
+}
+
+func parseServerOptions(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--config" || !filepath.IsAbs(args[1]) {
+		return "", fmt.Errorf("usage: factory server --config <absolute-path>")
+	}
+	return args[1], nil
 }
 
 func foregroundContext() (context.Context, context.CancelFunc) {
@@ -640,6 +668,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory work <command>", "Queue and inspect issue work requests; does not start engineering."},
 		{"factory job <command>", "Manage detached jobs."},
 		{"factory run <command>", "Manage gated runs."},
+		{"factory server --config <absolute-path>", "Start the REST API server."},
 		{"factory version", "Print the build version."},
 		{"factory help, -h, --help", "Show this concise help."},
 	}

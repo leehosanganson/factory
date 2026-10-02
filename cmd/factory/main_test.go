@@ -64,7 +64,7 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
-		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory work", "factory job", "factory run", "--gate", "factory version"} {
+		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory work", "factory job", "factory run", "factory server", "--gate", "factory version"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("root %v help missing %q: %s", args, want, out.String())
 			}
@@ -146,6 +146,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		omit []string
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
+		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "server-only JSON config"}, omit: []string{"api-key-value"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "{repo}"}, omit: []string{"factory run", "Monitor management", "Example:"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
@@ -193,6 +194,23 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("inspect state after help: %v", err)
+	}
+}
+
+func TestServerCommandRequiresExactAbsoluteConfigSyntax(t *testing.T) {
+	for _, args := range [][]string{
+		{"server"},
+		{"server", "--config"},
+		{"server", "--config", "relative.json"},
+		{"server", "relative.json", "--config"},
+		{"server", "--config=/tmp/server.json"},
+		{"server", "--config", "/tmp/server.json", "extra"},
+	} {
+		var out, errOut bytes.Buffer
+		err := run(args, strings.NewReader(""), &out, &errOut)
+		if err == nil || !strings.Contains(err.Error(), "usage: factory server --config <absolute-path>") {
+			t.Errorf("run(%v) error=%v, want strict syntax error", args, err)
+		}
 	}
 }
 

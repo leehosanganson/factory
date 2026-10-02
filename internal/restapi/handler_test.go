@@ -73,6 +73,23 @@ func request(handler http.Handler, method, path, body string, authenticated bool
 	return recorder
 }
 
+func TestNotReadyRejectsJobOperationsBeforeAuthentication(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 2))
+	handler := newTestHandler(t, manager, func() bool { return false })
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/v1/jobs"},
+		{method: http.MethodGet, path: "/v1/jobs/unknown"},
+	} {
+		response := request(handler, tc.method, tc.path, `{"repository":"widget","task":"task"}`, false)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"not_ready"`) {
+			t.Errorf("%s %s while not ready = %d %s", tc.method, tc.path, response.Code, response.Body.String())
+		}
+	}
+}
+
 func TestHealthAndReadinessAreMinimalAndUnauthenticated(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 2))
 	ready := false
@@ -291,6 +308,14 @@ func TestStatusHistoryTruncationAndSafeErrors(t *testing.T) {
 			t.Fatalf("internal error leaked %q: %s", forbidden, internal.Body.String())
 		}
 	}
+}
+
+func TestClosedManagerReturnsStableUnavailableResponse(t *testing.T) {
+	manager := newTestManager(t, managerConfig(1, 1, 1))
+	manager.Close()
+	handler := newTestHandler(t, manager, func() bool { return true })
+	response := postJob(handler, `{"repository":"widget","task":"task"}`, "key")
+	assertError(t, response, http.StatusServiceUnavailable, "server_shutting_down")
 }
 
 func TestMethodsPathsAndAllowHeaders(t *testing.T) {
