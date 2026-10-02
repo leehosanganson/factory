@@ -208,6 +208,17 @@ func TestNewLocalJobManagerUsesServerRegistryLimits(t *testing.T) {
 	}
 }
 
+func TestNewLocalJobManagerReturnsConfiguredSQLiteOpenFailure(t *testing.T) {
+	config := restserver.DefaultConfig()
+	config.Repositories = map[string]string{"trusted": t.TempDir()}
+	config.Harness = restserver.HarnessConfig{Executable: "agent", Args: []string{"{task}", "{system_prompt}"}}
+	config.APIKeyFile = filepath.Join(t.TempDir(), "api-key")
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: "relative.db"}
+	if _, err := NewLocalJobManager(config); err == nil {
+		t.Fatal("configured SQLite open failure silently fell back to memory")
+	}
+}
+
 func TestNewFactoryExecutorRequiresWorkspaceForMatchingTrustedRepository(t *testing.T) {
 	validManager := &testWorkspaceManager{root: t.TempDir()}
 	server := restserver.DefaultConfig()

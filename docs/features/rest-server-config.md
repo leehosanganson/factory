@@ -20,7 +20,8 @@ This file configures the implemented `factory server` command. Configuration is 
   },
   "api_key_file": "/run/secrets/factory-api-key",
   "persistence": {
-    "backend": "memory"
+    "backend": "sqlite",
+    "path": "/var/lib/factory/jobs.db"
   },
   "verification_checks": [
     ["go", "test", "./..."],
@@ -46,10 +47,10 @@ This file configures the implemented `factory server` command. Configuration is 
 
 The loader rejects unknown/duplicate JSON fields and trailing JSON. Start the service with `factory server --config /absolute/path/to/server.json`; no other argument ordering or config source is accepted. Resource limits are positive and bounded: request body 2 MiB, task 256 KiB, queue 1024, workers 64, retained records 1,000, events per job 200, logical registry budget 256 MiB, job timeout 24 hours, and captured output 16 MiB maximum. Defaults are 512 KiB body, 256 KiB task, queue 32, two workers, 1,000 records, 200 events, 256 MiB registry budget, 30 minutes, and 1 MiB output. Task limits count UTF-8 bytes.
 
-The registry budget is a deterministic retained-state estimate, not a Go heap/RSS ceiling. Each record charges 256 fixed bytes plus normalized task, repository alias, and idempotency-key bytes; each event charges 64 fixed bytes plus event type and message bytes. Replays add no bytes. Event histories may be truncated under per-job or aggregate pressure, with truncation reported. Oldest terminal records may be evicted to admit new work; queued/running records are never evicted. If neither eviction nor history truncation can free sufficient capacity, admission fails with `registry_full` and does not reserve the attempted key. Lifecycle changes still complete if history cannot retain the event and mark history truncated.
+The registry budget is a deterministic retained-state estimate, not a Go heap/RSS ceiling. Each record charges 256 fixed bytes plus normalized task, repository alias, and idempotency-key bytes; each event charges 64 fixed bytes plus event type and message bytes. Replays add no bytes. The memory backend applies that aggregate budget and may evict oldest terminal records or truncate old events under pressure. SQLite bounds record count and per-job event history, but its database/WAL disk usage is instead governed by filesystem capacity and operator maintenance; idempotency keys remain durable with retained jobs. Admission fails with `registry_full` when bounded memory capacity cannot be reclaimed, or with a generic storage error if SQLite persistence fails.
 
-The server captures no more than the configured combined stdout/stderr limit per job across workflow and verification subprocesses, continues draining child output after the cap, and does not expose raw transcripts over the HTTP API. The current in-memory registry, jobs, history, and idempotency data do not survive process restart.
+The server captures no more than the configured combined stdout/stderr limit per job across workflow and verification subprocesses, continues draining child output after the cap, and does not expose raw transcripts over the HTTP API. The `memory` registry, jobs, history, and idempotency data do not survive process restart; SQLite retains these records and classifies startup work for recovery. Queued jobs are candidates for resumption; running jobs require operator reconciliation and are never automatically replayed.
 
-`persistence.backend` is explicit and currently accepts only `memory`. That backend is volatile and loses jobs, history, and idempotency records on process restart. A configured but unknown or unavailable backend fails validation; there is no fallback path. SQL is not implemented here. See the [REST job contract](../roadmap/rest-api-contract.md) for the planned durable semantics.
+`persistence.backend` defaults to `memory`, which is volatile and loses jobs, history, and idempotency records on restart. Set `backend` to `sqlite` and provide an absolute `path` for restart-durable storage. The parent directory must already exist and be private (no group/other permissions); new database files are created with owner-only access. SQLite schema upgrades run before the listener starts. Failures are fatal—there is no fallback to memory. The database is single-server storage; do not share it across hosts/network filesystems. Back it up using SQLite-consistent backup procedures. No down migration is provided because downgrading would risk destroying job data.
 
 Key files must be regular, non-symlink files owned by the effective user, owner-readable, and inaccessible to group/others. The shared key is read at startup; rotation requires restart. Raw keys are never represented in JSON or formatting. API credentials are not passed to the harness.

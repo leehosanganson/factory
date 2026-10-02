@@ -44,10 +44,30 @@ func TestLoadConfigSelectsMemoryPersistenceExplicitly(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsUnimplementedPersistenceBackend(t *testing.T) {
-	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"sql"}}`)
-	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "persistence.backend") {
-		t.Fatalf("LoadConfig() error = %v, want persistence backend error", err)
+func TestLoadConfigAcceptsSQLitePersistenceWithAbsoluteFilePath(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"sqlite","path":"/var/lib/factory/jobs.db"}}`)
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Persistence.Backend != PersistenceBackendSQLite || config.Persistence.Path != "/var/lib/factory/jobs.db" {
+		t.Fatalf("persistence = %+v, want explicit SQLite path", config.Persistence)
+	}
+}
+
+func TestLoadConfigRejectsSQLitePersistenceWithoutPath(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"sqlite"}}`)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "persistence.path") {
+		t.Fatalf("LoadConfig() error = %v, want persistence path error", err)
+	}
+}
+
+func TestLoadConfigRejectsSQLiteRelativePathAndMemoryPath(t *testing.T) {
+	for _, persistence := range []string{`{"backend":"sqlite","path":"jobs.db"}`, `{"backend":"memory","path":"/tmp/jobs.db"}`} {
+		path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":`+persistence+`}`)
+		if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "persistence") {
+			t.Errorf("LoadConfig(%s) error = %v, want persistence validation error", persistence, err)
+		}
 	}
 }
 

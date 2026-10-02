@@ -499,7 +499,7 @@ func TestRunValidatesRepositoriesBeforeOpeningListener(t *testing.T) {
 func TestRunRequiresProtectedServerStateParent(t *testing.T) {
 	config, _ := runtimeFixture(t)
 	base := filepath.Join(t.TempDir(), "shared")
-	if err := os.MkdirAll(base, 0o755); err != nil {
+	if err := os.MkdirAll(base, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	unsafeServerParent := filepath.Join(base, aliasDirectory("trusted"))

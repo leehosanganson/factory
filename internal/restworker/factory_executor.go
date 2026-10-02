@@ -116,16 +116,21 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 }
 
 // NewLocalJobManager builds the selected job store from validated trusted
-// server settings. Only memory persistence is currently implemented.
+// server settings. A configured SQLite failure is returned directly; there is
+// no fallback to volatile memory.
 func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
 	if err := config.Validate(); err != nil {
 		return nil, errors.New("invalid REST job manager configuration")
 	}
-	return restjobs.NewManager(restjobs.Config{
+	limits := restjobs.Config{
 		QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers,
 		MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob,
 		MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
-	})
+	}
+	if config.Persistence.Backend == restserver.PersistenceBackendSQLite {
+		return restjobs.OpenSQLiteStore(config.Persistence.Path, limits)
+	}
+	return restjobs.NewManager(limits)
 }
 
 // Execute bounds workspace provisioning, every workflow stage, and configured

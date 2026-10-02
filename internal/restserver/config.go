@@ -18,6 +18,7 @@ const configFileLimit = 1 << 20
 
 const (
 	PersistenceBackendMemory = "memory"
+	PersistenceBackendSQLite = "sqlite"
 )
 
 const (
@@ -79,10 +80,11 @@ type Limits struct {
 	HarnessOutput    int    `json:"harness_output_bytes"`
 }
 
-// PersistenceConfig selects the job store. SQL support will be added in a
-// later roadmap slice; this version accepts only explicit memory mode.
+// PersistenceConfig selects volatile memory or an explicitly configured
+// file-backed SQLite store.
 type PersistenceConfig struct {
 	Backend string `json:"backend"`
+	Path    string `json:"path,omitempty"`
 }
 
 // DefaultConfig returns conservative resource limits and a loopback-only listener.
@@ -150,8 +152,17 @@ func (c Config) Validate() error {
 	if c.Mode != "local_process" {
 		return errors.New("mode must be local_process")
 	}
-	if c.Persistence.Backend != PersistenceBackendMemory {
-		return errors.New("persistence.backend must be memory; SQL persistence is not implemented")
+	switch c.Persistence.Backend {
+	case PersistenceBackendMemory:
+		if c.Persistence.Path != "" {
+			return errors.New("persistence.path is only valid with sqlite backend")
+		}
+	case PersistenceBackendSQLite:
+		if !filepath.IsAbs(c.Persistence.Path) || strings.TrimSpace(c.Persistence.Path) == "" || strings.ContainsRune(c.Persistence.Path, 0) {
+			return errors.New("persistence.path must be an absolute SQLite database file path")
+		}
+	default:
+		return errors.New("persistence.backend must be memory or sqlite")
 	}
 	if err := validateListenAddress(c.ListenAddress); err != nil {
 		return err
@@ -344,7 +355,7 @@ func configFieldAllowed(parent, key string) bool {
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "persistence":
-		fields = map[string]struct{}{"backend": {}}
+		fields = map[string]struct{}{"backend": {}, "path": {}}
 	case "limits":
 		fields = map[string]struct{}{"request_body_bytes": {}, "task_bytes": {}, "queue_capacity": {}, "workers": {}, "max_records": {}, "max_events_per_job": {}, "registry_bytes": {}, "job_timeout": {}, "harness_output_bytes": {}}
 	case "repositories":

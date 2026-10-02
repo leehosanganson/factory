@@ -16,6 +16,7 @@ import (
 
 	"github.com/leehosanganson/factory/internal/factory"
 	"github.com/leehosanganson/factory/internal/restapi"
+	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restserver"
 	"github.com/leehosanganson/factory/internal/restworker"
 	"github.com/leehosanganson/factory/internal/restworkspace"
@@ -52,16 +53,29 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("invalid REST server config: %w", err)
 	}
-	// Repository validation must complete before any listener is opened.
-	if err := config.ValidateRepositoryRoots(); err != nil {
-		return err
-	}
 	key, err := restserver.LoadAPIKey(config.APIKeyFile)
 	if err != nil {
 		return err
 	}
-	manager, err := restworker.NewLocalJobManager(config)
+	store, err := restworker.NewLocalJobManager(config)
 	if err != nil {
+		return err
+	}
+	manager, ok := store.(restjobs.Manager)
+	if !ok {
+		store.Close()
+		return errors.New("configured job store does not provide worker lifecycle operations")
+	}
+	closeStore := func() {
+		if closer, ok := store.(interface{ CloseStore() error }); ok {
+			_ = closer.CloseStore()
+		} else {
+			store.Close()
+		}
+	}
+	// Repository validation must complete before any listener is opened.
+	if err := config.ValidateRepositoryRoots(); err != nil {
+		closeStore()
 		return err
 	}
 	logger := options.Log
@@ -72,6 +86,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if resultsBase == "" {
 		resultsBase, err = serverResultsBase()
 		if err != nil {
+			closeStore()
 			return err
 		}
 	}
@@ -85,6 +100,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			Now:            options.WorkspaceNow,
 		})
 		if err != nil {
+			closeStore()
 			return fmt.Errorf("initialize workspace for repository %q: %w", alias, err)
 		}
 		workspaces[alias] = workspace
@@ -101,17 +117,42 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			Server: config, Workflow: workflowConfig, Workspaces: workspaces,
 		})
 		if err != nil {
+			closeStore()
 			return fmt.Errorf("initialize REST workflow executor: %w", err)
 		}
 	}
 	var ready atomic.Bool
+	var backendReady atomic.Bool
+	backendReady.Store(true)
+	var readyCheck func(context.Context) error
+	if probe, ok := store.(interface{ Ping(context.Context) error }); ok {
+		readyCheck = probe.Ping
+	}
 	apiHandler, err := restapi.New(manager, key, restapi.Config{
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
-		Ready:               ready.Load,
+		Ready:               func() bool { return ready.Load() && backendReady.Load() },
+		ReadyError: func() error {
+			if !ready.Load() {
+				return errors.New("server not initialized")
+			}
+			probe := readyCheck
+			if probe == nil {
+				return nil
+			}
+			probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := probe(probeCtx); err != nil {
+				backendReady.Store(false)
+				return err
+			}
+			backendReady.Store(true)
+			return nil
+		},
 	})
 	if err != nil {
+		closeStore()
 		return err
 	}
 
@@ -132,6 +173,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 
 	coordinator, err := restworker.New(manager, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers})
 	if err != nil {
+		closeStore()
 		return err
 	}
 	server := &http.Server{
@@ -153,6 +195,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		cancelSweep()
 		_ = waitForSweep(shutdownCtx, sweepDone)
 		_ = coordinator.Shutdown(shutdownCtx)
+		closeStore()
 		return fmt.Errorf("listen for REST server: %w", err)
 	}
 	serveDone := make(chan error, 1)
@@ -178,6 +221,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		_ = server.Close()
 	}
 	workerErr := coordinator.Shutdown(shutdownCtx)
+	closeStore()
 	if serveErr != nil {
 		return serveErr
 	}

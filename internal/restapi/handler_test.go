@@ -28,6 +28,7 @@ func newTestHandler(t *testing.T, manager restjobs.Manager, ready func() bool) *
 		MaxTaskBytes:        128,
 		RepositoryAliases:   map[string]struct{}{"widget": {}},
 		Ready:               ready,
+		ReadyError:          func() error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
