@@ -139,6 +139,9 @@ func (m *Manager) Create(jobID string) (Workspace, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.verifyRepository(); err != nil {
+		return Workspace{}, err
+	}
 	if err := m.verifyRoot(); err != nil {
 		return Workspace{}, err
 	}
@@ -162,8 +165,17 @@ func (m *Manager) Create(jobID string) (Workspace, error) {
 	if err != nil || !validGitObjectID(head) {
 		return Workspace{}, errors.New("read repository checkout HEAD")
 	}
+	if err := m.verifyRepository(); err != nil {
+		return Workspace{}, err
+	}
 	if err := m.runGit(context.Background(), m.repoRoot, "worktree", "add", "--detach", workspace.WorktreePath, head); err != nil {
 		return Workspace{}, fmt.Errorf("create detached job worktree: %w", err)
+	}
+	// If the configured repository changed while Git was adding the worktree,
+	// retain the result directory rather than attempting cleanup through an
+	// untrusted repository path.
+	if err := m.verifyRepository(); err != nil {
+		return Workspace{}, err
 	}
 	if err := verifyWorktreeDir(workspace.WorktreePath); err != nil {
 		return Workspace{}, fmt.Errorf("validate created worktree: %w", err)
@@ -196,6 +208,9 @@ func (m *Manager) MarkSucceeded(jobID string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.verifyRepository(); err != nil {
+		return err
+	}
 	if err := m.verifyRoot(); err != nil {
 		return err
 	}
@@ -210,6 +225,9 @@ func (m *Manager) MarkSucceeded(jobID string) error {
 	if err := registeredWorktree(m.repoRoot, worktree); err != nil {
 		return err
 	}
+	if err := m.verifyRepository(); err != nil {
+		return err
+	}
 	dev, inode, err := directoryIdentity(worktree)
 	if err != nil {
 		return err
@@ -221,12 +239,19 @@ func (m *Manager) MarkSucceeded(jobID string) error {
 	}
 	data = append(data, '\n')
 	markerPath := filepath.Join(jobDir, markerName)
+	if err := m.verifyRepository(); err != nil {
+		return err
+	}
 	tmp, err := os.OpenFile(filepath.Join(jobDir, ".completion.tmp"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create completion metadata: %w", err)
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
+	if err := m.verifyRepository(); err != nil {
+		tmp.Close()
+		return err
+	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write completion metadata: %w", err)
@@ -240,6 +265,9 @@ func (m *Manager) MarkSucceeded(jobID string) error {
 	}
 	if err := verifyProtectedDir(jobDir); err != nil {
 		return fmt.Errorf("revalidate job result directory: %w", err)
+	}
+	if err := m.verifyRepository(); err != nil {
+		return err
 	}
 	if err := os.Link(tmpName, markerPath); err != nil {
 		return fmt.Errorf("publish completion metadata: %w", err)
@@ -309,6 +337,9 @@ func (m *Manager) verifySameDevice(paths ...string) error {
 }
 
 func (m *Manager) verifyRepository() error {
+	if !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
+		return errors.New("configured repository identity changed")
+	}
 	if err := gitIsRepository(m.repoRoot); err != nil || !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
 		return errors.New("configured repository identity changed")
 	}
