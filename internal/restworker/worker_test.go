@@ -32,10 +32,10 @@ func admit(t *testing.T, manager *restjobs.LocalManager, key string) restjobs.Sn
 	return job
 }
 
-type executorFunc func(context.Context, restjobs.Request) error
+type executorFunc func(context.Context, restjobs.Snapshot) error
 
-func (f executorFunc) Execute(ctx context.Context, request restjobs.Request) error {
-	return f(ctx, request)
+func (f executorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error {
+	return f(ctx, job)
 }
 
 func waitForStatus(t *testing.T, manager *restjobs.LocalManager, id string, want restjobs.Status) restjobs.Snapshot {
@@ -65,7 +65,7 @@ func TestWorkerCountBoundsConcurrentExecutions(t *testing.T) {
 	release := make(chan struct{})
 	var mu sync.Mutex
 	active, maximum := 0, 0
-	executor := executorFunc(func(ctx context.Context, _ restjobs.Request) error {
+	executor := executorFunc(func(ctx context.Context, _ restjobs.Snapshot) error {
 		mu.Lock()
 		active++
 		if active > maximum {
@@ -113,7 +113,7 @@ func TestManagerConcurrencyLimitConstrainsCoordinator(t *testing.T) {
 	}
 	started := make(chan struct{}, 3)
 	release := make(chan struct{})
-	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Request) error {
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Snapshot) error {
 		started <- struct{}{}
 		select {
 		case <-release:
@@ -147,9 +147,9 @@ func TestSingleWorkerExecutesFIFO(t *testing.T) {
 	}
 	var mu sync.Mutex
 	var order []string
-	coordinator, err := New(manager, executorFunc(func(_ context.Context, request restjobs.Request) error {
+	coordinator, err := New(manager, executorFunc(func(_ context.Context, job restjobs.Snapshot) error {
 		mu.Lock()
-		order = append(order, request.Task)
+		order = append(order, job.Request.Task)
 		mu.Unlock()
 		return nil
 	}), CoordinatorConfig{Workers: 1})
@@ -181,10 +181,39 @@ func TestSingleWorkerExecutesFIFO(t *testing.T) {
 	}
 }
 
+func TestExecutorReceivesClaimedSnapshotIncludingOpaqueJobID(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	admitted := admit(t, manager, "task carried with job")
+	executed := make(chan restjobs.Snapshot, 1)
+	coordinator, err := New(manager, executorFunc(func(_ context.Context, job restjobs.Snapshot) error {
+		executed <- job
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := <-executed
+	waitForStatus(t, manager, admitted.ID, restjobs.StatusSucceeded)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != admitted.ID {
+		t.Fatalf("executor job ID = %q, want claimed job ID %q", got.ID, admitted.ID)
+	}
+	if got.Request.Repository != admitted.Request.Repository || got.Request.Task != admitted.Request.Task {
+		t.Fatalf("executor request = %+v, want admitted request %+v", got.Request, admitted.Request)
+	}
+	if got.Status != restjobs.StatusRunning {
+		t.Fatalf("executor snapshot status = %q, want running", got.Status)
+	}
+}
+
 func TestExecutorErrorFinishesFailedWithoutLeakingError(t *testing.T) {
 	manager := newTestManager(t, 1, 1)
 	job := admit(t, manager, "failing")
-	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Request) error {
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Snapshot) error {
 		return errors.New("sensitive executor output")
 	}), CoordinatorConfig{Workers: 1})
 	if err != nil {
@@ -203,8 +232,8 @@ func TestExecutorPanicFinishesFailedAndWorkerContinues(t *testing.T) {
 	manager := newTestManager(t, 2, 1)
 	panicked := admit(t, manager, "panic")
 	after := admit(t, manager, "after-panic")
-	coordinator, err := New(manager, executorFunc(func(_ context.Context, request restjobs.Request) error {
-		if request.Task == "panic" {
+	coordinator, err := New(manager, executorFunc(func(_ context.Context, job restjobs.Snapshot) error {
+		if job.Request.Task == "panic" {
 			panic("private panic details")
 		}
 		return nil
@@ -227,7 +256,7 @@ func TestShutdownCancelsQueuedAndActiveJobs(t *testing.T) {
 	active := admit(t, manager, "active")
 	queued := admit(t, manager, "queued")
 	started := make(chan struct{})
-	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Request) error {
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Snapshot) error {
 		close(started)
 		<-ctx.Done()
 		return ctx.Err()
@@ -254,7 +283,7 @@ func TestShutdownWaitContextCanTimeOutThenWaitAgain(t *testing.T) {
 	job := admit(t, manager, "blocked")
 	started := make(chan struct{})
 	release := make(chan struct{})
-	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Request) error {
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Snapshot) error {
 		close(started)
 		<-release
 		return nil
@@ -284,7 +313,7 @@ func TestShutdownDeadlineDoesNotWaitForeverForNonCooperativeExecutor(t *testing.
 	admit(t, manager, "ignores-cancel")
 	started := make(chan struct{})
 	release := make(chan struct{})
-	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Request) error {
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Snapshot) error {
 		close(started)
 		<-release
 		return nil
@@ -317,7 +346,7 @@ func TestWaitClaimHonorsContextWithoutPolling(t *testing.T) {
 
 func TestNewRejectsMissingDependenciesAndWorkers(t *testing.T) {
 	manager := newTestManager(t, 1, 1)
-	validExecutor := executorFunc(func(context.Context, restjobs.Request) error { return nil })
+	validExecutor := executorFunc(func(context.Context, restjobs.Snapshot) error { return nil })
 	for _, tc := range []struct {
 		manager  restjobs.Manager
 		executor Executor
