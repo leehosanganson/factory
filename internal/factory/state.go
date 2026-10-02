@@ -23,6 +23,7 @@ type State struct {
 	Subtasks            []SubtaskRecord `json:"subtasks,omitempty"`
 	SubtaskPlanStatus   string          `json:"subtask_plan_status,omitempty"`
 	SubtaskPlanLog      string          `json:"subtask_plan_log,omitempty"`
+	OutputTruncated     bool            `json:"output_truncated,omitempty"`
 	UpdatedAt           time.Time       `json:"updated_at"`
 }
 
@@ -117,8 +118,10 @@ func createRun(root, workdir, task string) (string, *State, error) {
 	if err := writeState(dir, state); err != nil {
 		return "", nil, err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "task.txt"), []byte(task+"\n"), 0o600); err != nil {
-		return "", nil, fmt.Errorf("write task file: %w", err)
+	if task != "" {
+		if err := os.WriteFile(filepath.Join(dir, "task.txt"), []byte(task+"\n"), 0o600); err != nil {
+			return "", nil, fmt.Errorf("write task file: %w", err)
+		}
 	}
 	return dir, state, nil
 }
