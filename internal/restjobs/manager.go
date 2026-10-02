@@ -101,13 +101,26 @@ type History struct {
 	Truncated bool    `json:"truncated"`
 }
 
-// Manager is the executor-independent seam for admission and job inspection.
+// RecoveryReport classifies retained work after opening a store. Only queued
+// work is safe to resume automatically; running work may have performed
+// external side effects and requires reconciliation.
+type RecoveryReport struct {
+	Resume        []Snapshot
+	NeedsOperator []Snapshot
+	Terminal      []Snapshot
+}
+
+// Store is the persistence contract shared by the local in-memory store and
+// future durable stores. Implementations must make Admit atomic with respect
+// to idempotency, preserve lifecycle/history consistency, and honor cancellation
+// for context-bearing operations.
+//
 // ClaimNext and Finish provide explicit synchronous lifecycle control; no
 // goroutines or workers are started by this package. WaitClaim blocks until a
 // job and worker slot are available, context cancellation, or Close. Close
 // stops admission, cancels queued jobs, and leaves running jobs for workers to
 // finish.
-type Manager interface {
+type Store interface {
 	Admit(idempotencyKey string, request Request) (Snapshot, bool, error)
 	ClaimNext() (Snapshot, error)
 	WaitClaim(ctx context.Context) (Snapshot, error)
@@ -116,6 +129,37 @@ type Manager interface {
 	History(id string) (History, error)
 	AddEvent(id, eventType, message string) error
 	Finish(id string, terminalStatus Status) error
+	Recover(ctx context.Context) (RecoveryReport, error)
+}
+
+// Manager is retained as the executor-facing name for the Store contract.
+type Manager interface {
+	Store
+}
+
+// RecoveryDisposition describes what is safe to do with a persisted job after
+// process restart. Running work must never be replayed automatically because
+// it may have performed external side effects before interruption.
+type RecoveryDisposition string
+
+const (
+	RecoveryResume         RecoveryDisposition = "resume"
+	RecoveryNeedsOperator  RecoveryDisposition = "needs_operator"
+	RecoveryRetainTerminal RecoveryDisposition = "retain_terminal"
+)
+
+// RecoveryDispositionFor classifies persisted statuses conservatively. Queued
+// work has not been claimed and may be resumed; terminal work is retained;
+// running or unknown states require operator reconciliation.
+func RecoveryDispositionFor(status Status) RecoveryDisposition {
+	switch status {
+	case StatusQueued:
+		return RecoveryResume
+	case StatusSucceeded, StatusFailed, StatusCanceled:
+		return RecoveryRetainTerminal
+	default:
+		return RecoveryNeedsOperator
+	}
 }
 
 type job struct {
@@ -345,6 +389,36 @@ func (m *LocalManager) History(id string) (History, error) {
 	}
 	events := append([]Event(nil), entry.events...)
 	return History{JobID: id, Events: events, Truncated: entry.truncated}, nil
+}
+
+// Recover classifies retained records without mutating them. The local backend
+// starts empty after process launch; durable implementations use the same
+// contract to identify queued work and interrupted work requiring reconciliation.
+func (m *LocalManager) Recover(ctx context.Context) (RecoveryReport, error) {
+	if ctx == nil {
+		return RecoveryReport{}, ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return RecoveryReport{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var report RecoveryReport
+	for _, entry := range m.jobs {
+		if err := ctx.Err(); err != nil {
+			return RecoveryReport{}, err
+		}
+		snapshot := cloneSnapshot(entry.snapshot)
+		switch RecoveryDispositionFor(entry.snapshot.Status) {
+		case RecoveryResume:
+			report.Resume = append(report.Resume, snapshot)
+		case RecoveryNeedsOperator:
+			report.NeedsOperator = append(report.NeedsOperator, snapshot)
+		case RecoveryRetainTerminal:
+			report.Terminal = append(report.Terminal, snapshot)
+		}
+	}
+	return report, nil
 }
 
 // AddEvent appends a bounded event to any retained job. Event strings must be
