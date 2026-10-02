@@ -17,6 +17,7 @@ import (
 	"github.com/leehosanganson/factory/internal/factory"
 	"github.com/leehosanganson/factory/internal/restapi"
 	"github.com/leehosanganson/factory/internal/restjobs"
+	"github.com/leehosanganson/factory/internal/restprovider"
 	"github.com/leehosanganson/factory/internal/restserver"
 	"github.com/leehosanganson/factory/internal/restworker"
 	"github.com/leehosanganson/factory/internal/restworkspace"
@@ -33,6 +34,7 @@ const (
 type runtimeOptions struct {
 	Listen          func(string, string) (net.Listener, error)
 	Executor        restworker.Executor
+	Publisher       restprovider.Publisher
 	ResultsBase     string
 	ShutdownTimeout time.Duration
 	Log             *log.Logger
@@ -42,6 +44,14 @@ type runtimeOptions struct {
 }
 
 // Run starts the REST server and blocks until ctx is canceled or serving fails.
+func closeLocalStore(store restjobs.Store) {
+	if closer, ok := store.(interface{ CloseStore() error }); ok {
+		_ = closer.CloseStore()
+	} else {
+		store.Close()
+	}
+}
+
 func Run(ctx context.Context, config restserver.Config) error {
 	return run(ctx, config, runtimeOptions{})
 }
@@ -61,9 +71,33 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err != nil {
 		return err
 	}
+	publisher := options.Publisher
+	if publisher == nil && config.Provider.Backend == "github" {
+		token, err := restserver.LoadProviderToken(config.Provider.TokenFile)
+		if err != nil {
+			closeLocalStore(store)
+			return err
+		}
+		publisher = restprovider.NewGitHubPublisherWithTokenPush(token.Value(), &http.Client{Timeout: 20 * time.Second}, restprovider.GitPushBranchWithToken)
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
+		probeErr := publisher.Ping(probeCtx)
+		cancelProbe()
+		if probeErr != nil {
+			closeLocalStore(store)
+			return errors.New("configured GitHub provider is unavailable")
+		}
+	} else if publisher != nil {
+		probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
+		probeErr := publisher.Ping(probeCtx)
+		cancelProbe()
+		if probeErr != nil {
+			closeLocalStore(store)
+			return errors.New("configured GitHub provider is unavailable")
+		}
+	}
 	manager, ok := store.(restjobs.Manager)
 	if !ok {
-		store.Close()
+		closeLocalStore(store)
 		return errors.New("configured job store does not provide worker lifecycle operations")
 	}
 	closeStore := func() {
@@ -114,7 +148,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	executor := options.Executor
 	if executor == nil {
 		executor, err = restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
-			Server: config, Workflow: workflowConfig, Workspaces: workspaces,
+			Server: config, Workflow: workflowConfig, Workspaces: workspaces, Provider: publisher,
 		})
 		if err != nil {
 			closeStore()
@@ -138,14 +172,19 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 				return errors.New("server not initialized")
 			}
 			probe := readyCheck
-			if probe == nil {
-				return nil
-			}
 			probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			if err := probe(probeCtx); err != nil {
-				backendReady.Store(false)
-				return err
+			if probe != nil {
+				if err := probe(probeCtx); err != nil {
+					backendReady.Store(false)
+					return err
+				}
+			}
+			if publisher != nil {
+				if err := publisher.Ping(probeCtx); err != nil {
+					backendReady.Store(false)
+					return err
+				}
 			}
 			backendReady.Store(true)
 			return nil

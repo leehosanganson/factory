@@ -2,7 +2,7 @@
 
 ## Status and product boundary
 
-This is the target contract for Factory's single REST job-service MVP. Factory already has a local REST server with authenticated bounded admission, in-memory job tracking, isolated workspaces, and execution of the configured multi-stage workflow. SQL persistence, restart recovery, and pull-request create/update through a configurable code-repository provider are not yet implemented. Proposed behavior below is a product requirement, not a claim about today's server.
+This is the target contract for Factory's single REST job-service MVP. Factory already has a local REST server with authenticated bounded admission, in-memory job tracking, isolated workspaces, and execution of the configured multi-stage workflow. Optional SQLite persistence, restart recovery classification, and configured GitHub pull-request create/update are being implemented; confirm feature docs and merged releases before treating them as available. Proposed behavior below remains the product contract.
 
 The product path is one service and one lifecycle:
 
@@ -55,13 +55,13 @@ Expose sanitized status/history rather than raw agent transcripts or host paths.
 
 ## Current runtime and implementation gates
 
-The implemented `factory server` currently uses the memory backend. It authenticates bounded requests, executes configured workflows, isolates job workspaces, exposes status/history, and performs bounded shutdown/cleanup. It does not currently offer SQL persistence or provider PR writes. The implemented behavior is documented in [REST job server](../features/rest-server.md) and [server configuration](../features/rest-server-config.md).
+The `factory server` supports memory mode; SQLite persistence and the GitHub provider are configuration-gated features. A provider-configured job is successful only after its verified branch is pushed, the matching PR is created/updated, and that outcome is recorded in the selected store. See [REST job server](../features/rest-server.md) and [server configuration](../features/rest-server-config.md) for shipped behavior.
 
 Delivery gates for the target MVP:
 
-1. Define persistence interfaces and durable lifecycle semantics without changing the existing memory-mode API contract.
-2. Add optional SQL persistence and migrations; fail closed when configured storage is unavailable; prove restart and concurrency behavior.
-3. Define/configure the code-repository provider interface and credential boundary.
+1. Define persistence interfaces and durable lifecycle semantics without changing the existing memory-mode API contract. (Implemented.)
+2. Add optional SQLite persistence and migrations; fail closed when configured storage is unavailable; prove restart and concurrency behavior. (Implemented; see current feature documentation.)
+3. Define/configure the code-repository provider interface and credential boundary. (Implementation in progress.)
 4. Implement idempotent branch/PR reconciliation, create/update, and durable recording of the confirmed result.
 5. Exercise end-to-end request-to-PR behavior including failure, cancellation, restart, duplicate requests, provider outages, and uncertain writes. Confirm no implementation job reports success before the PR outcome is recorded.
 6. Document memory-mode volatility, SQL setup/recovery, backup/retention, security boundaries, and provider configuration.

@@ -13,6 +13,7 @@ import (
 
 	"github.com/leehosanganson/factory/internal/factory"
 	"github.com/leehosanganson/factory/internal/restjobs"
+	"github.com/leehosanganson/factory/internal/restprovider"
 	"github.com/leehosanganson/factory/internal/restserver"
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
@@ -36,6 +37,7 @@ type FactoryExecutorConfig struct {
 	Workflow         factory.Config
 	Workspaces       map[string]WorkspaceManager
 	WorkflowObserver factory.WorkflowObserver
+	Provider         restprovider.Publisher
 
 	// ValidateRepositoryRoot replaces Git-backed repository validation when set.
 	// It must honor ctx; this seam is intended for tests and controlled callers.
@@ -53,6 +55,7 @@ type FactoryExecutor struct {
 	agent                  func(factory.Config, []string, io.Writer) factory.Agent
 	validateRepositoryRoot func(context.Context, string) error
 	observer               factory.WorkflowObserver
+	provider               restprovider.Publisher
 }
 
 // NewFactoryExecutor validates the trusted configuration and builds the
@@ -108,7 +111,7 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver,
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, provider: config.Provider,
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -136,30 +139,48 @@ func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
 // Execute bounds workspace provisioning, every workflow stage, and configured
 // checks with one job-wide deadline. All returned errors are intentionally
 // generic because lower layers can include paths, command output, or secrets.
-func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) error {
-	if ctx == nil {
+func (e *FactoryExecutor) RequiresProviderOutcome() bool { return e.provider != nil }
+
+func (e *FactoryExecutor) CompleteResult(job restjobs.Snapshot) error {
+	if e.provider != nil {
+		return errors.New("successful provider jobs require verified outcome recording first")
+	}
+	workspaceManager := e.workspaces[job.Request.Repository]
+	if workspaceManager == nil || workspaceManager.MarkSucceeded(job.ID) != nil {
 		return errExecutionFailed
+	}
+	return nil
+}
+
+func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) error {
+	_, err := e.ExecuteWithResult(ctx, job)
+	return err
+}
+
+func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+	if ctx == nil {
+		return nil, errExecutionFailed
 	}
 	jobCtx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 	if job.ID == "" || job.Request.Task == "" {
-		return errExecutionFailed
+		return nil, errExecutionFailed
 	}
 	root, ok := e.server.Repositories[job.Request.Repository]
 	workspaceManager := e.workspaces[job.Request.Repository]
 	if !ok || workspaceManager == nil || e.validateRepositoryRoot(jobCtx, root) != nil {
-		return errExecutionFailed
+		return nil, errExecutionFailed
 	}
 	if err := jobCtx.Err(); err != nil {
-		return errExecutionFailed
+		return nil, errExecutionFailed
 	}
 	workspace, err := workspaceManager.CreateContext(jobCtx, job.ID)
 	if err != nil || jobCtx.Err() != nil || validateWorkspace(workspaceManager, job.ID, workspace) != nil {
-		return errExecutionFailed
+		return nil, errExecutionFailed
 	}
 	outputFile, err := os.OpenFile(filepath.Join(workspace.OutputPath, "workflow.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return errExecutionFailed
+		return nil, errExecutionFailed
 	}
 	defer outputFile.Close()
 	capture := factory.NewBoundedOutputWriter(jobCtx, outputFile, e.server.Limits.HarnessOutput)
@@ -181,12 +202,85 @@ func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) er
 	flushErr := capture.Flush()
 	closeErr := outputFile.Close()
 	if runErr != nil || flushErr != nil || closeErr != nil || jobCtx.Err() != nil {
-		return errExecutionFailed
+		return nil, errExecutionFailed
 	}
-	if err := workspaceManager.MarkSucceeded(job.ID); err != nil {
-		return errExecutionFailed
+	var providerOutcome *restjobs.ProviderOutcome
+	if e.provider != nil {
+		commit, err := prepareProviderBranch(jobCtx, workspace.WorktreePath, job.ID)
+		if err != nil {
+			return nil, errExecutionFailed
+		}
+		branch := restprovider.JobBranch(job.ID)
+		published, err := e.provider.Publish(jobCtx, restprovider.PublishRequest{JobID: job.ID, Repository: e.server.Provider.Repositories[job.Request.Repository], Worktree: workspace.WorktreePath, Branch: branch, Commit: commit, Title: job.Request.Task, Summary: "Factory completed configured workflow and verification checks.", BaseBranch: e.server.Provider.BaseBranch})
+		if err != nil {
+			return nil, errExecutionFailed
+		}
+		providerOutcome = &restjobs.ProviderOutcome{Provider: published.Provider, Repository: published.Repository, Number: published.Number, URL: published.URL, Branch: published.Branch, Commit: published.Commit, State: published.State}
 	}
-	return nil
+	if e.provider == nil {
+		if err := workspaceManager.MarkSucceeded(job.ID); err != nil {
+			return nil, errExecutionFailed
+		}
+	}
+	return providerOutcome, nil
+}
+
+func providerGitCommand(ctx context.Context, worktree string, args ...string) *exec.Cmd {
+	gitArgs := append([]string{"-C", worktree, "-c", "core.hooksPath=/dev/null"}, args...)
+	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd.Env = allowlistedEnvironment(os.Environ())
+	cmd.Env = append(cmd.Env, "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null")
+	return cmd
+}
+
+func prepareProviderBranch(ctx context.Context, worktree, jobID string) (string, error) {
+	if ctx == nil || ctx.Err() != nil || !restprovider.JobIDValid(jobID) || !filepath.IsAbs(worktree) || filepath.Clean(worktree) != worktree {
+		return "", errors.New("invalid provider worktree")
+	}
+	reported, err := providerGitCommand(ctx, worktree, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		reported, err = providerGitCommand(ctx, worktree, "rev-parse", "--show-cdup").Output()
+		if err != nil || len(reported) != 0 {
+			return "", errors.New("provider worktree is invalid")
+		}
+	} else if strings.TrimSpace(string(reported)) != worktree {
+		return "", errors.New("provider worktree is invalid")
+	}
+	if err := providerGitCommand(ctx, worktree, "switch", "--detach", "HEAD").Run(); err != nil {
+		return "", errors.New("provider worktree could not be detached safely")
+	}
+	branch := restprovider.JobBranch(jobID)
+	if err := providerGitCommand(ctx, worktree, "check-ref-format", "--branch", branch).Run(); err != nil {
+		return "", errors.New("provider branch is invalid")
+	}
+	if err := providerGitCommand(ctx, worktree, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run(); err == nil {
+		return "", errors.New("provider job branch already exists")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", errors.New("provider job was canceled")
+	}
+	if err := providerGitCommand(ctx, worktree, "switch", "-c", branch).Run(); err != nil {
+		return "", errors.New("create provider job branch")
+	}
+	if err := providerGitCommand(ctx, worktree, "add", "--all").Run(); err != nil {
+		return "", errors.New("stage verified provider changes")
+	}
+	if err := providerGitCommand(ctx, worktree, "diff", "--cached", "--quiet").Run(); err == nil {
+		return "", errors.New("provider worktree contains no changes")
+	}
+	commit := providerGitCommand(ctx, worktree, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Factory", "-c", "user.email=factory@localhost", "commit", "--no-gpg-sign", "-m", "Factory job "+jobID)
+	if err := commit.Run(); err != nil {
+		return "", errors.New("commit verified provider changes")
+	}
+	head, err := providerGitCommand(ctx, worktree, "rev-parse", "--verify", "HEAD").Output()
+	if err != nil {
+		return "", errors.New("read provider commit")
+	}
+	value := strings.TrimSpace(string(head))
+	if len(value) < 7 || len(value) > 64 || strings.Trim(value, "0123456789abcdefABCDEF") != "" {
+		return "", errors.New("provider commit identity is invalid")
+	}
+	return value, nil
 }
 
 func validateWorkspace(manager WorkspaceManager, jobID string, workspace restworkspace.Workspace) error {
@@ -207,6 +301,11 @@ func cloneServerConfig(config restserver.Config) restserver.Config {
 		config.Repositories[alias] = root
 	}
 	config.Harness.Args = append([]string(nil), config.Harness.Args...)
+	providerRepositories := config.Provider.Repositories
+	config.Provider.Repositories = make(map[string]string, len(providerRepositories))
+	for alias, repository := range providerRepositories {
+		config.Provider.Repositories[alias] = repository
+	}
 	return config
 }
 

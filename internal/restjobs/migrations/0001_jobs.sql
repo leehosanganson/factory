@@ -44,3 +44,9 @@ CREATE TABLE factory_worker_ownership (
 
 CREATE INDEX factory_job_events_at_idx ON factory_job_events(job_id, sequence);
 CREATE INDEX factory_job_side_effects_state_idx ON factory_job_side_effects(state, updated_at);
+
+CREATE TABLE factory_job_provider_outcomes (
+    job_id TEXT PRIMARY KEY NOT NULL REFERENCES factory_jobs(id),
+    provider_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);

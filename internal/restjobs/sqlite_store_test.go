@@ -206,6 +206,37 @@ func TestSQLiteStoreRejectsInvalidPathAndUnavailableDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteStorePersistsProviderOutcomeAcrossRestart(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("provider-key", Request{Repository: "widget", Task: "publish"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	want := ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 5, URL: "https://github.com/acme/widget/pull/5", Branch: "factory/job/2c9131bb-2cde-4c9d-aaf3-bcc675e482bb", Commit: "abc123", State: "open"}
+	if err := store.RecordProviderOutcome(job.ID, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	got, err := reopened.Get(job.ID)
+	if err != nil || got.Provider == nil || *got.Provider != want {
+		t.Fatalf("provider outcome = (%+v,%v)", got.Provider, err)
+	}
+}
+
 func TestSQLiteStoreRejectsDatabaseSymlink(t *testing.T) {
 	dir := privateSQLiteDir(t)
 	target := filepath.Join(dir, "target.db")

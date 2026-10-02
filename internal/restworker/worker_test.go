@@ -38,6 +38,38 @@ func (f executorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error 
 	return f(ctx, job)
 }
 
+type requiredResultExecutor struct{ outcome *restjobs.ProviderOutcome }
+
+func (requiredResultExecutor) Execute(context.Context, restjobs.Snapshot) error { return nil }
+func (e requiredResultExecutor) ExecuteWithResult(context.Context, restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+	return e.outcome, nil
+}
+func (requiredResultExecutor) RequiresProviderOutcome() bool { return true }
+
+func TestWorkerRequiresProviderOutcomeBeforeSuccess(t *testing.T) {
+	for _, outcome := range []*restjobs.ProviderOutcome{nil, {Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}} {
+		manager := newTestManager(t, 1, 1)
+		job := admit(t, manager, "provider-result")
+		coordinator, err := New(manager, requiredResultExecutor{outcome: outcome}, CoordinatorConfig{Workers: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := restjobs.StatusSucceeded
+		if outcome == nil {
+			want = restjobs.StatusFailed
+		}
+		result := waitForStatus(t, manager, job.ID, want)
+		if outcome != nil && (result.Provider == nil || *result.Provider != *outcome) {
+			t.Fatalf("provider outcome=%+v", result.Provider)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+	}
+}
+
 func waitForStatus(t *testing.T, manager *restjobs.LocalManager, id string, want restjobs.Status) restjobs.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

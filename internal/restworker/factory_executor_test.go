@@ -14,6 +14,7 @@ import (
 
 	"github.com/leehosanganson/factory/internal/factory"
 	"github.com/leehosanganson/factory/internal/restjobs"
+	"github.com/leehosanganson/factory/internal/restprovider"
 	"github.com/leehosanganson/factory/internal/restserver"
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
@@ -57,6 +58,26 @@ func (m *testWorkspaceManager) MarkSucceeded(id string) error {
 	m.markedID = id
 	return m.markErr
 }
+
+func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t *testing.T) {
+	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, &executorTestAgent{})
+	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
+		return restprovider.Outcome{}, nil
+	})
+	if err := executor.CompleteResult(executorJob("protect provider side effect")); err == nil {
+		t.Fatal("provider-configured job marked complete without outcome persistence")
+	}
+	if manager.markedID != "" {
+		t.Fatalf("workspace marked complete prematurely: %q", manager.markedID)
+	}
+}
+
+type testJobPublisher func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error)
+
+func (f testJobPublisher) Publish(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	return f(ctx, request)
+}
+func (f testJobPublisher) Ping(context.Context) error { return nil }
 
 type executorTestAgent struct {
 	calls       []string

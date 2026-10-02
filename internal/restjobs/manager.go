@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,19 @@ var (
 	ErrNoWorkerSlots       = errors.New("no worker slots available")
 	ErrManagerClosed       = errors.New("job manager is closed")
 )
+
+func validateProviderOutcome(outcome ProviderOutcome) error {
+	parsed, err := url.Parse(outcome.URL)
+	if outcome.Provider != "github" || !validRepositoryName(outcome.Repository) || outcome.Number <= 0 || outcome.Branch == "" || outcome.Commit == "" || outcome.State != "open" || err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.User != nil || parsed.RawPath != "" || parsed.Path != "/"+outcome.Repository+"/pull/"+fmt.Sprint(outcome.Number) || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ErrInvalidInput
+	}
+	return nil
+}
+
+func validRepositoryName(value string) bool {
+	parts := strings.Split(value, "/")
+	return len(parts) == 2 && parts[0] != "" && parts[1] != "" && !strings.Contains(value, "..")
+}
 
 const (
 	maxRecordsLimit    = 1000
@@ -79,12 +93,23 @@ type Config struct {
 
 // Snapshot is a copy of the public job state and is safe to serialize after the
 // manager lock has been released.
+type ProviderOutcome struct {
+	Provider   string `json:"provider"`
+	Repository string `json:"repository"`
+	Number     int    `json:"number"`
+	URL        string `json:"url"`
+	Branch     string `json:"branch"`
+	Commit     string `json:"commit"`
+	State      string `json:"state"`
+}
+
 type Snapshot struct {
-	ID        string    `json:"id"`
-	Request   Request   `json:"request"`
-	Status    Status    `json:"status"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        string           `json:"id"`
+	Request   Request          `json:"request"`
+	Status    Status           `json:"status"`
+	CreatedAt time.Time        `json:"created_at"`
+	UpdatedAt time.Time        `json:"updated_at"`
+	Provider  *ProviderOutcome `json:"provider,omitempty"`
 }
 
 // Event is one bounded history entry.
@@ -128,6 +153,7 @@ type Store interface {
 	Get(id string) (Snapshot, error)
 	History(id string) (History, error)
 	AddEvent(id, eventType, message string) error
+	RecordProviderOutcome(id string, outcome ProviderOutcome) error
 	Finish(id string, terminalStatus Status) error
 	Recover(ctx context.Context) (RecoveryReport, error)
 }
@@ -441,8 +467,25 @@ func (m *LocalManager) AddEvent(id, eventType, message string) error {
 	return nil
 }
 
-// Finish marks a running job terminal. Only the explicit terminal lifecycle
-// statuses are accepted; queued jobs must first be claimed.
+func (m *LocalManager) RecordProviderOutcome(id string, outcome ProviderOutcome) error {
+	if err := validateProviderOutcome(outcome); err != nil {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.jobs[id]
+	if entry == nil {
+		return ErrNotFound
+	}
+	if entry.snapshot.Status != StatusRunning {
+		return ErrInvalidTransition
+	}
+	copy := outcome
+	entry.snapshot.Provider = &copy
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	if !terminalStatus.Terminal() {
 		return ErrInvalidTransition
