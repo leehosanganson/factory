@@ -32,9 +32,10 @@ type WorkspaceManager interface {
 // FactoryExecutorConfig contains trusted server settings and non-public Factory
 // workflow settings such as verification checks and prompt overrides.
 type FactoryExecutorConfig struct {
-	Server     restserver.Config
-	Workflow   factory.Config
-	Workspaces map[string]WorkspaceManager
+	Server           restserver.Config
+	Workflow         factory.Config
+	Workspaces       map[string]WorkspaceManager
+	WorkflowObserver factory.WorkflowObserver
 
 	// ValidateRepositoryRoot replaces Git-backed repository validation when set.
 	// It must honor ctx; this seam is intended for tests and controlled callers.
@@ -51,6 +52,7 @@ type FactoryExecutor struct {
 	env                    []string
 	agent                  func(factory.Config, []string, io.Writer) factory.Agent
 	validateRepositoryRoot func(context.Context, string) error
+	observer               factory.WorkflowObserver
 }
 
 // NewFactoryExecutor validates the trusted configuration and builds the
@@ -106,7 +108,7 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot,
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver,
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -168,7 +170,7 @@ func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) er
 		In: strings.NewReader(""), Out: io.Discard, Workdir: workspace.WorktreePath,
 		Stages: []string{"requirements", "implement", "review", "document"},
 		Gate:   false, RequireComplete: true, OutputWriter: capture, DisableTranscripts: true,
-		PipelineCheckEnv: append([]string(nil), e.env...),
+		DisableStateTask: true, PipelineCheckEnv: append([]string(nil), e.env...), Observer: e.observer,
 	}
 	runErr := workflow.RunContext(jobCtx, job.Request.Task)
 	flushErr := capture.Flush()
