@@ -13,10 +13,11 @@ import (
 
 var ErrInvalidConfig = errors.New("invalid restworker configuration")
 
-// Executor runs one request. Implementations should honor ctx cancellation.
-// Returned error details are deliberately not added to job history.
+// Executor runs one claimed job. Implementations should honor ctx
+// cancellation. Returned error details are deliberately not added to job
+// history.
 type Executor interface {
-	Execute(ctx context.Context, request restjobs.Request) error
+	Execute(ctx context.Context, job restjobs.Snapshot) error
 }
 
 // CoordinatorConfig selects the maximum number of executor goroutines. The
@@ -119,7 +120,7 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 				status = restjobs.StatusFailed
 			}
 		}()
-		if err := c.executor.Execute(c.ctx, job.Request); err == nil {
+		if err := c.executor.Execute(c.ctx, job); err == nil {
 			status = restjobs.StatusSucceeded
 		} else if c.ctx.Err() != nil {
 			status = restjobs.StatusCanceled
