@@ -115,9 +115,9 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}, nil
 }
 
-// NewLocalJobManager builds the process-local registry from validated trusted
-// server limits, including its 256 MiB logical registry ceiling.
-func NewLocalJobManager(config restserver.Config) (*restjobs.LocalManager, error) {
+// NewLocalJobManager builds the selected job store from validated trusted
+// server settings. Only memory persistence is currently implemented.
+func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
 	if err := config.Validate(); err != nil {
 		return nil, errors.New("invalid REST job manager configuration")
 	}

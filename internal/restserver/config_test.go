@@ -28,6 +28,27 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 	if err != nil || timeout != 30*time.Minute {
 		t.Fatalf("default timeout = %q, %v", config.Limits.JobTimeout, err)
 	}
+	if config.Persistence.Backend != PersistenceBackendMemory {
+		t.Fatalf("default persistence backend = %q, want %q", config.Persistence.Backend, PersistenceBackendMemory)
+	}
+}
+
+func TestLoadConfigSelectsMemoryPersistenceExplicitly(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"memory"}}`)
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Persistence.Backend != PersistenceBackendMemory {
+		t.Fatalf("persistence backend = %q, want %q", config.Persistence.Backend, PersistenceBackendMemory)
+	}
+}
+
+func TestLoadConfigRejectsUnimplementedPersistenceBackend(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"sql"}}`)
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), "persistence.backend") {
+		t.Fatalf("LoadConfig() error = %v, want persistence backend error", err)
+	}
 }
 
 func TestLoadConfigParsesOperatorVerificationChecksWithoutShellParsing(t *testing.T) {

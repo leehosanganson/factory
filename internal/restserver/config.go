@@ -17,6 +17,10 @@ import (
 const configFileLimit = 1 << 20
 
 const (
+	PersistenceBackendMemory = "memory"
+)
+
+const (
 	defaultListenAddress    = "127.0.0.1:8080"
 	defaultRequestBodyBytes = 512 << 10
 	defaultTaskBytes        = 256 << 10
@@ -52,6 +56,7 @@ type Config struct {
 	Harness            HarnessConfig     `json:"harness"`
 	VerificationChecks [][]string        `json:"verification_checks,omitempty"`
 	APIKeyFile         string            `json:"api_key_file"`
+	Persistence        PersistenceConfig `json:"persistence"`
 	Limits             Limits            `json:"limits"`
 }
 
@@ -74,12 +79,19 @@ type Limits struct {
 	HarnessOutput    int    `json:"harness_output_bytes"`
 }
 
+// PersistenceConfig selects the job store. SQL support will be added in a
+// later roadmap slice; this version accepts only explicit memory mode.
+type PersistenceConfig struct {
+	Backend string `json:"backend"`
+}
+
 // DefaultConfig returns conservative resource limits and a loopback-only listener.
 // Aliases, harness, and key path remain deployment-specific.
 func DefaultConfig() Config {
 	return Config{
 		Mode:          "local_process",
 		ListenAddress: defaultListenAddress,
+		Persistence:   PersistenceConfig{Backend: PersistenceBackendMemory},
 		Limits: Limits{
 			RequestBodyBytes: defaultRequestBodyBytes,
 			TaskBytes:        defaultTaskBytes,
@@ -137,6 +149,9 @@ func LoadConfig(path string) (Config, error) {
 func (c Config) Validate() error {
 	if c.Mode != "local_process" {
 		return errors.New("mode must be local_process")
+	}
+	if c.Persistence.Backend != PersistenceBackendMemory {
+		return errors.New("persistence.backend must be memory; SQL persistence is not implemented")
 	}
 	if err := validateListenAddress(c.ListenAddress); err != nil {
 		return err
@@ -325,9 +340,11 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "api_key_file": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "api_key_file": {}, "persistence": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
+	case "persistence":
+		fields = map[string]struct{}{"backend": {}}
 	case "limits":
 		fields = map[string]struct{}{"request_body_bytes": {}, "task_bytes": {}, "queue_capacity": {}, "workers": {}, "max_records": {}, "max_events_per_job": {}, "registry_bytes": {}, "job_timeout": {}, "harness_output_bytes": {}}
 	case "repositories":
@@ -363,7 +380,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "repositories", "verification_checks":
+	case "harness", "limits", "persistence", "repositories", "verification_checks":
 		return key
 	default:
 		return ""

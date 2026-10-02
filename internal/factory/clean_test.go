@@ -1397,6 +1397,9 @@ func TestCleanCancellationDuringGitCheckStopsBeforePublishing(t *testing.T) {
 }
 
 func TestCleanTerminalProgressUsesSpinnerAndClearsLine(t *testing.T) {
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("COLUMNS", "100")
+	t.Setenv("LINES", "30")
 	repo := newCleanRepo(t)
 	var output bytes.Buffer
 	workflow := cleanTestWorkflow(repo.work, &cleanWriterAgent{work: repo.work, outputs: map[string][]string{}})

@@ -19,6 +19,9 @@ This file configures the implemented `factory server` command. Configuration is 
     ]
   },
   "api_key_file": "/run/secrets/factory-api-key",
+  "persistence": {
+    "backend": "memory"
+  },
   "verification_checks": [
     ["go", "test", "./..."],
     ["go", "vet", "./..."]
@@ -47,6 +50,6 @@ The registry budget is a deterministic retained-state estimate, not a Go heap/RS
 
 The server captures no more than the configured combined stdout/stderr limit per job across workflow and verification subprocesses, continues draining child output after the cap, and does not expose raw transcripts over the HTTP API. The current in-memory registry, jobs, history, and idempotency data do not survive process restart.
 
-The target MVP adds optional SQL persistence and provider PR create/update; neither is configured by this schema today. The durable-storage interface, SQL connection options, provider choice, and provider credential configuration remain to be designed before implementation. Do not add speculative fields to this example. See the [REST job contract](../roadmap/rest-api-contract.md) for the target requirements.
+`persistence.backend` is explicit and currently accepts only `memory`. That backend is volatile and loses jobs, history, and idempotency records on process restart. A configured but unknown or unavailable backend fails validation; there is no fallback path. SQL is not implemented here. See the [REST job contract](../roadmap/rest-api-contract.md) for the planned durable semantics.
 
 Key files must be regular, non-symlink files owned by the effective user, owner-readable, and inaccessible to group/others. The shared key is read at startup; rotation requires restart. Raw keys are never represented in JSON or formatting. API credentials are not passed to the harness.
