@@ -353,22 +353,23 @@ func TestSweepContextCancelsBlockedGitAndRetainsWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	now = now.Add(25 * time.Hour)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan SweepReport, 1)
 	go func() { done <- manager.SweepContext(ctx) }()
 	select {
 	case <-enteredGit:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("sweep did not reach blocked Git cleanup")
 	}
+	cancel()
 	select {
 	case report := <-done:
 		if report.Removed != 0 || report.Retained != 1 {
 			t.Fatalf("canceled sweep report = %+v; expired workspace must be retained", report)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("SweepContext did not return after its Git context expired")
+	case <-time.After(5 * time.Second):
+		t.Fatal("SweepContext did not return after its Git context was canceled")
 	}
 	close(releaseGit)
 	if _, err := os.Stat(filepath.Join(manager.root, testJobID)); err != nil {
