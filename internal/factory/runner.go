@@ -24,6 +24,22 @@ type Agent interface {
 type Runner struct {
 	Config          Config
 	ProcessObserver func(command string, pid int, started bool)
+	// Env replaces the inherited process environment when non-nil.
+	Env []string
+	// OutputWriter optionally receives a copy of stdout and stderr.
+	OutputWriter io.Writer
+}
+
+func (r Runner) withOutputWriter(output io.Writer) Agent {
+	r.OutputWriter = output
+	return r
+}
+
+func cloneEnvironment(env []string) []string {
+	if env == nil {
+		return nil
+	}
+	return append([]string{}, env...)
 }
 
 const stdoutProtocolCaptureLimit = maxSubtaskPlanBytes
@@ -160,11 +176,23 @@ func (r Runner) runContext(ctx context.Context, stage, systemPrompt, task, workd
 	cmd := exec.CommandContext(ctx, command, args...)
 	configureProcessCancellation(cmd)
 	cmd.Dir = workdir
-	cmd.Stdout = log
-	if response != nil {
-		cmd.Stdout = io.MultiWriter(log, response)
+	if r.Env != nil {
+		cmd.Env = append([]string(nil), r.Env...)
 	}
-	cmd.Stderr = log
+	if r.OutputWriter == nil {
+		cmd.Stdout = log
+		if response != nil {
+			cmd.Stdout = io.MultiWriter(log, response)
+		}
+		cmd.Stderr = log
+	} else {
+		stdoutWriters := []io.Writer{log, r.OutputWriter}
+		if response != nil {
+			stdoutWriters = append(stdoutWriters, response)
+		}
+		cmd.Stdout = io.MultiWriter(stdoutWriters...)
+		cmd.Stderr = io.MultiWriter(log, r.OutputWriter)
+	}
 	if err := cmd.Start(); err != nil {
 		if ctx.Err() != nil {
 			return fmt.Errorf("run %s agent: %w", stage, ctx.Err())
