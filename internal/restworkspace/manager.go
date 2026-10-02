@@ -1,7 +1,8 @@
 // Package restworkspace manages isolated Git worktrees and private per-job
-// result directories. Successful workspaces are retained until Sweep observes
-// protected completion metadata older than the retention period. The effective
-// server account is trusted not to tamper with that metadata.
+// result directories. The results root must be owned by the server account and
+// private (0700); processes running as that same UID are trusted operators with
+// filesystem control. Successful workspaces are retained until Sweep observes
+// protected completion metadata older than the retention period.
 package restworkspace
 
 import (
@@ -56,11 +57,17 @@ type SweepReport struct {
 // Manager owns a repository/results-root pair. Operations are serialized within
 // this manager; filesystem ownership and permission checks guard persisted data.
 type Manager struct {
-	mu       sync.Mutex
-	repoRoot string
-	root     string
-	now      func() time.Time
-	runGit   func(context.Context, string, ...string) error
+	mu        sync.Mutex
+	repoRoot  string
+	root      string
+	rootDev   uint64
+	rootIno   uint64
+	parentDev uint64
+	parentIno uint64
+	repoDev   uint64
+	repoIno   uint64
+	now       func() time.Time
+	runGit    func(context.Context, string, ...string) error
 }
 
 type completion struct {
@@ -98,10 +105,29 @@ func New(config Config) (*Manager, error) {
 	if err != nil {
 		return nil, fmt.Errorf("validate results root: %w", err)
 	}
+	if err := verifyProtectedDir(filepath.Dir(root)); err != nil {
+		return nil, fmt.Errorf("validate server-specific results parent %q: %w", filepath.Dir(root), err)
+	}
 	if err := verifyProtectedDir(root); err != nil {
 		return nil, fmt.Errorf("validate results root: %w", err)
 	}
-	return &Manager{repoRoot: repo, root: root, now: config.Now, runGit: config.RunGit}, nil
+	rootDev, rootInode, err := directoryIdentity(root)
+	if err != nil {
+		return nil, fmt.Errorf("validate results root identity: %w", err)
+	}
+	parentDev, parentInode, err := directoryIdentity(filepath.Dir(root))
+	if err != nil {
+		return nil, fmt.Errorf("validate results parent identity: %w", err)
+	}
+	repoDev, repoInode, err := directoryIdentity(repo)
+	if err != nil {
+		return nil, fmt.Errorf("validate repository identity: %w", err)
+	}
+	return &Manager{
+		repoRoot: repo, root: root, rootDev: rootDev, rootIno: rootInode,
+		parentDev: parentDev, parentIno: parentInode, repoDev: repoDev, repoIno: repoInode,
+		now: config.Now, runGit: config.RunGit,
+	}, nil
 }
 
 // Create creates a separate detached worktree at the repository's current
@@ -139,10 +165,7 @@ func (m *Manager) Create(jobID string) (Workspace, error) {
 	if err := m.runGit(context.Background(), m.repoRoot, "worktree", "add", "--detach", workspace.WorktreePath, head); err != nil {
 		return Workspace{}, fmt.Errorf("create detached job worktree: %w", err)
 	}
-	if err := os.Chmod(workspace.WorktreePath, 0o700); err != nil {
-		return Workspace{}, fmt.Errorf("protect created worktree: %w", err)
-	}
-	if err := verifyProtectedDir(workspace.WorktreePath); err != nil {
+	if err := verifyWorktreeDir(workspace.WorktreePath); err != nil {
 		return Workspace{}, fmt.Errorf("validate created worktree: %w", err)
 	}
 	if err := m.verifySameDevice(jobDir, workspace.StatePath, workspace.OutputPath, workspace.WorktreePath); err != nil {
@@ -285,12 +308,22 @@ func (m *Manager) verifySameDevice(paths ...string) error {
 	return nil
 }
 
+func (m *Manager) verifyRepository() error {
+	if err := gitIsRepository(m.repoRoot); err != nil || !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
+		return errors.New("configured repository identity changed")
+	}
+	return nil
+}
+
 func (m *Manager) verifyRoot() error {
+	if err := verifyProtectedDir(filepath.Dir(m.root)); err != nil || !identityMatches(filepath.Dir(m.root), m.parentDev, m.parentIno) {
+		return errors.New("managed server-specific results parent failed validation")
+	}
 	if err := verifyProtectedDir(m.root); err != nil {
 		return errors.New("managed results root failed validation")
 	}
 	resolved, err := filepath.EvalSymlinks(m.root)
-	if err != nil || resolved != m.root {
+	if err != nil || resolved != m.root || !identityMatches(m.root, m.rootDev, m.rootIno) {
 		return errors.New("managed results root changed")
 	}
 	return nil
@@ -337,13 +370,28 @@ func (m *Manager) readMarker(jobDir, jobID string) (completion, error) {
 }
 
 func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error {
-	// Re-read the marker and all server-derived paths immediately before removal.
 	current, err := m.readCompletion(jobDir, jobID)
 	if err != nil || !current.CompletedAt.Equal(metadata.CompletedAt) || current.Repository != metadata.Repository {
 		return errors.New("completion metadata changed")
 	}
+	jobDev, jobInode, err := directoryIdentity(jobDir)
+	if err != nil {
+		return err
+	}
+	stateDev, stateInode, err := directoryIdentity(filepath.Join(jobDir, "state"))
+	if err != nil {
+		return err
+	}
+	outputDev, outputInode, err := directoryIdentity(filepath.Join(jobDir, "output"))
+	if err != nil {
+		return err
+	}
+	markerInfo, err := os.Lstat(filepath.Join(jobDir, markerName))
+	if err != nil || verifyProtectedFile(filepath.Join(jobDir, markerName)) != nil {
+		return errors.New("completion metadata changed")
+	}
 	worktree := filepath.Join(jobDir, "worktree")
-	if err := verifyProtectedDir(worktree); err != nil {
+	if err := verifyWorktreeDir(worktree); err != nil {
 		return err
 	}
 	dev, inode, err := directoryIdentity(worktree)
@@ -353,18 +401,24 @@ func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error
 	if err := registeredWorktree(m.repoRoot, worktree); err != nil {
 		return err
 	}
-	// Close the validation window as much as path-based APIs allow before
-	// invoking Git; all command arguments remain server-derived.
-	current, err = m.readCompletion(jobDir, jobID)
-	if err != nil || !current.CompletedAt.Equal(metadata.CompletedAt) {
+	// Revalidate the repository, root, job ID, metadata, and worktree at the
+	// last path-based boundary before asking Git to remove the worktree.
+	if err := m.verifyRoot(); err != nil {
+		return err
+	}
+	if err := m.verifyRepository(); err != nil {
+		return err
+	}
+	current, err = m.readMarker(jobDir, jobID)
+	if err != nil || current.JobID != jobID || current.Repository != m.repoRoot || !current.CompletedAt.Equal(metadata.CompletedAt) {
+		return errors.New("job identity changed before worktree cleanup")
+	}
+	if !identityMatches(jobDir, jobDev, jobInode) || !samePathIdentity(filepath.Join(jobDir, markerName), markerInfo) {
 		return errors.New("job identity changed before worktree cleanup")
 	}
 	dev, inode, err = directoryIdentity(worktree)
-	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode {
+	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode || registeredWorktree(m.repoRoot, worktree) != nil {
 		return errors.New("worktree identity changed before cleanup")
-	}
-	if err := m.verifyRoot(); err != nil {
-		return err
 	}
 	if err := m.runGit(context.Background(), m.repoRoot, "worktree", "remove", "--force", worktree); err != nil {
 		return errors.New("git worktree cleanup failed")
@@ -372,31 +426,147 @@ func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error
 	if _, err := os.Lstat(worktree); !errors.Is(err, os.ErrNotExist) {
 		return errors.New("git worktree path remains after cleanup")
 	}
-	// Validate the containing directory again; remove only this server-derived
-	// job tree. RemoveAll does not traverse symlink targets.
-	current, err = m.readMarker(jobDir, jobID)
-	if err != nil || !current.CompletedAt.Equal(metadata.CompletedAt) {
-		return errors.New("job identity changed after worktree cleanup")
+	if err := m.verifyRoot(); err != nil || !identityMatches(jobDir, jobDev, jobInode) {
+		return errors.New("job result directory changed after worktree cleanup")
 	}
-	for _, child := range []string{"state", "output"} {
-		path := filepath.Join(jobDir, child)
-		if err := verifyProtectedDir(path); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(path); err != nil {
-			return errors.New("private job directory cleanup failed")
-		}
-	}
-	if err := os.Remove(filepath.Join(jobDir, markerName)); err != nil {
-		return errors.New("completion metadata cleanup failed")
-	}
-	if err := verifyProtectedDir(jobDir); err != nil {
+	if err := m.verifyRepository(); err != nil {
 		return err
 	}
-	if err := os.Remove(jobDir); err != nil {
+	if !identityMatches(filepath.Join(jobDir, "state"), stateDev, stateInode) || !identityMatches(filepath.Join(jobDir, "output"), outputDev, outputInode) {
+		return errors.New("private job directory identity changed after worktree cleanup")
+	}
+	current, err = m.readMarker(jobDir, jobID)
+	if err != nil || current.JobID != jobID || current.Repository != m.repoRoot || !current.CompletedAt.Equal(metadata.CompletedAt) || !samePathIdentity(filepath.Join(jobDir, markerName), markerInfo) {
+		return errors.New("job identity changed after worktree cleanup")
+	}
+	if err := removeOwnedDirectory(filepath.Join(jobDir, "state"), stateDev, stateInode); err != nil {
+		return errors.New("private state cleanup failed")
+	}
+	if err := removeOwnedDirectory(filepath.Join(jobDir, "output"), outputDev, outputInode); err != nil {
+		return errors.New("private output cleanup failed")
+	}
+	if err := removeOwnedFile(filepath.Join(jobDir, markerName), markerInfo); err != nil {
+		return errors.New("completion metadata cleanup failed")
+	}
+	if err := removeOwnedDirectory(jobDir, jobDev, jobInode); err != nil {
 		return errors.New("job result directory is not empty or changed")
 	}
 	return nil
+}
+
+func identityMatches(path string, dev, inode uint64) bool {
+	gotDev, gotInode, err := directoryIdentity(path)
+	return err == nil && gotDev == dev && gotInode == inode
+}
+
+func samePathIdentity(path string, expected os.FileInfo) bool {
+	current, err := os.Lstat(path)
+	return err == nil && sameFileIdentity(current, expected)
+}
+
+func removeOwnedDirectory(path string, dev, inode uint64) error {
+	if !identityMatches(path, dev, inode) {
+		return errors.New("directory identity changed")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.IsDir() {
+		return errors.New("opened path is not a directory")
+	}
+	openedDev, openedInode, err := fileIdentity(opened)
+	if err != nil || openedDev != dev || openedInode != inode || !identityMatches(path, dev, inode) {
+		return errors.New("directory identity changed while opening")
+	}
+	entries, err := file.ReadDir(-1)
+	if err != nil || !identityMatches(path, dev, inode) {
+		return errors.New("directory changed while enumerating")
+	}
+	for _, entry := range entries {
+		child := filepath.Join(path, entry.Name())
+		expected, err := os.Lstat(child)
+		if err != nil || !identityMatches(path, dev, inode) {
+			return errors.New("directory entry changed during cleanup")
+		}
+		if err := removeOwnedEntry(child, expected); err != nil {
+			return err
+		}
+		if !identityMatches(path, dev, inode) {
+			return errors.New("directory identity changed during cleanup")
+		}
+	}
+	if !identityMatches(path, dev, inode) {
+		return errors.New("directory identity changed before removal")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("directory reappeared after removal")
+	}
+	return nil
+}
+
+func removeOwnedEntry(path string, expected os.FileInfo) error {
+	info, err := os.Lstat(path)
+	if err != nil || !sameFileIdentity(info, expected) {
+		return errors.New("directory entry identity changed")
+	}
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		dev, inode, err := fileIdentity(expected)
+		if err != nil {
+			return err
+		}
+		return removeOwnedDirectory(path, dev, inode)
+	}
+	if !info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 {
+		return errors.New("refusing to remove special filesystem entry")
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		opened, statErr := file.Stat()
+		closeErr := file.Close()
+		if statErr != nil || closeErr != nil || !sameFileIdentity(info, opened) {
+			return errors.New("file identity changed while opening")
+		}
+	}
+	if !samePathIdentity(path, info) {
+		return errors.New("entry identity changed before removal")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("entry reappeared after removal")
+	}
+	return nil
+}
+
+func removeOwnedFile(path string, expected os.FileInfo) error {
+	if !samePathIdentity(path, expected) {
+		return errors.New("file identity changed")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("file reappeared after removal")
+	}
+	return nil
+}
+
+func fileIdentity(info os.FileInfo) (uint64, uint64, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Ino == 0 {
+		return 0, 0, errors.New("filesystem does not expose file identity")
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
 
 func verifyExpectedWorkspace(jobDir string) error {
@@ -405,7 +575,7 @@ func verifyExpectedWorkspace(jobDir string) error {
 			return fmt.Errorf("invalid managed %s directory", name)
 		}
 	}
-	if err := verifyProtectedDir(filepath.Join(jobDir, "worktree")); err != nil {
+	if err := verifyWorktreeDir(filepath.Join(jobDir, "worktree")); err != nil {
 		return errors.New("invalid managed worktree directory")
 	}
 	return nil
@@ -443,7 +613,14 @@ func canonicalDirectory(path string) (string, error) {
 func mkdirProtected(path string) error {
 	volume := filepath.VolumeName(path)
 	current := volume + string(filepath.Separator)
-	for _, part := range strings.Split(strings.TrimPrefix(path, current), string(filepath.Separator)) {
+	if filepath.Clean(path) == current {
+		return errors.New("results root cannot be a filesystem root")
+	}
+	parts := strings.Split(strings.TrimPrefix(path, current), string(filepath.Separator))
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return errors.New("results root must be beneath a server-specific parent")
+	}
+	for _, part := range parts[:len(parts)-1] {
 		if part == "" {
 			continue
 		}
@@ -459,7 +636,17 @@ func mkdirProtected(path string) error {
 			return errors.New("results root path contains a non-directory or symlink")
 		}
 	}
-	return os.Chmod(path, 0o700)
+	if err := verifyProtectedDir(current); err != nil {
+		return errors.New("results root parent is not a private server-specific directory")
+	}
+	rootInfo, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return os.Mkdir(path, 0o700)
+	}
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return errors.New("results root path contains a non-directory or symlink")
+	}
+	return verifyProtectedDir(path)
 }
 
 func verifyProtectedDir(path string) error {
