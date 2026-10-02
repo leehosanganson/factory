@@ -16,8 +16,10 @@ import (
 // filesystem and Git metadata. A future server startup path must call this before
 // opening its listener; Config.Validate intentionally performs no process I/O.
 func (c Config) ValidateRepositoryRoots() error {
+	ctx, cancel := context.WithTimeout(context.Background(), repositoryRootValidationTimeout)
+	defer cancel()
 	for alias, root := range c.Repositories {
-		if err := validateRepositoryRoot(root); err != nil {
+		if err := validateRepositoryRoot(ctx, root); err != nil {
 			return fmt.Errorf("repository %q is not a valid Git working tree root: %w", alias, err)
 		}
 	}
@@ -26,7 +28,7 @@ func (c Config) ValidateRepositoryRoots() error {
 
 const repositoryRootValidationTimeout = 10 * time.Second
 
-func validateRepositoryRoot(root string) error {
+func validateRepositoryRoot(ctx context.Context, root string) error {
 	if !filepath.IsAbs(root) || strings.TrimSpace(root) == "" || strings.ContainsRune(root, 0) || filepath.Clean(root) != root {
 		return errors.New("root must be an absolute canonical path")
 	}
@@ -39,8 +41,6 @@ func validateRepositoryRoot(root string) error {
 		return errors.New("root and its ancestors must not use symlinks")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), repositoryRootValidationTimeout)
-	defer cancel()
 	command := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", "--show-toplevel")
 	var output bytes.Buffer
 	command.Stdout = &output
