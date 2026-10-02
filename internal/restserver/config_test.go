@@ -18,12 +18,32 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 	if config.ListenAddress != "127.0.0.1:8080" {
 		t.Fatalf("default listener = %q, want loopback-only default", config.ListenAddress)
 	}
+	if len(config.VerificationChecks) != 0 {
+		t.Fatalf("default verification checks = %#v, want none", config.VerificationChecks)
+	}
 	if config.Limits.RequestBodyBytes != 512<<10 || config.Limits.TaskBytes != 256<<10 || config.Limits.QueueCapacity != 32 || config.Limits.Workers != 2 || config.Limits.MaxRecords != 1000 || config.Limits.MaxEventsPerJob != 200 || config.Limits.RegistryBytes != 256<<20 || config.Limits.HarnessOutput != 1<<20 {
 		t.Fatalf("unexpected defaults: %+v", config.Limits)
 	}
 	timeout, err := time.ParseDuration(config.Limits.JobTimeout)
 	if err != nil || timeout != 30*time.Minute {
 		t.Fatalf("default timeout = %q, %v", config.Limits.JobTimeout, err)
+	}
+}
+
+func TestLoadConfigParsesOperatorVerificationChecksWithoutShellParsing(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"verification_checks":[["go","test","./..."],["./scripts/check.sh","--strict mode"]],"api_key_file":"/run/secrets/key"}`)
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"go", "test", "./..."}, {"./scripts/check.sh", "--strict mode"}}
+	if len(config.VerificationChecks) != len(want) {
+		t.Fatalf("verification checks = %#v, want %#v", config.VerificationChecks, want)
+	}
+	for i := range want {
+		if strings.Join(config.VerificationChecks[i], "\x00") != strings.Join(want[i], "\x00") {
+			t.Fatalf("verification check %d = %#v, want exact argv %#v", i, config.VerificationChecks[i], want[i])
+		}
 	}
 }
 
@@ -58,6 +78,15 @@ func TestLoadConfigRejectsStrictSchemaViolations(t *testing.T) {
 		{"null nested value", `{` + strings.Replace(valid, `"executable":"pi"`, `"executable":null`, 1) + `}`},
 		{"invalid repository alias", `{` + strings.Replace(valid, `"widget":"/srv/widget"`, `"../widget":"/srv/widget"`, 1) + `}`},
 		{"null optional limit", `{` + valid + `,"limits":{"workers":null}}`},
+		{"unknown verification field", `{` + valid + `,"verification_checks":[["make","test"]],"verification_shell":"make test"}`},
+		{"empty verification command", `{` + valid + `,"verification_checks":[[]]}`},
+		{"non-string verification argument", `{` + valid + `,"verification_checks":[["make",1]]}`},
+		{"null verification checks", `{` + valid + `,"verification_checks":null}`},
+		{"duplicate verification checks", `{` + valid + `,"verification_checks":[],"verification_checks":[]}`},
+		{"verification command count over limit", `{` + valid + `,"verification_checks":[["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"],["x"]]}`},
+		{"verification argv count over limit", `{` + valid + `,"verification_checks":[["x","a","b","c","d","e","f","g","h","i","j","k","l","m","n","o","p","q","r","s","t","u","v","w","x","y","z","aa","ab","ac","ad","ae","af"]]}`},
+		{"verification argument with nul", `{` + valid + `,"verification_checks":[["make","bad\u0000arg"]]}`},
+		{"verification blank argument", `{` + valid + `,"verification_checks":[["make"," "]]}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -111,6 +140,14 @@ func TestConfigValidateRejectsUnsupportedAuthorityAndUnsafeValues(t *testing.T) 
 		{"nul key path", func(c *Config) { c.APIKeyFile = "/run/key\x00" }},
 		{"host with whitespace", func(c *Config) { c.ListenAddress = "bad host:8080" }},
 		{"empty harness arguments", func(c *Config) { c.Harness.Args = nil }},
+		{"empty verification executable", func(c *Config) { c.VerificationChecks = [][]string{{" "}} }},
+		{"empty verification arg", func(c *Config) { c.VerificationChecks = [][]string{{"go", ""}} }},
+		{"nul verification arg", func(c *Config) { c.VerificationChecks = [][]string{{"go", "bad\x00arg"}} }},
+		{"verification command count over limit", func(c *Config) { c.VerificationChecks = make([][]string, maxVerificationChecks+1) }},
+		{"verification argv count over limit", func(c *Config) {
+			c.VerificationChecks = [][]string{append([]string{"go"}, make([]string, maxVerificationArgs)...)}
+		}},
+		{"verification total bytes over limit", func(c *Config) { c.VerificationChecks = [][]string{{"go", strings.Repeat("x", maxVerificationBytes)}} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

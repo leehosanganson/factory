@@ -17,6 +17,7 @@ import (
 
 	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restserver"
+	"github.com/leehosanganson/factory/internal/restworkspace"
 )
 
 type runtimeExecutor func(context.Context, restjobs.Snapshot) error
@@ -53,7 +54,14 @@ func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 			},
 		})
 	}()
-	listener := <-listenerReady
+	var listener net.Listener
+	select {
+	case listener = <-listenerReady:
+	case err := <-done:
+		t.Fatalf("server exited before listener startup: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not start a listener")
+	}
 	baseURL := "http://" + listener.Addr().String()
 	waitForStatus(t, baseURL+"/readyz", http.StatusOK)
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -177,6 +185,12 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	checkMarker := filepath.Join(t.TempDir(), "configured-check-ran")
+	check := filepath.Join(t.TempDir(), "verification-check.sh")
+	if err := os.WriteFile(check, []byte("#!/bin/sh\ntest \"$1\" = \"--literal argument\" && touch \"$2\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.VerificationChecks = [][]string{{check, "--literal argument", checkMarker}}
 	resultsBase := filepath.Join(t.TempDir(), "state", "factory", "rest-server")
 	listenerReady := make(chan net.Listener, 1)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -245,6 +259,9 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("Factory harness stage calls = %d, want requirements/implement/review/document", len(lines))
 	}
+	if _, err := os.Stat(checkMarker); err != nil {
+		t.Fatalf("operator-configured verification argv was not invoked: %v", err)
+	}
 	resultRoot := filepath.Join(resultsBase, aliasDirectory("trusted"), "results", admitted.Job.ID)
 	for index, workdir := range lines {
 		want := filepath.Join(resultRoot, "worktree")
@@ -272,6 +289,93 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down")
+	}
+}
+
+func TestRunCancellationDoesNotWaitBeyondDeadlineForBlockedWorkspaceGit(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	resultsBase := filepath.Join(t.TempDir(), "state", "factory", "rest-server")
+	resultsRoot := filepath.Join(resultsBase, aliasDirectory("trusted"), "results")
+	var sweepNow atomic.Int64
+	sweepNow.Store(time.Now().UTC().UnixNano())
+	workspace, err := restworkspace.New(restworkspace.Config{
+		RepositoryRoot: config.Repositories["trusted"], ResultsRoot: resultsRoot,
+		Now: func() time.Time { return time.Unix(0, sweepNow.Load()).UTC() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "01234567-89ab-4cde-8fab-0123456789ab"
+	if _, err := workspace.Create(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := workspace.MarkSucceeded(id); err != nil {
+		t.Fatal(err)
+	}
+	enteredGit := make(chan struct{})
+	releaseGit := make(chan struct{})
+	listenerReady := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	shutdownBound := 200 * time.Millisecond
+	go func() {
+		done <- run(ctx, config, runtimeOptions{
+			ResultsBase: resultsBase, ShutdownTimeout: shutdownBound,
+			WorkspaceNow: func() time.Time { return time.Unix(0, sweepNow.Load()).UTC() }, SweepInterval: 10 * time.Millisecond,
+			WorkspaceGit: func(runCtx context.Context, root string, args ...string) error {
+				if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+					close(enteredGit)
+					select {
+					case <-runCtx.Done():
+						return runCtx.Err()
+					case <-releaseGit:
+						return errors.New("released fake Git")
+					}
+				}
+				command := exec.CommandContext(runCtx, "git", append([]string{"-C", root}, args...)...)
+				return command.Run()
+			},
+			Listen: func(network, _ string) (net.Listener, error) {
+				listener, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					close(listenerReady)
+				}
+				return listener, err
+			},
+		})
+	}()
+	select {
+	case <-listenerReady:
+	case <-time.After(3 * time.Second):
+		cancel()
+		close(releaseGit)
+		t.Fatal("server listener did not start")
+	}
+	sweepNow.Add(int64(25 * time.Hour))
+	select {
+	case <-enteredGit:
+	case <-time.After(3 * time.Second):
+		cancel()
+		close(releaseGit)
+		t.Fatal("hourly sweep did not reach blocked workspace Git cleanup")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run() after cancellation = %v", err)
+		}
+		if elapsed := time.Since(started); elapsed > shutdownBound+100*time.Millisecond {
+			t.Fatalf("Run() cancellation took %s, beyond shared shutdown bound %s", elapsed, shutdownBound)
+		}
+	case <-time.After(shutdownBound + time.Second):
+		close(releaseGit)
+		t.Fatal("Run() blocked beyond configured shutdown bound")
+	}
+	close(releaseGit)
+	if _, err := os.Stat(filepath.Join(resultsRoot, id)); err != nil {
+		t.Fatalf("canceled cleanup removed workspace: %v", err)
 	}
 }
 
@@ -416,7 +520,11 @@ func TestRunRequiresProtectedServerStateParent(t *testing.T) {
 
 func runtimeFixture(t *testing.T) (restserver.Config, string) {
 	t.Helper()
-	root := filepath.Join(t.TempDir(), "repo")
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "repo")
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}

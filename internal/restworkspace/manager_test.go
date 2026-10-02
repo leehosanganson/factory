@@ -312,6 +312,70 @@ func restoreConfiguredCheckout(t *testing.T, repo, repoBackup, replacement strin
 	}
 }
 
+func TestSweepContextReturnsWhenManagerLockIsHeld(t *testing.T) {
+	now := time.Now().UTC()
+	manager, _, _ := testManager(t, &now, nil)
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	report := manager.SweepContext(ctx)
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("SweepContext blocked for %s after lock-wait deadline", elapsed)
+	}
+	if report.Removed != 0 || report.Retained != 0 || len(report.Errors) != 1 {
+		t.Fatalf("lock-wait cancellation report = %+v", report)
+	}
+}
+
+func TestSweepContextCancelsBlockedGitAndRetainsWorkspace(t *testing.T) {
+	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
+	enteredGit := make(chan struct{})
+	releaseGit := make(chan struct{})
+	runner := func(ctx context.Context, root string, args ...string) error {
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+			close(enteredGit)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-releaseGit:
+				return errors.New("blocked fake Git released")
+			}
+		}
+		return runGit(ctx, root, args...)
+	}
+	manager, _, _ := testManager(t, &now, runner)
+	if _, err := manager.Create(testJobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.MarkSucceeded(testJobID); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	done := make(chan SweepReport, 1)
+	go func() { done <- manager.SweepContext(ctx) }()
+	select {
+	case <-enteredGit:
+	case <-time.After(time.Second):
+		t.Fatal("sweep did not reach blocked Git cleanup")
+	}
+	select {
+	case report := <-done:
+		if report.Removed != 0 || report.Retained != 1 {
+			t.Fatalf("canceled sweep report = %+v; expired workspace must be retained", report)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SweepContext did not return after its Git context expired")
+	}
+	close(releaseGit)
+	if _, err := os.Stat(filepath.Join(manager.root, testJobID)); err != nil {
+		t.Fatalf("canceled cleanup removed workspace: %v", err)
+	}
+}
+
 func TestSweepRetainsAtBoundaryAndRemovesOnlyStrictlyOlderThan24Hours(t *testing.T) {
 	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
 	manager, _, _ := testManager(t, &now, nil)

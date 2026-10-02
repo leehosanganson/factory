@@ -313,9 +313,24 @@ func (m *Manager) MarkSucceeded(jobID string) error {
 // older than 24 hours. Every uncertain, malformed, failed, canceled, orphaned,
 // or unsafe item is retained and represented in the report.
 func (m *Manager) Sweep() SweepReport {
-	m.mu.Lock()
+	return m.SweepContext(context.Background())
+}
+
+// SweepContext removes expired workspaces until ctx is canceled. Git cleanup
+// operations receive ctx; interrupted or uncertain cleanup retains the item.
+func (m *Manager) SweepContext(ctx context.Context) SweepReport {
+	if ctx == nil {
+		return SweepReport{Errors: []error{errors.New("sweep context must not be nil")}}
+	}
+	if err := lockContext(ctx, &m.mu); err != nil {
+		return SweepReport{Errors: []error{errors.New("workspace sweep canceled before lock")}}
+	}
 	defer m.mu.Unlock()
 	report := SweepReport{}
+	if ctx.Err() != nil {
+		report.Errors = append(report.Errors, errors.New("workspace sweep canceled"))
+		return report
+	}
 	if err := m.verifyRoot(); err != nil {
 		report.Errors = append(report.Errors, errors.New("managed results root failed validation"))
 		return report
@@ -327,6 +342,10 @@ func (m *Manager) Sweep() SweepReport {
 	}
 	cutoff := m.now().Add(-Retention)
 	for _, entry := range entries {
+		if ctx.Err() != nil {
+			report.Retained += len(entries) - report.Scanned
+			break
+		}
 		report.Scanned++
 		name := entry.Name()
 		if !validJobID(name) || !entry.IsDir() {
@@ -343,7 +362,7 @@ func (m *Manager) Sweep() SweepReport {
 			}
 			continue
 		}
-		if err := m.removeExpired(jobDir, name, metadata); err != nil {
+		if err := m.removeExpired(ctx, jobDir, name, metadata); err != nil {
 			report.Retained++
 			report.Errors = append(report.Errors, errors.New("retained expired job after cleanup safety check failed"))
 			continue
@@ -351,6 +370,21 @@ func (m *Manager) Sweep() SweepReport {
 		report.Removed++
 	}
 	return report
+}
+
+func lockContext(ctx context.Context, mutex *sync.Mutex) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if mutex.TryLock() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func (m *Manager) verifySameDevice(paths ...string) error {
@@ -368,10 +402,14 @@ func (m *Manager) verifySameDevice(paths ...string) error {
 }
 
 func (m *Manager) verifyRepository() error {
-	if !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
+	return m.verifyRepositoryContext(context.Background())
+}
+
+func (m *Manager) verifyRepositoryContext(ctx context.Context) error {
+	if ctx.Err() != nil || !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
 		return errors.New("configured repository identity changed")
 	}
-	if err := gitIsRepository(m.repoRoot); err != nil || !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
+	if err := gitIsRepositoryContext(ctx, m.repoRoot); err != nil || ctx.Err() != nil || !identityMatches(m.repoRoot, m.repoDev, m.repoIno) {
 		return errors.New("configured repository identity changed")
 	}
 	return nil
@@ -431,7 +469,7 @@ func (m *Manager) readMarker(jobDir, jobID string) (completion, error) {
 	return metadata, nil
 }
 
-func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error {
+func (m *Manager) removeExpired(ctx context.Context, jobDir, jobID string, metadata completion) error {
 	current, err := m.readCompletion(jobDir, jobID)
 	if err != nil || !current.CompletedAt.Equal(metadata.CompletedAt) || current.Repository != metadata.Repository {
 		return errors.New("completion metadata changed")
@@ -460,7 +498,7 @@ func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error
 	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode {
 		return errors.New("worktree identity changed")
 	}
-	if err := registeredWorktree(m.repoRoot, worktree); err != nil {
+	if err := registeredWorktreeContext(ctx, m.repoRoot, worktree); err != nil {
 		return err
 	}
 	// Revalidate the repository, root, job ID, metadata, and worktree at the
@@ -468,7 +506,7 @@ func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error
 	if err := m.verifyRoot(); err != nil {
 		return err
 	}
-	if err := m.verifyRepository(); err != nil {
+	if err := m.verifyRepositoryContext(ctx); err != nil {
 		return err
 	}
 	current, err = m.readMarker(jobDir, jobID)
@@ -479,10 +517,10 @@ func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error
 		return errors.New("job identity changed before worktree cleanup")
 	}
 	dev, inode, err = directoryIdentity(worktree)
-	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode || registeredWorktree(m.repoRoot, worktree) != nil {
+	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode || registeredWorktreeContext(ctx, m.repoRoot, worktree) != nil {
 		return errors.New("worktree identity changed before cleanup")
 	}
-	if err := m.runGit(context.Background(), m.repoRoot, "worktree", "remove", "--force", worktree); err != nil {
+	if err := m.runGit(ctx, m.repoRoot, "worktree", "remove", "--force", worktree); err != nil || ctx.Err() != nil {
 		return errors.New("git worktree cleanup failed")
 	}
 	if _, err := os.Lstat(worktree); !errors.Is(err, os.ErrNotExist) {
@@ -491,7 +529,7 @@ func (m *Manager) removeExpired(jobDir, jobID string, metadata completion) error
 	if err := m.verifyRoot(); err != nil || !identityMatches(jobDir, jobDev, jobInode) {
 		return errors.New("job result directory changed after worktree cleanup")
 	}
-	if err := m.verifyRepository(); err != nil {
+	if err := m.verifyRepositoryContext(ctx); err != nil {
 		return err
 	}
 	if !identityMatches(filepath.Join(jobDir, "state"), stateDev, stateInode) || !identityMatches(filepath.Join(jobDir, "output"), outputDev, outputInode) {
@@ -788,7 +826,11 @@ func ownedByEffectiveUser(info os.FileInfo) bool {
 }
 
 func gitIsRepository(root string) error {
-	got, err := gitOutput(root, "rev-parse", "--show-toplevel")
+	return gitIsRepositoryContext(context.Background(), root)
+}
+
+func gitIsRepositoryContext(ctx context.Context, root string) error {
+	got, err := gitOutputContext(ctx, root, "rev-parse", "--show-toplevel")
 	if err != nil || got != root {
 		return errors.New("path is not the exact Git worktree root")
 	}
@@ -796,7 +838,11 @@ func gitIsRepository(root string) error {
 }
 
 func gitOutput(root string, args ...string) (string, error) {
-	command := exec.Command("git", append([]string{"-C", root}, args...)...)
+	return gitOutputContext(context.Background(), root, args...)
+}
+
+func gitOutputContext(ctx context.Context, root string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil {
@@ -816,7 +862,11 @@ func runGit(ctx context.Context, root string, args ...string) error {
 }
 
 func registeredWorktree(root, path string) error {
-	output, err := gitOutput(root, "worktree", "list", "--porcelain")
+	return registeredWorktreeContext(context.Background(), root, path)
+}
+
+func registeredWorktreeContext(ctx context.Context, root, path string) error {
+	output, err := gitOutputContext(ctx, root, "worktree", "list", "--porcelain")
 	if err != nil {
 		return errors.New("cannot verify registered worktree")
 	}

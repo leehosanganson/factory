@@ -19,6 +19,10 @@ This file configures the implemented `factory server` command. Configuration is 
     ]
   },
   "api_key_file": "/run/secrets/factory-api-key",
+  "verification_checks": [
+    ["go", "test", "./..."],
+    ["go", "vet", "./..."]
+  ],
   "limits": {
     "request_body_bytes": 524288,
     "task_bytes": 262144,
@@ -33,7 +37,7 @@ This file configures the implemented `factory server` command. Configuration is 
 }
 ```
 
-`listen_address` defaults to `127.0.0.1:8080` when omitted. Operators may explicitly bind another address, including a non-loopback interface; doing so exposes the API on that interface and requires appropriate network controls. `repositories` maps a validated alias to an explicitly configured absolute checkout root; requests cannot provide paths. Before opening a listener, `factory server` calls `Config.ValidateRepositoryRoots`. That method requires each path to be an existing directory and the exact canonical root reported by `git -C <root> rev-parse --show-toplevel`; subdirectories, bare repositories, and symlink/path-indirected roots are rejected. Linked worktree roots are accepted. Git must be installed. Validation errors identify the repository alias without echoing configured paths. `harness` is a fixed executable and argument vector, never shell text. Arguments must contain `{task}` and `{system_prompt}` exactly once each; other placeholders are rejected. Only `mode: local_process` is accepted.
+`listen_address` defaults to `127.0.0.1:8080` when omitted. Operators may explicitly bind another address, including a non-loopback interface; doing so exposes the API on that interface and requires appropriate network controls. `repositories` maps a validated alias to an explicitly configured absolute checkout root; requests cannot provide paths. Before opening a listener, `factory server` calls `Config.ValidateRepositoryRoots`. That method requires each path to be an existing directory and the exact canonical root reported by `git -C <root> rev-parse --show-toplevel`; subdirectories, bare repositories, and symlink/path-indirected roots are rejected. Linked worktree roots are accepted. Git must be installed. Validation errors identify the repository alias without echoing configured paths. `harness` is a fixed executable and argument vector, never shell text. Arguments must contain `{task}` and `{system_prompt}` exactly once each; other placeholders are rejected. `verification_checks` is an optional array of trusted operator-configured argv arrays. Each array is invoked directly without shell parsing after the workflow stages; callers cannot provide or alter checks. Omitted or empty checks means no external verification checks run. The strict schema limits this field to 16 commands, at most 32 nonempty argv elements (including the executable) per command, and 16 KiB total argv bytes per command. Only `mode: local_process` is accepted.
 
 The loader rejects unknown/duplicate JSON fields and trailing JSON. Start the service with `factory server --config /absolute/path/to/server.json`; the command accepts no other argument ordering or config source. See [REST job server](rest-server.md) for runtime and shutdown behavior. Resource limits are positive and bounded: request body at 2 MiB, task at 256 KiB, queue at 1024, workers at 64, at most 1,000 retained records, at most 200 events per job, a 256 MiB logical registry budget, job timeout at 24 hours, and captured harness output at 16 MiB maximum. Omitted limits default to 512 KiB body, 256 KiB task, queue 32, two workers, 1,000 records, 200 events, 256 MiB registry budget, 30 minutes, and 1 MiB output. The task limit is byte-based (UTF-8), and the request body default leaves room for JSON and headers around the maximum task.
 

@@ -28,27 +28,31 @@ const (
 	defaultJobTimeout       = 30 * time.Minute
 	defaultHarnessOutput    = 1 << 20
 
-	maxRequestBodyBytes = 2 << 20
-	maxTaskBytes        = 256 << 10
-	maxQueueCapacity    = 1024
-	maxWorkers          = 64
-	maxRecords          = 1000
-	maxEventsPerJob     = 200
-	maxRegistryBytes    = 256 << 20
-	maxJobTimeout       = 24 * time.Hour
-	maxHarnessOutput    = 16 << 20
+	maxRequestBodyBytes   = 2 << 20
+	maxTaskBytes          = 256 << 10
+	maxQueueCapacity      = 1024
+	maxWorkers            = 64
+	maxRecords            = 1000
+	maxEventsPerJob       = 200
+	maxRegistryBytes      = 256 << 20
+	maxJobTimeout         = 24 * time.Hour
+	maxHarnessOutput      = 16 << 20
+	maxVerificationChecks = 16
+	maxVerificationArgs   = 32
+	maxVerificationBytes  = 16 << 10
 )
 
 var aliasPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
 // Config contains server-only settings. It is independent of the CLI config.
 type Config struct {
-	Mode          string            `json:"mode"`
-	ListenAddress string            `json:"listen_address"`
-	Repositories  map[string]string `json:"repositories"`
-	Harness       HarnessConfig     `json:"harness"`
-	APIKeyFile    string            `json:"api_key_file"`
-	Limits        Limits            `json:"limits"`
+	Mode               string            `json:"mode"`
+	ListenAddress      string            `json:"listen_address"`
+	Repositories       map[string]string `json:"repositories"`
+	Harness            HarnessConfig     `json:"harness"`
+	VerificationChecks [][]string        `json:"verification_checks,omitempty"`
+	APIKeyFile         string            `json:"api_key_file"`
+	Limits             Limits            `json:"limits"`
 }
 
 // HarnessConfig is a fixed executable and argument vector selected by the operator.
@@ -154,6 +158,9 @@ func (c Config) Validate() error {
 	if err := validateHarnessArgs(c.Harness.Args); err != nil {
 		return err
 	}
+	if err := validateVerificationChecks(c.VerificationChecks); err != nil {
+		return err
+	}
 	if !filepath.IsAbs(c.APIKeyFile) || strings.TrimSpace(c.APIKeyFile) == "" || strings.ContainsRune(c.APIKeyFile, 0) {
 		return errors.New("api_key_file must be an absolute path")
 	}
@@ -171,6 +178,28 @@ func validateListenAddress(address string) error {
 	var portNumber int
 	if _, err := fmt.Sscanf(port, "%d", &portNumber); err != nil || portNumber < 1 || portNumber > 65535 || fmt.Sprintf("%d", portNumber) != port {
 		return errors.New("listen_address port must be between 1 and 65535")
+	}
+	return nil
+}
+
+func validateVerificationChecks(checks [][]string) error {
+	if len(checks) > maxVerificationChecks {
+		return fmt.Errorf("verification_checks must contain at most %d commands", maxVerificationChecks)
+	}
+	for index, check := range checks {
+		if len(check) == 0 || len(check) > maxVerificationArgs || strings.TrimSpace(check[0]) == "" {
+			return fmt.Errorf("verification check %d must contain an executable and at most %d arguments", index, maxVerificationArgs)
+		}
+		totalBytes := 0
+		for _, arg := range check {
+			if strings.TrimSpace(arg) == "" || strings.ContainsRune(arg, 0) {
+				return fmt.Errorf("verification check %d contains an empty or invalid argument", index)
+			}
+			totalBytes += len(arg)
+		}
+		if totalBytes > maxVerificationBytes {
+			return fmt.Errorf("verification check %d exceeds %d bytes", index, maxVerificationBytes)
+		}
 	}
 	return nil
 }
@@ -296,7 +325,7 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "api_key_file": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "api_key_file": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "limits":
@@ -334,7 +363,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "repositories":
+	case "harness", "limits", "repositories", "verification_checks":
 		return key
 	default:
 		return ""

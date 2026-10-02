@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +24,7 @@ import (
 const (
 	defaultShutdownTimeout = 15 * time.Second
 	sweepInterval          = time.Hour
+	sweepTimeout           = 30 * time.Second
 	maxHeaderBytes         = 1 << 20
 )
 
@@ -35,6 +35,9 @@ type runtimeOptions struct {
 	ResultsBase     string
 	ShutdownTimeout time.Duration
 	Log             *log.Logger
+	WorkspaceGit    func(context.Context, string, ...string) error
+	WorkspaceNow    func() time.Time
+	SweepInterval   time.Duration
 }
 
 // Run starts the REST server and blocks until ctx is canceled or serving fails.
@@ -78,6 +81,8 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		workspace, err := restworkspace.New(restworkspace.Config{
 			RepositoryRoot: root,
 			ResultsRoot:    filepath.Join(resultsBase, aliasDirectory(alias), "results"),
+			RunGit:         options.WorkspaceGit,
+			Now:            options.WorkspaceNow,
 		})
 		if err != nil {
 			return fmt.Errorf("initialize workspace for repository %q: %w", alias, err)
@@ -88,7 +93,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	workflowConfig := factory.DefaultConfig()
 	workflowConfig.AutoPublish = false
 	workflowConfig.WorktreeParent = ""
-	workflowConfig.PipelineChecks = nil
+	workflowConfig.PipelineChecks = cloneVerificationChecks(config.VerificationChecks)
 	workflowConfig.ParallelImplementation = nil
 	executor := options.Executor
 	if executor == nil {
@@ -110,22 +115,20 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		return err
 	}
 
+	startupSweepCtx, cancelStartupSweep := context.WithTimeout(ctx, sweepTimeout)
 	for _, workspace := range workspaceManagers {
-		if report := workspace.Sweep(); len(report.Errors) > 0 {
+		if report := workspace.SweepContext(startupSweepCtx); len(report.Errors) > 0 {
 			logCleanup(logger, len(report.Errors))
 		}
+		if startupSweepCtx.Err() != nil {
+			break
+		}
 	}
-	stopSweep := make(chan struct{})
+	cancelStartupSweep()
+	sweepCtx, cancelSweep := context.WithCancel(context.Background())
+	defer cancelSweep()
 	sweepDone := make(chan struct{})
-	go sweepWorkspaces(stopSweep, sweepDone, workspaceManagers, logger)
-	var stopSweepOnce sync.Once
-	stopSweeper := func() {
-		stopSweepOnce.Do(func() {
-			close(stopSweep)
-			<-sweepDone
-		})
-	}
-	defer stopSweeper()
+	go sweepWorkspaces(sweepCtx, sweepDone, workspaceManagers, logger, options.SweepInterval)
 
 	coordinator, err := restworker.New(manager, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers})
 	if err != nil {
@@ -145,7 +148,11 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	listener, err := listen("tcp", config.ListenAddress)
 	if err != nil {
-		shutdownWorkers(coordinator, options.ShutdownTimeout)
+		shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
+		defer cancel()
+		cancelSweep()
+		_ = waitForSweep(shutdownCtx, sweepDone)
+		_ = coordinator.Shutdown(shutdownCtx)
 		return fmt.Errorf("listen for REST server: %w", err)
 	}
 	serveDone := make(chan error, 1)
@@ -160,15 +167,12 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			serveErr = fmt.Errorf("serve REST API: %w", err)
 		}
 	}
+	shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
+	defer cancel()
 	ready.Store(false)
 	manager.Close()
-	stopSweeper()
-	shutdownTimeout := options.ShutdownTimeout
-	if shutdownTimeout <= 0 {
-		shutdownTimeout = defaultShutdownTimeout
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
+	cancelSweep()
+	sweepErr := waitForSweep(shutdownCtx, sweepDone)
 	shutdownErr := server.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
 		_ = server.Close()
@@ -183,7 +187,34 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if workerErr != nil {
 		return fmt.Errorf("shut down REST workers: %w", workerErr)
 	}
+	if sweepErr != nil {
+		return fmt.Errorf("stop REST workspace sweeper: %w", sweepErr)
+	}
 	return nil
+}
+
+func newShutdownContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = defaultShutdownTimeout
+	}
+	return context.WithTimeout(context.Background(), timeout)
+}
+
+func waitForSweep(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func cloneVerificationChecks(checks [][]string) [][]string {
+	cloned := make([][]string, len(checks))
+	for i, check := range checks {
+		cloned[i] = append([]string(nil), check...)
+	}
+	return cloned
 }
 
 func serverResultsBase() (string, error) {
@@ -214,20 +245,28 @@ func repositoryAliases(repositories map[string]string) map[string]struct{} {
 	return aliases
 }
 
-func sweepWorkspaces(stop <-chan struct{}, done chan<- struct{}, managers map[string]*restworkspace.Manager, logger *log.Logger) {
+func sweepWorkspaces(ctx context.Context, done chan<- struct{}, managers map[string]*restworkspace.Manager, logger *log.Logger, interval time.Duration) {
 	defer close(done)
-	ticker := time.NewTicker(sweepInterval)
+	if interval <= 0 {
+		interval = sweepInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-stop:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			sweepCtx, cancel := context.WithTimeout(ctx, sweepTimeout)
 			for _, manager := range managers {
-				if report := manager.Sweep(); len(report.Errors) > 0 {
+				if report := manager.SweepContext(sweepCtx); len(report.Errors) > 0 {
 					logCleanup(logger, len(report.Errors))
 				}
+				if sweepCtx.Err() != nil {
+					break
+				}
 			}
+			cancel()
 		}
 	}
 }
@@ -236,13 +275,4 @@ func logCleanup(logger *log.Logger, count int) {
 	if logger != nil {
 		logger.Printf("REST workspace cleanup retained or skipped %d item(s)", count)
 	}
-}
-
-func shutdownWorkers(coordinator *restworker.Coordinator, timeout time.Duration) {
-	if timeout <= 0 {
-		timeout = defaultShutdownTimeout
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	_ = coordinator.Shutdown(ctx)
 }
