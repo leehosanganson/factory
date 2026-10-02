@@ -93,6 +93,7 @@ type Workflow struct {
 	Observer            WorkflowObserver
 	ProcessObserver     func(string, int, bool)
 	OutputWriter        io.Writer
+	DisableTranscripts  bool
 	ExecutionHook       WorkflowExecutionHook
 	PipelineCheckRunner PipelineCheckRunner
 	PipelineCheckEnv    []string
@@ -272,7 +273,7 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 		if runner == nil {
 			runner = processPipelineCheckRunner{}
 		}
-		checksErr := runPipelineChecksWithOutput(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe, runner, w.OutputWriter, w.PipelineCheckEnv)
+		checksErr := runPipelineChecksWithOutput(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe, runner, w.OutputWriter, w.PipelineCheckEnv, !w.DisableTranscripts)
 		if flusher, ok := w.OutputWriter.(interface{ Flush() error }); ok {
 			if flushErr := flusher.Flush(); flushErr != nil {
 				checksErr = errors.Join(checksErr, fmt.Errorf("flush workflow output capture: %w", flushErr))
@@ -314,10 +315,10 @@ func (processPipelineCheckRunner) Run(ctx context.Context, workdir string, args 
 }
 
 func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner PipelineCheckRunner) error {
-	return runPipelineChecksWithOutput(ctx, checks, workdir, runDir, state, observe, runner, nil, nil)
+	return runPipelineChecksWithOutput(ctx, checks, workdir, runDir, state, observe, runner, nil, nil, true)
 }
 
-func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner PipelineCheckRunner, sharedOutput io.Writer, env []string) error {
+func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner PipelineCheckRunner, sharedOutput io.Writer, env []string, retainTranscript bool) error {
 	for i, args := range checks {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("pipeline check interrupted: %w", err)
@@ -332,7 +333,11 @@ func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir
 		if err := observe(startedEvent); err != nil {
 			return fmt.Errorf("persist pipeline check start: %w", err)
 		}
-		log, err := pipelineCheckOpenFile(logPath)
+		var log *os.File
+		var err error
+		if retainTranscript || sharedOutput == nil {
+			log, err = pipelineCheckOpenFile(logPath)
+		}
 		if err != nil {
 			ended := time.Now().UTC()
 			exitCode := -1
@@ -349,12 +354,18 @@ func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir
 			eventErr := observe(completedEvent)
 			return errors.Join(fmt.Errorf("create pipeline check log %s: %w", logName, err), stateErr, eventErr)
 		}
-		output := io.Writer(log)
+		var output io.Writer = log
 		if sharedOutput != nil {
-			output = io.MultiWriter(log, sharedOutput)
+			output = sharedOutput
+			if retainTranscript {
+				output = io.MultiWriter(log, sharedOutput)
+			}
 		}
 		exitCode, runErr := runner.Run(ctx, workdir, args, output, cloneEnvironment(env))
-		closeErr := pipelineCheckCloseFile(log)
+		var closeErr error
+		if log != nil {
+			closeErr = pipelineCheckCloseFile(log)
+		}
 		ended := time.Now().UTC()
 		if closeErr != nil && runErr == nil {
 			exitCode = -1
@@ -382,7 +393,7 @@ func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir
 			return errors.Join(runErr, closeErr, fmt.Errorf("persist pipeline check completion: %w", err))
 		}
 		if closeErr != nil {
-			return fmt.Errorf("close pipeline check transcript %s: %w", logPath, closeErr)
+			return fmt.Errorf("close pipeline check transcript %s: %w", logName, closeErr)
 		}
 		if runErr != nil {
 			if ctx.Err() != nil {
@@ -435,8 +446,8 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 	}
 	stageRunner := w.Agent
 	if w.OutputWriter != nil {
-		if configurable, ok := stageRunner.(interface{ withOutputWriter(io.Writer) Agent }); ok {
-			stageRunner = configurable.withOutputWriter(w.OutputWriter)
+		if configurable, ok := stageRunner.(interface{ WithOutputWriter(io.Writer) Agent }); ok {
+			stageRunner = configurable.WithOutputWriter(w.OutputWriter)
 		}
 	}
 	stageAgent := budgetedAgent{agent: stageRunner, budget: budget, timeout: agentTimeout}

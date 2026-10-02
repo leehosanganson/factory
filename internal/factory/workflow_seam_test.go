@@ -128,6 +128,38 @@ func TestWorkflowSeamDoesNotPublishWithoutPublicationApprovalPath(t *testing.T) 
 	}
 }
 
+func TestWorkflowCanAvoidPerCheckTranscriptsWhileSharingBoundedOutput(t *testing.T) {
+	root := t.TempDir()
+	workdir := filepath.Join(root, "work")
+	if err := os.Mkdir(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	check := filepath.Join(root, "check.sh")
+	if err := os.WriteFile(check, []byte("#!/bin/sh\nprintf 'sensitive check output'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capture := NewBoundedOutputWriter(context.Background(), nil, 8)
+	workflow := Workflow{
+		Agent:  &fakeAgent{outputs: map[string][]string{}},
+		Config: Config{StateDir: filepath.Join(root, "state"), PipelineChecks: [][]string{{check}}},
+		Out:    io.Discard, Workdir: workdir, Stages: []string{"requirements"},
+		OutputWriter: capture, DisableTranscripts: true,
+	}
+	if err := workflow.Run("verify bounded output"); err != nil {
+		t.Fatalf("Workflow.Run() error = %v", err)
+	}
+	if len(capture.Bytes()) > 8 || !capture.Truncated() {
+		t.Fatalf("shared output capture = %q, truncated=%v", capture.String(), capture.Truncated())
+	}
+	runDirs, err := filepath.Glob(filepath.Join(root, "state", "runs", "*"))
+	if err != nil || len(runDirs) != 1 {
+		t.Fatalf("workflow run dirs=%q, err=%v", runDirs, err)
+	}
+	if _, err := os.Stat(filepath.Join(runDirs[0], "pipeline-check-01.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("per-check transcript unexpectedly exists: %v", err)
+	}
+}
+
 func TestProcessPipelineCheckRunnerUsesOnlyExplicitEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	script := filepath.Join(dir, "check.sh")

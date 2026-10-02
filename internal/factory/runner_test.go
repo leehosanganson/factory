@@ -235,6 +235,26 @@ func TestRunnerDrainsProcessOutputAfterSharedCaptureLimit(t *testing.T) {
 	}
 }
 
+func TestRunnerDisableTranscriptStillDrainsAndForwardsBoundedOutput(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "agent.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\000' x\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	capture := NewBoundedOutputWriter(context.Background(), nil, 64)
+	logPath := filepath.Join(dir, "agent.log")
+	runner := Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}, OutputWriter: capture, DisableTranscript: true}
+	if err := runner.RunWithContext(context.Background(), "implement", "prompt", "task", dir, logPath); err != nil {
+		t.Fatalf("RunWithContext() error = %v", err)
+	}
+	if _, err := os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disabled transcript unexpectedly exists: %v", err)
+	}
+	if len(capture.Bytes()) > 64 || !capture.Truncated() || !strings.Contains(capture.String(), "[output truncated]") {
+		t.Fatalf("shared output capture = %q, truncated=%v", capture.String(), capture.Truncated())
+	}
+}
+
 func TestRunnerCapturesAndValidatesPlanSizedProtocolWithoutChangingWhitespace(t *testing.T) {
 	plan := `{"subtasks":[{"id":"model","task":"Implement the model","files":["internal/model.go"],"depends_on":[]},{"id":"tests","task":"Add model tests","files":["internal/model_test.go"],"depends_on":[]}]}`
 	const trailingWhitespaceBytes = 12 * 1024
