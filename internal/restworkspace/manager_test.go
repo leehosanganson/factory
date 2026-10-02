@@ -117,6 +117,131 @@ func TestMarkSucceededWritesAtomicProtectedMarker(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsReplacedConfiguredRepositoryBeforeCreatingWorkspace(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, _ := testManager(t, &now, nil)
+	replacement := createSiblingCheckout(t, repo)
+	repoBackup := swapConfiguredCheckout(t, repo, replacement)
+	if _, err := manager.Create(testJobID); err == nil {
+		t.Fatal("accepted a different valid checkout at the configured path")
+	}
+	jobDir := filepath.Join(manager.root, testJobID)
+	if _, err := os.Lstat(jobDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created result directory for a rejected repository identity: %v", err)
+	}
+	restoreConfiguredCheckout(t, repo, repoBackup, replacement)
+	if _, err := manager.Create(testJobID); err != nil {
+		t.Fatalf("rejected restored original repository identity: %v", err)
+	}
+}
+
+func TestMarkSucceededRejectsReplacedConfiguredRepositoryWithoutMarker(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, _ := testManager(t, &now, nil)
+	workspace, err := manager.Create(testJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := createSiblingCheckout(t, repo)
+	repoBackup := swapConfiguredCheckout(t, repo, replacement)
+	if err := manager.MarkSucceeded(testJobID); err == nil {
+		t.Fatal("marked success after configured repository identity changed")
+	}
+	if _, err := os.Lstat(workspace.WorktreePath); err != nil {
+		t.Fatalf("worktree was modified or removed after rejection: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(manager.root, testJobID, markerName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created completion marker for a rejected repository identity: %v", err)
+	}
+	restoreConfiguredCheckout(t, repo, repoBackup, replacement)
+	if err := manager.MarkSucceeded(testJobID); err != nil {
+		t.Fatalf("rejected restored original repository identity: %v", err)
+	}
+}
+
+func TestCreateRetainsWorktreeIfRepositoryChangesDuringGitAdd(t *testing.T) {
+	now := time.Now().UTC()
+	var manager *Manager
+	var repo, replacement, repoBackup string
+	swapped := false
+	runner := func(ctx context.Context, root string, args ...string) error {
+		if err := runGit(ctx, root, args...); err != nil {
+			return err
+		}
+		if len(args) >= 2 && args[0] == "worktree" && args[1] == "add" {
+			repoBackup = swapConfiguredCheckout(t, repo, replacement)
+			swapped = true
+		}
+		return nil
+	}
+	manager, repo, _ = testManager(t, &now, runner)
+	replacement = createSiblingCheckout(t, repo)
+	defer func() {
+		if swapped {
+			restoreConfiguredCheckout(t, repo, repoBackup, replacement)
+		}
+	}()
+
+	workspace, err := manager.Create(testJobID)
+	if err == nil {
+		t.Fatal("accepted repository identity changed during git worktree add")
+	}
+	if !swapped {
+		t.Fatal("git worktree add did not execute")
+	}
+	if _, err := os.Lstat(workspace.WorktreePath); err == nil {
+		t.Fatal("expected failed Create to return an empty workspace")
+	}
+	worktree := filepath.Join(manager.root, testJobID, "worktree")
+	if _, err := os.Lstat(worktree); err != nil {
+		t.Fatalf("did not retain just-created worktree after identity change: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(manager.root, testJobID, markerName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("created completion marker after identity change: %v", err)
+	}
+}
+
+func createSiblingCheckout(t *testing.T, repo string) string {
+	t.Helper()
+	replacement := filepath.Join(filepath.Dir(repo), "replacement-repo")
+	if err := os.Mkdir(replacement, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, replacement, "init", "-q")
+	gitTest(t, replacement, "config", "user.email", "test@example.com")
+	gitTest(t, replacement, "config", "user.name", "Workspace Test")
+	if err := os.WriteFile(filepath.Join(replacement, "replacement.txt"), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, replacement, "add", ".")
+	gitTest(t, replacement, "commit", "-qm", "replacement")
+	return replacement
+}
+
+func swapConfiguredCheckout(t *testing.T, repo, replacement string) string {
+	t.Helper()
+	repoBackup := repo + "-original"
+	if err := os.Rename(repo, repoBackup); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(replacement, repo); err != nil {
+		_ = os.Rename(repoBackup, repo)
+		t.Fatal(err)
+	}
+	return repoBackup
+}
+
+func restoreConfiguredCheckout(t *testing.T, repo, repoBackup, replacement string) {
+	t.Helper()
+	if err := os.Rename(repo, replacement); err != nil {
+		t.Errorf("restore replacement checkout location: %v", err)
+		return
+	}
+	if err := os.Rename(repoBackup, repo); err != nil {
+		t.Errorf("restore original repository checkout: %v", err)
+	}
+}
+
 func TestSweepRetainsAtBoundaryAndRemovesOnlyStrictlyOlderThan24Hours(t *testing.T) {
 	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
 	manager, _, _ := testManager(t, &now, nil)
