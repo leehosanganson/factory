@@ -35,7 +35,7 @@ func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- run(ctx, config, runtimeOptions{
-			ResultsBase: filepath.Join(t.TempDir(), "state", "factory", "rest-server"),
+			ResultsBase: testResultsBase(t),
 			Executor: runtimeExecutor(func(ctx context.Context, request restjobs.Snapshot) error {
 				calls.Add(1)
 				if request.Request.Task != "review change" || request.Request.Repository != "trusted" {
@@ -191,7 +191,7 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.VerificationChecks = [][]string{{check, "--literal argument", checkMarker}}
-	resultsBase := filepath.Join(t.TempDir(), "state", "factory", "rest-server")
+	resultsBase := testResultsBase(t)
 	listenerReady := make(chan net.Listener, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -207,7 +207,14 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 			},
 		})
 	}()
-	listener := <-listenerReady
+	var listener net.Listener
+	select {
+	case listener = <-listenerReady:
+	case err := <-done:
+		t.Fatalf("server exited before listener startup: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not start a listener")
+	}
 	baseURL := "http://" + listener.Addr().String()
 	waitForStatus(t, baseURL+"/readyz", http.StatusOK)
 	requestBody := `{"repository":"trusted","task":"execute runtime integration"}`
@@ -294,7 +301,7 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 
 func TestRunCancellationDoesNotWaitBeyondDeadlineForBlockedWorkspaceGit(t *testing.T) {
 	config, _ := runtimeFixture(t)
-	resultsBase := filepath.Join(t.TempDir(), "state", "factory", "rest-server")
+	resultsBase := testResultsBase(t)
 	resultsRoot := filepath.Join(resultsBase, aliasDirectory("trusted"), "results")
 	var sweepNow atomic.Int64
 	sweepNow.Store(time.Now().UTC().UnixNano())
@@ -387,7 +394,7 @@ func TestRunRecordsExecutorFailureWithoutExposingDetails(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- run(ctx, config, runtimeOptions{
-			ResultsBase: filepath.Join(t.TempDir(), "state", "factory", "rest-server"),
+			ResultsBase: testResultsBase(t),
 			Executor: runtimeExecutor(func(context.Context, restjobs.Snapshot) error {
 				return errors.New("private /path and credential-secret")
 			}),
@@ -516,6 +523,15 @@ func TestRunRequiresProtectedServerStateParent(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o755 {
 		t.Fatalf("existing broad parent permissions changed: info=%v err=%v", info, err)
 	}
+}
+
+func testResultsBase(t *testing.T) string {
+	t.Helper()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(base, "state", "factory", "rest-server")
 }
 
 func runtimeFixture(t *testing.T) (restserver.Config, string) {
