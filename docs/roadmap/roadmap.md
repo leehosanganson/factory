@@ -1,81 +1,56 @@
 # Factory roadmap
 
-## Direction and status
+## Product direction
 
-Factory's long-term direction is to manage a durable feedback loop that turns intent into deployed, improved software:
+Factory is a RESTful job service for agent-driven repository work. A client submits a bounded job request; Factory executes it against an operator-approved repository, records its lifecycle, and creates or updates a pull request through the configured code-repository provider. Humans retain authority over merge, release, and deployment. Verification evidence and limitations remain visible; agent or process success is not an independent correctness verdict.
 
-**intent → requirements → implementation → review → documentation → CI/CD → deploy → feedback → intent**
+The target MVP has one service and one job lifecycle—not separate REST-task and autonomous issue-to-PR products. Its core path is:
 
-The loop should retain context, decisions, evidence, and outcomes at each transition. Feedback from checks, deployments, users, and operations should refine requirements and future work rather than being discarded at job completion. Human direction remains essential for ambiguity, risk, and approval; automation should not be presented as an independent correctness verdict.
+**request → durable admission → bounded execution → verification → provider PR create/update → inspectable outcome**
 
-## Proposed REST server MVP foundation
+Issue details may be supplied as context or added through a future intake adapter, but issue polling/reconciliation is not a separate MVP. Provider-neutral interfaces keep repository hosting replaceable; each supported provider must implement the same scoped branch/PR behavior.
 
-The proposed MVP is one remote Factory server on a host, using existing Factory business logic to run supported implementation jobs through a server-configured harness as local subprocesses. It uses one shared bearer API key; every holder is trusted with the configured server account's local-process authority, with no per-caller identity or isolation. This is not a sandbox and makes no claim of isolation against malicious callers. The service accepts a configured repository alias, task description, and optional positive issue number; issue URLs are excluded. Branch push, PR create/update, and shared PAT use are deferred until a separately designed, restart-safe, cross-process reconciliation gate can safely resolve uncertain side effects. Clients resubmit after process restart, but external side effects are never blindly retried. Merge, release, and deployment are unavailable. Job status, idempotency, and history are process-memory-only; PostgreSQL, durable restart recovery, backup/restore, and persistent job metadata are deferred. Docker Compose runs the single Factory Server with its local executor, not a per-job container and not a sandbox. Future ephemeral Docker/Pod execution remains server-operator configured and must preserve the same API/job contract. **No REST server exists today.** See the [proposed REST server MVP contract](rest-api-contract.md) and its [execution-mode architecture note](execution-modes.md). The [credential-custody design](credential-custody-design.md) remains a future proposal for OAuth grant custody.
+## Persistence and runtime
 
-Today Factory is a Go CLI with sequential implementation stages, a repository-wide tidy workflow, detached PR monitoring, detached jobs, and opt-in parallel implementation within an eligible implementation stage. It does not currently provide a server, fleet coordinator, issue scheduler, deployment engine, generic arbitrary-command `run`, reusable workflow/task catalog, or chained jobs. The [feature index](../features/README.md) describes implemented behavior.
+The service starts with a simple in-memory backend for local development, demonstrations, and tests. It is intentionally volatile: process restart loses jobs, history, idempotency records, and active execution state. It must never be described as durable across restarts.
 
-This is a directional roadmap, not a commitment to specific features, release dates, or ordering. The capabilities below are aspirations and require design, validation, and explicit product decisions before implementation.
+Persistence is behind a backend interface. An optional SQL backend is recommended for real deployments that need restart durability, retained job history, and reliable idempotency. The SQL design must define schema/migrations, transactions, retention, concurrency/worker ownership, and recovery of interrupted jobs. A deployment requiring restart durability must configure SQL (or another explicitly approved durable backend); memory mode is not an implicit fallback when the configured durable store fails.
 
-## Reusable tasks and composed workflows
+The first deployment is a single Factory server with bounded workers and operator-configured repositories, agent harness, credentials, and limits. Local-process execution and containers are not security sandboxes. Horizontal scaling, a fleet coordinator, remote worker placement, and a web UI are later options, not MVP prerequisites.
 
-A future system may support reusable, versioned task definitions and workflows rather than hard-coding each use case. Reusable units could describe inputs, prerequisites, outputs, safety limits, approvals, verification, and provenance. Composition should preserve clear ownership and auditability: a combined workflow must show which task ran, what evidence it produced, and why the next action was permitted.
+## Pull-request and human boundary
 
-The existing `implement`, `tidy`, and `monitor` workflows are distinct current CLI behavior. A future `run` concept might execute a user-defined workflow, and multiple jobs and job chains might pass explicit results or artifacts between work. These are not current generic runner or chaining capabilities. Design must define dependency handling, cancellation propagation, retries, resource limits, and how partial outcomes are represented before treating composition as safe.
+Creating or updating a PR with the configured code-repository provider is a required part of a successful implementation job, not an optional publication feature. A job must not report success until the provider operation is confirmed and its PR identity/URL is recorded. Retries after timeouts or process interruption must reconcile live provider state before repeating a write; uncertain outcomes are surfaced for recovery rather than blindly creating another branch or PR.
 
-## Full feedback lifecycle
+Factory may commit and push only within the job's approved repository and scope. It does not merge PRs, release artifacts, or deploy software. Approval gates, policy escalation, bounded retries, visible verification results, and safe cancellation preserve human control without making PR creation itself an approval decision.
 
-The intended lifecycle spans requirements through deployment and back to new intent:
+## Current implementation versus target
 
-1. Capture user intent and source evidence.
-2. Refine and approve requirements, constraints, and acceptance criteria.
-3. Implement bounded changes, sequentially or through validated independent work.
-4. Review changes and verify them with appropriate tests and policy checks.
-5. Update documentation based on verified implementation.
-6. Run CI/CD and deployment through explicitly integrated systems.
-7. Observe deployment and operational/user feedback.
-8. Feed evidence and unresolved issues into the next intent/requirements cycle.
+Factory currently has a Go CLI and a local REST job server. The server accepts authenticated bounded requests, runs configured multi-stage workflows in isolated workspaces, and exposes status/history. Its registry and idempotency records are in memory and are lost on restart. It does not yet create or update PRs through a configurable code-repository provider. These are known gaps to the target MVP, not separate product directions.
 
-Factory's present implementation workflow covers requirements, implementation, review, and documentation; tidy covers review/fix/document and local checks; monitor handles bounded existing-PR maintenance. CI/release automation lives in repository GitHub workflows. End-to-end deployment and feedback orchestration are future direction, not present Factory behavior.
+The CLI's `implement`, `tidy`, `monitor`, detached jobs, and `work` commands remain available and are documented under [implemented features](../features/README.md). They are current interfaces, not additional MVP architectures. The local `work` issue-observation commands do not start an autonomous issue-to-PR worker.
 
-The feedback loop should distinguish observations from inferred causes, preserve links to source evidence, and make retries and human decisions visible. It should also allow a workflow to stop safely when evidence is missing or scope changes.
+## Delivery sequence
 
-## Proposed REST server MVP contract
+1. **Define durable job semantics:** canonical job/request and lifecycle, backend interface, idempotent admission, bounded history, retention, worker ownership, cancellation, and recovery behavior.
+2. **Add SQL persistence:** transactions and migrations for jobs, events, idempotency, and execution state; test restart recovery and concurrent admission. Keep the in-memory backend for tests and local development.
+3. **Complete REST job operation:** ensure status/history, safe errors, limits, and recovery semantics behave consistently across backends. A job must have an inspectable outcome after restart when SQL is configured.
+4. **Add provider-neutral repository operations:** configure a code-repository provider and credentials; implement scoped branch and PR create/update, idempotency/reconciliation for uncertain writes, and persist the associated PR identity.
+5. **Integrate and validate the full path:** execute the existing workflow through the service, verify changes, create/update the PR, exercise cancellation/failures/restarts, and prove that no job reports success without a confirmed PR outcome.
+6. **Operational hardening:** document deployment, secret handling, retention/backups, resource bounds, observability, and the limits of local-process/container isolation.
 
-The planned service accepts bounded task requests from HTTP clients such as agents, then schedules server-configured harness subprocesses under bounded in-process queue and worker concurrency. Every API-key holder is trusted with the configured server account's local-process authority; this is not a sandbox or an isolation claim against malicious callers. Clients cannot select an executable or submit commands. It uses a shared API key, configured repository aliases, and may accept a positive issue number as supplemental context; issue URLs are excluded. Job status, idempotency, and bounded history are process-memory-only; an `Idempotency-Key` makes identical retries return the same retained job and conflicts on changed payload, but process exit or terminal-record eviction forgets it. The registry retains a configured maximum number of jobs, evicting oldest terminal records but never queued/active work; per-job event history is capped and reports truncation. A full queue is rejected with `503` and no job record. PostgreSQL, migrations, durable admission, backup/restore, and restart recovery are deferred. Clients resubmit after restart, but external side effects are never blindly retried. Branch push, PR create/update, and shared PAT use are deferred until a separately designed restart-safe, cross-process reconciliation gate can safely resolve uncertain side effects. Merge, release, and deployment are unavailable. Docker Compose runs the single Factory Server with its local subprocess executor, not a per-job container and not a sandbox; future ephemeral Docker/Pod execution is server-operator configured and preserves the API/job contract. Request limits, API-key provisioning, local Compose testing, and operational behavior still require validation. The [REST server contract](rest-api-contract.md) records ordered implementation slices and acceptance gates; the [execution-mode note](execution-modes.md) describes the proposed server/executor boundary. Both remain proposed, not implemented. GitHub App OAuth grant custody remains deferred in the [future credential-custody proposal](credential-custody-design.md).
+These are dependency gates, not dates. CI/CD feedback, issue polling/reconciliation, provider events, additional code hosts, fleet coordination, reusable workflow catalogs, and deployment orchestration can be considered after the single-server request-to-PR lifecycle is proven.
 
-## Durable Factory servers and horizontal scaling
+## Explicit exclusions
 
-A future Factory server could accept workflow requests and run multiple independent jobs with configured concurrency and resource limits. Horizontal scaling requires durable job definitions, stage state, events, logs/artifact references, cancellation, worker ownership, and safe recovery independent of one process. Sequential stages within a job should remain distinct from parallel jobs or task waves.
+- No merge, release, or deployment authority.
+- No general arbitrary-command endpoint or caller-selected executable.
+- No claim that an agent, process, Nix shell, or container is sandboxed.
+- No second MVP for autonomous issue polling; it can later feed the same job API/lifecycle.
+- No horizontal fleet or distributed broker requirement for the initial service.
 
-Before enabling reassignment across instances, prove restart recovery and define durable checkpoints, leases/fencing, idempotency, and handling of uncertain external side effects. A lease expiring cannot prove a paused worker has stopped making changes. Safe resume should require a validated checkpoint or operator reconciliation rather than blind replay.
+See the [REST job contract](rest-api-contract.md) for API and reliability requirements and [execution modes](execution-modes.md) for the server/executor boundary.
 
-Factory instances could run on local infrastructure or remote hosts and scale independently. A shared durable coordination boundary would be needed for job discovery, admission, ownership, and recovery; local state alone cannot coordinate a fleet. Containerization may be one deployment option but is not sufficient isolation or a substitute for external lifecycle management.
+## Feedback loop
 
-See the separate [fleet manager design note](fleet-manager-design.md) for an exploratory topology, authority boundaries, Nix environment considerations, trust assumptions, and open decisions. It is a design proposal, not an implementation specification or commitment.
-
-## Fleet coordination
-
-A future `factory-control` service could register Factory servers, track health/capacity/capabilities, schedule work, drain instances, coordinate configuration/upgrades, and expose fleet-wide job discovery and control. Execution should remain in Factory workers; the coordinator should not duplicate workflow stage logic or create a competing retry loop.
-
-Any fleet design depends on durable shared job state and safe worker ownership first. Worker identity, authenticated outbound communication, store consistency, recovery rules, and treatment of uncertain side effects need explicit answers before production use.
-
-## Possible future integrations
-
-The proposed task-description REST server MVP above is distinct from the autonomous issue-to-PR system below. A REST request may include a positive issue number as supplemental context; issue URLs are excluded. This context alone does not define autonomous issue polling, reconciliation, or issue-driven lifecycle behavior.
-
-- **Autonomous issue-to-PR engineering:** the [issue-to-PR design](autonomous-issue-to-pr-design.md) records the agreed GitHub Issues + GitHub PR MVP, separate provider-neutral tracker/code-host interfaces, durable local queue and shared worker path, continuous issue reconciliation, safety requirements, and ordered implementation gates. A read-only GitHub Issues snapshot adapter implements the tracker contract; explicit `factory work refresh/history` commands record and display durable observations, and `factory work watch` offers opt-in foreground polling with a durable baseline / `waiting_for_human` / terminal `stopped` lifecycle until closure. Polling and recording continue while waiting for a human; lifecycle recovery derives state from immutable version history after a crash. This watch is not an autonomous worker and does not reconcile requirements or restart engineering. `factory work respond` can persist version-pinned human direction for an exactly reconciled `waiting_for_human` request, and `factory work directions` inspects it; these commands do not approve, resume, or initiate any work. A separate read-only GitHub PR snapshot adapter implements the code-host contract, but is not connected to a worker or CLI; branch/PR writes, worker lifecycle, and autonomous continuous reconciliation remain unimplemented. Azure DevOps (both Azure Boards and Azure Repos PRs), server hosting, provider events, and an external distributed broker are outside MVP scope. The full system remains future direction, not implemented behavior or a dated commitment.
-- **CI/CD and deployment:** integrations could carry verified artifacts and approvals across CI and deployment systems, then record deployment outcomes. Factory does not currently deploy software.
-- **Web application:** a UI could build on stable APIs for instances, workflows, jobs, stages, logs, approvals, provenance, and outcomes. It should not introduce a separate execution or persistence authority.
-
-## Suggested sequencing and feedback
-
-1. Validate durable server-side job state, worker ownership, and recovery on a single instance.
-2. Demonstrate multiple concurrent jobs on that instance with explicit resource bounds and traceable stage outcomes.
-3. Add container or other deployment packaging and validate restart behavior without equating process restart with safe replay.
-4. Introduce shared coordination and test horizontal scaling, partitions, stale workers, and reconciliation.
-5. Add fleet control only after worker contracts and ownership are proven.
-6. Explore reusable task definitions, job composition/chains, CI/CD/deployment feedback, and a web interface against the same durable APIs.
-
-Issue-to-PR automation has a separate proposed sequence in the [autonomous issue-to-PR design](autonomous-issue-to-pr-design.md). Its GitHub MVP is based on a durable single-host queue and does not depend on server or fleet milestones above.
-
-At each step, use observed user and operational feedback to revisit intent, document evidence and friction, and adjust the direction. These stages are a planning aid, not a schedule or promise; sequence and scope may change as evidence and product priorities evolve.
+Use observed user and operational feedback to revise the direction. Keep observations distinct from verified causes, preserve evidence, and update documentation when behavior or product decisions change. This roadmap is directional, not a release-date commitment.

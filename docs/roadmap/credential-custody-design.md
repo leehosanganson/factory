@@ -1,8 +1,8 @@
 # GitHub App delegated credential custody design
 
-## Status — future proposal; deferred from REST MVP
+## Status — future credential design; not the current provider decision
 
-**GitHub App OAuth linking and encrypted user-grant custody are future proposals, not part of the proposed REST MVP.** The MVP uses one shared bearer API key; it does not select or require a GitHub credential and does not perform branch pushes or PR create/update. Shared PAT use and those writes are deferred until a separately designed, restart-safe, cross-process reconciliation gate can resolve uncertain side effects. This document's technical material is retained as a future proposal only; none of its OAuth handlers, encrypted grant storage, remote work admission, or worker execution is implemented. See the [proposed REST server contract](rest-api-contract.md) for current planned direction. If OAuth custody is revisited, an encryption key may be supplied through an environment variable or a configured secret-file path; key bytes must not be placed in ordinary config. The exact provisioning mechanism remains a future deployment gate. The specific choices in this future design require review before any OAuth implementation. A Factory API bearer credential and a future GitHub App user grant would have separate roles.
+This design explores GitHub App OAuth grant custody. It is not implemented and does not define the current MVP credential strategy. The target Factory MVP requires creating/updating a PR through the configured code-repository provider, with credentials operator-configured and least-privilege. The provider and credential mechanism must be selected and specified before provider writes are implemented; this proposal is one possible GitHub-specific option, not an approved requirement. See the [REST job contract](rest-api-contract.md) for current product direction. If OAuth custody is revisited, the security material below remains a design input, not a settled implementation contract.
 
 > **Scope:** The sections below preserve an earlier per-principal GitHub App OAuth proposal for possible future use; they do not describe the REST MVP.
 
