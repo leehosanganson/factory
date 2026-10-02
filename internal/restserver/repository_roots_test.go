@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateRepositoryRootsAcceptsExactGitRootAndLinkedWorktree(t *testing.T) {
@@ -27,6 +28,19 @@ func TestValidateRepositoryRootsAcceptsExactGitRootAndLinkedWorktree(t *testing.
 	config.Repositories = map[string]string{"linked": linked}
 	if err := config.ValidateRepositoryRoots(); err != nil {
 		t.Fatalf("valid linked worktree root rejected: %v", err)
+	}
+}
+
+func TestValidateRepositoryRootsBoundsGitProcessLookup(t *testing.T) {
+	root := t.TempDir()
+	config := Config{Repositories: map[string]string{"repo": root}}
+	t.Setenv("PATH", t.TempDir())
+	started := time.Now()
+	if err := config.ValidateRepositoryRoots(); err == nil {
+		t.Fatal("validation succeeded without Git")
+	}
+	if elapsed := time.Since(started); elapsed > 2*repositoryRootValidationTimeout {
+		t.Fatalf("repository validation exceeded its bound: %s", elapsed)
 	}
 }
 

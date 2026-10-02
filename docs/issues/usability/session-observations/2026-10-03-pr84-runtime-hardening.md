@@ -1,0 +1,7 @@
+# PR #84 REST runtime hardening session
+
+- **Type:** Implementation session observation; not a user-reported finding.
+- **Scope:** Hardened workspace sweep cancellation/shutdown, added trusted server-only `verification_checks` configuration, and documented optional verification behavior. The PR's existing HTTP handler/auth ordering, Compose status, and roadmap files were left unchanged.
+- **Evidence:** `SweepContext` passes cancellation into repository-validation, worktree-list, and worktree-remove Git commands; canceled cleanup leaves uncertain workspaces retained. A blocked-Git runtime test exercises the hourly sweeper and verifies server cancellation returns within the shared configured deadline. A runtime workflow test confirms a configured argv check executes with a literal argument containing whitespace.
+- **Verification:** Focused and race tests for restworkspace, restserver, runtime, and restworker passed. `make test`, `make vet`, `make build`, and `git diff --check` passed. The pre-change macOS CI failure was traced to a runtime test waiting indefinitely for a listener when symlinked temp paths caused repository-root validation to exit; the fixture now uses a canonical temp path and the wait reports early server exit.
+- **Friction:** The Makefile has no `help` target. Running `go test` from another working directory while using `-C` did not target the isolated checkout; commands were run from the checkout after correcting this.

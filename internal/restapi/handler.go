@@ -80,6 +80,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if h.config.Ready != nil && !h.config.Ready() {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "The server is not accepting requests.")
+		return
+	}
 
 	if !isJobsPath(r.URL.Path) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
@@ -285,6 +289,8 @@ func (h *Handler) writeManagerError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "queue_full", "Job queue is full.")
 	case errors.Is(err, restjobs.ErrRegistryFull):
 		writeError(w, http.StatusServiceUnavailable, "registry_full", "Job registry is full.")
+	case errors.Is(err, restjobs.ErrManagerClosed):
+		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "The server is shutting down.")
 	case errors.Is(err, restjobs.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	default:

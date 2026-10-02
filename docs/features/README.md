@@ -1,12 +1,13 @@
 # Implemented features
 
-This section describes Factory's current Go CLI behavior, not the aspirational roadmap. Factory does not currently provide a server, fleet coordinator, generic arbitrary-command `run`, or job chaining.
+This section describes Factory's current Go CLI behavior, not the aspirational roadmap. Factory provides a local REST job server, but not a fleet coordinator, generic arbitrary-command `run`, or job chaining.
 
 - [Implementation workflow](implementation.md) — requirements, implementation, review, and documentation, with optional approval gates and eligible parallel implementation.
 - [Tidy workflow](tidy.md) — repository review/fix/document/verify, with foreground publishing safeguards and a nonpublishing detached mode.
 - [Detached jobs](jobs.md) — durable lifecycle for detached implementation, tidy, and monitor jobs.
 - [PR monitor](monitor.md) — detached, guarded maintenance of an existing open pull request.
 - [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, opt-in foreground GitHub issue polling, and version-pinned human-direction records; requests remain queued because no autonomous worker is implemented.
+- [REST job server](rest-server.md) — authenticated, bounded local job execution, isolated workspaces, and graceful runtime lifecycle.
 
 ## Shared behavior
 
