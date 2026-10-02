@@ -28,9 +28,11 @@ type Runner struct {
 	Env []string
 	// OutputWriter optionally receives a copy of stdout and stderr.
 	OutputWriter io.Writer
+	// DisableTranscript prevents retaining a separate unbounded process log.
+	DisableTranscript bool
 }
 
-func (r Runner) withOutputWriter(output io.Writer) Agent {
+func (r Runner) WithOutputWriter(output io.Writer) Agent {
 	r.OutputWriter = output
 	return r
 }
@@ -165,33 +167,41 @@ func (r Runner) runContext(ctx context.Context, stage, systemPrompt, task, workd
 	for i, arg := range r.Config.Args {
 		args[i] = expand(arg, stage, systemPrompt, task, workdir)
 	}
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return fmt.Errorf("create log directory: %w", err)
+	var log *os.File
+	var err error
+	if !r.DisableTranscript {
+		if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+			return fmt.Errorf("create log directory: %w", err)
+		}
+		log, err = os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("open log: %w", err)
+		}
+		defer log.Close()
 	}
-	log, err := os.OpenFile(logPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open log: %w", err)
-	}
-	defer log.Close()
 	cmd := exec.CommandContext(ctx, command, args...)
 	configureProcessCancellation(cmd)
 	cmd.Dir = workdir
 	if r.Env != nil {
 		cmd.Env = append([]string(nil), r.Env...)
 	}
+	var transcript io.Writer = log
+	if r.DisableTranscript {
+		transcript = io.Discard
+	}
 	if r.OutputWriter == nil {
-		cmd.Stdout = log
+		cmd.Stdout = transcript
 		if response != nil {
-			cmd.Stdout = io.MultiWriter(log, response)
+			cmd.Stdout = io.MultiWriter(transcript, response)
 		}
-		cmd.Stderr = log
+		cmd.Stderr = transcript
 	} else {
-		stdoutWriters := []io.Writer{log, r.OutputWriter}
+		stdoutWriters := []io.Writer{transcript, r.OutputWriter}
 		if response != nil {
 			stdoutWriters = append(stdoutWriters, response)
 		}
 		cmd.Stdout = io.MultiWriter(stdoutWriters...)
-		cmd.Stderr = io.MultiWriter(log, r.OutputWriter)
+		cmd.Stderr = io.MultiWriter(transcript, r.OutputWriter)
 	}
 	if err := cmd.Start(); err != nil {
 		if ctx.Err() != nil {

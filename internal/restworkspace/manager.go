@@ -130,6 +130,9 @@ func New(config Config) (*Manager, error) {
 	}, nil
 }
 
+// RepositoryRoot returns the canonical trusted checkout root owned by this manager.
+func (m *Manager) RepositoryRoot() string { return m.repoRoot }
+
 // Create creates a separate detached worktree at the repository's current
 // checkout HEAD and private state/output directories. It creates no branch and
 // leaves partial results in place on failure so startup recovery fails closed.
