@@ -30,13 +30,15 @@ type Config struct {
 	MaxTaskBytes        int
 	RepositoryAliases   map[string]struct{}
 	Ready               func() bool
+	ReadyError          func() error
 }
 
 // Handler serves the REST API using the supplied manager and immutable API key.
 type Handler struct {
-	manager restjobs.Manager
-	key     restserver.APIKey
-	config  Config
+	manager    restjobs.Manager
+	key        restserver.APIKey
+	config     Config
+	readyError func() error
 }
 
 var _ http.Handler = (*Handler)(nil)
@@ -57,6 +59,20 @@ func New(manager restjobs.Manager, key restserver.APIKey, config Config) (*Handl
 	return &Handler{manager: manager, key: key, config: config}, nil
 }
 
+func (h *Handler) ready() bool {
+	return h.config.Ready != nil && h.config.Ready()
+}
+
+func (h *Handler) readinessError() error {
+	if h.config.Ready != nil && !h.config.Ready() {
+		return errors.New("server not ready")
+	}
+	if h.config.ReadyError != nil {
+		return h.config.ReadyError()
+	}
+	return nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz" && r.URL.EscapedPath() == "/healthz" {
 		if r.Method != http.MethodGet {
@@ -73,14 +89,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if h.config.Ready != nil && h.config.Ready() {
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-		} else {
+		if h.config.Ready == nil || h.readinessError() != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		} else {
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 		}
 		return
 	}
-	if h.config.Ready != nil && !h.config.Ready() {
+	if h.readinessError() != nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", "The server is not accepting requests.")
 		return
 	}
