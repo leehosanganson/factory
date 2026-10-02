@@ -39,6 +39,7 @@ type WorkflowEvent struct {
 	Command    []string
 	Transcript string
 	Outcome    string
+	Truncated  bool
 	ExitCode   *int
 	StartedAt  time.Time
 	EndedAt    time.Time
@@ -54,6 +55,7 @@ type workflowEventRecord struct {
 	Command    []string   `json:"command,omitempty"`
 	Transcript string     `json:"transcript,omitempty"`
 	Outcome    string     `json:"outcome,omitempty"`
+	Truncated  bool       `json:"truncated,omitempty"`
 	ExitCode   *int       `json:"exit_code,omitempty"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	EndedAt    *time.Time `json:"ended_at,omitempty"`
@@ -94,6 +96,7 @@ type Workflow struct {
 	ProcessObserver     func(string, int, bool)
 	OutputWriter        io.Writer
 	DisableTranscripts  bool
+	DisableStateTask    bool
 	ExecutionHook       WorkflowExecutionHook
 	PipelineCheckRunner PipelineCheckRunner
 	PipelineCheckEnv    []string
@@ -134,9 +137,16 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	if isWithin(target, root) {
 		return fmt.Errorf("state directory %s must be outside target directory %s", root, target)
 	}
-	runDir, state, err := createRun(root, w.Workdir, task)
+	stateTask := task
+	if w.DisableStateTask {
+		stateTask = ""
+	}
+	runDir, state, err := createRun(root, w.Workdir, stateTask)
 	if err != nil {
 		return err
+	}
+	if w.DisableStateTask {
+		state.Task = ""
 	}
 	if w.RunCreated != nil {
 		w.RunCreated(runDir, state.ID)
@@ -274,6 +284,18 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 			runner = processPipelineCheckRunner{}
 		}
 		checksErr := runPipelineChecksWithOutput(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe, runner, w.OutputWriter, w.PipelineCheckEnv, !w.DisableTranscripts)
+		if outputState, ok := w.OutputWriter.(interface{ Truncated() bool }); ok && outputState.Truncated() {
+			if !state.OutputTruncated {
+				state.OutputTruncated = true
+				if stateErr := writeState(runDir, state); stateErr != nil {
+					checksErr = errors.Join(checksErr, fmt.Errorf("persist output truncation state: %w", stateErr))
+				}
+				truncatedEvent := WorkflowEvent{RunID: state.ID, Type: "output.truncated", Stage: state.Stage, Message: "combined workflow output cap reached", Truncated: true}
+				if eventErr := observe(truncatedEvent); eventErr != nil {
+					checksErr = errors.Join(checksErr, eventErr)
+				}
+			}
+		}
 		if flusher, ok := w.OutputWriter.(interface{ Flush() error }); ok {
 			if flushErr := flusher.Flush(); flushErr != nil {
 				checksErr = errors.Join(checksErr, fmt.Errorf("flush workflow output capture: %w", flushErr))
@@ -326,9 +348,13 @@ func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir
 		started := time.Now().UTC()
 		logName := fmt.Sprintf("pipeline-check-%02d.log", i+1)
 		logPath := filepath.Join(runDir, logName)
+		transcript := logName
+		if !retainTranscript && sharedOutput != nil {
+			transcript = ""
+		}
 		startedEvent := WorkflowEvent{
 			RunID: state.ID, Type: "check.started", Stage: args[0],
-			Command: append([]string(nil), args...), Transcript: logName, StartedAt: started,
+			Command: append([]string(nil), args...), Transcript: transcript, StartedAt: started,
 		}
 		if err := observe(startedEvent); err != nil {
 			return fmt.Errorf("persist pipeline check start: %w", err)
@@ -348,7 +374,7 @@ func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir
 			stateErr := writeState(runDir, state)
 			completedEvent := WorkflowEvent{
 				RunID: state.ID, Type: "check.completed", Stage: args[0],
-				Command: append([]string(nil), args...), Transcript: logName, Outcome: "failure",
+				Command: append([]string(nil), args...), Transcript: transcript, Outcome: "failure",
 				ExitCode: &exitCode, StartedAt: started, EndedAt: ended,
 			}
 			eventErr := observe(completedEvent)
@@ -384,9 +410,22 @@ func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir
 				outcome = "canceled"
 			}
 		}
+		outputTruncated := false
+		if outputState, ok := sharedOutput.(interface{ Truncated() bool }); ok {
+			outputTruncated = outputState.Truncated()
+			if outputTruncated && !state.OutputTruncated {
+				state.OutputTruncated = true
+				if stateErr := writeState(runDir, state); stateErr != nil {
+					return errors.Join(runErr, closeErr, fmt.Errorf("persist output truncation state: %w", stateErr))
+				}
+				if eventErr := observe(WorkflowEvent{RunID: state.ID, Type: "output.truncated", Stage: args[0], Message: "combined workflow output cap reached", Truncated: true}); eventErr != nil {
+					return errors.Join(runErr, closeErr, eventErr)
+				}
+			}
+		}
 		completedEvent := WorkflowEvent{
 			RunID: state.ID, Type: "check.completed", Stage: args[0],
-			Command: append([]string(nil), args...), Transcript: logName, Outcome: outcome,
+			Command: append([]string(nil), args...), Transcript: transcript, Outcome: outcome, Truncated: outputTruncated,
 			ExitCode: &exitCode, StartedAt: started, EndedAt: ended,
 		}
 		if err := observe(completedEvent); err != nil {
@@ -416,7 +455,7 @@ func persistWorkflowEvent(runDir string, event WorkflowEvent) error {
 	record := workflowEventRecord{
 		Version: 1, Timestamp: time.Now().UTC(), RunID: event.RunID,
 		Type: event.Type, Stage: event.Stage, Message: event.Message,
-		Command: event.Command, Transcript: event.Transcript, Outcome: event.Outcome,
+		Command: event.Command, Transcript: event.Transcript, Outcome: event.Outcome, Truncated: event.Truncated,
 		ExitCode: event.ExitCode, StartedAt: optionalTime(event.StartedAt), EndedAt: optionalTime(event.EndedAt),
 	}
 	data, err := json.Marshal(record)
@@ -494,11 +533,24 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 			return runAgentWithContext(primaryCtx, stageAgent, stage, prompt, stageTask, stageWorkdir, stageLog)
 		})
 	})
+	outputTruncated := false
+	if outputState, ok := w.OutputWriter.(interface{ Truncated() bool }); ok {
+		outputTruncated = outputState.Truncated()
+		if outputTruncated && !state.OutputTruncated {
+			state.OutputTruncated = true
+			if err := writeState(runDir, state); err != nil {
+				return false, fmt.Errorf("persist output truncation state: %w", err)
+			}
+			if err := observe(WorkflowEvent{RunID: state.ID, Type: "output.truncated", Stage: stage, Message: "combined workflow output cap reached", Truncated: true}); err != nil {
+				return false, err
+			}
+		}
+	}
 	if runErr != nil {
-		if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.failed", Stage: stage, Message: boundedOutput(runErr.Error()+"\n"+stageLog, evaluatorOutputLimit)}); err != nil {
+		if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.failed", Stage: stage, Message: boundedOutput(runErr.Error()+"\n"+stageLog, evaluatorOutputLimit), Truncated: outputTruncated}); err != nil {
 			return false, err
 		}
-	} else if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.completed", Stage: stage, Message: stageLog}); err != nil {
+	} else if err := observe(WorkflowEvent{RunID: filepath.Base(runDir), Type: "stage.completed", Stage: stage, Message: stageLog, Truncated: outputTruncated}); err != nil {
 		return false, err
 	}
 	if ctx.Err() != nil {

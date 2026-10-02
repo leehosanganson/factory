@@ -2,6 +2,7 @@ package restworker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -284,6 +285,98 @@ func TestFactoryExecutorRetainsWorkspaceUnmarkedOnStageOrCheckFailure(t *testing
 				t.Fatalf("failed workspace was not retained: %v", err)
 			}
 		})
+	}
+}
+
+func TestFactoryExecutorBoundsCombinedStageAndCheckFilesAndRecordsTruncation(t *testing.T) {
+	checkRoot := t.TempDir()
+	checkMarker := filepath.Join(checkRoot, "check-finished")
+	check := filepath.Join(checkRoot, "large-check.sh")
+	if err := os.WriteFile(check, []byte("#!/bin/sh\ndd if=/dev/zero bs=1048576 count=5 2>/dev/null | tr '\\000' c\ntouch '"+checkMarker+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agent := &executorTestAgent{outputBytes: 5 << 20}
+	executor, manager, _ := newExecutorFixture(t, "20s", restJobOutputLimit, agent, []string{check})
+	var observed []factory.WorkflowEvent
+	executor.observer = factory.WorkflowObserverFunc(func(event factory.WorkflowEvent) error {
+		observed = append(observed, event)
+		return nil
+	})
+	if err := executor.Execute(context.Background(), executorJob("sensitive user task")); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := strings.Join(agent.calls, ","); got != "requirements,implement,review,document" {
+		t.Fatalf("stages stopped after reaching the output cap: %q", got)
+	}
+	if _, err := os.Stat(checkMarker); err != nil {
+		t.Fatalf("check did not finish draining after output cap: %v", err)
+	}
+	var retained int64
+	for _, root := range []string{manager.workspace.StatePath, manager.workspace.OutputPath} {
+		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				retained += info.Size()
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if retained > restJobOutputLimit+(256<<10) {
+		t.Fatalf("output/state retained %d bytes; cap plus metadata allowance is %d", retained, restJobOutputLimit+(256<<10))
+	}
+	outputInfo, err := os.Stat(filepath.Join(manager.workspace.OutputPath, "workflow.log"))
+	if err != nil || outputInfo.Size() != restJobOutputLimit {
+		t.Fatalf("combined output file size=%v err=%v, want exact configured cap %d", outputInfo, err, restJobOutputLimit)
+	}
+	statePaths, err := filepath.Glob(filepath.Join(manager.workspace.StatePath, "runs", "*", "state.json"))
+	if err != nil || len(statePaths) != 1 {
+		t.Fatalf("state paths=%q err=%v", statePaths, err)
+	}
+	stateData, err := os.ReadFile(statePaths[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(stateData), "[omitted]") || strings.Contains(string(stateData), strings.Repeat("r", 128)) || strings.Contains(string(stateData), strings.Repeat("c", 128)) {
+		t.Fatal("workflow state duplicated task or stage output")
+	}
+	var state struct {
+		OutputTruncated bool `json:"output_truncated"`
+	}
+	if err := json.Unmarshal(stateData, &state); err != nil || !state.OutputTruncated {
+		t.Fatalf("state truncation metadata=%+v err=%v", state, err)
+	}
+	eventsData, err := os.ReadFile(filepath.Join(filepath.Dir(statePaths[0]), "workflow-events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(eventsData), `"type":"output.truncated"`) || !strings.Contains(string(eventsData), `"truncated":true`) || strings.Contains(string(eventsData), strings.Repeat("r", 128)) || strings.Contains(string(eventsData), strings.Repeat("c", 128)) {
+		t.Fatalf("workflow events lack safe truncation metadata or include output: %s", eventsData)
+	}
+	foundAPIEvent := false
+	for _, event := range observed {
+		if event.Type == "output.truncated" && event.Truncated && event.Message == "combined workflow output cap reached" {
+			foundAPIEvent = true
+		}
+		if strings.Contains(event.Message, "sensitive user task") || strings.Contains(event.Message, strings.Repeat("r", 128)) || strings.Contains(event.Message, strings.Repeat("c", 128)) {
+			t.Fatalf("observer event exposed task/output data: %+v", event)
+		}
+	}
+	if !foundAPIEvent {
+		t.Fatalf("WorkflowObserver did not receive safe truncation event: %+v", observed)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(statePaths[0]), "task.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("task transcript was retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(statePaths[0]), "01-requirements.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stage transcript was retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(statePaths[0]), "pipeline-check-01.log")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("check transcript was retained: %v", err)
 	}
 }
 
