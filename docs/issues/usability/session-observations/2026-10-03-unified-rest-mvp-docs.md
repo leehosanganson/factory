@@ -1,0 +1,7 @@
+# Unified REST MVP documentation review
+
+- **Type:** Documentation alignment observation; product direction was clarified by the user.
+- **Decision recorded:** One REST job-service MVP. In-memory persistence is the simple volatile starter; optional SQL is recommended for restart durability. Creating/updating a PR through the configured code-repository provider is required for an implementation job to succeed. Issue polling is not a separate MVP and, if pursued, should feed the same job lifecycle.
+- **Changes:** Reframed README, roadmap, REST contract/executor note, feature overview, server docs, AGENTS guidance, and Factory operating skill around that direction. Renamed the prior autonomous issue-to-PR design as a later issue-intake note and marked the older conflicting REST security proposal as superseded.
+- **Verification:** `git diff --check` and local Markdown-link checks passed. No code changed; Go is unavailable in the environment, so code tests were not run.
+- **Friction:** The previous roadmap split issue-to-PR work from the REST server and had multiple old claims (no server, no publication, durable local queue) that now need to remain clearly historical or be retired as documentation evolves.

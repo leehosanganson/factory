@@ -6,7 +6,7 @@ By default `implement` starts a detached implementation job and attaches to its 
 
 ## Automatic PR publication
 
-Automatic publication is enabled by default for implementation workflows. Set `auto_publish` to `false` in the configuration file to opt out; see the [configuration example](../../config.json.example).
+For the current CLI implementation workflow, automatic publication is enabled by default. Set `auto_publish` to `false` to opt out; see the [configuration example](../../config.json.example). This is existing CLI behavior. The target REST MVP separately requires provider PR creation/update for a server implementation job to succeed; see the [REST job contract](../roadmap/rest-api-contract.md).
 
 Both the default detached-and-attached `factory implement <description>` path and `factory implement --detach <description>` run publication in the detached worker. Gated `factory implement --gate <description>` runs the isolated workflow and publisher in the foreground, with stage approvals. Every implementation mode—including `auto_publish: false`—requires the target to be a Git checkout root on a named branch. The clean-checkout requirement applies only when automatic publication is enabled. The workflow runs in a separate Git worktree and task branch named `factory-implement-<id>`; the invoking checkout's files, branch, and HEAD are not used for generated changes or changed by publication.
 

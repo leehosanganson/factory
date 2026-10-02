@@ -1,114 +1,73 @@
-# Proposed REST server MVP contract
+# REST job API and lifecycle contract
 
-## Status and scope
+## Status and product boundary
 
-**Proposed, not implemented.** Factory currently has REST configuration, request validation, an authenticated HTTP handler, and process-local job admission/inspection foundations, but no REST server entry point or remote job execution integration. This document records the planned single-host service and result lifecycle; it is not an implementation claim or delivery commitment.
+This is the target contract for Factory's single REST job-service MVP. Factory already has a local REST server with authenticated bounded admission, in-memory job tracking, isolated workspaces, and execution of the configured multi-stage workflow. SQL persistence, restart recovery, and pull-request create/update through a configurable code-repository provider are not yet implemented. Proposed behavior below is a product requirement, not a claim about today's server.
 
-The service accepts bounded task requests for configured repository aliases and executes the existing multi-stage Factory requirements, implementation, review, and documentation workflow, followed by configured verification checks. A job may launch multiple configured harness subprocesses across stages; it is not restricted to one literal harness invocation. A job-wide deadline and a cumulative 16 MiB stdout/stderr capture cap per job bound all stages and subprocesses; output must still be drained after the cap, with truncation marked. The listener defaults to loopback (`127.0.0.1:8080`); operators may explicitly configure another address. Callers cannot select an executable or submit command arguments, shell text, or a generic command. A bounded in-memory queue and configured worker concurrency limit govern execution. Every API-key holder is trusted with the configured server account's local-process authority: this design is not a sandbox and does not claim isolation from malicious callers. Publication is forbidden in this MVP: jobs must not create commits, push branches, create/update PRs, or use a PAT. Merge, release, and deployment remain unavailable. See the [proposed execution-mode architecture](execution-modes.md) for the server/executor boundary and local-process MVP direction.
+The product path is one service and one lifecycle:
 
-## Authentication and GitHub authority
+**HTTP request → job admission → execution → verification → create/update PR → inspectable result**
 
-- All `/v1/jobs` routes require one configured shared bearer API key. `/healthz` and `/readyz` are the only unauthenticated routes and return minimal health/readiness information without sensitive details. All key holders share the same trust domain and can inspect every retained job; there is no per-caller identity, isolation, or ownership boundary. Do not accept caller-supplied principal identities. The key must not be exposed to the harness.
-- The MVP does not select or require a GitHub credential and does not perform branch pushes or PR create/update. A future design for those writes must define credential custody and least privilege as part of the restart-safe, cross-process reconciliation gate; OAuth, GitHub App, and shared-PAT approaches are not selected by this contract.
-- The [credential-custody proposal](credential-custody-design.md) describes possible future OAuth grant custody, not an MVP credential requirement.
+Opening or updating a PR through the configured code-repository provider is required for a successful implementation job. Merge, release, and deployment are out of scope. Agent success alone is not a correctness verdict.
 
-## Client, request, and admission
+## Persistence modes
 
-A remote client (for example, a Hermes agent) submits a normal authenticated HTTP task request to Factory Server. The client is not a worker manager and does not launch or control the configured coding harness directly; Factory Server owns job admission, scheduling, execution, status, and history. Publication is explicitly excluded from the MVP as described below. Client technology is not otherwise part of the server contract.
+- **Memory backend:** the simple local-development and test mode. Jobs, history, idempotency keys, and execution state are volatile and lost on process restart. The service must disclose this mode and must not imply durable acceptance.
+- **SQL backend:** optional and recommended for real deployments. It must persist accepted jobs, idempotency, lifecycle/history, worker ownership/checkpoints, and provider-side-effect references sufficiently to recover or clearly classify interrupted work after restart. Schema/migrations, transactions, retention, concurrency, and recovery behavior must be explicit.
+- When SQL is explicitly configured and unavailable or unhealthy, admission fails closed; the server must not silently fall back to memory. Deployments requiring restart durability must use SQL or another explicitly supported durable backend.
 
+Both backends implement the same API and lifecycle contract. Tests should exercise the shared behavioral suite against memory and SQL. SQL acceptance requires process-restart tests, duplicate/concurrent admission tests, and interrupted-side-effect recovery tests.
 
-A proposed `POST /v1/jobs` request contains:
+## Request and API
 
-```json
-{
-  "repository": "widget",
-  "task": "Add a bounded note to the README; do not change code.",
-  "issue": 42
-}
-```
+The current route shape is the target unless a reviewed contract change supersedes it:
 
-- `repository` is a configured repository alias, not an arbitrary repository URL. Server configuration maps each alias to an approved local Git checkout root and its repository identity; callers cannot submit filesystem paths. `task` is a required nonblank task description. `issue` is optional supplemental context and accepts only a positive issue number in the alias's configured repository. Issue URLs are excluded from this MVP.
-- The task description—not an issue—is the requested work; the optional issue number does not start autonomous polling, reconciliation, or issue tracking.
-- The request must not accept arbitrary shell, command, or executable fields.
-- Bound request body and task sizes before decoding/processing. Require `Content-Type: application/json` for job submission. Reject malformed JSON, unknown fields, invalid UTF-8, blank task descriptions, invalid issue numbers, and unknown repository aliases. The implementation uses configured request/task limits; oversized request bodies are rejected before admission.
-- Admission validates and creates the job in the process-local registry and bounded in-memory queue before returning acceptance. Require a client-generated `Idempotency-Key` header. Repeating the same key with an identical normalized request while retained returns the existing job; reusing a key with a different request returns `409 Conflict`. Idempotency keys are forgotten when the process exits or their terminal record is evicted.
-- Configure a maximum total registry record count, a maximum event count per job, and a task-byte limit. Proposed values are `max_records: 1000`, `max_events_per_job: 200`, and `task_bytes: 262144`; these are planned limits, not claims about current defaults or runtime configuration. Never evict queued or active jobs. At the record cap, evict the oldest terminal job records as needed; if all retained records are queued/active and the cap is reached, reject admission. Eviction makes prior status/history return `404` and forgets its idempotency key. When an individual job exceeds its event cap, drop oldest events and mark its history as truncated.
-- Bound the manager's aggregate logical memory estimate at 256 MiB, in addition to the record/event/task limits. This is a deterministic accounting budget, not a process RSS limit: charge UTF-8 byte lengths of retained request and event strings plus fixed per-record and per-event allowances. The implementation must define those fixed allowances explicitly and use the same accounting rules for admission, event changes, and eviction; do not describe the budget as measured heap or total process memory.
-- If the bounded pending queue has no capacity, return `503 Service Unavailable` with a stable capacity error and do not create a job record. A later client retry must reuse its `Idempotency-Key`.
+- `GET /healthz` and `GET /readyz` are minimal unauthenticated probes.
+- `POST /v1/jobs` submits a bounded request for a configured repository alias and task; a positive issue number may be optional context, not a separate issue-polling workflow.
+- `GET /v1/jobs/{id}` returns the job status.
+- `GET /v1/jobs/{id}/history` returns bounded lifecycle events and a truncation indicator.
 
-A successful admission returns `202 Accepted` with an opaque job ID, status snapshot, and links to status/history; an idempotent replay returns that same job rather than queueing another. The supported job routes are `POST /v1/jobs`, `GET /v1/jobs/{id}`, and `GET /v1/jobs/{id}/history`. These routes require bearer authentication before route-specific handling. `/healthz` reports process liveness and `/readyz` reports whether configuration is valid and the server is accepting requests; both are unauthenticated, minimal, and disclose no sensitive data. Readiness is not a claim that workers are idle or that an external dependency is healthy.
+All job routes require bearer authentication. Requests cannot select arbitrary filesystem paths, executables, shell text, or verification commands. The server owns repository/provider configuration and enforces request, task, concurrency, time, history, and output bounds. Preserve strict JSON validation, safe generic errors, secret/path redaction, exact route/method behavior, and the current loopback listener default.
 
-Representative JSON DTOs (RFC 3339 UTC timestamps; optional `issue` is omitted when absent):
+Use a client-supplied `Idempotency-Key`. An identical retry maps to the same job; reuse with a different normalized payload conflicts. In memory mode this guarantee lasts only while the process and record remain. In SQL mode the key's scope and retention period must be durable and documented; never evict or expire keys in a way that permits duplicate active work or unsafe duplicate PRs.
 
-```json
-{
-  "job": {
-    "id": "7ac42bd3-67fb-47be-b4c2-68269438d4bd",
-    "request": {"repository": "widget", "task": "Add a bounded note.", "issue": 42},
-    "status": "queued",
-    "created_at": "2026-10-02T12:00:00Z",
-    "updated_at": "2026-10-02T12:00:00Z"
-  },
-  "replayed": false,
-  "links": {
-    "self": "/v1/jobs/7ac42bd3-67fb-47be-b4c2-68269438d4bd",
-    "history": "/v1/jobs/7ac42bd3-67fb-47be-b4c2-68269438d4bd/history"
-  }
-}
-```
+## Job lifecycle and provider operations
 
-`GET /v1/jobs/{id}` returns the `job` object itself. The submitted repository, task, and optional issue are included in both admission and status responses. Task text is intentionally visible to every key holder: holders share the trusted server-account authority and are not isolated from one another. This is not a per-user/private task store.
+A job is not successful until Factory has:
 
-```json
-{
-  "job_id": "7ac42bd3-67fb-47be-b4c2-68269438d4bd",
-  "events": [
-    {"at": "2026-10-02T12:00:00Z", "type": "queued", "message": "Job admitted"},
-    {"at": "2026-10-02T12:01:00Z", "type": "running", "message": "Job started"}
-  ],
-  "truncated": false
-}
-```
+1. admitted and recorded the request according to the selected persistence mode;
+2. executed the configured requirements/implementation/review/documentation workflow in a job-specific workspace;
+3. run configured verification checks and recorded results/limitations;
+4. created or updated the job's PR through the configured code-repository provider; and
+5. persisted the confirmed provider outcome and PR identity/URL.
 
-History fields follow the current `internal/restjobs` model: bounded timestamp, type, and optional message entries, plus a truncation flag. The manager's lifecycle values are `queued`, `running`, `succeeded`, `failed`, and `canceled`; its corresponding built-in event types use those values. Do not add HTTP-only lifecycle states or promise other event types. Each event has a type of at most 64 bytes and an optional message of at most 4,096 bytes; history is bounded per job by server configuration, drops oldest events on overflow, and sets `truncated`. Sanitize messages before exposing them; never include agent output, host paths, executable names, credentials/secrets, or stack traces. Since API credentials are shared, any valid key holder can inspect any retained job. Status/history for unknown or evicted jobs returns `404`; history reports whether older events were truncated.
+The repository-provider interface is independent of issue-tracker integrations. The initial provider choice is configuration, not embedded in the canonical job model. Provider implementations must support scoped repository identity, branch and PR lookup/create/update, and enough stable identifiers to reconcile retries. Credentials are operator-configured, least-privilege, excluded from task prompts, records, logs, and API responses, and passed only to the operations that need them.
 
-Path matching is exact. Only `GET /healthz` and `GET /readyz` are supported for probe paths; other methods return `405 Method Not Allowed` with `Allow: GET`. Unsupported methods on recognized job paths return `405` with `Allow`; unknown paths return `404`. All paths under `/v1/jobs`, including unsupported methods and unknown job subpaths, pass bearer authentication before route/method resolution. Do not redirect API routes.
+Treat timeouts, disconnects, and restarts around branch/PR writes as uncertain outcomes. Reconcile live provider state against the durable job/branch/PR identity before retrying. Do not blindly create another branch or PR. If state cannot be resolved safely, preserve the workspace and expose a recoverable/needs-operator outcome; do not report success.
 
-## Process-local jobs and lifecycle
+Cancellation is cooperative and must record which external operation may have completed. A cancellation or issue closure must not silently delete workspaces or close/merge a PR. Ambiguous or over-policy scope pauses for human direction. Factory never merges, releases, or deploys.
 
-- Job records, execution status, idempotency keys, and history exist only in the running server process's memory. No PostgreSQL, SQL migration, file-backed job store, or durable job history is required by this MVP.
-- The service runs accepted jobs in bounded in-process workers. A worker executes the existing multi-stage Factory requirements/implementation/review/documentation workflow and configured verification checks; multiple configured harness subprocesses may be started during one job. Subprocesses use argument-vector invocations rather than caller-controlled shell text. Each job receives a separate workspace and agent session, with one job-wide deadline and a cumulative 16 MiB subprocess-output capture limit across stdout and stderr for every stage and subprocess combined. Once the capture cap is reached, continue draining subprocess output to avoid blocking the child, discard bytes beyond the cap, and mark captured output as truncated; reaching the cap alone does not fail or stop the job. Every subprocess runs with the configured server account's local-process authority; it is not a sandbox. Worker execution and job tracking share one process lifetime, so this is not a distributed or horizontally scalable service.
-- A process crash or forced termination loses all job records, history, idempotency data, and knowledge of active execution. Clients must resubmit after restart; the server cannot resume jobs or recover their status. A recognized successful workspace may remain on disk for inspection, but its completion marker is cleanup metadata only and does not recover the job record, history, or execution status. The MVP performs no branch push or PR create/update; publication is forbidden. No external side effect may be blindly retried; before any future retry, a separately designed restart-safe, cross-process reconciliation gate must resolve what happened or require human inspection.
-- On graceful shutdown, stop accepting requests, cancel active jobs and their harness processes, allow bounded cancellation/cleanup, then exit. Successful workspaces/results remain available for human local inspection after completion. On verified success, write protected, validated completion metadata in the workspace parent recording the successful outcome and completion time. Automatic cleanup is permitted only when that metadata establishes an age strictly greater than 24 hours. A periodic sweep runs at startup and in the background; therefore deletion may occur later than the 24-hour threshold, not exactly at it. It removes only well-formed, recognized successful-result directories, after rejecting symlink/path escapes and revalidating against safe races. Failed, canceled, unknown, orphaned, or unparseable directories are retained for operator inspection, including after restart. A failed check, unsafe path/race, or missing/corrupt/lost external completion metadata must fail closed and retain the directory; loss of metadata can therefore leave successful results uncollected until operator action. Remove only through validated paths and only after workers exit. All process-local job records disappear on exit, including completed history.
-- Do not claim durable acceptance, restart recovery, exactly-once execution, or recovery of process/agent memory. This MVP explicitly accepts these limitations in exchange for avoiding a database and migrations.
+## Security and trust
 
-## Local deployment testing
+The service accepts work that executes agent and repository-controlled content with the server account's local-process authority. A local process, Nix shell, or container is not a security sandbox. Define the trust boundary for API-key holders, repository allowlists, provider credentials, network exposure, and untrusted issue/repository/PR content. The API key must not be passed to the harness. Keep external text and generated output as untrusted data; it cannot override user scope, policy, or credential boundaries.
 
-Provide a Docker Compose setup for local deployment testing once the server entry point exists. It should run a single Factory Server with its configured local-subprocess executor, mount configured repository checkouts and protected API-key files, and configure the harness server-side. Compose does not run a per-job container and is not a security sandbox or production-hardening claim. Future ephemeral Docker-container or Kubernetes-Pod execution remains operator-configured and must retain the same API/job contract; neither is an isolation guarantee against malicious API-key holders. The remote caller can be any HTTP client, including an agent such as Hermes; credentials must travel over an appropriately protected connection in deployed use.
+Expose sanitized status/history rather than raw agent transcripts or host paths. Bound subprocess output while continuing to drain child pipes after the capture limit. Do not describe limits as RSS guarantees unless actually enforced at the OS/container level.
 
-## Ordered implementation slices
+## Current runtime and implementation gates
 
-These slices are dependency-ordered; they are planning gates, not claims of existing behavior or delivery dates. Keep each independently reviewable and preserve the CLI's current behavior.
+The implemented `factory server` currently uses the memory backend. It authenticates bounded requests, executes configured workflows, isolates job workspaces, exposes status/history, and performs bounded shutdown/cleanup. It does not currently offer SQL persistence or provider PR writes. The implemented behavior is documented in [REST job server](../features/rest-server.md) and [server configuration](../features/rest-server-config.md).
 
-1. **Server configuration and runtime boundaries.** Define server-only configuration for listener, repository aliases, checkout roots, harness executable/argument template, resource limits, and protected API-key file path. Validate exact Git roots and strict API-key file ownership/mode/no-symlink rules. Add startup loading and ensure the coding-harness child environment excludes the API key. No HTTP or job execution yet.
-2. **Volatile job manager.** Implement a concurrency-safe process-local registry, bounded pending queue and worker slots, stable opaque IDs, in-process idempotency, status transitions, and bounded history. Define queue-full/repeated-idempotency behavior and tests for concurrent admission, status/history inspection, and memory/history limits. No database, disk queue, or recovery behavior.
-3. **Authenticated HTTP API.** Add a separately testable `net/http` handler for unauthenticated minimal `GET /healthz` and `GET /readyz`, `POST /v1/jobs`, `GET /v1/jobs/{id}`, and bounded `GET /v1/jobs/{id}/history`. Default the listener to loopback. Require the shared bearer API key on every `/v1/jobs` path; validate request size/schema/UTF-8/unknown fields and issue-number semantics. Implement the error envelope and mappings below. Verify authorization, exact method/path behavior, status codes, safe errors, redaction, queue-full handling, and DTOs with handler tests.
-4. **In-process worker and harness lifecycle.** Connect accepted jobs to bounded workers. Each job gets a distinct server-created workspace/session; Factory's multi-stage workflow may start multiple server-selected harness subprocesses, all bounded by a job-wide deadline and 16 MiB cumulative per-job subprocess-output capture across stdout, stderr, stages, and subprocesses. Continue draining output after the cap, discard excess bytes, and mark output truncated without failing solely because the cap was reached. Invocations use no caller-controlled shell parsing. Processes run with the server account's local-process authority; this is not a sandbox. Implement cancellation propagation, process-group cleanup, graceful shutdown admission stop, bounded worker exit, and safe workspace handling. Preserve successful results for human local inspection and implement protected completion metadata plus startup/periodic age-based cleanup as specified above. Sweep only well-formed recognized successes older than 24 hours; reject symlinks/path escapes and safe-races, and retain failed/canceled/unknown/orphaned/unparseable directories. Test competing jobs, multi-invocation limits, cancellation, shutdown, cleanup failure, and workspace handling with fake harness executables.
-5. **Factory workflow integration.** Adapt the existing multi-stage requirements/implementation/review/documentation workflow and configured verification checks behind an injectable job execution interface while preserving CLI state and behavior. A job may invoke the configured harness multiple times across workflow stages; enforce one job-wide deadline and cumulative 16 MiB stdout/stderr capture across those invocations rather than treating a subprocess invocation as the job. Continue draining after the capture cap and report truncation without failing solely due to the cap. Validate configured checkout root, isolate task workspaces, and expose only sanitized status/history—not raw unfiltered logs or host paths. Test supported harness contracts where practical; unsupported differences must fail clearly rather than run caller-supplied commands.
-6. **Safe side-effect design gate (deferred from MVP).** Before enabling shared PAT use, branch push, or PR create/update, design and test restart-safe cross-process reconciliation for uncertain outcomes. Specify credential custody, idempotent association, and operator escalation when state cannot be established. Do not blindly retry external side effects. This is a separate gate, not an MVP implementation slice.
-7. **Local Compose and end-to-end acceptance.** Package one Factory Server with its configured local-subprocess executor in Docker Compose for local testing, without PostgreSQL. Mount explicit repository/config/API-key inputs; document image build, port exposure, and that Compose/containerization is not a sandbox. Exercise authenticated submission through status/history, and verify process restart loses registry state as specified and graceful shutdown cancels workers safely.
+Delivery gates for the target MVP:
 
-**MVP gate:** the full path from HTTP admission through the existing multi-stage requirements/implementation/review/documentation workflow and configured verification checks to inspectable in-process status/history and a completed, verified task must work under the job-wide deadline and cumulative 16 MiB stdout/stderr capture bound, with continued draining and truncation marking after the cap. A job may use multiple harness subprocesses. Successful workspaces/results remain locally inspectable and are eligible for automatic cleanup only after protected completion metadata establishes an age greater than 24 hours; startup/periodic cleanup is fail-closed and preserves ambiguous or unsafe results for operator inspection. Process exit loses job records; clients resubmit after restart; no publication or external side effect is allowed; authentication is tested; merge, release, and deployment are unavailable; the documented local Compose flow works without a database.
+1. Define persistence interfaces and durable lifecycle semantics without changing the existing memory-mode API contract.
+2. Add optional SQL persistence and migrations; fail closed when configured storage is unavailable; prove restart and concurrency behavior.
+3. Define/configure the code-repository provider interface and credential boundary.
+4. Implement idempotent branch/PR reconciliation, create/update, and durable recording of the confirmed result.
+5. Exercise end-to-end request-to-PR behavior including failure, cancellation, restart, duplicate requests, provider outages, and uncertain writes. Confirm no implementation job reports success before the PR outcome is recorded.
+6. Document memory-mode volatility, SQL setup/recovery, backup/retention, security boundaries, and provider configuration.
 
-## Limits, errors, and deferred controls
+These are design and delivery gates, not claims of implementation or dates. Issue polling/reconciliation, provider events, additional hosting/fleet layers, UI, merge, release, and deployment are not prerequisites for this MVP. If issue intake is added later, it feeds the same REST job lifecycle rather than creating a second autonomous issue-to-PR product.
 
-- Job-route failures use one stable JSON envelope: `{"error":{"code":"invalid_request","message":"Request is invalid."}}`. `message` is safe, generic text; clients branch on `code`, not message. Never return stack traces, API keys, authorization headers, raw provider payloads, sensitive filesystem paths, executable names, or agent output; never log API-key values.
-- Stable code-to-status mapping: `400 malformed_json`, `400 unknown_field`, and `400 invalid_request` (including invalid/unknown repository alias, blank or invalid task, invalid issue, invalid UTF-8, and malformed/missing idempotency key); `401 unauthenticated`; `404 not_found` (unknown/evicted job or unknown path); `409 idempotency_conflict`; `503 queue_full` and `503 registry_full`; `405 method_not_allowed`; `415 unsupported_media_type`; `413 body_too_large`; `500 internal_error`. Do not return validation details that reveal server configuration. Responses for `/healthz` and `/readyz` are minimal and contain no error detail or sensitive data.
-- `GET /healthz` returns `200 {"status":"ok"}` while the process is alive. `GET /readyz` returns `200 {"status":"ready"}` only while configuration is valid and the server is accepting requests; while not ready (including graceful shutdown), it returns `503 {"status":"not_ready"}`. Both are unauthenticated and disclose no job, configuration, host, or dependency details.
-- Rate limiting is deferred. This proposal does not promise rate limits, `429`, or a `Retry-After` contract. Request/body input bounds and bounded in-memory job/history capacity remain necessary and do not constitute rate limiting.
-- Concurrency, queue capacity, total retained job count, per-job event count, task/body bounds, manager logical-memory budget, job-wide deadline, aggregate output limit, harness executable/arguments, and resource bounds are server configuration, not caller-controlled job fields. Proposed values are `max_records: 1000`, `max_events_per_job: 200`, `task_bytes: 262144`, a 256 MiB manager logical-memory budget, and a 16 MiB cumulative subprocess-output capture per job across stdout/stderr and all subprocesses. The logical estimate counts request/event string bytes plus fixed record/event allowances; it is not RSS. Subprocess output continues to be drained after the capture cap and is marked truncated. The configured harness may be launched multiple times within one job for the multi-stage workflow; process-pool/session reuse is not part of this direction. These values are proposed contract choices only and must not be read as implemented runtime configuration.
-- PostgreSQL-backed persistence, database migrations, backup/restore, and durable restart recovery are explicitly deferred. Revisit them only if product requirements change to require jobs or history to survive process exit.
+## Proposed REST configuration reference
 
-## Explicit human boundary
-
-The MVP worker does not push an implementation branch or create/update a PR; those writes require the separate reconciliation gate above. Merge, release, and deployment are unavailable. Successful process exit is not an independent correctness verdict; verification evidence and limitations should remain reviewable by a human.
+[The server configuration guide](../features/rest-server-config.md) describes the implemented schema. SQL connection/configuration fields and repository-provider credential settings remain to be designed and must not be invented in example configs before implementation.

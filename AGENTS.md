@@ -2,7 +2,7 @@
 
 ## Working in this repository
 
-- This is a standard-library Go CLI. Follow existing architecture and conventions; read `README.md`, the [implemented feature documentation](docs/features/README.md), and nearby code before making substantive changes.
+- This is a standard-library Go CLI with a local REST job server. Read `README.md`, the [implemented feature documentation](docs/features/README.md), the [target REST job contract](docs/roadmap/rest-api-contract.md), and nearby code before substantive changes.
 - Preserve user changes. Keep changes focused, avoid speculative abstractions/dependencies, and do not reformat or alter unrelated files.
 - For substantive engineering work, use Factory's [`implement` workflow](.agents/skills/factory/SKILL.md) by default. If already inside an active Factory workflow, continue there rather than starting a nested Factory workflow. Use a focused direct edit for small isolated fixes, questions, research, and review-only work; consult the skill for `tidy` and `monitor` limits.
 - Clarify user goals, constraints, and acceptance criteria before consequential choices. Keep the user in control; request explicit approval for proposed usability fixes before implementation. Approval gates are opt-in unless requested.
@@ -34,4 +34,4 @@ Actionable code-review findings belong in `docs/to-fix.md` only when a code revi
 - `docs/roadmap/` — future direction and design notes; aspirational items are not claims of current behavior.
 - `.github/workflows/` — CI and release automation.
 
-The project is a standard-library-only Go CLI; do not describe roadmap concepts such as a Factory server, fleet manager, issue scheduler, generic arbitrary `run`, or chained jobs as implemented. Current functionality is documented in [features](docs/features/README.md); future direction is in the [roadmap](docs/roadmap/roadmap.md).
+The project has a local REST job server and CLI. Do not describe SQL persistence or provider PR writes as implemented: the current REST registry is memory-backed, while SQL durability and required PR create/update belong to the target MVP. Do not describe a fleet manager, issue scheduler, generic arbitrary `run`, or chained jobs as implemented. Current behavior is documented in [features](docs/features/README.md); intended product direction is in the [roadmap](docs/roadmap/roadmap.md) and [REST job contract](docs/roadmap/rest-api-contract.md).
