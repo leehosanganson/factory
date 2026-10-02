@@ -13,12 +13,16 @@ import (
 
 var ErrInvalidConfig = errors.New("invalid restworker configuration")
 
-// Executor runs one claimed job. Implementations should honor ctx
-// cancellation. Returned error details are deliberately not added to job
-// history.
+// Executor runs one claimed job. Implementations should honor ctx cancellation.
 type Executor interface {
 	Execute(ctx context.Context, job restjobs.Snapshot) error
 }
+type ResultExecutor interface {
+	ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error)
+}
+
+type ProviderOutcomeExecutor interface{ RequiresProviderOutcome() bool }
+type ResultCompletionExecutor interface{ CompleteResult(restjobs.Snapshot) error }
 
 // CoordinatorConfig selects the maximum number of executor goroutines. The
 // manager independently enforces its own MaxConcurrentJobs bound.
@@ -120,6 +124,40 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 				status = restjobs.StatusFailed
 			}
 		}()
+		if required, ok := c.executor.(ProviderOutcomeExecutor); ok && required.RequiresProviderOutcome() {
+			executor, resultCapable := c.executor.(ResultExecutor)
+			if !resultCapable {
+				return
+			}
+			outcome, err := executor.ExecuteWithResult(c.ctx, job)
+			if err != nil {
+				if c.ctx.Err() != nil {
+					status = restjobs.StatusCanceled
+				}
+				return
+			}
+			if outcome == nil || c.manager.RecordProviderOutcome(job.ID, *outcome) != nil {
+				return
+			}
+			if completion, ok := c.executor.(ResultCompletionExecutor); ok && completion.CompleteResult(job) != nil {
+				return
+			}
+			status = restjobs.StatusSucceeded
+			return
+		}
+		if executor, ok := c.executor.(ResultExecutor); ok {
+			outcome, err := executor.ExecuteWithResult(c.ctx, job)
+			if err == nil && outcome != nil {
+				if c.manager.RecordProviderOutcome(job.ID, *outcome) == nil {
+					status = restjobs.StatusSucceeded
+				}
+			} else if err == nil {
+				status = restjobs.StatusSucceeded
+			} else if c.ctx.Err() != nil {
+				status = restjobs.StatusCanceled
+			}
+			return
+		}
 		if err := c.executor.Execute(c.ctx, job); err == nil {
 			status = restjobs.StatusSucceeded
 		} else if c.ctx.Err() != nil {

@@ -71,6 +71,21 @@ func TestLoadConfigRejectsSQLiteRelativePathAndMemoryPath(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsGitHubProviderAndRejectsPartialProviderConfig(t *testing.T) {
+	valid := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","provider":{"backend":"github","token_file":"/run/secrets/provider","base_branch":"main","repositories":{"widget":"acme/widget"}}}`
+	path := writeConfig(t, valid)
+	config, err := LoadConfig(path)
+	if err != nil || config.Provider.Backend != "github" || config.Provider.Repositories["widget"] != "acme/widget" {
+		t.Fatalf("LoadConfig() = (%+v,%v)", config.Provider, err)
+	}
+	for _, provider := range []string{`{"backend":"github","token_file":"relative","base_branch":"main","repositories":{"widget":"acme/widget"}}`, `{"backend":"github","token_file":"/run/token","base_branch":"main","repositories":{"other":"acme/widget"}}`, `{"backend":"gitlab","token_file":"/run/token"}`} {
+		bad := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","provider":`+provider+`}`)
+		if _, err := LoadConfig(bad); err == nil {
+			t.Errorf("provider config %s accepted", provider)
+		}
+	}
+}
+
 func TestLoadConfigParsesOperatorVerificationChecksWithoutShellParsing(t *testing.T) {
 	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"verification_checks":[["go","test","./..."],["./scripts/check.sh","--strict mode"]],"api_key_file":"/run/secrets/key"}`)
 	config, err := LoadConfig(path)

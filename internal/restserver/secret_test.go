@@ -10,6 +10,27 @@ import (
 	"testing"
 )
 
+func TestProviderTokenLoadsPrivatelyAndAuthenticates(t *testing.T) {
+	path := writeSecret(t, "provider-token\n", 0o600)
+	token, err := LoadProviderToken(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !token.Authenticate("provider-token") || token.Authenticate("wrong") {
+		t.Fatal("provider token authentication mismatch")
+	}
+	if fmt.Sprint(token) != "[REDACTED]" || strings.Contains(fmt.Sprintf("%#v", token), "provider-token") {
+		t.Fatal("provider token formatting leaked secret")
+	}
+}
+
+func TestLoadProviderTokenRejectsOversizePrivateFile(t *testing.T) {
+	path := writeSecret(t, strings.Repeat("a", apiKeyFileLimit+1), 0o600)
+	if _, err := LoadProviderToken(path); err == nil {
+		t.Fatal("oversized token accepted")
+	}
+}
+
 func TestLoadAPIKeyAcceptsSingleLineEndingsAndAuthenticates(t *testing.T) {
 	for _, tc := range []struct {
 		name string

@@ -3,6 +3,7 @@ package restserver
 import (
 	"crypto/sha256"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -66,6 +67,61 @@ func LoadAPIKey(path string) (APIKey, error) {
 	}
 	return APIKey{value: string(data)}, nil
 }
+
+type ProviderToken struct{ value string }
+
+func (token ProviderToken) Value() string { return token.value }
+
+func LoadProviderToken(path string) (ProviderToken, error) {
+	if path == "" {
+		return ProviderToken{}, fmt.Errorf("provider token file path must not be empty")
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return ProviderToken{}, fmt.Errorf("open provider token file: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return ProviderToken{}, fmt.Errorf("stat provider token file: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !info.Mode().IsRegular() || info.Mode().Perm()&^0o600 != 0 || info.Mode().Perm()&0o400 == 0 || !ok || stat.Uid != uint32(os.Geteuid()) {
+		return ProviderToken{}, errors.New("provider token file must be a private, owner-readable regular file owned by the effective user")
+	}
+	if info.Size() > apiKeyFileLimit {
+		return ProviderToken{}, errors.New("provider token file is too large")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, apiKeyFileLimit+1))
+	if err != nil || len(data) > apiKeyFileLimit {
+		return ProviderToken{}, errors.New("read provider token file")
+	}
+	if info.Size() > int64(apiKeyFileLimit) {
+		return ProviderToken{}, errors.New("provider token file is too large")
+	}
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
+		if len(data) > 0 && data[len(data)-1] == '\r' {
+			data = data[:len(data)-1]
+		}
+	}
+	if !validAPIKey(data) {
+		return ProviderToken{}, errors.New("provider token file must contain one nonempty token without whitespace")
+	}
+	return ProviderToken{value: string(data)}, nil
+}
+
+func (token ProviderToken) Authenticate(value string) bool {
+	if token.value == "" || value == "" {
+		return false
+	}
+	want, got := sha256.Sum256([]byte(token.value)), sha256.Sum256([]byte(value))
+	return subtle.ConstantTimeCompare(want[:], got[:]) == 1
+}
+
+func (ProviderToken) String() string   { return "[REDACTED]" }
+func (ProviderToken) GoString() string { return "[REDACTED]" }
 
 // Authenticate reports whether token matches this shared key.
 func (key APIKey) Authenticate(token string) bool {

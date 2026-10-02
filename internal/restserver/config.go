@@ -58,6 +58,7 @@ type Config struct {
 	VerificationChecks [][]string        `json:"verification_checks,omitempty"`
 	APIKeyFile         string            `json:"api_key_file"`
 	Persistence        PersistenceConfig `json:"persistence"`
+	Provider           ProviderConfig    `json:"provider"`
 	Limits             Limits            `json:"limits"`
 }
 
@@ -85,6 +86,13 @@ type Limits struct {
 type PersistenceConfig struct {
 	Backend string `json:"backend"`
 	Path    string `json:"path,omitempty"`
+}
+
+type ProviderConfig struct {
+	Backend      string            `json:"backend,omitempty"`
+	TokenFile    string            `json:"token_file,omitempty"`
+	BaseBranch   string            `json:"base_branch,omitempty"`
+	Repositories map[string]string `json:"repositories,omitempty"`
 }
 
 // DefaultConfig returns conservative resource limits and a loopback-only listener.
@@ -164,6 +172,27 @@ func (c Config) Validate() error {
 	default:
 		return errors.New("persistence.backend must be memory or sqlite")
 	}
+	if c.Provider.Backend != "" && c.Provider.Backend != "github" {
+		return errors.New("provider.backend must be github when configured")
+	}
+	if c.Provider.Backend == "github" {
+		if !filepath.IsAbs(c.Provider.TokenFile) || strings.TrimSpace(c.Provider.TokenFile) == "" || strings.ContainsRune(c.Provider.TokenFile, 0) {
+			return errors.New("provider.token_file must be an absolute path")
+		}
+		if !validBranchName(c.Provider.BaseBranch) {
+			return errors.New("provider.base_branch must be a valid branch name")
+		}
+		if len(c.Provider.Repositories) != len(c.Repositories) {
+			return errors.New("provider.repositories must map every configured repository alias")
+		}
+		for alias, repo := range c.Provider.Repositories {
+			if _, ok := c.Repositories[alias]; !ok || !validGitHubRepository(repo) {
+				return errors.New("provider.repositories must map configured aliases to valid owner/repository names")
+			}
+		}
+	} else if c.Provider.TokenFile != "" || c.Provider.BaseBranch != "" || len(c.Provider.Repositories) != 0 {
+		return errors.New("provider settings require provider.backend github")
+	}
 	if err := validateListenAddress(c.ListenAddress); err != nil {
 		return err
 	}
@@ -206,6 +235,16 @@ func validateListenAddress(address string) error {
 		return errors.New("listen_address port must be between 1 and 65535")
 	}
 	return nil
+}
+
+var providerBranchPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$`)
+var providerRepositoryPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+
+func validBranchName(value string) bool {
+	return providerBranchPattern.MatchString(value) && !strings.Contains(value, "..") && !strings.Contains(value, "//")
+}
+func validGitHubRepository(value string) bool {
+	return providerRepositoryPattern.MatchString(value) && !strings.Contains(value, "..")
 }
 
 func validateVerificationChecks(checks [][]string) error {
@@ -351,11 +390,18 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "api_key_file": {}, "persistence": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "api_key_file": {}, "persistence": {}, "provider": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "persistence":
 		fields = map[string]struct{}{"backend": {}, "path": {}}
+	case "provider":
+		if key == "backend" || key == "token_file" || key == "base_branch" {
+			return true
+		}
+		if key == "repositories" {
+			return true
+		}
 	case "limits":
 		fields = map[string]struct{}{"request_body_bytes": {}, "task_bytes": {}, "queue_capacity": {}, "workers": {}, "max_records": {}, "max_events_per_job": {}, "registry_bytes": {}, "job_timeout": {}, "harness_output_bytes": {}}
 	case "repositories":
@@ -391,7 +437,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "persistence", "repositories", "verification_checks":
+	case "harness", "limits", "persistence", "provider", "repositories", "verification_checks":
 		return key
 	default:
 		return ""

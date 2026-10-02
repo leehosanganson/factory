@@ -506,6 +506,9 @@ func TestRunRequiresProtectedServerStateParent(t *testing.T) {
 	if err := os.Mkdir(unsafeServerParent, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(unsafeServerParent, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	// Existing broad parent directories are not silently chmodded or trusted
 	// for cleanup; the workspace package rejects them at construction.
 	called := false

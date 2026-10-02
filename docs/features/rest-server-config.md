@@ -23,6 +23,14 @@ This file configures the implemented `factory server` command. Configuration is 
     "backend": "sqlite",
     "path": "/var/lib/factory/jobs.db"
   },
+  "provider": {
+    "backend": "github",
+    "token_file": "/run/secrets/github-token",
+    "base_branch": "main",
+    "repositories": {
+      "widget": "acme/widget"
+    }
+  },
   "verification_checks": [
     ["go", "test", "./..."],
     ["go", "vet", "./..."]
@@ -53,4 +61,6 @@ The server captures no more than the configured combined stdout/stderr limit per
 
 `persistence.backend` defaults to `memory`, which is volatile and loses jobs, history, and idempotency records on restart. Set `backend` to `sqlite` and provide an absolute `path` for restart-durable storage. The parent directory must already exist and be private (no group/other permissions); new database files are created with owner-only access. SQLite schema upgrades run before the listener starts. Failures are fatal—there is no fallback to memory. The database is single-server storage; do not share it across hosts/network filesystems. Back it up using SQLite-consistent backup procedures. No down migration is provided because downgrading would risk destroying job data.
 
-Key files must be regular, non-symlink files owned by the effective user, owner-readable, and inaccessible to group/others. The shared key is read at startup; rotation requires restart. Raw keys are never represented in JSON or formatting. API credentials are not passed to the harness.
+`provider` is optional. When configured, `backend` must be `github`, `token_file` must point to an absolute private regular file, `base_branch` selects the PR target, and `repositories` maps every configured alias to its exact GitHub `owner/repository`. Startup checks the GitHub token and provider API; readiness continues probing the selected store. The provider pushes only to the matching configured GitHub remote and creates or updates one PR per job-specific branch. If branch push or PR state is uncertain, the job fails and its workspace is retained; it does not report success. Memory mode stores provider outcomes only for the life of the process, so use SQLite when restart durability is required. Never use credentials in repository remote URLs.
+
+Key files must be regular, non-symlink files owned by the effective user, owner-readable, and inaccessible to group/others. The shared key and provider token are read at startup; rotation requires restart. Raw secrets are redacted in formatting and are not passed to the workflow harness.
