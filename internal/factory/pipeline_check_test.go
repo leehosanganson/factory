@@ -465,7 +465,7 @@ type fakePipelineCheckRunner struct {
 	run     func(context.Context) (int, error)
 }
 
-func (r *fakePipelineCheckRunner) Run(ctx context.Context, workdir string, args []string, output io.Writer) (int, error) {
+func (r *fakePipelineCheckRunner) Run(ctx context.Context, workdir string, args []string, output io.Writer, env []string) (int, error) {
 	r.workdir = workdir
 	r.args = append([]string(nil), args...)
 	if _, err := io.WriteString(output, r.output); err != nil {

@@ -70,26 +70,38 @@ type WorkflowObserverFunc func(WorkflowEvent) error
 
 func (f WorkflowObserverFunc) ObserveWorkflowEvent(event WorkflowEvent) error { return f(event) }
 
+// WorkflowExecutionHook optionally replaces stage execution.
+type WorkflowExecutionHook func(ctx context.Context, stage, prompt, task, workdir, logPath string, output io.Writer) error
+
+// PipelineCheckRunner runs one configured check without invoking a shell.
+type PipelineCheckRunner interface {
+	Run(ctx context.Context, workdir string, args []string, output io.Writer, env []string) (int, error)
+}
+
 // Workflow coordinates fresh agent processes and human approval gates.
 type Workflow struct {
-	Agent            Agent
-	Config           Config
-	In               io.Reader
-	Out              io.Writer
-	Workdir          string
-	Terminal         bool
-	Gate             bool
-	RequireComplete  bool
-	Stages           []string
-	FinalApproval    string
-	Observer         WorkflowObserver
-	ProcessObserver  func(string, int, bool)
-	DeferCompletion  bool
-	Managed          bool
-	RunCreated       func(runDir, runID string)
-	stageBudgetLimit time.Duration
-	statusInterval   time.Duration
-	statusCall       func(context.Context, string, string, string, string) (string, error)
+	Agent               Agent
+	Config              Config
+	In                  io.Reader
+	Out                 io.Writer
+	Workdir             string
+	Terminal            bool
+	Gate                bool
+	RequireComplete     bool
+	Stages              []string
+	FinalApproval       string
+	Observer            WorkflowObserver
+	ProcessObserver     func(string, int, bool)
+	OutputWriter        io.Writer
+	ExecutionHook       WorkflowExecutionHook
+	PipelineCheckRunner PipelineCheckRunner
+	PipelineCheckEnv    []string
+	DeferCompletion     bool
+	Managed             bool
+	RunCreated          func(runDir, runID string)
+	stageBudgetLimit    time.Duration
+	statusInterval      time.Duration
+	statusCall          func(context.Context, string, string, string, string) (string, error)
 }
 
 // Run starts a persisted run and executes the complete human-gated workflow.
@@ -256,8 +268,18 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 		return fail(fmt.Errorf("workflow interrupted: %w", ctx.Err()))
 	}
 	if !w.DeferCompletion {
-		if err := runPipelineChecks(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe, processPipelineCheckRunner{}); err != nil {
-			return fail(err)
+		runner := w.PipelineCheckRunner
+		if runner == nil {
+			runner = processPipelineCheckRunner{}
+		}
+		checksErr := runPipelineChecksWithOutput(ctx, w.Config.PipelineChecks, w.Workdir, runDir, state, observe, runner, w.OutputWriter, w.PipelineCheckEnv)
+		if flusher, ok := w.OutputWriter.(interface{ Flush() error }); ok {
+			if flushErr := flusher.Flush(); flushErr != nil {
+				checksErr = errors.Join(checksErr, fmt.Errorf("flush workflow output capture: %w", flushErr))
+			}
+		}
+		if checksErr != nil {
+			return fail(checksErr)
 		}
 	}
 	if w.DeferCompletion {
@@ -269,16 +291,15 @@ func (w Workflow) RunContext(ctx context.Context, task string) error {
 	return nil
 }
 
-type pipelineCheckRunner interface {
-	Run(context.Context, string, []string, io.Writer) (int, error)
-}
-
 type processPipelineCheckRunner struct{}
 
-func (processPipelineCheckRunner) Run(ctx context.Context, workdir string, args []string, output io.Writer) (int, error) {
+func (processPipelineCheckRunner) Run(ctx context.Context, workdir string, args []string, output io.Writer, env []string) (int, error) {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	configureProcessCancellation(cmd)
 	cmd.Dir = workdir
+	if env != nil {
+		cmd.Env = cloneEnvironment(env)
+	}
 	cmd.Stdout = output
 	cmd.Stderr = output
 	err := cmd.Run()
@@ -292,7 +313,11 @@ func (processPipelineCheckRunner) Run(ctx context.Context, workdir string, args 
 	return -1, err
 }
 
-func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner pipelineCheckRunner) error {
+func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner PipelineCheckRunner) error {
+	return runPipelineChecksWithOutput(ctx, checks, workdir, runDir, state, observe, runner, nil, nil)
+}
+
+func runPipelineChecksWithOutput(ctx context.Context, checks [][]string, workdir, runDir string, state *State, observe func(WorkflowEvent) error, runner PipelineCheckRunner, sharedOutput io.Writer, env []string) error {
 	for i, args := range checks {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("pipeline check interrupted: %w", err)
@@ -324,7 +349,11 @@ func runPipelineChecks(ctx context.Context, checks [][]string, workdir, runDir s
 			eventErr := observe(completedEvent)
 			return errors.Join(fmt.Errorf("create pipeline check log %s: %w", logName, err), stateErr, eventErr)
 		}
-		exitCode, runErr := runner.Run(ctx, workdir, args, log)
+		output := io.Writer(log)
+		if sharedOutput != nil {
+			output = io.MultiWriter(log, sharedOutput)
+		}
+		exitCode, runErr := runner.Run(ctx, workdir, args, output, cloneEnvironment(env))
 		closeErr := pipelineCheckCloseFile(log)
 		ended := time.Now().UTC()
 		if closeErr != nil && runErr == nil {
@@ -404,7 +433,13 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 	if err != nil {
 		return false, err
 	}
-	stageAgent := budgetedAgent{agent: w.Agent, budget: budget, timeout: agentTimeout}
+	stageRunner := w.Agent
+	if w.OutputWriter != nil {
+		if configurable, ok := stageRunner.(interface{ withOutputWriter(io.Writer) Agent }); ok {
+			stageRunner = configurable.withOutputWriter(w.OutputWriter)
+		}
+	}
+	stageAgent := budgetedAgent{agent: stageRunner, budget: budget, timeout: agentTimeout}
 	prompt, err := LoadPrompt(w.Config.PromptDir, stage)
 	if err != nil {
 		return false, err
@@ -430,13 +465,20 @@ func (w Workflow) runStage(ctx context.Context, reader io.Reader, runDir, task, 
 		statusWorkflow := w
 		statusWorkflow.ProcessObserver = w.ProcessObserver
 		return runWithSecondaryStatus(ctx, statusWorkflow, progress, stage, stageTask, stageWorkdir, stageLog, observe, func(primaryCtx context.Context) error {
-			if stage == "implement" {
+			if stage == "implement" && w.ExecutionHook == nil {
 				parallelWorkflow := w
 				parallelWorkflow.Agent = stageAgent
 				used, err := parallelWorkflow.runParallelImplementation(primaryCtx, stageTask, stageLog, runDir, state, observe)
 				if used || err != nil {
 					return err
 				}
+			}
+			if w.ExecutionHook != nil {
+				invocationCtx, cancel := stageAgent.invocationContext(primaryCtx)
+				defer cancel()
+				return stageAgent.budget.invoke(invocationCtx, func(ctx context.Context) error {
+					return w.ExecutionHook(ctx, stage, prompt, stageTask, stageWorkdir, stageLog, w.OutputWriter)
+				})
 			}
 			return runAgentWithContext(primaryCtx, stageAgent, stage, prompt, stageTask, stageWorkdir, stageLog)
 		})

@@ -207,6 +207,34 @@ func TestRunnerBoundsProtocolCaptureAndPreservesFirstNonemptyLine(t *testing.T) 
 	}
 }
 
+func TestRunnerDrainsProcessOutputAfterSharedCaptureLimit(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "agent.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nhead -c 262144 /dev/zero | tr '\\000' 'x'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var privateLog strings.Builder
+	capture := NewBoundedOutputWriter(context.Background(), &privateLog, 64)
+	logPath := filepath.Join(dir, "agent.log")
+	runner := Runner{Config: Config{Command: script, Args: []string{"{task}", "{system_prompt}"}}, OutputWriter: capture}
+	if err := runner.RunWithContext(context.Background(), "implement", "prompt", "task", dir, logPath); err != nil {
+		t.Fatalf("agent failed while output exceeded capture: %v", err)
+	}
+	if err := capture.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(logPath)
+	if err != nil || info.Size() != 262144 {
+		t.Fatalf("full agent log size = %v, %v; want all process output", info, err)
+	}
+	if len(capture.Bytes()) > 64 || !capture.Truncated() || !strings.Contains(capture.String(), "[output truncated]") {
+		t.Fatalf("bounded capture = %q (%d bytes), truncated=%v", capture.String(), len(capture.Bytes()), capture.Truncated())
+	}
+	if privateLog.Len() > 64 {
+		t.Fatalf("private output destination exceeded limit: %d bytes", privateLog.Len())
+	}
+}
+
 func TestRunnerCapturesAndValidatesPlanSizedProtocolWithoutChangingWhitespace(t *testing.T) {
 	plan := `{"subtasks":[{"id":"model","task":"Implement the model","files":["internal/model.go"],"depends_on":[]},{"id":"tests","task":"Add model tests","files":["internal/model_test.go"],"depends_on":[]}]}`
 	const trailingWhitespaceBytes = 12 * 1024
