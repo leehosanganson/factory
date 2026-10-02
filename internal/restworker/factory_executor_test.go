@@ -17,7 +17,10 @@ import (
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
 
-const executorJobID = "01234567-89ab-4cde-8fab-0123456789ab"
+const (
+	executorJobID      = "01234567-89ab-4cde-8fab-0123456789ab"
+	restJobOutputLimit = 16 << 20
+)
 
 type testWorkspaceManager struct {
 	root      string
@@ -96,7 +99,10 @@ func (a *executorTestAgent) RunWithContext(ctx context.Context, stage, _, _, _, 
 
 func newExecutorFixture(t *testing.T, timeout string, outputLimit int, agent *executorTestAgent, checks ...[]string) (*FactoryExecutor, *testWorkspaceManager, string) {
 	t.Helper()
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	repo := filepath.Join(root, "repo")
 	if err := os.Mkdir(repo, 0o700); err != nil {
 		t.Fatal(err)
@@ -281,6 +287,38 @@ func TestFactoryExecutorRetainsWorkspaceUnmarkedOnStageOrCheckFailure(t *testing
 	}
 }
 
+func TestFactoryExecutorUsesConfiguredSharedOutputLimitAndDrainsStagesAndChecks(t *testing.T) {
+	checkRoot := t.TempDir()
+	checkOne := filepath.Join(checkRoot, "check-one.sh")
+	checkTwo := filepath.Join(checkRoot, "check-two.sh")
+	checkTwoMarker := filepath.Join(checkRoot, "check-two-finished")
+	if err := os.WriteFile(checkOne, []byte("#!/bin/sh\nprintf 'check-one-output\\n'\ndd if=/dev/zero bs=4096 count=1 2>/dev/null\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(checkTwo, []byte("#!/bin/sh\nprintf 'check-two-output\\n'\ntouch '"+checkTwoMarker+"'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	agent := &executorTestAgent{outputBytes: 2}
+	const configuredLimit = 64
+	executor, manager, _ := newExecutorFixture(t, "5s", configuredLimit, agent, []string{checkOne}, []string{checkTwo})
+	if err := executor.Execute(context.Background(), executorJob("capture shared output")); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := strings.Join(agent.calls, ","); got != "requirements,implement,review,document" {
+		t.Fatalf("stages = %q", got)
+	}
+	if _, err := os.Stat(checkTwoMarker); err != nil {
+		t.Fatalf("later check was not drained to completion: %v", err)
+	}
+	capture, err := os.ReadFile(filepath.Join(manager.workspace.OutputPath, "workflow.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(capture) != configuredLimit || !strings.Contains(string(capture), "rr") || !strings.Contains(string(capture), "check-one-output") || !strings.Contains(string(capture), "output truncated") {
+		t.Fatalf("shared output length=%d content=%q, want configured cap and check output", len(capture), capture)
+	}
+}
+
 func TestFactoryExecutorUsesOneDeadlineForWorkspaceAndAllStages(t *testing.T) {
 	t.Run("workspace creation", func(t *testing.T) {
 		agent := &executorTestAgent{}
@@ -305,6 +343,96 @@ func TestFactoryExecutorUsesOneDeadlineForWorkspaceAndAllStages(t *testing.T) {
 			t.Fatalf("timed-out workflow marked=%q stages=%v", manager.markedID, agent.calls)
 		}
 	})
+}
+
+func TestFactoryExecutorRepositoryValidationUsesJobContext(t *testing.T) {
+	executor, manager, _ := newExecutorFixture(t, "5s", restJobOutputLimit, &executorTestAgent{})
+	started := make(chan struct{})
+	executor.validateRepositoryRoot = func(ctx context.Context, _ string) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- executor.Execute(ctx, executorJob("cancel root validation")) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("repository validation did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, errExecutionFailed) || strings.Contains(err.Error(), "context") {
+			t.Fatalf("Execute() error = %v, want sanitized failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("job cancellation did not stop repository validation")
+	}
+	if manager.createdID != "" {
+		t.Fatalf("workspace created after canceled validation: %q", manager.createdID)
+	}
+}
+
+func TestNewFactoryExecutorBoundsStartupRepositoryValidation(t *testing.T) {
+	executor, _, _ := newExecutorFixture(t, "5s", restJobOutputLimit, &executorTestAgent{})
+	started := make(chan struct{})
+	config := FactoryExecutorConfig{
+		Server: executor.server, Workflow: executor.workflow, Workspaces: executor.workspaces,
+		ValidateRepositoryRoot: func(ctx context.Context, _ string) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	const validationTimeout = 20 * time.Millisecond
+	start := time.Now()
+	_, err := newFactoryExecutor(context.Background(), config, validationTimeout)
+	if err == nil || strings.Contains(err.Error(), "context") || strings.Contains(err.Error(), executor.server.Repositories["trusted"]) {
+		t.Fatalf("constructor error = %v, want sanitized timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed < validationTimeout || elapsed > time.Second {
+		t.Fatalf("startup validation elapsed %s, want bounded near %s", elapsed, validationTimeout)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("startup repository validation did not start")
+	}
+}
+
+func TestNewFactoryExecutorContextPropagatesShutdownCancellation(t *testing.T) {
+	executor, _, _ := newExecutorFixture(t, "5s", restJobOutputLimit, &executorTestAgent{})
+	started := make(chan struct{})
+	config := FactoryExecutorConfig{
+		Server: executor.server, Workflow: executor.workflow, Workspaces: executor.workspaces,
+		ValidateRepositoryRoot: func(ctx context.Context, _ string) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewFactoryExecutorContext(ctx, config)
+		done <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("startup repository validation did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil || strings.Contains(err.Error(), "context") || strings.Contains(err.Error(), executor.server.Repositories["trusted"]) {
+			t.Fatalf("constructor error = %v, want sanitized cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown cancellation did not stop startup validation")
+	}
 }
 
 func TestFactoryExecutorRejectsUntrustedAliasAndNonExactCheckoutBeforeWorkspace(t *testing.T) {
@@ -383,7 +511,10 @@ func TestFactoryExecutorPassesOnlyAllowlistedEnvironmentToHarness(t *testing.T) 
 }
 
 func TestFactoryExecutorMarksARealWorkspaceOnlyAfterCompleteWorkflow(t *testing.T) {
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	repo := filepath.Join(root, "repo")
 	if err := os.Mkdir(repo, 0o700); err != nil {
 		t.Fatal(err)

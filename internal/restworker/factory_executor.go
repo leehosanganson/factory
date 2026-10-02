@@ -17,7 +17,7 @@ import (
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
 
-const restJobOutputLimit = 16 << 20
+const startupRepositoryValidationTimeout = 10 * time.Second
 
 var errExecutionFailed = errors.New("REST job execution failed")
 
@@ -35,23 +35,43 @@ type FactoryExecutorConfig struct {
 	Server     restserver.Config
 	Workflow   factory.Config
 	Workspaces map[string]WorkspaceManager
+
+	// ValidateRepositoryRoot replaces Git-backed repository validation when set.
+	// It must honor ctx; this seam is intended for tests and controlled callers.
+	ValidateRepositoryRoot func(context.Context, string) error
 }
 
 // FactoryExecutor adapts one REST job to Factory's requirements, implement,
 // review, and document workflow. It never publishes changes.
 type FactoryExecutor struct {
-	server     restserver.Config
-	workflow   factory.Config
-	workspaces map[string]WorkspaceManager
-	timeout    time.Duration
-	env        []string
-	agent      func(factory.Config, []string, io.Writer) factory.Agent
+	server                 restserver.Config
+	workflow               factory.Config
+	workspaces             map[string]WorkspaceManager
+	timeout                time.Duration
+	env                    []string
+	agent                  func(factory.Config, []string, io.Writer) factory.Agent
+	validateRepositoryRoot func(context.Context, string) error
 }
 
 // NewFactoryExecutor validates the trusted configuration and builds the
 // multi-stage executor. Repository aliases must each have a configured workspace
 // manager; managers must be constructed for the corresponding trusted root.
 func NewFactoryExecutor(config FactoryExecutorConfig) (*FactoryExecutor, error) {
+	return NewFactoryExecutorContext(context.Background(), config)
+}
+
+// NewFactoryExecutorContext constructs an executor while bounding startup Git
+// validation by both the caller's lifecycle context and a fixed timeout.
+func NewFactoryExecutorContext(ctx context.Context, config FactoryExecutorConfig) (*FactoryExecutor, error) {
+	if ctx == nil {
+		return nil, errors.New("invalid repository validation context")
+	}
+	validationCtx, cancelValidation := context.WithTimeout(ctx, startupRepositoryValidationTimeout)
+	defer cancelValidation()
+	return newFactoryExecutor(validationCtx, config, startupRepositoryValidationTimeout)
+}
+
+func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, validationTimeout time.Duration) (*FactoryExecutor, error) {
 	if err := config.Server.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid REST executor configuration")
 	}
@@ -62,10 +82,19 @@ func NewFactoryExecutor(config FactoryExecutorConfig) (*FactoryExecutor, error) 
 	if err != nil || timeout <= 0 {
 		return nil, errors.New("invalid REST job timeout")
 	}
+	if validationTimeout <= 0 {
+		return nil, errors.New("invalid repository validation timeout")
+	}
+	validateRoot := config.ValidateRepositoryRoot
+	if validateRoot == nil {
+		validateRoot = validateExactRepositoryRoot
+	}
+	validationCtx, cancelValidation := context.WithTimeout(ctx, validationTimeout)
+	defer cancelValidation()
 	workspaces := make(map[string]WorkspaceManager, len(config.Workspaces))
 	for alias, workspace := range config.Workspaces {
 		root := config.Server.Repositories[alias]
-		if root == "" || workspace == nil || validateExactRepositoryRoot(context.Background(), root) != nil || workspace.RepositoryRoot() != root {
+		if root == "" || workspace == nil || validateRoot(validationCtx, root) != nil || validationCtx.Err() != nil || workspace.RepositoryRoot() != root {
 			return nil, errors.New("workspace managers must match configured repository aliases and roots")
 		}
 		workspaces[alias] = workspace
@@ -77,7 +106,7 @@ func NewFactoryExecutor(config FactoryExecutorConfig) (*FactoryExecutor, error) 
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()),
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot,
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -111,7 +140,7 @@ func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) er
 	}
 	root, ok := e.server.Repositories[job.Request.Repository]
 	workspaceManager := e.workspaces[job.Request.Repository]
-	if !ok || workspaceManager == nil || validateExactRepositoryRoot(jobCtx, root) != nil {
+	if !ok || workspaceManager == nil || e.validateRepositoryRoot(jobCtx, root) != nil {
 		return errExecutionFailed
 	}
 	if err := jobCtx.Err(); err != nil {
@@ -126,7 +155,7 @@ func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) er
 		return errExecutionFailed
 	}
 	defer outputFile.Close()
-	capture := factory.NewBoundedOutputWriter(jobCtx, outputFile, restJobOutputLimit)
+	capture := factory.NewBoundedOutputWriter(jobCtx, outputFile, e.server.Limits.HarnessOutput)
 	workflowConfig := e.workflow
 	workflowConfig.Command = e.server.Harness.Executable
 	workflowConfig.Args = append([]string(nil), e.server.Harness.Args...)
