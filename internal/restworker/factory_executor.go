@@ -159,7 +159,14 @@ func (e *FactoryExecutor) CompleteResult(ctx context.Context, job restjobs.Snaps
 }
 
 func (e *FactoryExecutor) ReconcileProvider(ctx context.Context, job restjobs.Snapshot, attempt restjobs.ProviderAttempt, reconciler restprovider.Reconciler) (restjobs.ProviderOutcome, error) {
-	if ctx == nil || ctx.Err() != nil || job.ID == "" || job.Status != restjobs.StatusFailed || reconciler == nil || attempt.Provider != "github" || attempt.Repository != e.server.Provider.Repositories[job.Request.Repository] || attempt.Branch != restprovider.JobBranch(job.ID) {
+	if job.Status != restjobs.StatusFailed {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	return e.ReconcileInterruptedProvider(ctx, job, attempt, reconciler)
+}
+
+func (e *FactoryExecutor) ReconcileInterruptedProvider(ctx context.Context, job restjobs.Snapshot, attempt restjobs.ProviderAttempt, reconciler restprovider.Reconciler) (restjobs.ProviderOutcome, error) {
+	if ctx == nil || ctx.Err() != nil || job.ID == "" || (job.Status != restjobs.StatusFailed && job.Status != restjobs.StatusRunning) || reconciler == nil || attempt.Provider != "github" || attempt.Repository != e.server.Provider.Repositories[job.Request.Repository] || attempt.Branch != restprovider.JobBranch(job.ID) {
 		return restjobs.ProviderOutcome{}, errExecutionFailed
 	}
 	workspaceManager := e.workspaces[job.Request.Repository]

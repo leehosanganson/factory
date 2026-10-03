@@ -215,6 +215,7 @@ type RecoveryReport struct {
 // finish.
 type Store interface {
 	Admit(idempotencyKey string, request Request) (Snapshot, bool, error)
+	ResolveInterrupted(id string, disposition InterruptedDisposition) error
 	ClaimNext() (Snapshot, error)
 	WaitClaim(ctx context.Context) (Snapshot, error)
 	Close()
@@ -232,6 +233,16 @@ type Store interface {
 type Manager interface {
 	Store
 }
+
+// InterruptedDisposition is the bounded non-success outcome an operator may
+// record for SQLite work found running at startup, only when no provider side
+// effect was recorded.
+type InterruptedDisposition string
+
+const (
+	InterruptedDispositionFailed   InterruptedDisposition = "failed"
+	InterruptedDispositionCanceled InterruptedDisposition = "canceled"
+)
 
 // RecoveryDisposition describes what is safe to do with a persisted job after
 // process restart. Running work must never be replayed automatically because
@@ -620,6 +631,17 @@ func (m *LocalManager) RecordVerificationEvidence(id string, evidence Verificati
 	entry.snapshot.Verification = &copy
 	entry.snapshot.UpdatedAt = time.Now().UTC()
 	return nil
+}
+
+// ResolveInterrupted is unsupported by the volatile store: it has no durable
+// startup recovery classification to authorize an operator disposition.
+func (m *LocalManager) ResolveInterrupted(id string, disposition InterruptedDisposition) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.jobs[id] == nil {
+		return ErrNotFound
+	}
+	return ErrInvalidTransition
 }
 
 func (m *LocalManager) Finish(id string, terminalStatus Status) error {

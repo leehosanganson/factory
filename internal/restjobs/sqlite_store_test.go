@@ -139,7 +139,7 @@ func TestSQLiteOperationalSummaryCountsStatusesAndRecoveryNeeded(t *testing.T) {
 	if _, err := store.OperationalSummary(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("OperationalSummary(canceled context) error = %v, want context.Canceled", err)
 	}
-	if err := store.Finish(running.ID, StatusSucceeded); err != nil {
+	if err := store.ResolveInterrupted(running.ID, InterruptedDispositionCanceled); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ClaimNext(); err != nil {
@@ -149,7 +149,7 @@ func TestSQLiteOperationalSummaryCountsStatusesAndRecoveryNeeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	summary, err = store.OperationalSummary(context.Background())
-	if err != nil || summary.RetainedRecords != 2 || summary.Queued != 0 || summary.Running != 0 || summary.Succeeded != 1 || summary.Failed != 1 || summary.RecoveryNeeded != 0 || summary.QueueSaturated {
+	if err != nil || summary.RetainedRecords != 2 || summary.Queued != 0 || summary.Running != 0 || summary.Succeeded != 0 || summary.Failed != 1 || summary.Canceled != 1 || summary.RecoveryNeeded != 0 || summary.QueueSaturated {
 		t.Fatalf("terminal summary = (%+v, %v)", summary, err)
 	}
 }

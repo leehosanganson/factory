@@ -552,6 +552,13 @@ func (s *SQLiteStore) MarkProviderAttemptUncertain(id string) error {
 	return tx.Commit()
 }
 
+func (s *SQLiteStore) RecoveryNeeded(id string) bool {
+	s.recoveryMu.RLock()
+	defer s.recoveryMu.RUnlock()
+	_, needed := s.recoveryNeeded[id]
+	return needed
+}
+
 func (s *SQLiteStore) ProviderAttempt(id string) (ProviderAttempt, error) {
 	if err := s.checkOpen(); err != nil {
 		return ProviderAttempt{}, err
@@ -607,22 +614,56 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 		}
 		return tx.Commit()
 	}
-	if status != string(StatusFailed) {
+	if status != string(StatusFailed) && status != string(StatusRunning) {
 		return ErrInvalidTransition
 	}
-	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&attemptJSON); err != nil {
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	_, interrupted := s.recoveryNeeded[id]
+	if status == string(StatusRunning) && !interrupted {
 		return ErrInvalidTransition
 	}
+	attemptErr := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&attemptJSON)
 	var attempt ProviderAttempt
-	if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) || outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
+	if attemptErr == nil {
+		if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
+			return ErrInvalidInput
+		}
+	} else if !errors.Is(attemptErr, sql.ErrNoRows) {
+		return errors.New("read SQLite provider attempt")
+	} else {
+		var previous string
+		if err := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=?`, id).Scan(&previous); err != nil {
+			return ErrInvalidTransition
+		}
+		var persisted ProviderOutcome
+		if json.Unmarshal([]byte(previous), &persisted) != nil || validateProviderOutcome(persisted) != nil {
+			return errors.New("SQLite provider outcome is invalid")
+		}
+		if persisted != outcome {
+			return ErrInvalidInput
+		}
+		attempt = ProviderAttempt{Provider: persisted.Provider, Repository: persisted.Repository, Branch: persisted.Branch, Commit: persisted.Commit}
+	}
+	if outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
 		return ErrInvalidInput
+	}
+	var previous string
+	previousErr := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=?`, id).Scan(&previous)
+	if previousErr == nil && previous != string(encoded) {
+		return ErrInvalidTransition
+	}
+	if previousErr != nil && !errors.Is(previousErr, sql.ErrNoRows) {
+		return errors.New("read SQLite provider outcome")
 	}
 	now := time.Now().UTC()
 	stamp := now.Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) VALUES(?,?,?)`, id, string(encoded), stamp); err != nil {
-		return errors.New("record SQLite provider outcome")
+	if previousErr != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) VALUES(?,?,?)`, id, string(encoded), stamp); err != nil {
+			return errors.New("record SQLite provider outcome")
+		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='succeeded',updated_at=? WHERE id=? AND status='failed'`, stamp, id)
+	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='succeeded',updated_at=? WHERE id=? AND status=?`, stamp, id, status)
 	if err != nil {
 		return errors.New("finish reconciled SQLite job")
 	}
@@ -638,6 +679,7 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite provider reconciliation")
 	}
+	delete(s.recoveryNeeded, id)
 	return nil
 }
 
@@ -793,6 +835,85 @@ func (s *SQLiteStore) AddEvent(id, eventType, message string) error {
 	return nil
 }
 
+// ResolveInterrupted records a bounded operator disposition for a job this
+// store found running at startup. Provider attempts/outcomes require provider
+// validation and cannot be resolved through this status-only operation.
+func (s *SQLiteStore) ResolveInterrupted(id string, disposition InterruptedDisposition) error {
+	if disposition != InterruptedDispositionFailed && disposition != InterruptedDispositionCanceled {
+		return ErrInvalidInput
+	}
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	// Take the recovery lock after acquiring the DB transaction, matching
+	// ClaimNext's lock order and keeping startup classification synchronized.
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	_, requiresOperator := s.recoveryNeeded[id]
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return errors.New("read SQLite job state")
+	}
+	var previous string
+	resolutionErr := tx.QueryRowContext(ctx, `SELECT disposition FROM factory_job_operator_dispositions WHERE job_id=?`, id).Scan(&previous)
+	if resolutionErr != nil && !errors.Is(resolutionErr, sql.ErrNoRows) {
+		return errors.New("read SQLite interrupted disposition")
+	}
+	if resolutionErr == nil {
+		if status != string(disposition) || previous != string(disposition) {
+			return ErrInvalidTransition
+		}
+		if err := tx.Commit(); err != nil {
+			return errors.New("confirm SQLite interrupted disposition")
+		}
+		delete(s.recoveryNeeded, id)
+		return nil
+	}
+	if status != string(StatusRunning) {
+		return ErrInvalidTransition
+	}
+	if !requiresOperator {
+		return ErrInvalidTransition
+	}
+	var providerRecord int
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM factory_job_provider_attempts WHERE job_id=?) + (SELECT COUNT(*) FROM factory_job_provider_outcomes WHERE job_id=?)`, id, id).Scan(&providerRecord); err != nil {
+		return errors.New("check SQLite provider side effects")
+	}
+	if providerRecord != 0 {
+		return ErrInvalidTransition
+	}
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,updated_at=? WHERE id=? AND status='running'`, string(disposition), stamp, id)
+	if err != nil {
+		return errors.New("record SQLite interrupted disposition")
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrInvalidTransition
+	}
+	if err := insertEvent(ctx, tx, id, "operator_disposition", string(disposition), now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite interrupted disposition history")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_operator_dispositions(job_id,disposition,updated_at) VALUES(?,?,?)`, id, string(disposition), stamp); err != nil {
+		return errors.New("persist SQLite interrupted disposition")
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.New("commit SQLite interrupted disposition")
+	}
+	delete(s.recoveryNeeded, id)
+	return nil
+}
+
 func (s *SQLiteStore) Finish(id string, status Status) error {
 	if !status.Terminal() {
 		return ErrInvalidTransition
@@ -823,12 +944,16 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	if err := insertEvent(ctx, tx, id, string(status), "Job finished", now, s.config.MaxEventsPerJob); err != nil {
 		return errors.New("record SQLite job completion")
 	}
+	// A worker cannot terminalize work inherited as running after restart;
+	// only the explicit recovery disposition may clear that classification.
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if _, interrupted := s.recoveryNeeded[id]; interrupted {
+		return ErrInvalidTransition
+	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite job completion")
 	}
-	s.recoveryMu.Lock()
-	delete(s.recoveryNeeded, id)
-	s.recoveryMu.Unlock()
 	return nil
 }
 
