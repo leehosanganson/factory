@@ -308,8 +308,27 @@ func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
 		return Snapshot{}, errors.New("SQLite job store unavailable")
 	}
 	defer tx.Rollback()
-	var running int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs WHERE status='running'`).Scan(&running); err != nil {
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM factory_jobs WHERE status='running'`)
+	if err != nil {
+		return Snapshot{}, errors.New("read SQLite worker capacity")
+	}
+	s.recoveryMu.RLock()
+	running := 0
+	for rows.Next() {
+		var runningID string
+		if err := rows.Scan(&runningID); err != nil {
+			s.recoveryMu.RUnlock()
+			_ = rows.Close()
+			return Snapshot{}, errors.New("read SQLite worker capacity")
+		}
+		if _, interrupted := s.recoveryNeeded[runningID]; !interrupted {
+			running++
+		}
+	}
+	rowsErr := rows.Err()
+	s.recoveryMu.RUnlock()
+	_ = rows.Close()
+	if rowsErr != nil {
 		return Snapshot{}, errors.New("read SQLite worker capacity")
 	}
 	if running >= s.config.MaxConcurrentJobs {

@@ -255,6 +255,196 @@ func (p *e2ePublisher) Publish(ctx context.Context, request restprovider.Publish
 	return outcome, nil
 }
 
+func TestRESTServerProcessRecoversQueuedAndRetainsInterruptedRunningSQLiteJobs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	config.Limits.Workers = 1
+	config.Limits.QueueCapacity = 2
+	stateDir := testResultsBase(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	harnessRuns := filepath.Join(t.TempDir(), "harness-runs")
+	harnessPID := filepath.Join(t.TempDir(), "harness-pid")
+	harness := filepath.Join(t.TempDir(), "restart-harness.sh")
+	script := fmt.Sprintf("#!/bin/sh\ntask=\nfor arg in \"$@\"; do case \"$arg\" in hold-running|queued-after-restart) task=$arg ;; esac; done\ncase \"$task\" in hold-running) printf 'hold-running\\n' >> %q; printf '%%s\\n' \"$$\" > %q; exec sleep 300 ;; queued-after-restart) printf 'queued-after-restart\\n' >> %q ;; esac\nprintf 'verified\\n' >> result.txt\n", harnessRuns, harnessPID, harnessRuns)
+	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outcomesPath := filepath.Join(t.TempDir(), "provider-outcomes.jsonl")
+	readyDir := t.TempDir()
+	startServer := func(readyName string) (*exec.Cmd, <-chan error, string) {
+		t.Helper()
+		readyPath := filepath.Join(readyDir, readyName)
+		logPath := filepath.Join(t.TempDir(), readyName+".log")
+		logFile, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+		child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+outcomesPath)
+		child.Stdout, child.Stderr = logFile, logFile
+		if err := child.Start(); err != nil {
+			_ = logFile.Close()
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			done <- child.Wait()
+			_ = logFile.Close()
+		}()
+		return child, done, waitForProcessURL(t, done, readyPath, logPath)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	var child *exec.Cmd
+	var childDone <-chan error
+	var harnessPIDValue int
+	defer func() {
+		if child != nil && child.ProcessState == nil {
+			_ = child.Process.Kill()
+			<-childDone
+		}
+		if harnessPIDValue > 0 {
+			_ = syscall.Kill(harnessPIDValue, syscall.SIGKILL)
+		}
+	}()
+	child, childDone, baseURL := startServer("listener-first")
+	running, err := submitProcessJob(client, baseURL, apiKey, "trusted", "hold-running", "restart-running")
+	if err != nil || running.StatusCode != http.StatusAccepted || running.ID == "" {
+		t.Fatalf("running job admission=%+v err=%v", running, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(harnessPID); err == nil {
+			if _, err := fmt.Sscanf(string(data), "%d", &harnessPIDValue); err != nil || harnessPIDValue <= 0 {
+				t.Fatalf("blocked harness PID=%q err=%v", data, err)
+			}
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if harnessPIDValue == 0 {
+		t.Fatal("running job harness did not reach its interruption barrier")
+	}
+	queued, err := submitProcessJob(client, baseURL, apiKey, "trusted", "queued-after-restart", "restart-queued")
+	if err != nil || queued.StatusCode != http.StatusAccepted || queued.ID == "" {
+		t.Fatalf("queued job admission=%+v err=%v", queued, err)
+	}
+	beforeRunning := getProcessJob(t, client, baseURL, running.ID, apiKey)
+	beforeQueued := getProcessJob(t, client, baseURL, queued.ID, apiKey)
+	if beforeRunning.Status != restjobs.StatusRunning || beforeQueued.Status != restjobs.StatusQueued {
+		t.Fatalf("pre-interruption states running=%+v queued=%+v", beforeRunning, beforeQueued)
+	}
+	beforeRunningHistory := getProcessHistory(t, client, baseURL, running.ID, apiKey)
+	if len(beforeRunningHistory.Events) != 2 || beforeRunningHistory.Events[0].Type != "queued" || beforeRunningHistory.Events[1].Type != "running" {
+		t.Fatalf("running job history before interruption=%+v", beforeRunningHistory)
+	}
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err == nil {
+		t.Fatal("server process exited successfully after forced interruption; expected SIGKILL")
+	}
+	child = nil
+	_ = syscall.Kill(harnessPIDValue, syscall.SIGKILL)
+
+	child, childDone, restartedURL := startServer("listener-restarted")
+	restartedRunning := getProcessJob(t, client, restartedURL, running.ID, apiKey)
+	if restartedRunning.Status != restjobs.StatusRunning {
+		t.Fatalf("interrupted running job was replayed or changed on restart: %+v", restartedRunning)
+	}
+	restartedRunningHistory := getProcessHistory(t, client, restartedURL, running.ID, apiKey)
+	if len(restartedRunningHistory.Events) != len(beforeRunningHistory.Events) || restartedRunningHistory.Events[len(restartedRunningHistory.Events)-1].Type != "running" {
+		t.Fatalf("interrupted running history changed on restart: before=%+v after=%+v", beforeRunningHistory, restartedRunningHistory)
+	}
+	waitForProcessJob(t, client, restartedURL, queued.ID, apiKey)
+	restartedQueued := getProcessJob(t, client, restartedURL, queued.ID, apiKey)
+	queuedHistory := getProcessHistory(t, client, restartedURL, queued.ID, apiKey)
+	if restartedQueued.Status != restjobs.StatusSucceeded || len(queuedHistory.Events) < 3 || queuedHistory.Events[0].Type != "queued" || queuedHistory.Events[1].Type != "running" || queuedHistory.Events[len(queuedHistory.Events)-1].Type != string(restjobs.StatusSucceeded) {
+		t.Fatalf("queued job did not resume to success with lifecycle history: job=%+v history=%+v", restartedQueued, queuedHistory)
+	}
+	unauthenticated, err := client.Get(restartedURL + "/v1/operations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unauthenticated.Body.Close()
+	if unauthenticated.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated operations status=%d, want %d", unauthenticated.StatusCode, http.StatusUnauthorized)
+	}
+	operationsRequest, err := http.NewRequest(http.MethodGet, restartedURL+"/v1/operations", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationsRequest.Header.Set("Authorization", "Bearer "+apiKey)
+	operationsResponse, err := client.Do(operationsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary restjobs.OperationalSummary
+	decodeErr := json.NewDecoder(operationsResponse.Body).Decode(&summary)
+	_ = operationsResponse.Body.Close()
+	if decodeErr != nil || operationsResponse.StatusCode != http.StatusOK || summary.Running != 1 || summary.Queued != 0 || summary.Succeeded != 1 || summary.RecoveryNeeded != 1 {
+		t.Fatalf("authenticated restart operations status=%d summary=%+v decodeErr=%v", operationsResponse.StatusCode, summary, decodeErr)
+	}
+	harnessRunData, err := os.ReadFile(harnessRuns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs := strings.Fields(string(harnessRunData))
+	runningRuns, queuedRuns := 0, 0
+	for _, task := range runs {
+		switch task {
+		case "hold-running":
+			runningRuns++
+		case "queued-after-restart":
+			queuedRuns++
+		default:
+			t.Fatalf("unexpected harness task execution %q in %q", task, harnessRunData)
+		}
+	}
+	if runningRuns != 1 || queuedRuns != 3 {
+		t.Fatalf("harness executions running=%d queued=%d task-count=%q, want interrupted job once and resumed job three times", runningRuns, queuedRuns, harnessRunData)
+	}
+	providerAttempts, err := os.ReadFile(outcomesPath + ".started")
+	if err != nil || string(providerAttempts) != queued.ID+"\n" {
+		t.Fatalf("provider publish attempts=%q err=%v, want only resumed queued job %q", providerAttempts, err, queued.ID)
+	}
+	providerOutcomes, err := os.ReadFile(outcomesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(strings.Fields(string(providerOutcomes))) == 0 || strings.Count(strings.TrimSpace(string(providerOutcomes)), "\n") != 0 {
+		t.Fatalf("provider outcomes=%q, want exactly one successful publication", providerOutcomes)
+	}
+	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err != nil {
+		t.Fatalf("restarted server graceful shutdown: %v", err)
+	}
+	child = nil
+}
+
 func TestRESTServerProcessRejectsUnavailableSQLiteBeforeListening(t *testing.T) {
 	if testing.Short() {
 		t.Skip("process-level REST E2E")
