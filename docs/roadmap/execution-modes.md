@@ -14,7 +14,7 @@ Mode and executable selection are operator-configured. A request cannot choose a
 
 ## Persistence is independent of execution mode
 
-The initial local-development mode uses the in-memory job backend. It is volatile: process exit loses job status, history, idempotency data, and knowledge of active execution. This mode must not claim restart durability.
+The server offers volatile in-memory state for local development and tests; process exit loses job status, history, idempotency data, and execution state.
 
 Optional SQLite persistence is available for single-server deployments requiring restart durability. The backend provides transactional admission/idempotency and durable job/history state. Queued jobs are safe candidates for resumption; jobs interrupted after entering the running state require operator reconciliation and are not automatically replayed. If explicitly configured storage is unavailable, the server fails closed rather than falling back to memory. Backend selection does not change the REST job contract. Durable worker leases, checkpoints, and multi-host ownership remain future work.
 
@@ -36,4 +36,4 @@ An operator may later choose an ephemeral container or Kubernetes Pod executor, 
 - Do not merge PRs, release, or deploy.
 - Do not report job success before verification evidence and confirmed PR outcome are durably recorded when a durable backend is selected.
 
-SQLite persistence is implemented as documented in the [server configuration guide](../features/rest-server-config.md). Provider writes, durable worker leases/checkpoints, and container execution remain target requirements rather than implemented behavior.
+SQLite persistence and configured GitHub provider writes are implemented as documented in the [server configuration guide](../features/rest-server-config.md). Durable worker leases/checkpoints, automatic replay of interrupted running jobs, and container execution remain outside the current implementation.

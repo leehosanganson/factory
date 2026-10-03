@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/leehosanganson/factory/internal/restjobs"
+	"github.com/leehosanganson/factory/internal/restprovider"
 	"github.com/leehosanganson/factory/internal/restserver"
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
@@ -24,6 +25,165 @@ type runtimeExecutor func(context.Context, restjobs.Snapshot) error
 
 func (f runtimeExecutor) Execute(ctx context.Context, request restjobs.Snapshot) error {
 	return f(ctx, request)
+}
+
+type readinessStore struct {
+	restjobs.Store
+	up atomic.Bool
+}
+
+func (s *readinessStore) Ping(ctx context.Context) error {
+	if !s.up.Load() {
+		return errors.New("store unavailable")
+	}
+	return s.Store.(interface{ Ping(context.Context) error }).Ping(ctx)
+}
+
+type readinessPublisher struct {
+	checks atomic.Int32
+	up     atomic.Bool
+}
+
+func (p *readinessPublisher) Ping(context.Context) error {
+	p.checks.Add(1)
+	if !p.up.Load() {
+		return errors.New("provider unavailable")
+	}
+	return nil
+}
+
+func (p *readinessPublisher) Publish(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
+	return restprovider.Outcome{}, errors.New("not used in readiness test")
+}
+
+func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T) {
+	config, key := runtimeFixture(t)
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(t.TempDir(), "jobs.db")}
+	jobConfig := restjobs.Config{
+		QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers,
+		MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob,
+		MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
+	}
+	stateDir := filepath.Join(t.TempDir(), "private-state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jobStore, err := restjobs.OpenSQLiteStore(filepath.Join(stateDir, "jobs.db"), jobConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &readinessStore{Store: jobStore}
+	store.up.Store(true)
+	publisher := &readinessPublisher{}
+	publisher.up.Store(true)
+	var executions atomic.Int32
+	listenerReady := make(chan net.Listener, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{
+			OpenStore: func(restserver.Config) (restjobs.Store, error) { return store, nil },
+			Publisher: publisher,
+			Executor: runtimeExecutor(func(context.Context, restjobs.Snapshot) error {
+				executions.Add(1)
+				return nil
+			}),
+			Listen: func(network, _ string) (net.Listener, error) {
+				listener, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					listenerReady <- listener
+				}
+				return listener, err
+			},
+		})
+	}()
+	var listener net.Listener
+	select {
+	case listener = <-listenerReady:
+	case err := <-done:
+		t.Fatalf("server exited before listener startup: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not start a listener")
+	}
+	baseURL := "http://" + listener.Addr().String()
+	client := &http.Client{Timeout: 2 * time.Second}
+	getStatus := func(path string) int {
+		t.Helper()
+		response, err := client.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	submitStatus := func() int {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs", strings.NewReader(`{"repository":"trusted","task":"must not queue"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+key)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "outage-request")
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	if got := getStatus("/healthz"); got != http.StatusOK {
+		t.Fatalf("health status=%d, want %d", got, http.StatusOK)
+	}
+	if got := getStatus("/readyz"); got != http.StatusOK {
+		t.Fatalf("initial readiness=%d, want %d", got, http.StatusOK)
+	}
+	store.up.Store(false)
+	if got := getStatus("/readyz"); got != http.StatusServiceUnavailable {
+		t.Fatalf("readiness during store outage=%d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := submitStatus(); got != http.StatusServiceUnavailable {
+		t.Fatalf("admission during store outage=%d, want %d", got, http.StatusServiceUnavailable)
+	}
+	store.up.Store(true)
+	if got := getStatus("/readyz"); got != http.StatusOK {
+		t.Fatalf("readiness after store recovery=%d, want %d", got, http.StatusOK)
+	}
+	publisher.up.Store(false)
+	if got := getStatus("/readyz"); got != http.StatusServiceUnavailable {
+		t.Fatalf("readiness during provider outage=%d, want %d", got, http.StatusServiceUnavailable)
+	}
+	if got := submitStatus(); got != http.StatusServiceUnavailable {
+		t.Fatalf("admission during provider outage=%d, want %d", got, http.StatusServiceUnavailable)
+	}
+	publisher.up.Store(true)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && getStatus("/readyz") != http.StatusOK {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := getStatus("/readyz"); got != http.StatusOK {
+		t.Fatalf("readiness after provider recovery=%d, want %d; probes=%d", got, http.StatusOK, publisher.checks.Load())
+	}
+	if got := submitStatus(); got != http.StatusAccepted {
+		t.Fatalf("admission after provider recovery=%d, want %d", got, http.StatusAccepted)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && executions.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("job execution count=%d, want one admitted job after recovery", executions.Load())
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("server shutdown error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down")
+	}
 }
 
 func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
