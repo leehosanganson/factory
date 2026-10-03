@@ -133,7 +133,7 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		t.Fatal(err)
 	}
 	harness := filepath.Join(t.TempDir(), "concurrent-harness.sh")
-	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in fail-*) exit 42;; esac\nmkdir '%s/'\"$1\"\nsleep 0.2\nprintf 'implemented\\n' >> \"$PWD/result.txt\"\n", barrier)
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$1\" in fail-*) exit 42;; cancel-*) touch '%s/cancel-started'; sleep 30; exit 0;; esac\nmkdir '%s/'\"$1\"\nsleep 0.2\nprintf 'implemented\\n' >> \"$PWD/result.txt\"\n", barrier, barrier)
 	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -153,7 +153,7 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		t.Skip("process-level REST E2E requires supported local process signal semantics")
 	}
 	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
-	child.Env = append(os.Environ(), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+outcomesPath)
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+outcomesPath)
 	childLogPath := filepath.Join(t.TempDir(), "server.log")
 	childLog, err := os.Create(childLogPath)
 	if err != nil {
@@ -275,6 +275,21 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 	if len(entries) != 2 {
 		t.Fatalf("independent workflows did not overlap: %v", entries)
 	}
+	canceled, err := submitProcessJob(client, baseURL, apiKey, "first", "cancel-shutdown", "key-canceled")
+	if err != nil || canceled.StatusCode != http.StatusAccepted || canceled.ID == "" {
+		t.Fatalf("cancellation admission: job=%+v err=%v", canceled, err)
+	}
+	cancelStarted := filepath.Join(barrier, "cancel-started")
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cancelStarted); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(cancelStarted); err != nil {
+		t.Fatalf("cancellation workflow did not start: %v", err)
+	}
 	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -301,6 +316,21 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		if err != nil || !duplicate || replayed.ID != id {
 			t.Fatalf("restart idempotency replay=(%+v,%v,%v)", replayed, duplicate, err)
 		}
+	}
+	canceledJob, err := persisted.Get(canceled.ID)
+	if err != nil || canceledJob.Status != restjobs.StatusCanceled || canceledJob.Provider != nil {
+		t.Fatalf("shutdown-canceled durable job=%+v err=%v", canceledJob, err)
+	}
+	canceledHistory, err := persisted.History(canceled.ID)
+	if err != nil || len(canceledHistory.Events) < 3 || canceledHistory.Events[len(canceledHistory.Events)-1].Type != string(restjobs.StatusCanceled) {
+		t.Fatalf("shutdown-canceled history=%+v err=%v", canceledHistory, err)
+	}
+	canceledResult := filepath.Join(stateDir, aliasDirectory("first"), "results", canceled.ID)
+	if _, err := os.Stat(filepath.Join(canceledResult, "worktree")); err != nil {
+		t.Fatalf("shutdown-canceled workspace was not retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(canceledResult, ".completion.json")); !os.IsNotExist(err) {
+		t.Fatalf("shutdown-canceled workspace has completion marker: %v", err)
 	}
 	type providerRecord struct {
 		JobID      string `json:"job_id"`
