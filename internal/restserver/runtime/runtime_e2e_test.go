@@ -2,11 +2,13 @@ package runtime
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -693,7 +695,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 			<-childDone
 		}
 	}()
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 10 * time.Second}
 	admitted, err := submitProcessJob(client, baseURL, apiKey, "trusted", "publish with uncertain response", "uncertain-create-key")
 	if err != nil || admitted.StatusCode != http.StatusAccepted || admitted.ID == "" {
 		t.Fatalf("uncertain-create admission=%+v err=%v", admitted, err)
@@ -852,6 +854,49 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	if err := os.Remove(outcomesPath + ".reconcile-mode"); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
+	unlockSQLite := lockSQLiteWrites(t, config.Persistence.Path)
+	locked := true
+	defer func() {
+		if locked {
+			unlockSQLite()
+		}
+	}()
+	if code, body := operatorReconcile(apiKey); code != http.StatusConflict || strings.Contains(body, "SQLite") || strings.Contains(body, "provider-test-token") {
+		t.Fatalf("reconciliation during SQLite write outage status=%d body=%s", code, body)
+	}
+	unlockSQLite()
+	locked = false
+	outageJob := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
+	if outageJob.Status != restjobs.StatusFailed || outageJob.Provider != nil {
+		t.Fatalf("SQLite write outage changed job: %+v", outageJob)
+	}
+	outageHistory := getProcessHistory(t, client, restartedURL, admitted.ID, apiKey)
+	for _, event := range outageHistory.Events {
+		if event.Type == "provider_reconciled" {
+			t.Fatalf("SQLite write outage recorded successful reconciliation: %+v", outageHistory)
+		}
+	}
+	providerAttemptStore, ok := persisted.(*restjobs.SQLiteStore)
+	if !ok {
+		t.Fatalf("persisted store type=%T, want SQLiteStore", persisted)
+	}
+	attemptDuringOutage, err := providerAttemptStore.ProviderAttempt(admitted.ID)
+	if err != nil || !attemptDuringOutage.Uncertain {
+		t.Fatalf("SQLite write outage lost uncertain provider attempt: %+v err=%v", attemptDuringOutage, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+		t.Fatalf("SQLite write outage removed retained workspace: %v", err)
+	}
+	if currentRuns, err := os.ReadFile(harnessCount); err != nil || string(currentRuns) != initialHarnessRuns {
+		t.Fatalf("SQLite write outage reran harness: before=%q after=%q err=%v", initialHarnessRuns, currentRuns, err)
+	}
+	recordData, err = os.ReadFile(recordPath)
+	if err != nil || json.Unmarshal(recordData, &record) != nil || record.Creates != 1 || record.Attempts != 1 {
+		t.Fatalf("SQLite write outage reran provider write: record=%+v err=%v", record, err)
+	}
+	if err := os.Remove(outcomesPath + ".reconcile-mode"); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
 	if code, body := operatorReconcile(apiKey); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
 		t.Fatalf("authenticated reconcile status=%d body=%s", code, body)
 	}
@@ -890,6 +935,37 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		t.Fatalf("reconciled server shutdown: %v", err)
 	}
 	restarted.Process = nil
+}
+
+func lockSQLiteWrites(t *testing.T, path string) func() {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+url.PathEscape(filepath.ToSlash(path))+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open SQLite lock connection: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("get SQLite lock connection: %v", err)
+	}
+	if _, err := conn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		_ = conn.Close()
+		_ = db.Close()
+		t.Fatalf("acquire SQLite immediate write lock: %v", err)
+	}
+	return func() {
+		t.Helper()
+		if _, err := conn.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+			t.Errorf("release SQLite immediate write lock: %v", err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Errorf("close SQLite lock connection: %v", err)
+		}
+		if err := db.Close(); err != nil {
+			t.Errorf("close SQLite lock database: %v", err)
+		}
+	}
 }
 
 func initE2ERepository(t *testing.T, root string) {

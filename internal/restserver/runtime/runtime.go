@@ -216,7 +216,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			if reconcileErr != nil {
 				return restjobs.ErrInvalidTransition
 			}
-			return sqliteStore.ReconcileProviderOutcome(id, outcome)
+			if err := sqliteStore.ReconcileProviderOutcome(id, outcome); err != nil {
+				return restjobs.ErrInvalidTransition
+			}
+			return nil
 		},
 		Ready: func() bool { return ready.Load() },
 		ReadyError: func() error {
