@@ -23,7 +23,7 @@ Factory's intended MVP is one RESTful service for agent-driven repository jobs:
 
 Creating or updating a pull request through the configured code-repository provider is required for an implementation job to succeed. Factory does not merge, release, or deploy. A successful agent process is not an independent correctness verdict; preserve verification evidence and limitations.
 
-The REST server currently uses an in-memory job backend. Memory mode is simple and useful for development/tests, but process restart loses jobs, history, idempotency, and active execution state. Optional SQL persistence is recommended when restart durability is needed, but is not implemented yet. Never describe memory mode as durable across restarts or imply SQL/provider PR operations already exist. The target has one request/job lifecycle; issue polling is not a separate MVP. If issue intake is added later, it should submit into the same lifecycle.
+The current REST server supports volatile memory persistence (the default) and operator-configured SQLite through strict server JSON; configured SQLite fails closed if unavailable. The runtime does not log which backend was selected or expose the SQLite path. Memory records are lost on restart. With SQLite, queued jobs resume after restart, while interrupted running jobs require operator investigation and are not replayed. Configured GitHub PR publication is required for job success. An explicit authenticated reconciliation action applies only to eligible failed SQLite jobs with a persisted provider attempt and retained workspace; it performs read-only provider confirmation without running the harness or writing to the provider. Keep these shipped behaviors distinct from remaining target requirements. The target has one request/job lifecycle; issue polling is not a separate MVP. If issue intake is added later, it should submit into the same lifecycle.
 
 A local process, agent, Nix shell, or container is not a security sandbox. Keep operator-configured repositories, credentials, harness, and resource limits separate from caller-controlled request data.
 
@@ -39,7 +39,7 @@ Do not start an implementation workflow for questions, research, review-only req
 - **Tidy:** repository-wide review/fix/document plus configured checks. Foreground pristine mode can publish only after safeguards and exact confirmation; dirty mode warns and never stages/commits/pushes. Detached tidy is nonpublishing.
 - **Monitor:** bounded maintenance on an existing open PR. It may publish guarded fixes after path and live-snapshot validation, but there is no independent correctness evaluator. Ambiguous/high-impact work requires human direction; it cannot merge.
 
-Current CLI implementation publication is enabled by default: successful stages/checks may lead to a task-branch commit, push, and PR creation. `auto_publish: false` disables it. A no-op creates no PR; failures may leave recovery artifacts. This is current CLI behavior, distinct from the REST target where provider PR create/update is required for successful implementation-job completion.
+Current CLI implementation publication is enabled by default: successful stages/checks may lead to a task-branch commit, push, and PR creation. `auto_publish: false` disables it. A no-op creates no PR; failures may leave recovery artifacts. This is current CLI behavior, distinct from the REST server, where configured GitHub PR create/update is required for successful job completion.
 
 Inspect logs, diffs, and checks. Keep the user in control of scope and consequential choices. Factory and its agent tools are not sandboxed.
 
@@ -60,7 +60,7 @@ Ctrl-C while attached detaches the observer but leaves the worker running. `stop
 
 ## REST server target
 
-The implemented `factory server` accepts authenticated bounded requests, executes configured workflows in isolated workspaces, and exposes status/history using a process-local in-memory registry. It does not persist jobs across restarts or create/update PRs through a configurable provider.
+The implemented `factory server` accepts authenticated bounded requests, executes configured workflows in isolated workspaces, and exposes status/history using operator-selected memory (default) or SQLite persistence and an optional configured GitHub PR provider. Memory state is lost on restart. With SQLite, queued jobs resume; interrupted running jobs require operator investigation and are not replayed. When GitHub is configured, PR create/update is required for success. An explicit authenticated reconciliation action is available only for eligible failed SQLite jobs with a persisted provider attempt and retained workspace; it confirms provider state read-only without harness replay or provider writes. The runtime does not log the selected persistence backend or expose the SQLite path.
 
 The target MVP must:
 
@@ -80,9 +80,11 @@ Keep implemented behavior, target MVP requirements, and later ideas distinct. Up
 
 ## Common pitfalls
 
-- Calling memory-backed REST jobs durable without noting restart loss.
-- Treating optional/recommended SQL as already implemented.
-- Reporting a REST job successful before provider PR create/update is confirmed and recorded.
+- Calling memory-backed REST jobs durable without noting restart loss, or implying SQLite startup reports the selected backend or database path.
+- Treating SQLite as available without operator configuration, or implying configured SQLite silently falls back to memory.
+- Reporting a GitHub-configured REST job successful before PR create/update is confirmed and recorded.
+- Assuming interrupted running SQLite jobs automatically resume or are eligible for failed-job reconciliation.
+- Treating failed-job reconciliation as a harness replay or provider write; it is read-only provider confirmation for eligible persisted attempts with retained workspaces.
 - Blindly retrying a timed-out provider write without reconciliation.
 - Treating PR creation as merge approval or a correctness verdict.
 - Treating tests, an agent response, process, worktree, Nix shell, or container as a security/correctness guarantee.
@@ -90,8 +92,9 @@ Keep implemented behavior, target MVP requirements, and later ideas distinct. Up
 
 ## Verification checklist
 
-- [ ] Distinguish current memory-backed REST behavior from target SQL/provider-PR requirements.
-- [ ] State that target implementation jobs require provider PR create/update; merge/release/deploy remain excluded.
+- [ ] Distinguish current selectable memory/SQLite REST behavior and optional GitHub publication from remaining target requirements; do not claim runtime backend/path logging.
+- [ ] State that configured GitHub PR create/update is required for current REST job success, while target provider requirements remain explicit; merge/release/deploy remain excluded.
+- [ ] Describe restart recovery precisely: queued SQLite jobs resume, interrupted running jobs require operator investigation and are not replayed; explicit reconciliation is read-only and restricted to eligible failed SQLite jobs with persisted provider attempts and retained workspaces.
 - [ ] Do not overstate persistence, restart recovery, or uncertain-write behavior.
 - [ ] Preserve user scope control and the documented trust boundary.
 - [ ] Run relevant checks or report the exact blocker.
