@@ -793,6 +793,85 @@ func (s *SQLiteStore) AddEvent(id, eventType, message string) error {
 	return nil
 }
 
+// ResolveInterrupted records a bounded operator disposition for a job this
+// store found running at startup. Provider attempts/outcomes require provider
+// validation and cannot be resolved through this status-only operation.
+func (s *SQLiteStore) ResolveInterrupted(id string, disposition InterruptedDisposition) error {
+	if disposition != InterruptedDispositionFailed && disposition != InterruptedDispositionCanceled {
+		return ErrInvalidInput
+	}
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	// Take the recovery lock after acquiring the DB transaction, matching
+	// ClaimNext's lock order and keeping startup classification synchronized.
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	_, requiresOperator := s.recoveryNeeded[id]
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return errors.New("read SQLite job state")
+	}
+	var previous string
+	resolutionErr := tx.QueryRowContext(ctx, `SELECT disposition FROM factory_job_operator_dispositions WHERE job_id=?`, id).Scan(&previous)
+	if resolutionErr != nil && !errors.Is(resolutionErr, sql.ErrNoRows) {
+		return errors.New("read SQLite interrupted disposition")
+	}
+	if resolutionErr == nil {
+		if status != string(disposition) || previous != string(disposition) {
+			return ErrInvalidTransition
+		}
+		if err := tx.Commit(); err != nil {
+			return errors.New("confirm SQLite interrupted disposition")
+		}
+		delete(s.recoveryNeeded, id)
+		return nil
+	}
+	if status != string(StatusRunning) {
+		return ErrInvalidTransition
+	}
+	if !requiresOperator {
+		return ErrInvalidTransition
+	}
+	var providerRecord int
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM factory_job_provider_attempts WHERE job_id=?) + (SELECT COUNT(*) FROM factory_job_provider_outcomes WHERE job_id=?)`, id, id).Scan(&providerRecord); err != nil {
+		return errors.New("check SQLite provider side effects")
+	}
+	if providerRecord != 0 {
+		return ErrInvalidTransition
+	}
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,updated_at=? WHERE id=? AND status='running'`, string(disposition), stamp, id)
+	if err != nil {
+		return errors.New("record SQLite interrupted disposition")
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrInvalidTransition
+	}
+	if err := insertEvent(ctx, tx, id, "operator_disposition", string(disposition), now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite interrupted disposition history")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_operator_dispositions(job_id,disposition,updated_at) VALUES(?,?,?)`, id, string(disposition), stamp); err != nil {
+		return errors.New("persist SQLite interrupted disposition")
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.New("commit SQLite interrupted disposition")
+	}
+	delete(s.recoveryNeeded, id)
+	return nil
+}
+
 func (s *SQLiteStore) Finish(id string, status Status) error {
 	if !status.Terminal() {
 		return ErrInvalidTransition
@@ -823,12 +902,16 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	if err := insertEvent(ctx, tx, id, string(status), "Job finished", now, s.config.MaxEventsPerJob); err != nil {
 		return errors.New("record SQLite job completion")
 	}
+	// A worker cannot terminalize work inherited as running after restart;
+	// only the explicit recovery disposition may clear that classification.
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	if _, interrupted := s.recoveryNeeded[id]; interrupted {
+		return ErrInvalidTransition
+	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite job completion")
 	}
-	s.recoveryMu.Lock()
-	delete(s.recoveryNeeded, id)
-	s.recoveryMu.Unlock()
 	return nil
 }
 
