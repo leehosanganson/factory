@@ -284,17 +284,21 @@ func TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI(t *testing.
 func TestGitHubPublisherReconcileRejectsMismatchedGitHubResponsesReadOnly(t *testing.T) {
 	valid := `{"number":42,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/42","head":{"ref":"factory/job/` + testJobID + `","sha":"0123456789abcdef"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}`
 	for _, tc := range []struct {
-		name    string
-		status  int
-		body    string
-		wantErr string
+		name         string
+		status       int
+		body         string
+		wantMismatch string
+		wantErr      string
 	}{
 		{name: "permission denied", status: http.StatusForbidden, body: `{"message":"secret provider detail"}`, wantErr: "provider reconciliation is unavailable"},
 		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"message":"secret provider detail"}`, wantErr: "provider reconciliation is unavailable"},
 		{name: "malformed response", status: http.StatusOK, body: `[{`, wantErr: "provider reconciliation is unavailable"},
-		{name: "repository mismatch", status: http.StatusOK, body: strings.Replace(valid, `"full_name":"acme/widget"`, `"full_name":"other/widget"`, 1), wantErr: "provider reconciliation is unavailable"},
-		{name: "branch mismatch", status: http.StatusOK, body: strings.Replace(valid, `"ref":"factory/job/`+testJobID+`"`, `"ref":"factory/job/other"`, 1), wantErr: "provider reconciliation is unavailable"},
+		{name: "repository mismatch", status: http.StatusOK, body: strings.Replace(valid, `"full_name":"acme/widget"`, `"full_name":"other/widget"`, 1), wantMismatch: `"full_name":"other/widget"`, wantErr: "provider reconciliation is unavailable"},
+		{name: "branch mismatch", status: http.StatusOK, body: strings.Replace(valid, `"ref":"factory/job/`+testJobID+`"`, `"ref":"factory/job/other"`, 1), wantMismatch: `"ref":"factory/job/other"`, wantErr: "provider reconciliation is unavailable"},
 	} {
+		if tc.wantMismatch != "" && (tc.body == valid || !strings.Contains(tc.body, tc.wantMismatch)) {
+			t.Fatalf("%s fixture does not contain its intended mismatch %q", tc.name, tc.wantMismatch)
+		}
 		t.Run(tc.name, func(t *testing.T) {
 			var writes int
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
