@@ -13,10 +13,10 @@ Opening or updating a PR through the configured code-repository provider is requ
 ## Persistence modes
 
 - **Memory backend:** the simple local-development and test mode. Jobs, history, idempotency keys, and execution state are volatile and lost on process restart. The service must disclose this mode and must not imply durable acceptance.
-- **SQL backend:** optional and recommended for real deployments. It must persist accepted jobs, idempotency, lifecycle/history, worker ownership/checkpoints, and provider-side-effect references sufficiently to recover or clearly classify interrupted work after restart. Schema/migrations, transactions, retention, concurrency, and recovery behavior must be explicit.
+- **SQL backend:** optional and recommended for real deployments. It persists accepted jobs, idempotency, lifecycle/history, and provider-side-effect references sufficiently to recover or clearly classify interrupted work after restart. Schema/migrations, transactions, retention, concurrency, and recovery behavior must be explicit. The current single-server implementation does not persist worker leases or execution checkpoints; it does not promise resumption within a running workflow or multi-host ownership/fencing.
 - When SQL is explicitly configured and unavailable or unhealthy, admission fails closed; the server must not silently fall back to memory. Deployments requiring restart durability must use SQL or another explicitly supported durable backend.
 
-Both backends implement the same API and lifecycle contract. Tests should exercise the shared behavioral suite against memory and SQL. SQL acceptance requires process-restart tests, duplicate/concurrent admission tests, and interrupted-side-effect recovery tests.
+Both backends implement the same API and lifecycle contract. Tests should exercise the shared behavioral suite against memory and SQL. Recovery disposition is conservative: queued jobs have not been claimed and may resume; jobs found running at restart require operator reconciliation and must not be automatically replayed because workflow/provider side effects may have occurred; terminal jobs are retained for inspection; unknown states require operator reconciliation. This classification is not a durable worker-ownership or checkpoint mechanism. SQL acceptance requires process-restart tests, duplicate/concurrent admission tests, and interrupted-side-effect recovery tests.
 
 ## Request and API
 
