@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
@@ -929,6 +930,16 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	if err := os.Remove(outcomesPath + ".reconcile-mode"); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
+	lockedJobBefore := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
+	lockedHistoryBefore := getProcessHistory(t, client, restartedURL, admitted.ID, apiKey)
+	providerAttemptStore, ok := persisted.(*restjobs.SQLiteStore)
+	if !ok {
+		t.Fatalf("persisted store type=%T, want SQLiteStore", persisted)
+	}
+	attemptBeforeLock, err := providerAttemptStore.ProviderAttempt(admitted.ID)
+	if err != nil || !attemptBeforeLock.Uncertain {
+		t.Fatalf("pre-lock uncertain provider attempt=%+v err=%v", attemptBeforeLock, err)
+	}
 	unlockSQLite := lockSQLiteWrites(t, config.Persistence.Path)
 	locked := true
 	defer func() {
@@ -938,6 +949,28 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	}()
 	if code, body := operatorReconcile(apiKey); code != http.StatusConflict || strings.Contains(body, "SQLite") || strings.Contains(body, "provider-test-token") {
 		t.Fatalf("reconciliation during SQLite write outage status=%d body=%s", code, body)
+	}
+	lockedJob, err := providerAttemptStore.Get(admitted.ID)
+	if err != nil {
+		t.Fatalf("inspect SQLite job while write lock held: %v", err)
+	}
+	lockedHistory, err := providerAttemptStore.History(admitted.ID)
+	if err != nil {
+		t.Fatalf("inspect SQLite history while write lock held: %v", err)
+	}
+	attemptDuringLock, err := providerAttemptStore.ProviderAttempt(admitted.ID)
+	if err != nil || !reflect.DeepEqual(lockedJob, lockedJobBefore) || !reflect.DeepEqual(lockedHistory, lockedHistoryBefore) || attemptDuringLock != attemptBeforeLock {
+		t.Fatalf("SQLite lock changed persisted reconciliation state: before=(%+v,%+v,%+v) after=(%+v,%+v,%+v) err=%v", lockedJobBefore, lockedHistoryBefore, attemptBeforeLock, lockedJob, lockedHistory, attemptDuringLock, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+		t.Fatalf("SQLite write lock removed retained workspace: %v", err)
+	}
+	if currentRuns, err := os.ReadFile(harnessCount); err != nil || string(currentRuns) != initialHarnessRuns {
+		t.Fatalf("SQLite write lock reran harness: before=%q after=%q err=%v", initialHarnessRuns, currentRuns, err)
+	}
+	recordData, err = os.ReadFile(recordPath)
+	if err != nil || json.Unmarshal(recordData, &record) != nil || record.Creates != 1 || record.Attempts != 1 {
+		t.Fatalf("SQLite write lock reran provider write: record=%+v err=%v", record, err)
 	}
 	unlockSQLite()
 	locked = false
@@ -950,10 +983,6 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		if event.Type == "provider_reconciled" {
 			t.Fatalf("SQLite write outage recorded successful reconciliation: %+v", outageHistory)
 		}
-	}
-	providerAttemptStore, ok := persisted.(*restjobs.SQLiteStore)
-	if !ok {
-		t.Fatalf("persisted store type=%T, want SQLiteStore", persisted)
 	}
 	attemptDuringOutage, err := providerAttemptStore.ProviderAttempt(admitted.ID)
 	if err != nil || !attemptDuringOutage.Uncertain {
