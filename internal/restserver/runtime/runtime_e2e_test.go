@@ -94,7 +94,7 @@ func TestRESTServerBackupRestoreProcessE2E(t *testing.T) {
 			t.Fatal(err)
 		}
 		child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
-		child.Env = append(os.Environ(), "XDG_STATE_HOME="+xdgStateHome, "FACTORY_E2E_HELPER=1", "FACTORY_E2E_NO_PROVIDER=1", "FACTORY_E2E_CONFIG="+configFile, "FACTORY_E2E_READY="+readyPath)
+		child.Env = append(os.Environ(), "XDG_STATE_HOME="+xdgStateHome, "FACTORY_E2E_HELPER=1", "FACTORY_E2E_NO_PROVIDER=1", "FACTORY_E2E_REPORT_RUNTIME_ERRORS=1", "FACTORY_E2E_CONFIG="+configFile, "FACTORY_E2E_READY="+readyPath)
 		child.Stdout, child.Stderr = logFile, logFile
 		if err := child.Start(); err != nil {
 			_ = logFile.Close()
@@ -373,7 +373,10 @@ func TestRESTServerProcessHelper(t *testing.T) {
 		return listener, nil
 	}
 	if err := run(ctx, config, runtimeOptions{Publisher: publisher, Listen: listen}); err != nil {
-		t.Fatalf("REST server helper runtime failed: %v", err)
+		if os.Getenv("FACTORY_E2E_REPORT_RUNTIME_ERRORS") == "1" {
+			t.Fatalf("REST server helper runtime failed: %v", err)
+		}
+		os.Exit(12)
 	}
 	os.Exit(0)
 }
