@@ -137,6 +137,17 @@ func (p *uncertainE2EPublisher) Reconcile(ctx context.Context, request restprovi
 	if err := ctx.Err(); err != nil {
 		return restprovider.Outcome{}, err
 	}
+	lookup, err := os.OpenFile(p.path+".reconcile-lookups", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return restprovider.Outcome{}, err
+	}
+	if _, err := lookup.WriteString(request.JobID + "\n"); err != nil {
+		_ = lookup.Close()
+		return restprovider.Outcome{}, err
+	}
+	if err := lookup.Close(); err != nil {
+		return restprovider.Outcome{}, err
+	}
 	data, err := os.ReadFile(p.path + ".uncertain.json")
 	if err != nil {
 		return restprovider.Outcome{}, fmt.Errorf("fake provider unavailable")
@@ -1487,6 +1498,260 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		t.Fatalf("reconciled server shutdown: %v", err)
 	}
 	restarted.Process = nil
+}
+
+func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	config.Limits.Workers = 2
+	config.Limits.QueueCapacity = 2
+	stateDir := testResultsBase(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	config.Limits.JobTimeout = "30s"
+	harnessCount := filepath.Join(t.TempDir(), "harness-count")
+	harnessPID := filepath.Join(t.TempDir(), "harness-pid")
+	harness := filepath.Join(t.TempDir(), "interrupted-harness.sh")
+	script := fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\ncase \"$1\" in hold-no-provider) printf '%%s\\n' \"$$\" > %q; exec sleep 300 ;; esac\nprintf 'verified\\n' >> result.txt\n", harnessCount, harnessPID)
+	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outcomesPath := filepath.Join(t.TempDir(), "provider-record")
+	readyDir := t.TempDir()
+	startServer := func(name string) (*exec.Cmd, <-chan error, string) {
+		t.Helper()
+		readyPath := filepath.Join(readyDir, name)
+		logPath := filepath.Join(t.TempDir(), name+".log")
+		logFile, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+		child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+outcomesPath, "FACTORY_E2E_PROVIDER_MODE=uncertain")
+		child.Stdout, child.Stderr = logFile, logFile
+		if err := child.Start(); err != nil {
+			_ = logFile.Close()
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- child.Wait(); _ = logFile.Close() }()
+		return child, done, waitForProcessURL(t, done, readyPath, logPath)
+	}
+	client := &http.Client{Timeout: 12 * time.Second}
+	child, childDone, baseURL := startServer("initial-listener")
+	noAttemptPID := 0
+	defer func() {
+		if child != nil && child.ProcessState == nil {
+			_ = child.Process.Kill()
+			<-childDone
+		}
+		if noAttemptPID > 0 {
+			_ = syscall.Kill(noAttemptPID, syscall.SIGKILL)
+		}
+	}()
+	providerJob, err := submitProcessJob(client, baseURL, apiKey, "trusted", "provider-interrupted", "recovery-provider")
+	if err != nil || providerJob.StatusCode != http.StatusAccepted {
+		t.Fatalf("provider job admission=%+v err=%v", providerJob, err)
+	}
+	noAttemptJob, err := submitProcessJob(client, baseURL, apiKey, "trusted", "hold-no-provider", "recovery-no-provider")
+	if err != nil || noAttemptJob.StatusCode != http.StatusAccepted {
+		t.Fatalf("no-attempt job admission=%+v err=%v", noAttemptJob, err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outcomesPath + ".uncertain.json"); err == nil {
+			if data, readErr := os.ReadFile(harnessPID); readErr == nil {
+				_, _ = fmt.Sscanf(string(data), "%d", &noAttemptPID)
+				if noAttemptPID > 0 {
+					break
+				}
+			}
+		}
+		select {
+		case err := <-childDone:
+			t.Fatalf("server exited before recovery barriers: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if noAttemptPID <= 0 {
+		t.Fatal("jobs did not reach provider and harness interruption barriers")
+	}
+	if getProcessJob(t, client, baseURL, providerJob.ID, apiKey).Status != restjobs.StatusRunning || getProcessJob(t, client, baseURL, noAttemptJob.ID, apiKey).Status != restjobs.StatusRunning {
+		t.Fatal("both jobs must be running before abrupt service termination")
+	}
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err == nil {
+		t.Fatal("server was not abruptly interrupted")
+	}
+	child = nil
+	_ = syscall.Kill(noAttemptPID, syscall.SIGKILL)
+
+	child, childDone, baseURL = startServer("recovery-listener")
+	action := func(id, path, authorization, body string) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs/"+id+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if authorization != "" {
+			req.Header.Set("Authorization", "Bearer "+authorization)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(data)
+	}
+	if code, _ := action(providerJob.ID, "/reconcile", "wrong-key", ""); code != http.StatusUnauthorized {
+		t.Fatalf("wrong-auth reconcile status=%d", code)
+	}
+	if code, _ := action(providerJob.ID, "/reconcile", apiKey, `{"number":900}`); code != http.StatusBadRequest {
+		t.Fatalf("body-bearing reconcile status=%d", code)
+	}
+	for _, mode := range []string{"mismatch", "outage"} {
+		if err := os.WriteFile(outcomesPath+".reconcile-mode", []byte(mode), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict || strings.Contains(body, "test-provider-token") {
+			t.Fatalf("%s interrupted reconcile status=%d body=%s", mode, code, body)
+		}
+		unchanged := getProcessJob(t, client, baseURL, providerJob.ID, apiKey)
+		if unchanged.Status != restjobs.StatusRunning || unchanged.Provider != nil || unchanged.Verification == nil {
+			t.Fatalf("%s reconciliation changed interrupted job or lost evidence: %+v", mode, unchanged)
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "worktree")); err != nil {
+			t.Fatalf("%s reconciliation removed retained workspace: %v", mode, err)
+		}
+	}
+	if code, _ := action(noAttemptJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict {
+		t.Fatalf("provider reconciliation without persisted attempt status=%d", code)
+	}
+	if err := os.Remove(outcomesPath + ".reconcile-mode"); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := action(providerJob.ID, "/disposition/failed", apiKey, ""); code != http.StatusConflict {
+		t.Fatalf("provider-attempt job accepted status-only disposition status=%d", code)
+	}
+	lockWrites := lockSQLiteWrites(t, config.Persistence.Path)
+	if code, _ := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict {
+		lockWrites()
+		t.Fatalf("SQLite-lock reconcile status=%d", code)
+	}
+	lockWrites()
+	if job := getProcessJob(t, client, baseURL, providerJob.ID, apiKey); job.Status != restjobs.StatusRunning || job.Provider != nil || job.Verification == nil {
+		t.Fatalf("SQLite lock changed provider job or lost evidence: %+v", job)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "worktree")); err != nil {
+		t.Fatalf("SQLite lock removed retained workspace: %v", err)
+	}
+	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("interrupted provider reconcile status=%d body=%s", code, body)
+	}
+	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("repeated interrupted provider reconcile status=%d body=%s", code, body)
+	}
+	if code, _ := action(noAttemptJob.ID, "/disposition/failed", "wrong-key", ""); code != http.StatusUnauthorized {
+		t.Fatalf("wrong-auth disposition status=%d", code)
+	}
+	if code, _ := action(noAttemptJob.ID, "/disposition/succeeded", apiKey, ""); code != http.StatusBadRequest {
+		t.Fatalf("success disposition status=%d", code)
+	}
+	if code, _ := action(noAttemptJob.ID, "/disposition/failed", apiKey, `{"evidence":"caller supplied"}`); code != http.StatusBadRequest {
+		t.Fatalf("body-bearing no-attempt disposition status=%d", code)
+	}
+	if code, body := action(noAttemptJob.ID, "/disposition/failed", apiKey, ""); code != http.StatusOK || !strings.Contains(body, `"status":"failed"`) {
+		t.Fatalf("no-attempt disposition status=%d body=%s", code, body)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", noAttemptJob.ID, "worktree")); err != nil {
+		t.Fatalf("failed disposition removed retained workspace: %v", err)
+	}
+	providerHistory := getProcessHistory(t, client, baseURL, providerJob.ID, apiKey)
+	if len(providerHistory.Events) != 4 || providerHistory.Events[2].Type != "succeeded" || providerHistory.Events[3].Type != "provider_reconciled" || providerHistory.Events[3].Message != "Operator confirmed provider outcome" {
+		t.Fatalf("provider recovery history=%+v", providerHistory)
+	}
+	noAttemptHistory := getProcessHistory(t, client, baseURL, noAttemptJob.ID, apiKey)
+	foundDisposition := false
+	for _, event := range noAttemptHistory.Events {
+		if event.Type == "operator_disposition" && event.Message == "failed" {
+			foundDisposition = true
+		}
+	}
+	if !foundDisposition {
+		t.Fatalf("no-attempt disposition audit missing: %+v", noAttemptHistory)
+	}
+	providerRecord, err := os.ReadFile(outcomesPath + ".uncertain.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookupCalls, err := os.ReadFile(outcomesPath + ".reconcile-lookups")
+	if err != nil || string(lookupCalls) != providerJob.ID+"\n"+providerJob.ID+"\n"+providerJob.ID+"\n"+providerJob.ID+"\n" {
+		t.Fatalf("read-only provider lookup calls=%q err=%v", lookupCalls, err)
+	}
+	var provider uncertainProviderRecord
+	if json.Unmarshal(providerRecord, &provider) != nil || provider.Creates != 1 || provider.Attempts != 1 {
+		t.Fatalf("provider write replayed: %+v", provider)
+	}
+	harnessBefore, err := os.ReadFile(harnessCount)
+	if err != nil || strings.TrimSpace(string(harnessBefore)) == "" {
+		t.Fatalf("harness run evidence unavailable before final restart: %q err=%v", harnessBefore, err)
+	}
+	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err != nil {
+		t.Fatalf("recovery server shutdown: %v", err)
+	}
+	child = nil
+	child, childDone, baseURL = startServer("final-listener")
+	finalProvider := getProcessJob(t, client, baseURL, providerJob.ID, apiKey)
+	finalNoAttempt := getProcessJob(t, client, baseURL, noAttemptJob.ID, apiKey)
+	if finalProvider.Status != restjobs.StatusSucceeded || finalProvider.Provider == nil || finalNoAttempt.Status != restjobs.StatusFailed {
+		t.Fatalf("recovery not durable across restart: provider=%+v noAttempt=%+v", finalProvider, finalNoAttempt)
+	}
+	if got := getProcessHistory(t, client, baseURL, providerJob.ID, apiKey); !reflect.DeepEqual(got, providerHistory) {
+		t.Fatalf("provider audit changed after restart: before=%+v after=%+v", providerHistory, got)
+	}
+	if got := getProcessHistory(t, client, baseURL, noAttemptJob.ID, apiKey); !reflect.DeepEqual(got, noAttemptHistory) {
+		t.Fatalf("disposition audit changed after restart: before=%+v after=%+v", noAttemptHistory, got)
+	}
+	harnessAfter, err := os.ReadFile(harnessCount)
+	if err != nil || string(harnessAfter) != string(harnessBefore) {
+		t.Fatalf("restart/recovery replayed harness: before=%q after=%q err=%v", harnessBefore, harnessAfter, err)
+	}
+	providerAfter, err := os.ReadFile(outcomesPath + ".uncertain.json")
+	if err != nil || string(providerAfter) != string(providerRecord) {
+		t.Fatalf("restart/recovery repeated provider write: before=%q after=%q err=%v", providerRecord, providerAfter, err)
+	}
+	lookupAfter, err := os.ReadFile(outcomesPath + ".reconcile-lookups")
+	if err != nil || string(lookupAfter) != string(lookupCalls) {
+		t.Fatalf("restart repeated provider lookup: before=%q after=%q err=%v", lookupCalls, lookupAfter, err)
+	}
 }
 
 func lockSQLiteWrites(t *testing.T, path string) func() {

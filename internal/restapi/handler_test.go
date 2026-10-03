@@ -118,6 +118,45 @@ func TestHealthAndReadinessAreMinimalAndUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestInterruptedDispositionRouteIsAuthenticatedBodylessAndBounded(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("interrupted-disposition", restjobs.Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := atomic.Int32{}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	handler.config.ResolveInterrupted = func(_ context.Context, id string, disposition restjobs.InterruptedDisposition) error {
+		called.Add(1)
+		if id != job.ID || disposition != restjobs.InterruptedDispositionFailed {
+			return restjobs.ErrInvalidTransition
+		}
+		return nil
+	}
+	path := "/v1/jobs/" + job.ID + "/disposition/failed"
+	if response := request(handler, http.MethodPost, path, "", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated disposition status=%d", response.Code)
+	}
+	if response := request(handler, http.MethodPost, path, `{"status":"succeeded"}`, true); response.Code != http.StatusBadRequest {
+		t.Fatalf("body-bearing disposition status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, invalid := range []string{"succeeded", "running", "unknown"} {
+		if response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/disposition/"+invalid, "", true); response.Code != http.StatusBadRequest {
+			t.Errorf("invalid disposition %q status=%d body=%s", invalid, response.Code, response.Body.String())
+		}
+	}
+	response := request(handler, http.MethodPost, path, "", true)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"queued"`) {
+		t.Fatalf("valid disposition response=%d body=%s", response.Code, response.Body.String())
+	}
+	if called.Load() != 1 {
+		t.Fatalf("disposition callback count=%d, want one callback for bodyless valid action", called.Load())
+	}
+	if response := request(handler, http.MethodGet, path, "", true); response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("disposition GET status=%d", response.Code)
+	}
+}
+
 func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 8))
 	job, _, err := manager.Admit("reconcile-route", restjobs.Request{Repository: "widget", Task: "task"})
@@ -140,6 +179,9 @@ func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *test
 	}
 	if response := request(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/reconcile", "", true); response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("reconcile GET status=%d", response.Code)
+	}
+	if response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", `{"number":1}`, true); response.Code != http.StatusBadRequest {
+		t.Fatalf("body-bearing reconcile status=%d", response.Code)
 	}
 }
 

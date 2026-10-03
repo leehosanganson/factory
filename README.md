@@ -2,7 +2,7 @@
 
 Factory is a Go service and CLI for agent-driven repository jobs. Its product direction is one RESTful job service: accept a bounded request, run the configured workflow, verify the result, and create or update a pull request through the configured code-repository provider. Factory does not merge, release, or deploy.
 
-The REST server supports volatile memory mode and optional SQLite persistence, with a configured GitHub provider for job PR publication and an authenticated operator action to reconcile recorded provider attempts on eligible failed SQLite jobs without replay. See the [REST server operations guide](docs/features/rest-server-operations.md) for probe semantics, backup/restore, restart recovery, reconciliation, and operator limits; the [REST job contract](docs/roadmap/rest-api-contract.md) describes remaining target-MVP requirements.
+The REST server supports volatile memory mode and optional SQLite persistence, with a configured GitHub provider for job PR publication and authenticated, no-replay operator recovery actions for eligible interrupted SQLite jobs: failed/canceled disposition without provider attempts, or read-only provider confirmation for persisted provider identity. See the [REST server operations guide](docs/features/rest-server-operations.md) for probe semantics, backup/restore, restart recovery, reconciliation, and operator limits; the [REST job contract](docs/roadmap/rest-api-contract.md) describes remaining target-MVP requirements.
 
 ## Documentation
 
