@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/leehosanganson/factory/internal/factory"
+	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restserver"
 	serverruntime "github.com/leehosanganson/factory/internal/restserver/runtime"
 )
@@ -57,6 +58,17 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			fmt.Fprintln(out, version)
 			return nil
 		case "server":
+			if len(args) > 1 && args[1] == "backup" {
+				configPath, destination, err := parseServerBackupOptions(args[2:])
+				if err != nil {
+					return err
+				}
+				config, err := restserver.LoadConfig(configPath)
+				if err != nil {
+					return err
+				}
+				return restjobs.BackupSQLiteDatabase(context.Background(), config.Persistence.Path, destination)
+			}
 			configPath, err := parseServerOptions(args[1:])
 			if err != nil {
 				return err
@@ -245,8 +257,11 @@ func printCommandHelp(out io.Writer, args []string) {
 		commands, paragraphs = workHelp(subcommand)
 	case "server":
 		title = "REST API server"
-		commands = []helpCommand{{"factory server --config <absolute-path>", "Start the local REST job service using a server-only JSON config."}}
-		paragraphs = []string{"The REST API uses a shared API key and executes the configured Factory workflow locally. It does not publish branches or pull requests. See docs/features/rest-server.md."}
+		commands = []helpCommand{
+			{"factory server --config <absolute-path>", "Start the local REST job service using a server-only JSON config."},
+			{"factory server backup --config <absolute-path> --destination <absolute-path>", "Create a consistent SQLite online backup."},
+		}
+		paragraphs = []string{"The REST API uses a shared API key and executes the configured Factory workflow locally. See docs/features/rest-server-operations.md for backup and recovery guidance."}
 	}
 	width := detectHelpWidth(out)
 	_, noColor := os.LookupEnv("NO_COLOR")
@@ -354,6 +369,13 @@ func parseServerOptions(args []string) (string, error) {
 		return "", fmt.Errorf("usage: factory server --config <absolute-path>")
 	}
 	return args[1], nil
+}
+
+func parseServerBackupOptions(args []string) (string, string, error) {
+	if len(args) != 4 || args[0] != "--config" || args[2] != "--destination" || !filepath.IsAbs(args[1]) || !filepath.IsAbs(args[3]) {
+		return "", "", fmt.Errorf("usage: factory server backup --config <absolute-path> --destination <absolute-path>")
+	}
+	return args[1], args[3], nil
 }
 
 func foregroundContext() (context.Context, context.CancelFunc) {

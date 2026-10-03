@@ -30,12 +30,28 @@ Configure worker count, queue capacity, retained records, request/task sizes, hi
 
 The service runs its configured local workflow with the server account's authority. A process, worktree, Nix shell, or container is not a security sandbox. Keep API-key holders and configured repositories trusted; protect provider credentials and state files; use loopback by default. Before non-loopback exposure, put the service behind operator-managed network controls and TLS/authentication appropriate to the environment.
 
+## Backup and restore
+
+Create a consistent online backup while the server is running. The destination directory must already exist and be private (owner-only permissions). Do not use the configured database path as the destination.
+
+```sh
+factory server backup --config /absolute/path/to/server.json --destination /secure/backup/path/jobs.db
+```
+
+The backup file is written with owner-only permissions. Restore by placing a copy at a new private database path, updating `persistence.path` in a disposable config, and starting the server with that config. Verify health/readiness and inspect representative job status/history. Do not point a live server at the source backup.
+
 ## First request and recovery drill
 
 After creating the placeholder-only [server config](rest-server-config.md), start the service:
 
 ```sh
 factory server --config /absolute/path/to/server.json
+```
+
+For SQLite recovery, create an online backup without starting the server:
+
+```sh
+factory server backup --config /absolute/path/to/server.json --destination /secure/backup/path/jobs.db
 ```
 
 In another terminal, confirm probes and submit a bounded job. Create a mode-`0600` curl header file containing `Authorization: Bearer` followed by the protected API key. Keep this file outside the repository, avoid logging it, and remove it when finished.

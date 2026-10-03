@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net/url"
 	"os"
@@ -17,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 //go:embed migrations/*.sql
@@ -30,6 +31,7 @@ const sqliteBusyTimeout = 5 * time.Second
 // blindly re-queued because external effects may already have happened.
 type SQLiteStore struct {
 	db        *sql.DB
+	dbPath    string
 	config    Config
 	mu        sync.Mutex
 	closed    bool
@@ -66,7 +68,7 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	store := &SQLiteStore{db: db, config: manager.config, closeCh: make(chan struct{}), closeDone: make(chan struct{})}
+	store := &SQLiteStore{db: db, dbPath: filepath.Clean(path), config: manager.config, closeCh: make(chan struct{}), closeDone: make(chan struct{})}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := db.PingContext(ctx); err != nil {
@@ -600,6 +602,137 @@ func (s *SQLiteStore) Recover(ctx context.Context) (RecoveryReport, error) {
 		return RecoveryReport{}, errors.New("recover SQLite jobs")
 	}
 	return report, nil
+}
+
+// Backup writes a transactionally consistent copy of the SQLite store using
+// SQLite's online backup mechanism, including its WAL state. The destination
+// must not be the source database; an existing destination is atomically
+// replaced after the backup succeeds.
+func (s *SQLiteStore) Backup(ctx context.Context, destination string) error {
+	if ctx == nil || strings.TrimSpace(destination) == "" || destination == ":memory:" {
+		return ErrInvalidInput
+	}
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	return copySQLiteDatabase(ctx, s.db, s.dbPath, destination)
+}
+
+// BackupSQLiteDatabase copies a configured SQLite database without applying
+// shutdown transitions or changing queued/running job state.
+func BackupSQLiteDatabase(ctx context.Context, sourcePath, destination string) error {
+	if ctx == nil || strings.TrimSpace(sourcePath) == "" || sourcePath == ":memory:" {
+		return ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(sourcePath) {
+		return errors.New("SQLite source path must be absolute")
+	}
+	if _, err := os.Lstat(sourcePath); err != nil {
+		return errors.New("SQLite source database is unavailable")
+	}
+	dsn, err := sqliteDSN(sourcePath)
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return errors.New("open SQLite backup source")
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if err := db.PingContext(ctx); err != nil {
+		return errors.New("SQLite source database is unavailable")
+	}
+	return copySQLiteDatabase(ctx, db, sourcePath, destination)
+}
+
+func copySQLiteDatabase(ctx context.Context, sourceDB *sql.DB, sourcePath, destination string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(destination) {
+		return errors.New("SQLite backup destination must be absolute")
+	}
+	destination, err := filepath.Abs(destination)
+	if err != nil {
+		return errors.New("resolve SQLite backup destination")
+	}
+	sourcePath, err = filepath.Abs(sourcePath)
+	if err != nil || filepath.Clean(destination) == filepath.Clean(sourcePath) {
+		return errors.New("SQLite backup destination must differ from its source")
+	}
+	info, err := os.Stat(filepath.Dir(destination))
+	if err != nil || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("SQLite backup directory must exist and be private")
+	}
+	source, err := sourceDB.Conn(ctx)
+	if err != nil {
+		return errors.New("open SQLite backup source")
+	}
+	defer source.Close()
+	targetPath := destination + ".partial"
+	if _, err := os.Lstat(targetPath); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return errors.New("SQLite backup temporary path is unavailable")
+	}
+	target, err := sql.Open("sqlite", "file:"+url.PathEscape(targetPath)+"?mode=rwc&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return errors.New("open SQLite backup destination")
+	}
+	target.SetMaxOpenConns(1)
+	defer target.Close()
+	targetConn, err := target.Conn(ctx)
+	if err != nil {
+		_ = os.Remove(targetPath)
+		return errors.New("initialize SQLite backup destination")
+	}
+	defer targetConn.Close()
+	backupErr := source.Raw(func(sourceDriverConn any) error {
+		onlineBackup, ok := sourceDriverConn.(interface {
+			NewBackup(string) (*sqlite.Backup, error)
+		})
+		if !ok {
+			return errors.New("SQLite online backup is unavailable")
+		}
+		backup, err := onlineBackup.NewBackup("file:" + url.PathEscape(targetPath) + "?mode=rwc&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)")
+		if err != nil {
+			return err
+		}
+		for {
+			more, err := backup.Step(128)
+			if err != nil {
+				_ = backup.Finish()
+				return err
+			}
+			if !more {
+				return backup.Finish()
+			}
+			if err := ctx.Err(); err != nil {
+				_ = backup.Finish()
+				return err
+			}
+		}
+	})
+	if backupErr != nil {
+		_ = os.Remove(targetPath)
+		return errors.New("copy SQLite backup")
+	}
+	if err := target.Close(); err != nil {
+		_ = os.Remove(targetPath)
+		return errors.New("close SQLite backup")
+	}
+	if err := os.Chmod(targetPath, 0o600); err != nil {
+		_ = os.Remove(targetPath)
+		return errors.New("protect SQLite backup")
+	}
+	if err := os.Rename(targetPath, destination); err != nil {
+		_ = os.Remove(targetPath)
+		return fmt.Errorf("publish SQLite backup: %w", err)
+	}
+	return nil
 }
 
 func (s *SQLiteStore) Ping(ctx context.Context) error {

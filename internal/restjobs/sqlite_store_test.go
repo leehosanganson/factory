@@ -53,6 +53,117 @@ func TestSQLiteStoreEnforcesRetainedRecordLimitWithoutEvictingTerminalHistory(t 
 	}
 }
 
+func TestSQLiteStoreBackupRejectsReplacingItsSource(t *testing.T) {
+	dir := privateSQLiteDir(t)
+	path := filepath.Join(dir, "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	if err := store.Backup(context.Background(), path); err == nil {
+		t.Fatal("Backup() replacing its open source database succeeded")
+	}
+	if err := store.Ping(context.Background()); err != nil {
+		t.Fatalf("source store unavailable after rejected backup: %v", err)
+	}
+}
+
+func TestBackupSQLiteDatabaseDoesNotChangeQueuedJobs(t *testing.T) {
+	dir := privateSQLiteDir(t)
+	sourcePath := filepath.Join(dir, "jobs.db")
+	store, err := OpenSQLiteStore(sourcePath, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("backup-queued", Request{Repository: "widget", Task: "still queued"})
+	if err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	if err := BackupSQLiteDatabase(context.Background(), sourcePath, filepath.Join(dir, "copy.db")); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(sourcePath, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	got, err := reopened.Get(job.ID)
+	if err != nil || got.Status != StatusRunning {
+		t.Fatalf("source job after backup = (%+v, %v), want running", got, err)
+	}
+}
+
+func TestSQLiteStoreBackupRestoresProviderOutcomeHistoryAndIdempotency(t *testing.T) {
+	dir := privateSQLiteDir(t)
+	databasePath := filepath.Join(dir, "jobs.db")
+	store, err := OpenSQLiteStore(databasePath, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("backup-key", Request{Repository: "widget", Task: "preserve this"})
+	if err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if err := store.AddEvent(job.ID, "verification", "checks recorded"); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	outcome := ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/" + job.ID, Commit: "abc123", State: "open"}
+	if err := store.RecordProviderOutcome(job.ID, outcome); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if err := store.Finish(job.ID, StatusSucceeded); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+
+	backupPath := filepath.Join(dir, "backup.db")
+	if err := store.Backup(context.Background(), backupPath); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := OpenSQLiteStore(backupPath, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.CloseStore()
+	got, err := restored.Get(job.ID)
+	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
+		t.Fatalf("restored job = (%+v, %v)", got, err)
+	}
+	history, err := restored.History(job.ID)
+	if err != nil || len(history.Events) != 4 || history.Events[2].Type != "verification" {
+		t.Fatalf("restored history = (%+v, %v)", history, err)
+	}
+	replay, repeated, err := restored.Admit("backup-key", Request{Repository: "widget", Task: "preserve this"})
+	if err != nil || !repeated || replay.ID != job.ID {
+		t.Fatalf("restored idempotent replay = (%+v, %v, %v)", replay, repeated, err)
+	}
+	report, err := restored.Recover(context.Background())
+	if err != nil || len(report.Terminal) != 1 || report.Terminal[0].ID != job.ID {
+		t.Fatalf("restored recovery report = (%+v, %v)", report, err)
+	}
+}
+
 func TestSQLiteStorePersistsJobHistoryAndIdempotencyAcrossRestart(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/leehosanganson/factory/internal/factory"
+	"github.com/leehosanganson/factory/internal/restjobs"
+	"github.com/leehosanganson/factory/internal/restserver"
 )
 
 func TestPrivateJobWorkerInvocationRequiresStoreRoot(t *testing.T) {
@@ -146,7 +148,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		omit []string
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
-		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "server-only JSON config"}, omit: []string{"api-key-value"}},
+		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "server-only JSON config"}, omit: []string{"api-key-value"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "{repo}"}, omit: []string{"factory run", "Monitor management", "Example:"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
@@ -194,6 +196,86 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("inspect state after help: %v", err)
+	}
+}
+
+func TestServerBackupCommandRequiresExactConfigAndDestinationSyntax(t *testing.T) {
+	for _, args := range [][]string{
+		{"server", "backup"},
+		{"server", "backup", "--config"},
+		{"server", "backup", "--config", "relative.json", "--destination", "/tmp/backup.db"},
+		{"server", "backup", "--config", "/tmp/server.json", "--destination", "relative.db"},
+		{"server", "backup", "--destination", "/tmp/backup.db", "--config", "/tmp/server.json"},
+		{"server", "backup", "--config", "/tmp/server.json", "--destination", "/tmp/backup.db", "extra"},
+	} {
+		var out, errOut bytes.Buffer
+		err := run(args, strings.NewReader(""), &out, &errOut)
+		if err == nil || !strings.Contains(err.Error(), "usage: factory server backup --config <absolute-path> --destination <absolute-path>") {
+			t.Errorf("run(%v) error=%v, want strict syntax error", args, err)
+		}
+	}
+}
+
+func TestServerBackupCommandCreatesSQLiteBackupWithoutLaunchingServer(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(dir, "repo")
+	if err := os.Mkdir(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test"}} {
+		command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	config := restserver.DefaultConfig()
+	config.Harness = restserver.HarnessConfig{Executable: "pi", Args: []string{"{task}", "{system_prompt}"}}
+	config.Repositories = map[string]string{"trusted": repository}
+	config.APIKeyFile = filepath.Join(dir, "api-key")
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(dir, "jobs.db")}
+	configPath := filepath.Join(dir, "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config.Persistence.Path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(config.Persistence.Path, restjobs.Config{QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers, MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob, MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("queued", restjobs.Request{Repository: "trusted", Task: "must remain queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		_ = store.CloseStore()
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(dir, "backup.db")
+	var out, errOut bytes.Buffer
+	args := []string{"server", "backup", "--config", configPath, "--destination", destination}
+	if err := run(args, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("run(%v): %v; stderr=%s", args, err, errOut.String())
+	}
+	restored, err := restjobs.OpenSQLiteStore(destination, restjobs.Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4})
+	if err != nil {
+		t.Fatalf("open created backup: %v", err)
+	}
+	defer restored.CloseStore()
+	got, err := restored.Get(job.ID)
+	if err != nil || got.Status != restjobs.StatusRunning {
+		t.Fatalf("backup changed running job state: (%+v, %v); want running state preserved", got, err)
 	}
 }
 
