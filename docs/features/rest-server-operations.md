@@ -45,6 +45,8 @@ On restart, queued records may be resumed because no worker claimed them. Termin
 
 Inspect job status and bounded history before taking action. For an uncertain provider operation, compare the durable job identity/branch with the configured provider's live PR state before retrying. Preserve the workspace and record until the outcome is resolved. Do not manually delete a running workspace or blindly resubmit with a new idempotency key.
 
+A process-level regression test uses a fake provider that records a PR create and then waits until the job timeout simulates a lost response. It verifies that the job ends `failed` without a confirmed provider outcome, and that the SQLite record/workspace survive a clean server restart without startup replaying the write. An explicit retry against the fake provider reconciles the same PR identity without a second create. This exercises the timeout/restart boundary, not automatic recovery: interrupted jobs remain `running` and need operator reconciliation, and the test does not validate a live GitHub timeout or automatically persist the explicitly reconciled outcome back into the job.
+
 ## Limits and trusted boundary
 
 Configure worker count, queue capacity, retained records, request/task sizes, history, execution timeout, and workspace bounds for the host's capacity. Queue saturation rejects new work; retry only after capacity becomes available, using the original idempotency key.
