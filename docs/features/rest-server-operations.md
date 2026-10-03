@@ -79,6 +79,14 @@ factory server backup --config /absolute/path/to/server.json --destination /secu
 
 The backup file is written with owner-only permissions. Restore by placing a copy at a new private database path, updating `persistence.path` in a disposable config, and starting the server with that config. Verify health/readiness and inspect representative job status/history. Do not point a live server at the source backup.
 
+The process-level regression test exercises this command against a live temporary SQLite server using only synthetic requests and no provider configuration or credentials. It restores a copied backup under a separate private path and starts a second server; assertions cover terminal status, verification evidence, lifecycle history, idempotent replay, queued-job resumption, and non-replay of an interrupted running job. It also checks backup/restore file modes, CLI rejection of the live source and a non-private destination directory, and sanitized startup failure for corrupt SQLite content. Run the reproducible test with:
+
+```sh
+go test ./internal/restserver/runtime -run '^TestRESTServerBackupRestoreProcessE2E$' -count=1
+```
+
+This is automated disposable test evidence, not a claim that a production or deployed-service restore drill has been performed.
+
 ## Clean setup and first client request
 
 This walkthrough starts with a trusted local checkout and an installed harness executable. Use a dedicated service account where practical: the server runs its configured workflow with that account's local authority, and neither the process nor a container is a security sandbox. Keep the repository, harness, config, API key, and any provider credentials operator-controlled.
