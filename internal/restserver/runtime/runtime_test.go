@@ -186,6 +186,52 @@ func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T)
 	}
 }
 
+func TestRunMemoryModeRejectsInterruptedDispositionEndpoint(t *testing.T) {
+	config, key := runtimeFixture(t)
+	listenerReady := make(chan net.Listener, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{
+			ResultsBase: testResultsBase(t),
+			Listen: func(network, _ string) (net.Listener, error) {
+				listener, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					listenerReady <- listener
+				}
+				return listener, err
+			},
+		})
+	}()
+	listener := <-listenerReady
+	baseURL := "http://" + listener.Addr().String()
+	waitForStatus(t, baseURL+"/readyz", http.StatusOK)
+	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs/00000000-0000-4000-8000-000000000000/disposition/failed", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	response.Body.Close()
+	if err != nil || response.StatusCode != http.StatusConflict || !strings.Contains(string(body), `"reconciliation_not_allowed"`) {
+		t.Fatalf("memory-mode disposition status=%d body=%s err=%v", response.StatusCode, body, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("server shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down")
+	}
+}
+
 func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 	config, key := runtimeFixture(t)
 	listenerReady := make(chan net.Listener, 1)

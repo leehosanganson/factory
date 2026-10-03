@@ -48,6 +48,12 @@ type sqliteProviderReconciliationStore interface {
 	Get(string) (restjobs.Snapshot, error)
 	ProviderAttempt(string) (restjobs.ProviderAttempt, error)
 	ReconcileProviderOutcome(string, restjobs.ProviderOutcome) error
+	RecoveryNeeded(string) bool
+}
+
+type sqliteInterruptedDispositionStore interface {
+	ResolveInterrupted(string, restjobs.InterruptedDisposition) error
+	RecoveryNeeded(string) bool
 }
 
 // Run starts the REST server and blocks until ctx is canceled or serving fails.
@@ -183,6 +189,19 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
+		ResolveInterrupted: func(requestCtx context.Context, id string, disposition restjobs.InterruptedDisposition) error {
+			if err := requestCtx.Err(); err != nil {
+				return restjobs.ErrInvalidTransition
+			}
+			sqliteStore, ok := store.(sqliteInterruptedDispositionStore)
+			if !ok {
+				return restjobs.ErrInvalidTransition
+			}
+			if !sqliteStore.RecoveryNeeded(id) {
+				return restjobs.ErrInvalidTransition
+			}
+			return sqliteStore.ResolveInterrupted(id, disposition)
+		},
 		ReconcileProvider: func(requestCtx context.Context, id string) error {
 			sqliteStore, ok := store.(sqliteProviderReconciliationStore)
 			if !ok || publisher == nil {
@@ -201,6 +220,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 				return getErr
 			}
 			attempt, attemptErr := sqliteStore.ProviderAttempt(id)
+			if errors.Is(attemptErr, restjobs.ErrInvalidTransition) && job.Provider != nil {
+				attempt = restjobs.ProviderAttempt{Provider: job.Provider.Provider, Repository: job.Provider.Repository, Branch: job.Provider.Branch, Commit: job.Provider.Commit}
+				attemptErr = nil
+			}
 			if errors.Is(attemptErr, restjobs.ErrInvalidTransition) {
 				return restjobs.ErrInvalidTransition
 			}
@@ -210,10 +233,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			if job.Status == restjobs.StatusSucceeded && job.Provider != nil && job.Provider.Provider == attempt.Provider && job.Provider.Repository == attempt.Repository && job.Provider.Branch == attempt.Branch && job.Provider.Commit == attempt.Commit {
 				return nil
 			}
-			if job.Status != restjobs.StatusFailed {
+			if job.Status != restjobs.StatusFailed && (job.Status != restjobs.StatusRunning || !sqliteStore.RecoveryNeeded(id)) {
 				return restjobs.ErrInvalidTransition
 			}
-			outcome, reconcileErr := factoryExecutor.ReconcileProvider(requestCtx, job, attempt, reconciler)
+			outcome, reconcileErr := factoryExecutor.ReconcileInterruptedProvider(requestCtx, job, attempt, reconciler)
 			if reconcileErr != nil {
 				return restjobs.ErrInvalidTransition
 			}
