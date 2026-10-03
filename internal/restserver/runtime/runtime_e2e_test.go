@@ -34,7 +34,10 @@ func TestRESTServerBackupRestoreProcessE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	temp := t.TempDir()
+	temp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(temp, 0o700); err != nil {
 		t.Fatal(err)
 	}
