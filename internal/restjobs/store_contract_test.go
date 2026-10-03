@@ -3,6 +3,7 @@ package restjobs
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 )
 
@@ -31,6 +32,58 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		}
 		if _, _, err := store.Admit("contract-key", Request{Repository: "widget", Task: "different"}); !errors.Is(err, ErrIdempotencyConflict) {
 			t.Fatalf("changed payload error = %v, want ErrIdempotencyConflict", err)
+		}
+	})
+
+	t.Run("concurrent identical admissions share one job", func(t *testing.T) {
+		store := newStore(t)
+		const callers = 16
+		type result struct {
+			job    Snapshot
+			replay bool
+			err    error
+		}
+		start := make(chan struct{})
+		results := make(chan result, callers)
+		var wg sync.WaitGroup
+		for i := 0; i < callers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				job, replay, err := store.Admit("shared-key", Request{Repository: "widget", Task: "same task"})
+				results <- result{job: job, replay: replay, err: err}
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		var jobID string
+		newAdmissions := 0
+		for result := range results {
+			if result.err != nil {
+				t.Errorf("concurrent Admit() error: %v", result.err)
+				continue
+			}
+			if jobID == "" {
+				jobID = result.job.ID
+			}
+			if result.job.ID != jobID {
+				t.Errorf("concurrent admissions returned IDs %q and %q", jobID, result.job.ID)
+			}
+			if !result.replay {
+				newAdmissions++
+			}
+		}
+		if jobID == "" {
+			t.Fatal("no concurrent admission returned a job")
+		}
+		if newAdmissions != 1 {
+			t.Errorf("new admissions = %d, want exactly one", newAdmissions)
+		}
+		if _, _, err := store.Admit("shared-key", Request{Repository: "widget", Task: "different"}); !errors.Is(err, ErrIdempotencyConflict) {
+			t.Errorf("changed-payload replay error = %v, want conflict", err)
 		}
 	})
 
