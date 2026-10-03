@@ -29,7 +29,7 @@ Authenticated clients can request `GET /v1/operations` with the same bearer toke
 }
 ```
 
-The response contains no job IDs, task or repository values, event history, provider data, or credentials. `recovery_needed` counts SQLite jobs found running when this store instance opened; these may have external side effects and require operator reconciliation. It is always zero for the volatile memory store, which starts empty. This endpoint is a snapshot for operational visibility, not a health/readiness probe or a correctness verdict. A store query error returns a generic internal error without storage details.
+The response contains no job IDs, task or repository values, event history, provider data, or credentials. `recovery_needed` counts SQLite jobs found running when this store instance opened; they may have external side effects and require manual operator investigation. Startup does not replay them, and they are not eligible for the endpoint that reconciles terminal failed jobs. It is always zero for the volatile memory store, which starts empty. This endpoint is a snapshot for operational visibility, not a health/readiness probe or a correctness verdict. A store query error returns a generic internal error without storage details.
 
 ## Persistence and backup
 
@@ -41,13 +41,27 @@ SQLite retention is bounded by the configured record limit. When the retained-re
 
 ## Restart and interrupted work
 
-On restart, queued records may be resumed because no worker claimed them. Terminal records remain available for inspection. A record that was running at interruption is classified as needing operator reconciliation; it is not replayed automatically because the workflow or provider write may have partially completed.
+On restart, queued records may be resumed because no worker claimed them. Terminal records remain available for inspection. A record still marked `running` at interruption is classified as needing operator investigation; it is not replayed automatically because the workflow or provider write may have partially completed. This startup classification is distinct from the explicit reconciliation endpoint below: that endpoint accepts only terminal `failed` jobs and cannot resolve a still-running startup interruption. Inspect status/history and investigate such running work manually; do not assume it is eligible for endpoint reconciliation.
 
-Inspect job status and bounded history before taking action. For an uncertain provider operation, compare the durable job identity, repository, and branch with the configured provider's live PR state before retrying. Preserve the workspace and record until the outcome is resolved. Do not manually delete a running workspace or blindly resubmit with a new idempotency key.
+Inspect job status and bounded history before taking action. For an uncertain provider operation, compare the durable job identity, repository, and branch with the configured provider's live PR state before acting. Preserve the workspace and record until the outcome is resolved. Do not manually delete a running workspace or blindly resubmit with a new idempotency key.
 
-A failed job cannot be resumed or changed through ordinary job submission. The original idempotency key returns the same record; a new key can admit duplicate work and is not a retry mechanism. For a SQLite-backed job, an explicit authenticated `POST /v1/jobs/{id}/reconcile` action is available only when Factory durably recorded the provider/repository/branch/commit identity and classified the provider write response as uncertain. Inspect its history and retained workspace first. The action verifies that the retained worktree still has the exact persisted branch and commit, performs a read-only lookup through the configured provider, and accepts only one open PR matching repository, branch, commit, and Factory job identity. It does not run the harness, verification checks, branch push, PR create, or PR update. Missing, mismatched, multiple, malformed, or unavailable provider state remains unresolved; the job stays failed and evidence is retained. On confirmation, Factory durably records the PR outcome, a `provider_reconciled` audit event, and the succeeded transition in one SQLite transaction. Repeating the action on that already-succeeded job is idempotent. Memory mode and jobs without a recorded uncertain provider attempt cannot use this action. Startup remains non-replaying.
+A failed job cannot be resumed or changed through ordinary job submission. The original idempotency key returns the same record; a new key can admit duplicate work and is not a retry mechanism. For a SQLite-backed job, an explicit authenticated `POST /v1/jobs/{id}/reconcile` action is available only for a terminal failed job whose uncertain provider attempt, provider/repository/branch/commit identity, and retained workspace are durably recorded. Memory mode, running jobs, and jobs without a recorded uncertain provider attempt are ineligible. Before invoking it, inspect the job's status/history and confirm the retained workspace is present. The action checks the configured repository checkout, verifies that the retained worktree is on the exact persisted branch at the exact persisted commit, then performs only a read-only lookup through the configured provider. It accepts exactly one open PR with matching configured repository, job-specific branch, commit, base branch, and Factory job identity. It does not run the harness or verification checks, push a branch, or create/update a PR. Missing, mismatched, multiple, malformed, or unavailable provider state fails closed: the job remains failed and its workspace/evidence is retained. On confirmation, Factory atomically persists the confirmed PR outcome, a `provider_reconciled` history event, and the transition to `succeeded` in SQLite. Repeating the request after success returns the same successful job without another provider write.
 
-A process-level regression test uses a fake provider that records one accepted PR create and then returns an uncertain lost-response error. It verifies the failed job has no provider outcome, retains its workspace and durable identity, and survives restart without startup replay. The authenticated reconciliation action then confirms the existing PR, durably succeeds the same job with one audit event, and leaves create count at one; repeats are idempotent. Fake-provider mismatch, absent/multiple match, malformed state, and outage scenarios fail closed. The E2E does not use live GitHub or claim automatic recovery.
+### Operator reconciliation recipe
+
+Use this only after inspecting a terminal `failed` SQLite job and its history, confirming an uncertain provider attempt, and verifying its retained workspace and expected PR identity. The walkthrough above creates the private `/var/lib/factory/curl-headers` authorization header file and sets `base_url`; set `job_id` to the inspected job ID in that same shell. The endpoint has no request body and does not accept caller-selected provider identity:
+
+```sh
+job_id='<inspected-failed-job-id>'
+curl --fail-with-body --silent --show-error --write-out '\nHTTP %{http_code}\n' \
+  --request POST \
+  --header @/var/lib/factory/curl-headers \
+  "$base_url/v1/jobs/$job_id/reconcile"
+```
+
+A confirmed match returns HTTP `200` with the same job now `succeeded` and its confirmed provider/PR outcome. Repeating the request is idempotent. An ineligible job or any unconfirmed/unsafe provider state returns a conflict and remains failed; inspect status/history and evidence, then investigate manually rather than retrying blindly. Keep the header file private and remove it when finished.
+
+A process-level regression test uses a fake provider that records one accepted PR create and then returns an uncertain lost-response error. The failed job has no provider outcome, retains its workspace and durable identity, and survives restart without startup replay. The test then calls the authenticated endpoint on that terminal failed job; confirmation of the existing PR durably succeeds the same job with one reconciliation history event while create and harness counts remain unchanged. Repeats are idempotent. Fake-provider mismatch, absent/multiple match, malformed state, and outage scenarios fail closed. This E2E tests explicit operator reconciliation after restart; it does not test automatic recovery or live GitHub.
 
 ## Limits and trusted boundary
 
@@ -120,7 +134,7 @@ This walkthrough starts with a trusted local checkout and an installed harness e
    curl --fail-with-body --silent --show-error --header @/var/lib/factory/curl-headers "$base_url/v1/jobs/$job_id/history"
    ```
 
-   A terminal `succeeded` status is the completed-job result. When GitHub is configured, it includes the confirmed PR outcome; without a provider, the current server does not publish a PR. If the request's outcome is uncertain, retry with the same idempotency key. Remove the temporary header file when finished and never print or log it.
+   A terminal `succeeded` status is the completed-job result. When GitHub is configured, it includes the confirmed PR outcome; without a provider, the current server does not publish a PR. If a provider outcome is uncertain, inspect the failed job and follow the [operator reconciliation recipe](#operator-reconciliation-recipe) when it meets the SQLite eligibility checks; retrying submission with the same idempotency key only returns the existing record. Remove the temporary header file when finished and never print or log it.
 
 For durable deployments, also verify status/history after a clean restart and perform the [backup and restore drill](#backup-and-restore) using a disposable database copy. Never use production credentials or repositories for recovery tests.
 
