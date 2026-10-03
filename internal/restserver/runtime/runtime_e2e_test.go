@@ -209,6 +209,19 @@ func TestRESTServerBackupRestoreProcessE2E(t *testing.T) {
 			}
 		}
 	}
+	if err := liveChild.Process.Kill(); err != nil {
+		t.Fatalf("interrupt live server after backup: %v", err)
+	}
+	if err := <-liveDone; err == nil {
+		t.Fatal("live server did not report forced interruption")
+	}
+	liveChild = nil
+	if data, err := os.ReadFile(harnessPID); err == nil {
+		var pid int
+		if _, err := fmt.Sscanf(string(data), "%d", &pid); err == nil && pid > 0 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
 	restoredDB := filepath.Join(restoreDir, "restored.db")
 	source, err := os.Open(backupPath)
 	if err != nil {
