@@ -33,6 +33,7 @@ const (
 // runtimeOptions contains injectable seams for runtime lifecycle tests.
 type runtimeOptions struct {
 	Listen          func(string, string) (net.Listener, error)
+	OpenStore       func(restserver.Config) (restjobs.Store, error)
 	Executor        restworker.Executor
 	Publisher       restprovider.Publisher
 	ResultsBase     string
@@ -67,7 +68,11 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err != nil {
 		return err
 	}
-	store, err := restworker.NewLocalJobManager(config)
+	openStore := options.OpenStore
+	if openStore == nil {
+		openStore = restworker.NewLocalJobManager
+	}
+	store, err := openStore(config)
 	if err != nil {
 		return err
 	}
@@ -156,8 +161,6 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		}
 	}
 	var ready atomic.Bool
-	var backendReady atomic.Bool
-	backendReady.Store(true)
 	var readyCheck func(context.Context) error
 	if probe, ok := store.(interface{ Ping(context.Context) error }); ok {
 		readyCheck = probe.Ping
@@ -166,27 +169,23 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
-		Ready:               func() bool { return ready.Load() && backendReady.Load() },
+		Ready:               func() bool { return ready.Load() },
 		ReadyError: func() error {
 			if !ready.Load() {
 				return errors.New("server not initialized")
 			}
-			probe := readyCheck
 			probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			if probe != nil {
-				if err := probe(probeCtx); err != nil {
-					backendReady.Store(false)
+			if readyCheck != nil {
+				if err := readyCheck(probeCtx); err != nil {
 					return err
 				}
 			}
 			if publisher != nil {
 				if err := publisher.Ping(probeCtx); err != nil {
-					backendReady.Store(false)
 					return err
 				}
 			}
-			backendReady.Store(true)
 			return nil
 		},
 	})

@@ -2,7 +2,7 @@
 
 ## Status and product boundary
 
-This is the target contract for Factory's single REST job-service MVP. Factory already has a local REST server with authenticated bounded admission, in-memory job tracking, isolated workspaces, and execution of the configured multi-stage workflow. Optional SQLite persistence, restart recovery classification, and configured GitHub pull-request create/update are being implemented; confirm feature docs and merged releases before treating them as available. Proposed behavior below remains the product contract.
+This is the target contract for Factory's single REST job-service MVP. Factory has a local REST server with authenticated bounded admission, selectable volatile-memory or SQLite persistence, isolated workspaces, the configured multi-stage workflow, and optional GitHub pull-request publication. Current implementation details are in the [REST server feature guide](../features/rest-server.md), [configuration guide](../features/rest-server-config.md), and [operations guide](../features/rest-server-operations.md). The contract below captures the full target; requirements not yet implemented or verified remain proposals.
 
 The product path is one service and one lifecycle:
 
@@ -61,13 +61,13 @@ Delivery gates for the target MVP:
 
 1. Define persistence interfaces and durable lifecycle semantics without changing the existing memory-mode API contract. (Implemented.)
 2. Add optional SQLite persistence and migrations; fail closed when configured storage is unavailable; prove restart and concurrency behavior. (Implemented; see current feature documentation.)
-3. Define/configure the code-repository provider interface and credential boundary. (Implementation in progress.)
-4. Implement idempotent branch/PR reconciliation, create/update, and durable recording of the confirmed result.
-5. Exercise end-to-end request-to-PR behavior including failure, cancellation, restart, duplicate requests, provider outages, and uncertain writes. Confirm no implementation job reports success before the PR outcome is recorded.
-6. Document memory-mode volatility, SQL setup/recovery, backup/retention, security boundaries, and provider configuration.
+3. Define/configure the code-repository provider interface and credential boundary. (Implemented.)
+4. Implement idempotent branch/PR reconciliation, create/update, and durable recording of the confirmed result. (Implemented; see the server configuration and operations guides.)
+5. Exercise end-to-end request-to-PR behavior including concurrent admission, process restart, duplicate requests, workflow/provider failure, and durable outcome checks. (Core request-to-PR and concurrency path implemented; additional cancellation and uncertain-write fault injection remain.)
+6. Document memory-mode volatility, SQLite setup/recovery, backup/retention, security boundaries, and provider configuration. (Configuration and operations guides available; backup/restore drill and aggregate observability remain.)
 
-These are design and delivery gates, not claims of implementation or dates. Issue polling/reconciliation, provider events, additional hosting/fleet layers, UI, merge, release, and deployment are not prerequisites for this MVP. If issue intake is added later, it feeds the same REST job lifecycle rather than creating a second autonomous issue-to-PR product.
+These are implementation gates, not claims of release dates. Completed steps describe merged behavior; remaining details above identify work not yet implemented or verified. Issue polling/reconciliation, provider events, additional hosting/fleet layers, UI, merge, release, and deployment are not prerequisites for this MVP. If issue intake is added later, it feeds the same REST job lifecycle rather than creating a second autonomous issue-to-PR product.
 
-## Proposed REST configuration reference
+## REST configuration reference
 
-[The server configuration guide](../features/rest-server-config.md) describes the implemented schema. SQL connection/configuration fields and repository-provider credential settings remain to be designed and must not be invented in example configs before implementation.
+[The server configuration guide](../features/rest-server-config.md) describes the implemented schema and [operations guide](../features/rest-server-operations.md) covers current readiness and recovery guidance. SQL connection settings and provider credential mechanisms beyond the configured GitHub token-file flow are outside the current implementation.

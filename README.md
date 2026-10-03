@@ -2,11 +2,12 @@
 
 Factory is a Go service and CLI for agent-driven repository jobs. Its product direction is one RESTful job service: accept a bounded request, run the configured workflow, verify the result, and create or update a pull request through the configured code-repository provider. Factory does not merge, release, or deploy.
 
-The REST server is implemented with an in-memory job backend. Memory mode is simple but volatile: process restart loses jobs and history. Optional SQL persistence is the recommended deployment path when jobs must survive restarts; SQL support and restart recovery are not implemented yet. See the [REST job contract](docs/roadmap/rest-api-contract.md) for the target MVP and [implemented features](docs/features/README.md) for current behavior.
+The REST server supports volatile memory mode and optional SQLite persistence, with a configured GitHub provider for job PR publication. See the [REST server operations guide](docs/features/rest-server-operations.md) for probe semantics, backup/restore, restart recovery, and operator limits; the [REST job contract](docs/roadmap/rest-api-contract.md) describes remaining target-MVP requirements.
 
 ## Documentation
 
 - [Implemented features](docs/features/README.md) — current CLI and REST server capabilities.
+- [REST server operations](docs/features/rest-server-operations.md) — health/readiness, backup/restore, restart recovery, limits, and trusted-network operations.
 - [REST job contract](docs/roadmap/rest-api-contract.md) — target request-to-PR lifecycle, persistence modes, and delivery gates.
 - [Agent guidance](AGENTS.md) — repository workflow and verification conventions.
 - [Factory operating skill](.agents/skills/factory/SKILL.md) — agent workflow guidance and intended product direction.
@@ -31,7 +32,7 @@ The binary is written to `./bin/factory`. Configuration and state are stored out
 
 ## Local REST server
 
-The current server accepts authenticated job requests, executes configured workflows in isolated workspaces, and exposes status and bounded history. Its job registry is in memory, so accepted jobs and history do not survive a process restart. A successful job does not yet create or update a provider pull request; both SQL persistence and provider PR operations are target-MVP gaps.
+The server accepts authenticated job requests, executes configured workflows in isolated workspaces, and exposes status and bounded history. It supports volatile in-memory state or configured SQLite persistence, plus optional GitHub pull-request publication. See [REST server operations](docs/features/rest-server-operations.md) for readiness, backup/restore, restart recovery, and capacity guidance.
 
 ```sh
 factory server --config /absolute/path/to/server.json

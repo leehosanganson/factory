@@ -26,7 +26,7 @@ Factory may commit and push only within the job's approved repository and scope.
 
 ## Current implementation versus target
 
-Factory currently has a Go CLI and a local REST job server. The server accepts authenticated bounded requests, runs configured multi-stage workflows in isolated workspaces, and exposes status/history. Its registry and idempotency records are in memory and are lost on restart. It does not yet create or update PRs through a configurable code-repository provider. These are known gaps to the target MVP, not separate product directions.
+Factory has a Go CLI and a local REST job server. The server accepts authenticated bounded requests, executes configured workflows in isolated workspaces, and exposes status/history. It supports volatile memory or optional SQLite persistence and configured GitHub PR publication; interrupted running work is conservatively classified rather than automatically replayed. Remaining target-MVP work includes full operator recovery/observability guidance, tested backup/restore, and broader failure/uncertain-write acceptance coverage. These are completion gaps, not separate product directions.
 
 The CLI's `implement`, `tidy`, `monitor`, detached jobs, and `work` commands remain available and are documented under [implemented features](../features/README.md). They are current interfaces, not additional MVP architectures. The local `work` issue-observation commands do not start an autonomous issue-to-PR worker.
 
