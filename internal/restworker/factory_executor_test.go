@@ -268,6 +268,14 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	}
 	agent.outputBytes = 5 << 20
 	executor, workspace, repo := newExecutorFixture(t, "10s", restJobOutputLimit, agent, []string{check})
+	var evidence restjobs.VerificationEvidence
+	executor.recordVerificationEvidence = func(id string, recorded restjobs.VerificationEvidence) error {
+		if id != executorJobID {
+			t.Fatalf("evidence job ID = %q", id)
+		}
+		evidence = recorded
+		return nil
+	}
 	before, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
 	if err != nil {
 		t.Fatal(err)
@@ -281,6 +289,9 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	if workspace.createdID != executorJobID || workspace.markedID != executorJobID {
 		t.Fatalf("workspace IDs = create %q, success %q", workspace.createdID, workspace.markedID)
 	}
+	if len(evidence.Checks) != 1 || evidence.Checks[0] != (restjobs.VerificationCheck{Name: "check-01", Outcome: restjobs.VerificationPassed}) || len(evidence.Limitations) != 1 || evidence.Limitations[0] != restjobs.LimitationAgentNotVerdict {
+		t.Fatalf("recorded verification evidence = %+v", evidence)
+	}
 	capture, err := os.ReadFile(filepath.Join(workspace.workspace.OutputPath, "workflow.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -291,6 +302,22 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	after, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
 	if err != nil || string(after) != string(before) {
 		t.Fatalf("executor published or changed checkout HEAD: before=%q after=%q err=%v", before, after, err)
+	}
+}
+
+func TestFactoryExecutorRecordsNoConfiguredCheckLimitation(t *testing.T) {
+	agent := &executorTestAgent{}
+	executor, _, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+	var evidence restjobs.VerificationEvidence
+	executor.recordVerificationEvidence = func(_ string, recorded restjobs.VerificationEvidence) error {
+		evidence = recorded
+		return nil
+	}
+	if err := executor.Execute(context.Background(), executorJob("do work")); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(evidence.Checks) != 0 || len(evidence.Limitations) != 2 || evidence.Limitations[0] != restjobs.LimitationAgentNotVerdict || evidence.Limitations[1] != restjobs.LimitationNoChecksConfigured {
+		t.Fatalf("no-check verification evidence = %+v", evidence)
 	}
 }
 
@@ -314,9 +341,17 @@ func TestFactoryExecutorRetainsWorkspaceUnmarkedOnStageOrCheckFailure(t *testing
 				checks = [][]string{{check}}
 			}
 			executor, manager, _ := newExecutorFixture(t, "2s", 256, agent, checks...)
+			var evidence restjobs.VerificationEvidence
+			executor.recordVerificationEvidence = func(_ string, recorded restjobs.VerificationEvidence) error {
+				evidence = recorded
+				return nil
+			}
 			err := executor.Execute(context.Background(), executorJob("do work"))
 			if !errors.Is(err, errExecutionFailed) || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "private") {
 				t.Fatalf("Execute() error = %v, want sanitized failure", err)
+			}
+			if test.check && (len(evidence.Checks) != 1 || evidence.Checks[0] != (restjobs.VerificationCheck{Name: "check-01", Outcome: restjobs.VerificationFailed})) {
+				t.Fatalf("failed check evidence = %+v", evidence)
 			}
 			if manager.markedID != "" {
 				t.Fatalf("failed workspace marked successful: %q", manager.markedID)
@@ -337,6 +372,11 @@ func TestFactoryExecutorBoundsCombinedStageAndCheckFilesAndRecordsTruncation(t *
 	}
 	agent := &executorTestAgent{outputBytes: 5 << 20}
 	executor, manager, _ := newExecutorFixture(t, "20s", restJobOutputLimit, agent, []string{check})
+	var evidence restjobs.VerificationEvidence
+	executor.recordVerificationEvidence = func(_ string, recorded restjobs.VerificationEvidence) error {
+		evidence = recorded
+		return nil
+	}
 	var observed []factory.WorkflowEvent
 	executor.observer = factory.WorkflowObserverFunc(func(event factory.WorkflowEvent) error {
 		observed = append(observed, event)
@@ -350,6 +390,9 @@ func TestFactoryExecutorBoundsCombinedStageAndCheckFilesAndRecordsTruncation(t *
 	}
 	if _, err := os.Stat(checkMarker); err != nil {
 		t.Fatalf("check did not finish draining after output cap: %v", err)
+	}
+	if len(evidence.Checks) != 1 || evidence.Checks[0].Outcome != restjobs.VerificationPassed {
+		t.Fatalf("check completion evidence = %+v", evidence)
 	}
 	var retained int64
 	for _, root := range []string{manager.workspace.StatePath, manager.workspace.OutputPath} {

@@ -221,6 +221,32 @@ func TestRegistryBudgetRejectsWithoutStoringKeyAndAllowsRetry(t *testing.T) {
 	}
 }
 
+func TestVerificationEvidenceCountsAgainstRegistryByteBudget(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 1000})
+	job, _, err := manager.Admit("evidence-key", Request{Repository: "repo", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	before := manager.registryBytes
+	evidence := VerificationEvidence{
+		Checks:      []VerificationCheck{{Name: "check-01", Outcome: VerificationPassed}},
+		Limitations: []string{LimitationAgentNotVerdict},
+	}
+	if err := manager.RecordVerificationEvidence(job.ID, evidence); err != nil {
+		t.Fatal(err)
+	}
+	if manager.registryBytes <= before {
+		t.Fatalf("recording evidence did not count against registry budget: before=%d after=%d", before, manager.registryBytes)
+	}
+	got, err := manager.Get(job.ID)
+	if err != nil || got.Verification == nil || got.Verification.Checks[0] != evidence.Checks[0] {
+		t.Fatalf("stored evidence = %+v, %v", got.Verification, err)
+	}
+}
+
 func TestRegistryBudgetAccountsForAdmissionLifecycleAndEviction(t *testing.T) {
 	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 128, RegistryBytes: 2000})
 	first, _, err := manager.Admit("first-key", Request{Repository: "repo", Task: "first"})

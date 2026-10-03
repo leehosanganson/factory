@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -42,14 +43,17 @@ func validRepositoryName(value string) bool {
 }
 
 const (
-	maxRecordsLimit    = 1000
-	maxConcurrentLimit = 100_000
-	maxQueueLimit      = 100_000
-	maxEventsLimit     = 200
-	maxKeyBytes        = 256
-	maxAliasBytes      = 256
-	maxTaskBytes       = 256 << 10
-	maxEventBytes      = 4_096
+	maxRecordsLimit            = 1000
+	maxConcurrentLimit         = 100_000
+	maxQueueLimit              = 100_000
+	maxEventsLimit             = 200
+	maxKeyBytes                = 256
+	maxAliasBytes              = 256
+	maxTaskBytes               = 256 << 10
+	maxEventBytes              = 4_096
+	maxVerificationChecks      = 16
+	maxVerificationLimitations = 4
+	maxVerificationTextBytes   = 128
 
 	defaultRegistryBytes = 256 << 20
 	recordOverheadBytes  = 256
@@ -111,15 +115,55 @@ type ProviderOutcome struct {
 	State      string `json:"state"`
 }
 
-// Snapshot is a copy of the public job state and is safe to serialize after the
-// manager lock has been released.
+// VerificationCheck contains only a generated safe label and outcome.
+type VerificationCheck struct {
+	Name    string `json:"name"`
+	Outcome string `json:"outcome"`
+}
+
+const (
+	VerificationNotCompleted = "not_completed"
+	VerificationPassed       = "passed"
+	VerificationFailed       = "failed"
+	VerificationCanceled     = "canceled"
+
+	LimitationNoChecksConfigured = "No operator-configured verification checks were run."
+	LimitationAgentNotVerdict    = "Agent-reported completion is not an independent correctness verdict."
+)
+
+// VerificationEvidence is bounded job outcome metadata safe for API exposure.
+type VerificationEvidence struct {
+	Checks      []VerificationCheck `json:"checks"`
+	Limitations []string            `json:"limitations"`
+}
+
+func validateVerificationEvidence(evidence VerificationEvidence) error {
+	if len(evidence.Checks) > maxVerificationChecks || len(evidence.Limitations) > maxVerificationLimitations {
+		return ErrInvalidInput
+	}
+	for index, check := range evidence.Checks {
+		if check.Name != fmt.Sprintf("check-%02d", index+1) || (check.Outcome != VerificationNotCompleted && check.Outcome != VerificationPassed && check.Outcome != VerificationFailed && check.Outcome != VerificationCanceled) {
+			return ErrInvalidInput
+		}
+	}
+	for _, limitation := range evidence.Limitations {
+		if len(limitation) > maxVerificationTextBytes || (limitation != LimitationNoChecksConfigured && limitation != LimitationAgentNotVerdict) {
+			return ErrInvalidInput
+		}
+	}
+	return nil
+}
+
+// Snapshot is a copy of public job state. Verification contains only safe
+// check labels/outcomes and fixed limitation messages, never command output.
 type Snapshot struct {
-	ID        string           `json:"id"`
-	Request   Request          `json:"request"`
-	Status    Status           `json:"status"`
-	CreatedAt time.Time        `json:"created_at"`
-	UpdatedAt time.Time        `json:"updated_at"`
-	Provider  *ProviderOutcome `json:"provider,omitempty"`
+	ID           string                `json:"id"`
+	Request      Request               `json:"request"`
+	Status       Status                `json:"status"`
+	CreatedAt    time.Time             `json:"created_at"`
+	UpdatedAt    time.Time             `json:"updated_at"`
+	Provider     *ProviderOutcome      `json:"provider,omitempty"`
+	Verification *VerificationEvidence `json:"verification,omitempty"`
 }
 
 // Event is one bounded history entry.
@@ -178,6 +222,7 @@ type Store interface {
 	History(id string) (History, error)
 	AddEvent(id, eventType, message string) error
 	RecordProviderOutcome(id string, outcome ProviderOutcome) error
+	RecordVerificationEvidence(id string, evidence VerificationEvidence) error
 	Finish(id string, terminalStatus Status) error
 	Recover(ctx context.Context) (RecoveryReport, error)
 	OperationalSummary(ctx context.Context) (OperationalSummary, error)
@@ -544,6 +589,39 @@ func (m *LocalManager) RecordProviderOutcome(id string, outcome ProviderOutcome)
 	return nil
 }
 
+func (m *LocalManager) RecordVerificationEvidence(id string, evidence VerificationEvidence) error {
+	if validateVerificationEvidence(evidence) != nil {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.jobs[id]
+	if entry == nil {
+		return ErrNotFound
+	}
+	if entry.snapshot.Status != StatusRunning {
+		return ErrInvalidTransition
+	}
+	previousCharge := verificationEvidenceBytes(entry.snapshot.Verification)
+	nextCharge := verificationEvidenceBytes(&evidence)
+	if nextCharge > previousCharge {
+		delta := nextCharge - previousCharge
+		if !m.makeByteRoomLocked(delta) {
+			return ErrRegistryFull
+		}
+		entry.accountedBytes += delta
+		m.registryBytes += delta
+	} else {
+		delta := previousCharge - nextCharge
+		entry.accountedBytes -= delta
+		m.registryBytes -= delta
+	}
+	copy := cloneVerificationEvidence(evidence)
+	entry.snapshot.Verification = &copy
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	if !terminalStatus.Terminal() {
 		return ErrInvalidTransition
@@ -691,6 +769,19 @@ func (m *LocalManager) makeRoomLocked(needed uint64) bool {
 	return true
 }
 
+func (m *LocalManager) makeByteRoomLocked(needed uint64) bool {
+	limit := uint64(m.config.RegistryBytes)
+	if m.registryBytes > limit || needed > limit {
+		return false
+	}
+	for needed > limit-m.registryBytes {
+		if !m.evictOldestTerminalExceptLocked(nil) {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *LocalManager) removeOldestEventLocked(entry *job) {
 	m.registryBytes -= eventBytes(entry.events[0])
 	entry.accountedBytes -= eventBytes(entry.events[0])
@@ -778,7 +869,25 @@ func cloneSnapshot(snapshot Snapshot) Snapshot {
 		issue := *snapshot.Request.Issue
 		snapshot.Request.Issue = &issue
 	}
+	if snapshot.Verification != nil {
+		copy := cloneVerificationEvidence(*snapshot.Verification)
+		snapshot.Verification = &copy
+	}
 	return snapshot
+}
+
+func verificationEvidenceBytes(evidence *VerificationEvidence) uint64 {
+	if evidence == nil {
+		return 0
+	}
+	encoded, _ := json.Marshal(evidence)
+	return uint64(len(encoded))
+}
+
+func cloneVerificationEvidence(evidence VerificationEvidence) VerificationEvidence {
+	evidence.Checks = append([]VerificationCheck(nil), evidence.Checks...)
+	evidence.Limitations = append([]string(nil), evidence.Limitations...)
+	return evidence
 }
 
 func newJobID() (string, error) {

@@ -243,7 +243,7 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 		if !sameRequest(existing, normalized) {
 			return Snapshot{}, false, ErrIdempotencyConflict
 		}
-		snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+		snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 		if err != nil {
 			return Snapshot{}, false, errors.New("read SQLite job record")
 		}
@@ -354,7 +354,7 @@ func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
 	if err := insertEvent(ctx, tx, id, "running", "Job started", now, s.config.MaxEventsPerJob); err != nil {
 		return Snapshot{}, errors.New("record SQLite job start")
 	}
-	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if err != nil {
 		return Snapshot{}, errors.New("read claimed SQLite job")
 	}
@@ -678,11 +678,48 @@ func (s *SQLiteStore) RecordProviderOutcome(id string, outcome ProviderOutcome) 
 	return tx.Commit()
 }
 
+func (s *SQLiteStore) RecordVerificationEvidence(id string, evidence VerificationEvidence) error {
+	if validateVerificationEvidence(evidence) != nil {
+		return ErrInvalidInput
+	}
+	if err := s.checkAccepting(); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return errors.New("read SQLite job state")
+	}
+	if status != string(StatusRunning) {
+		return ErrInvalidTransition
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_verification_evidence(job_id,evidence_json,updated_at) VALUES(?,?,?) ON CONFLICT(job_id) DO UPDATE SET evidence_json=excluded.evidence_json,updated_at=excluded.updated_at`, id, string(encoded), now); err != nil {
+		return errors.New("record SQLite verification evidence")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET updated_at=? WHERE id=? AND status='running'`, now, id); err != nil {
+		return errors.New("update SQLite job timestamp")
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) Get(id string) (Snapshot, error) {
 	if err := s.checkOpen(); err != nil {
 		return Snapshot{}, err
 	}
-	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Snapshot{}, ErrNotFound
 	}
@@ -805,7 +842,7 @@ func (s *SQLiteStore) Recover(ctx context.Context) (RecoveryReport, error) {
 	if err := s.checkOpen(); err != nil {
 		return RecoveryReport{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id) FROM factory_jobs j ORDER BY j.queue_sequence`)
+	rows, err := s.db.QueryContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j ORDER BY j.queue_sequence`)
 	if err != nil {
 		return RecoveryReport{}, errors.New("recover SQLite jobs")
 	}
@@ -1055,8 +1092,8 @@ func scanSnapshot(row interface{ Scan(...any) error }) (Snapshot, error) {
 	var snapshot Snapshot
 	var raw, status, created, updated string
 	var truncated int
-	var providerJSON sql.NullString
-	if err := row.Scan(&snapshot.ID, &raw, &status, &created, &updated, &truncated, &providerJSON); err != nil {
+	var providerJSON, evidenceJSON sql.NullString
+	if err := row.Scan(&snapshot.ID, &raw, &status, &created, &updated, &truncated, &providerJSON, &evidenceJSON); err != nil {
 		return Snapshot{}, err
 	}
 	if err := json.Unmarshal([]byte(raw), &snapshot.Request); err != nil {
@@ -1080,6 +1117,13 @@ func scanSnapshot(row interface{ Scan(...any) error }) (Snapshot, error) {
 			return Snapshot{}, errors.New("invalid persisted provider outcome")
 		}
 		snapshot.Provider = &outcome
+	}
+	if evidenceJSON.Valid {
+		var evidence VerificationEvidence
+		if err := json.Unmarshal([]byte(evidenceJSON.String), &evidence); err != nil || validateVerificationEvidence(evidence) != nil {
+			return Snapshot{}, errors.New("invalid persisted verification evidence")
+		}
+		snapshot.Verification = &evidence
 	}
 	_ = truncated
 	return snapshot, nil
