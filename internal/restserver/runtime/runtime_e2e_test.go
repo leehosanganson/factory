@@ -165,6 +165,123 @@ func (p *e2ePublisher) Publish(ctx context.Context, request restprovider.Publish
 	return outcome, nil
 }
 
+func TestRESTServerProcessRejectsAndRetriesAtQueueCapacity(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	config.Limits.Workers = 1
+	config.Limits.QueueCapacity = 1
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	barrier := filepath.Join(t.TempDir(), "worker-started")
+	harness := filepath.Join(t.TempDir(), "capacity-harness.sh")
+	script := fmt.Sprintf("#!/bin/sh\nif [ \"$1\" = hold-worker ] && [ ! -e '%s' ]; then touch '%s'; sleep 2; fi\nprintf 'verified\\n' >> result.txt\n", barrier, barrier)
+	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := filepath.Join(t.TempDir(), "listener")
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+filepath.Join(t.TempDir(), "outcomes.jsonl"))
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	defer func() {
+		if child.Process == nil {
+			return
+		}
+		_ = child.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			_ = child.Process.Kill()
+			<-done
+		}
+	}()
+	baseURL := waitForProcessURL(t, done, readyPath, logPath)
+	client := &http.Client{Timeout: 3 * time.Second}
+	first, err := submitProcessJob(client, baseURL, apiKey, "trusted", "hold-worker", "capacity-first")
+	if err != nil || first.StatusCode != http.StatusAccepted || first.ID == "" {
+		t.Fatalf("worker job admission=%+v err=%v", first, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(barrier); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(barrier); err != nil {
+		t.Fatalf("worker did not start before filling queue: %v", err)
+	}
+	second, err := submitProcessJob(client, baseURL, apiKey, "trusted", "queued-job", "capacity-second")
+	if err != nil || second.StatusCode != http.StatusAccepted || second.ID == "" {
+		t.Fatalf("queued job admission=%+v err=%v", second, err)
+	}
+	full, err := submitProcessJob(client, baseURL, apiKey, "trusted", "retry-after-capacity", "capacity-retry")
+	if err != nil || full.StatusCode != http.StatusServiceUnavailable || full.ErrorCode != "queue_full" || full.ID != "" {
+		t.Fatalf("full-queue admission=%+v err=%v, want an unrecorded queue_full rejection", full, err)
+	}
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/v1/operations", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+apiKey)
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var summary restjobs.OperationalSummary
+	decodeErr := json.NewDecoder(response.Body).Decode(&summary)
+	_ = response.Body.Close()
+	if decodeErr != nil || response.StatusCode != http.StatusOK || summary.Running != 1 || summary.Queued != 1 || summary.QueueCapacity != 1 || !summary.QueueSaturated {
+		t.Fatalf("operations while full: status=%d summary=%+v decodeErr=%v", response.StatusCode, summary, decodeErr)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		job := getProcessJob(t, client, baseURL, first.ID, apiKey)
+		if job.Status == restjobs.StatusSucceeded {
+			break
+		}
+		if job.Status.Terminal() {
+			t.Fatalf("running job ended unexpectedly: %+v", job)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if job := getProcessJob(t, client, baseURL, first.ID, apiKey); job.Status != restjobs.StatusSucceeded {
+		t.Fatalf("worker did not complete and release capacity: %+v", job)
+	}
+	waitForProcessJob(t, client, baseURL, second.ID, apiKey)
+	retried, err := submitProcessJob(client, baseURL, apiKey, "trusted", "retry-after-capacity", "capacity-retry")
+	if err != nil || retried.StatusCode != http.StatusAccepted || retried.ID == "" || retried.Replayed {
+		t.Fatalf("same-key retry after capacity freed=%+v err=%v, want new admission", retried, err)
+	}
+}
+
 func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) {
 	if testing.Short() {
 		t.Skip("process-level REST E2E")
@@ -676,6 +793,7 @@ func waitForProcessURL(t *testing.T, childDone <-chan error, readyPath, logPath 
 type submittedProcessJob struct {
 	ID         string `json:"id"`
 	Replayed   bool   `json:"replayed"`
+	ErrorCode  string
 	StatusCode int
 }
 
@@ -698,11 +816,14 @@ func submitProcessJob(client *http.Client, baseURL, apiKey, alias, task, key str
 			ID string `json:"id"`
 		} `json:"job"`
 		Replayed bool `json:"replayed"`
+		Error    struct {
+			Code string `json:"code"`
+		} `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return submittedProcessJob{}, err
 	}
-	return submittedProcessJob{ID: result.Job.ID, Replayed: result.Replayed, StatusCode: resp.StatusCode}, nil
+	return submittedProcessJob{ID: result.Job.ID, Replayed: result.Replayed, ErrorCode: result.Error.Code, StatusCode: resp.StatusCode}, nil
 }
 
 func waitForProcessFailure(t *testing.T, client *http.Client, baseURL, id, apiKey string) {
