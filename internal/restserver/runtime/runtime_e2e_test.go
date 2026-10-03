@@ -30,7 +30,10 @@ func TestRESTServerProcessHelper(t *testing.T) {
 	if err != nil {
 		os.Exit(11)
 	}
-	publisher := &e2ePublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
+	var publisher restprovider.Publisher = &e2ePublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
+	if os.Getenv("FACTORY_E2E_PROVIDER_MODE") == "uncertain" {
+		publisher = &uncertainE2EPublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	listen := func(string, string) (net.Listener, error) {
@@ -51,6 +54,65 @@ func TestRESTServerProcessHelper(t *testing.T) {
 }
 
 type e2ePublisher struct{ path string }
+
+type uncertainE2EPublisher struct{ path string }
+
+type uncertainProviderRecord struct {
+	JobID      string               `json:"job_id"`
+	Repository string               `json:"repository"`
+	Branch     string               `json:"branch"`
+	Commit     string               `json:"commit"`
+	Outcome    restprovider.Outcome `json:"outcome"`
+	Creates    int                  `json:"creates"`
+	Attempts   int                  `json:"attempts"`
+}
+
+func (p *uncertainE2EPublisher) Ping(context.Context) error { return nil }
+
+func (p *uncertainE2EPublisher) Publish(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	path := p.path + ".uncertain.json"
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		branch, branchErr := exec.CommandContext(ctx, "git", "-C", request.Worktree, "branch", "--show-current").Output()
+		commit, commitErr := exec.CommandContext(ctx, "git", "-C", request.Worktree, "rev-parse", "HEAD").Output()
+		if branchErr != nil || strings.TrimSpace(string(branch)) != request.Branch || commitErr != nil || strings.TrimSpace(string(commit)) != request.Commit {
+			return restprovider.Outcome{}, fmt.Errorf("uncertain provider request identity mismatch")
+		}
+		record := uncertainProviderRecord{
+			JobID: request.JobID, Repository: request.Repository, Branch: request.Branch, Commit: request.Commit,
+			Outcome: restprovider.Outcome{Provider: "github", Repository: request.Repository, Number: 71, URL: fmt.Sprintf("https://github.com/%s/pull/71", request.Repository), Branch: request.Branch, Commit: request.Commit, State: "open"},
+			Creates: 1, Attempts: 1,
+		}
+		data, err = json.Marshal(record)
+		if err != nil {
+			return restprovider.Outcome{}, err
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			return restprovider.Outcome{}, err
+		}
+		<-ctx.Done()
+		return restprovider.Outcome{}, fmt.Errorf("provider response was lost after create")
+	}
+	if err != nil {
+		return restprovider.Outcome{}, err
+	}
+	var record uncertainProviderRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	if record.JobID != request.JobID || record.Repository != request.Repository || record.Branch != request.Branch || record.Commit != request.Commit {
+		return restprovider.Outcome{}, fmt.Errorf("uncertain provider identity mismatch")
+	}
+	record.Attempts++
+	data, err = json.Marshal(record)
+	if err != nil {
+		return restprovider.Outcome{}, err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	return record.Outcome, nil
+}
 
 func (p *e2ePublisher) Ping(context.Context) error { return nil }
 
@@ -363,6 +425,215 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		if expectedTask == "" || record.Repository != wantRepository || requestIDs[expectedTask] == "" {
 			t.Fatalf("provider repository does not match request alias: %+v", record)
 		}
+	}
+}
+
+func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	stateDir := testResultsBase(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	config.Limits.JobTimeout = "2s"
+	harness := filepath.Join(t.TempDir(), "harness.sh")
+	if err := os.WriteFile(harness, []byte("#!/bin/sh\nprintf 'verified\\n' >> result.txt\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outcomesPath := filepath.Join(t.TempDir(), "provider-outcomes.jsonl")
+	startServer := func() (*exec.Cmd, <-chan error, string) {
+		t.Helper()
+		readyPath := filepath.Join(t.TempDir(), "listener")
+		logPath := filepath.Join(t.TempDir(), "server.log")
+		logFile, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+		child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+outcomesPath, "FACTORY_E2E_PROVIDER_MODE=uncertain")
+		child.Stdout, child.Stderr = logFile, logFile
+		if err := child.Start(); err != nil {
+			_ = logFile.Close()
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			done <- child.Wait()
+			_ = logFile.Close()
+		}()
+		return child, done, waitForProcessURL(t, done, readyPath, logPath)
+	}
+
+	child, childDone, baseURL := startServer()
+	defer func() {
+		if child.Process == nil {
+			return
+		}
+		_ = child.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-childDone:
+		case <-time.After(2 * time.Second):
+			_ = child.Process.Kill()
+			<-childDone
+		}
+	}()
+	client := &http.Client{Timeout: 3 * time.Second}
+	admitted, err := submitProcessJob(client, baseURL, apiKey, "trusted", "publish with uncertain response", "uncertain-create-key")
+	if err != nil || admitted.StatusCode != http.StatusAccepted || admitted.ID == "" {
+		t.Fatalf("uncertain-create admission=%+v err=%v", admitted, err)
+	}
+	recordPath := outcomesPath + ".uncertain.json"
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(recordPath); err == nil {
+			break
+		}
+		job := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+		if job.Status.Terminal() {
+			t.Fatalf("job became terminal before fake provider create; job=%+v history=%+v", job, getProcessHistory(t, client, baseURL, admitted.ID, apiKey))
+		}
+		select {
+		case err := <-childDone:
+			t.Fatalf("server exited before provider create became uncertain: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(recordPath); err != nil {
+		job := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+		t.Fatalf("fake provider did not record accepted PR create: %v; job=%+v history=%+v", err, job, getProcessHistory(t, client, baseURL, admitted.ID, apiKey))
+	}
+	waitForProcessFailure(t, client, baseURL, admitted.ID, apiKey)
+	recordData, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record uncertainProviderRecord
+	if err := json.Unmarshal(recordData, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.JobID != admitted.ID || record.Creates != 1 || record.Attempts != 1 || record.Outcome.Number != 71 {
+		t.Fatalf("fake provider create record=%+v", record)
+	}
+	failed := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+	if failed.Status != restjobs.StatusFailed || failed.Provider != nil {
+		t.Fatalf("job reported success despite ambiguous provider timeout: %+v", failed)
+	}
+	failedHistory := getProcessHistory(t, client, baseURL, admitted.ID, apiKey)
+	if len(failedHistory.Events) < 3 || failedHistory.Events[len(failedHistory.Events)-1].Type != string(restjobs.StatusFailed) {
+		t.Fatalf("ambiguous provider timeout evidence was not retained: %+v", failedHistory)
+	}
+	workspace := filepath.Join(stateDir, aliasDirectory("trusted"), "results", admitted.ID)
+	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+		t.Fatalf("ambiguous provider workspace was not retained before restart: %v", err)
+	}
+	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-childDone; err != nil {
+		t.Fatalf("server shutdown after provider timeout: %v", err)
+	}
+	child.Process = nil
+
+	persisted, err := restworker.NewLocalJobManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persisted.Close()
+	persistedJob, err := persisted.Get(admitted.ID)
+	if err != nil || persistedJob.Status != restjobs.StatusFailed || persistedJob.Provider != nil {
+		t.Fatalf("timed-out job was reported successful or lost: %+v err=%v", persistedJob, err)
+	}
+	persistedHistory, err := persisted.History(admitted.ID)
+	if err != nil || len(persistedHistory.Events) < 3 || persistedHistory.Events[len(persistedHistory.Events)-1].Type != string(restjobs.StatusFailed) {
+		t.Fatalf("timed-out provider evidence was not durable: history=%+v err=%v", persistedHistory, err)
+	}
+	recovery, err := persisted.Recover(context.Background())
+	if err != nil || len(recovery.Terminal) != 1 || recovery.Terminal[0].ID != admitted.ID {
+		t.Fatalf("timed-out job recovery classification=%+v err=%v", recovery, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+		t.Fatalf("uncertain provider workspace was not retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".completion.json")); !os.IsNotExist(err) {
+		t.Fatalf("uncertain provider workspace has completion marker: %v", err)
+	}
+
+	// Starting a fresh server must keep the failed job inspectable and must not
+	// replay a provider write without explicit reconciliation.
+	restarted, restartedDone, restartedURL := startServer()
+	defer func() {
+		if restarted.Process == nil {
+			return
+		}
+		_ = restarted.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-restartedDone:
+		case <-time.After(2 * time.Second):
+			_ = restarted.Process.Kill()
+			<-restartedDone
+		}
+	}()
+	restartedJob := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
+	if restartedJob.Status != restjobs.StatusFailed || restartedJob.Provider != nil {
+		t.Fatalf("restart changed unresolved provider job: %+v", restartedJob)
+	}
+	time.Sleep(100 * time.Millisecond)
+	recordData, err = os.ReadFile(recordPath)
+	if err != nil || json.Unmarshal(recordData, &record) != nil || record.Creates != 1 || record.Attempts != 1 {
+		t.Fatalf("restart blindly retried unresolved provider write: record=%+v err=%v", record, err)
+	}
+	if err := restarted.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-restartedDone; err != nil {
+		t.Fatalf("restarted server shutdown: %v", err)
+	}
+	restarted.Process = nil
+
+	// An explicit retry with the durable job/branch identity finds the already
+	// created PR. It returns the same outcome and does not create a duplicate.
+	publisher := &uncertainE2EPublisher{path: outcomesPath}
+	retryOutcome, err := publisher.Publish(context.Background(), restprovider.PublishRequest{
+		JobID: record.JobID, Repository: record.Repository, Worktree: filepath.Join(workspace, "worktree"),
+		Branch: record.Branch, Commit: record.Commit, Title: "publish with uncertain response", BaseBranch: "main",
+	})
+	if err != nil || retryOutcome.Number != record.Outcome.Number || retryOutcome.URL != record.Outcome.URL {
+		t.Fatalf("explicit provider reconciliation outcome=%+v err=%v", retryOutcome, err)
+	}
+	recordData, err = os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(recordData, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Creates != 1 || record.Attempts != 2 {
+		t.Fatalf("reconciliation duplicated create or did not retry: %+v", record)
+	}
+	stillUnresolved, err := persisted.Get(admitted.ID)
+	if err != nil || stillUnresolved.Status != restjobs.StatusFailed || stillUnresolved.Provider != nil {
+		t.Fatalf("unrecorded retry result changed job state: %+v err=%v", stillUnresolved, err)
 	}
 }
 
