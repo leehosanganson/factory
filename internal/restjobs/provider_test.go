@@ -96,13 +96,13 @@ func TestSQLiteExplicitReconciliationIsAtomicAndIdempotent(t *testing.T) {
 	}
 }
 
-func TestSQLiteExplicitReconciliationRejectsUncertainAttemptWithoutConfirmation(t *testing.T) {
+func TestSQLiteExplicitReconciliationAcceptsConfirmedAttemptAndRejectsMissingAttempt(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), testConfig())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.CloseStore()
-	job, _, err := store.Admit("not-uncertain", Request{Repository: "widget", Task: "task"})
+	job, _, err := store.Admit("confirmed-attempt", Request{Repository: "widget", Task: "task"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,11 +115,48 @@ func TestSQLiteExplicitReconciliationRejectsUncertainAttemptWithoutConfirmation(
 		t.Fatal(err)
 	}
 	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 71, URL: "https://github.com/acme/widget/pull/71", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("non-uncertain reconciliation error=%v", err)
+	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("reconcile matching recorded attempt: %v", err)
 	}
-	if err := store.MarkProviderAttemptUncertain(job.ID); !errors.Is(err, ErrInvalidTransition) {
-		t.Fatalf("mark failed attempt uncertain error=%v", err)
+	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("repeat reconciliation: %v", err)
+	}
+	got, err := store.Get(job.ID)
+	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
+		t.Fatalf("reconciled confirmed-attempt job = %+v, %v", got, err)
+	}
+	history, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconciledEvents := 0
+	for _, event := range history.Events {
+		if event.Type == "provider_reconciled" {
+			reconciledEvents++
+		}
+	}
+	if reconciledEvents != 1 {
+		t.Fatalf("reconciliation audit events=%d history=%+v", reconciledEvents, history.Events)
+	}
+
+	withoutAttempt, _, err := store.Admit("missing-attempt", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(withoutAttempt.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	missingOutcome := outcome
+	missingOutcome.Branch = "factory/job/" + withoutAttempt.ID
+	if err := store.ReconcileProviderOutcome(withoutAttempt.ID, missingOutcome); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("missing-attempt reconciliation error=%v, want ErrInvalidTransition", err)
+	}
+	unchanged, err := store.Get(withoutAttempt.ID)
+	if err != nil || unchanged.Status != StatusFailed || unchanged.Provider != nil {
+		t.Fatalf("missing-attempt reconciliation changed job: %+v %v", unchanged, err)
 	}
 }
 

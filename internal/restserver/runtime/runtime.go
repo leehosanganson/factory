@@ -206,7 +206,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			if attemptErr != nil {
 				return attemptErr
 			}
-			if job.Status == restjobs.StatusSucceeded && job.Provider != nil && attempt.Uncertain && job.Provider.Provider == attempt.Provider && job.Provider.Repository == attempt.Repository && job.Provider.Branch == attempt.Branch && job.Provider.Commit == attempt.Commit {
+			if job.Status == restjobs.StatusSucceeded && job.Provider != nil && job.Provider.Provider == attempt.Provider && job.Provider.Repository == attempt.Repository && job.Provider.Branch == attempt.Branch && job.Provider.Commit == attempt.Commit {
 				return nil
 			}
 			if job.Status != restjobs.StatusFailed {
