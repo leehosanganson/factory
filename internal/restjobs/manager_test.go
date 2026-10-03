@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -218,6 +219,111 @@ func TestRegistryBudgetRejectsWithoutStoringKeyAndAllowsRetry(t *testing.T) {
 	accepted, replay, err := manager.Admit("retry-key", Request{Repository: "w", Task: "retry now"})
 	if err != nil || replay || accepted.ID == firstID {
 		t.Fatalf("retry after reclaiming budget = (%+v, %v, %v), want new job", accepted, replay, err)
+	}
+}
+
+func TestVerificationEvidenceRejectionDoesNotEvictTerminalJobs(t *testing.T) {
+	terminalRequest := Request{Repository: "repo", Task: "terminal"}
+	targetRequest := Request{Repository: "repo", Task: "target"}
+	queuedRequest := Request{Repository: "repo", Task: "queued"}
+	terminalKey, targetKey, queuedKey := "terminal-key", "target-key", "queued-key"
+	setupBytes := recordBytes(terminalRequest, terminalKey) +
+		eventBytes(Event{Type: "queued", Message: "Job admitted"}) +
+		eventBytes(Event{Type: "running", Message: "Job started"}) +
+		eventBytes(Event{Type: "succeeded", Message: "Job finished"}) +
+		recordBytes(targetRequest, targetKey) +
+		eventBytes(Event{Type: "queued", Message: "Job admitted"}) +
+		eventBytes(Event{Type: "running", Message: "Job started"}) +
+		recordBytes(queuedRequest, queuedKey) +
+		eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	manager := testManager(t, Config{
+		QueueCapacity: 3, MaxConcurrentJobs: 2, MaxRecords: 3, MaxEventsPerJob: 4,
+		RegistryBytes: int64(setupBytes + 1),
+	})
+	terminal, _, err := manager.Admit(terminalKey, terminalRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(terminal.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	target, _, err := manager.Admit(targetKey, targetRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := manager.Admit(queuedKey, queuedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := VerificationEvidence{
+		Checks: make([]VerificationCheck, maxVerificationChecks),
+		Limitations: []string{
+			LimitationAgentNotVerdict, LimitationAgentNotVerdict,
+			LimitationAgentNotVerdict, LimitationAgentNotVerdict,
+		},
+	}
+	for index := range evidence.Checks {
+		evidence.Checks[index] = VerificationCheck{Name: fmt.Sprintf("check-%02d", index+1), Outcome: VerificationPassed}
+	}
+	terminalEntry := manager.jobs[terminal.ID]
+	available := uint64(manager.config.RegistryBytes) - manager.registryBytes
+	delta := verificationEvidenceBytes(&evidence)
+	if delta <= available+terminalEntry.accountedBytes {
+		t.Fatalf("test setup must be impossible even after terminal eviction: evidence delta=%d available=%d terminal bytes=%d", delta, available, terminalEntry.accountedBytes)
+	}
+
+	jobsBefore := make(map[string]struct {
+		snapshot Snapshot
+		history  History
+	}, len(manager.jobs))
+	for id, entry := range manager.jobs {
+		jobsBefore[id] = struct {
+			snapshot Snapshot
+			history  History
+		}{snapshot: cloneSnapshot(entry.snapshot), history: History{JobID: id, Events: append([]Event(nil), entry.events...), Truncated: entry.truncated}}
+	}
+	keysBefore := make(map[string]string, len(manager.idempotency))
+	for key, id := range manager.idempotency {
+		keysBefore[key] = id
+	}
+	bytesBefore := manager.registryBytes
+
+	if err := manager.RecordVerificationEvidence(target.ID, evidence); !errors.Is(err, ErrRegistryFull) {
+		t.Fatalf("non-fitting evidence error = %v, want ErrRegistryFull", err)
+	}
+	jobsAfter := make(map[string]struct {
+		snapshot Snapshot
+		history  History
+	}, len(manager.jobs))
+	for id, entry := range manager.jobs {
+		jobsAfter[id] = struct {
+			snapshot Snapshot
+			history  History
+		}{snapshot: cloneSnapshot(entry.snapshot), history: History{JobID: id, Events: append([]Event(nil), entry.events...), Truncated: entry.truncated}}
+	}
+	if !reflect.DeepEqual(jobsAfter, jobsBefore) {
+		t.Fatalf("rejected evidence changed retained jobs: before=%+v after=%+v", jobsBefore, jobsAfter)
+	}
+	if !reflect.DeepEqual(manager.idempotency, keysBefore) {
+		t.Fatalf("rejected evidence changed idempotency keys: before=%v after=%v", keysBefore, manager.idempotency)
+	}
+	if manager.registryBytes != bytesBefore {
+		t.Fatalf("rejected evidence changed accounting: before=%d after=%d", bytesBefore, manager.registryBytes)
+	}
+	if _, err := manager.Get(terminal.ID); err != nil {
+		t.Fatalf("terminal job was evicted: %v", err)
+	}
+	if got, err := manager.Get(target.ID); err != nil || got.Verification != nil {
+		t.Fatalf("rejected evidence was stored: verification=%+v err=%v", got.Verification, err)
+	}
+	if got, err := manager.Get(queued.ID); err != nil || got.Status != StatusQueued {
+		t.Fatalf("queued job changed: job=%+v err=%v", got, err)
 	}
 }
 
