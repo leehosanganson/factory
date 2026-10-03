@@ -1,0 +1,6 @@
+# REST roadmap gate status audit
+
+- **Scope:** Compared roadmap delivery gates 5/6 with the REST job contract, server/config/operations guides, and merged SQLite restart-resumption behavior at `c04ab3b`.
+- **Verified status:** Queued SQLite jobs resume after restart; interrupted running jobs remain visible and are not replayed. Eligible terminal failed SQLite jobs can be explicitly reconciled using read-only provider confirmation. Setup/readiness, consistent backup command and restore guidance, and count-only aggregate operational status are implemented/documented. Process-level recovery tests use a fake provider, not live GitHub.
+- **Remaining limitations:** Automatic recovery/reconciliation of interrupted running jobs, live-GitHub uncertain-write fault injection, and completed deployment/restore drills or broad telemetry are not established by the shipped behavior or referenced tests.
+- **Observation:** The roadmap's previous status phrased operator recovery/observability and backup/restore broadly as remaining gaps despite the narrower shipped capabilities; its sequence did not distinguish implemented gates from remaining validation. Updated only the roadmap to state these boundaries and preserve the unverified work explicitly.
