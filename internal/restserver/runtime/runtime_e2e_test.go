@@ -35,8 +35,11 @@ func TestRESTServerProcessHelper(t *testing.T) {
 		os.Exit(11)
 	}
 	var publisher restprovider.Publisher = &e2ePublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
-	if os.Getenv("FACTORY_E2E_PROVIDER_MODE") == "uncertain" {
+	switch os.Getenv("FACTORY_E2E_PROVIDER_MODE") {
+	case "uncertain":
 		publisher = &uncertainE2EPublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
+	case "confirmed-wait":
+		publisher = &confirmedWaitingE2EPublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -61,6 +64,8 @@ type e2ePublisher struct{ path string }
 
 type uncertainE2EPublisher struct{ path string }
 
+type confirmedWaitingE2EPublisher struct{ path string }
+
 type uncertainProviderRecord struct {
 	JobID      string               `json:"job_id"`
 	Repository string               `json:"repository"`
@@ -69,6 +74,61 @@ type uncertainProviderRecord struct {
 	Outcome    restprovider.Outcome `json:"outcome"`
 	Creates    int                  `json:"creates"`
 	Attempts   int                  `json:"attempts"`
+}
+
+func (p *confirmedWaitingE2EPublisher) Ping(context.Context) error { return nil }
+
+func (p *confirmedWaitingE2EPublisher) Publish(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	branch, branchErr := exec.CommandContext(ctx, "git", "-C", request.Worktree, "branch", "--show-current").Output()
+	commit, commitErr := exec.CommandContext(ctx, "git", "-C", request.Worktree, "rev-parse", "HEAD").Output()
+	if branchErr != nil || strings.TrimSpace(string(branch)) != request.Branch || commitErr != nil || strings.TrimSpace(string(commit)) != request.Commit {
+		return restprovider.Outcome{}, fmt.Errorf("confirmed provider request identity mismatch")
+	}
+	record := uncertainProviderRecord{
+		JobID: request.JobID, Repository: request.Repository, Branch: request.Branch, Commit: request.Commit,
+		Outcome: restprovider.Outcome{Provider: "github", Repository: request.Repository, Number: 72, URL: fmt.Sprintf("https://github.com/%s/pull/72", request.Repository), Branch: request.Branch, Commit: request.Commit, State: "open"},
+		Creates: 1, Attempts: 1,
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return restprovider.Outcome{}, err
+	}
+	if err := os.WriteFile(p.path+".confirmed.json", data, 0o600); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	if err := os.WriteFile(p.path+".publish-waiting", []byte("ready"), 0o600); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	for {
+		if _, err := os.Stat(p.path + ".release-publish"); err == nil {
+			return record.Outcome, nil
+		} else if !os.IsNotExist(err) {
+			return restprovider.Outcome{}, err
+		}
+		select {
+		case <-ctx.Done():
+			return restprovider.Outcome{}, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (p *confirmedWaitingE2EPublisher) Reconcile(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	if err := ctx.Err(); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	data, err := os.ReadFile(p.path + ".confirmed.json")
+	if err != nil {
+		return restprovider.Outcome{}, fmt.Errorf("confirmed PR unavailable")
+	}
+	var record uncertainProviderRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.JobID != request.JobID || record.Repository != request.Repository || record.Branch != request.Branch || record.Commit != request.Commit {
+		return restprovider.Outcome{}, fmt.Errorf("confirmed PR identity mismatch")
+	}
+	if err := os.WriteFile(p.path+".read-only-lookup", []byte("confirmed"), 0o600); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	return record.Outcome, nil
 }
 
 func (p *uncertainE2EPublisher) Ping(context.Context) error { return nil }
@@ -697,6 +757,187 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		if expectedTask == "" || record.Repository != wantRepository || requestIDs[expectedTask] == "" {
 			t.Fatalf("provider repository does not match request alias: %+v", record)
 		}
+	}
+}
+
+func TestRESTServerProcessReconcilesConfirmedProviderWriteAfterOutcomePersistenceFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	stateDir := testResultsBase(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	config.Limits.JobTimeout = "30s"
+	harness := filepath.Join(t.TempDir(), "harness.sh")
+	harnessCount := filepath.Join(t.TempDir(), "harness-count")
+	if err := os.WriteFile(harness, []byte(fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\nprintf 'verified\\n' >> result.txt\n", harnessCount)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outcomesPath := filepath.Join(t.TempDir(), "provider-outcomes")
+	readyPath := filepath.Join(t.TempDir(), "listener")
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+outcomesPath, "FACTORY_E2E_PROVIDER_MODE=confirmed-wait")
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	childDone := make(chan error, 1)
+	go func() {
+		childDone <- child.Wait()
+		_ = logFile.Close()
+	}()
+	baseURL := waitForProcessURL(t, childDone, readyPath, logPath)
+	client := &http.Client{Timeout: 15 * time.Second}
+	defer func() {
+		if child.Process == nil {
+			return
+		}
+		_ = child.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-childDone:
+		case <-time.After(3 * time.Second):
+			_ = child.Process.Kill()
+			<-childDone
+		}
+	}()
+	admitted, err := submitProcessJob(client, baseURL, apiKey, "trusted", "publish with confirmed response", "confirmed-outcome-lock-key")
+	if err != nil || admitted.StatusCode != http.StatusAccepted || admitted.ID == "" {
+		t.Fatalf("confirmed-outcome admission=%+v err=%v", admitted, err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outcomesPath + ".publish-waiting"); err == nil {
+			break
+		}
+		select {
+		case err := <-childDone:
+			t.Fatalf("server exited before confirmed provider publish: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(outcomesPath + ".publish-waiting"); err != nil {
+		t.Fatalf("provider did not reach confirmed publish: %v", err)
+	}
+	unlockSQLite := lockSQLiteWrites(t, config.Persistence.Path)
+	locked := true
+	defer func() {
+		if locked {
+			unlockSQLite()
+		}
+	}()
+	if err := os.WriteFile(outcomesPath+".release-publish", []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5500 * time.Millisecond)
+	unlockSQLite()
+	locked = false
+	waitForProcessFailure(t, client, baseURL, admitted.ID, apiKey)
+	failed := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+	if failed.Provider != nil {
+		t.Fatalf("outcome persistence failure recorded provider result: %+v", failed)
+	}
+	failedHistory := getProcessHistory(t, client, baseURL, admitted.ID, apiKey)
+	for _, event := range failedHistory.Events {
+		if event.Type == "provider_reconciled" || event.Type == string(restjobs.StatusSucceeded) {
+			t.Fatalf("outcome persistence failure recorded completion: %+v", failedHistory)
+		}
+	}
+	workspace := filepath.Join(stateDir, aliasDirectory("trusted"), "results", admitted.ID)
+	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+		t.Fatalf("failed provider outcome workspace was not retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, ".completion.json")); !os.IsNotExist(err) {
+		t.Fatalf("failed provider outcome workspace has completion marker: %v", err)
+	}
+	persisted, err := restworker.NewLocalJobManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persisted.Close()
+	providerAttemptStore, ok := persisted.(*restjobs.SQLiteStore)
+	if !ok {
+		t.Fatalf("persisted store type=%T, want SQLiteStore", persisted)
+	}
+	attempt, err := providerAttemptStore.ProviderAttempt(admitted.ID)
+	if err != nil || attempt.Uncertain {
+		t.Fatalf("confirmed provider attempt=%+v err=%v, want recorded non-uncertain attempt", attempt, err)
+	}
+	if err := os.Remove(outcomesPath + ".release-publish"); err != nil {
+		t.Fatal(err)
+	}
+	failed = getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+	if failed.Status != restjobs.StatusFailed || failed.Provider != nil {
+		t.Fatalf("post-lock job state=%+v, want failed without outcome", failed)
+	}
+	harnessRunsBeforeReconcile, err := os.ReadFile(harnessCount)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcile := func() (int, string) {
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs/"+admitted.ID+"/reconcile", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	if code, body := reconcile(); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("confirmed-attempt reconcile status=%d body=%s", code, body)
+	}
+	if code, body := reconcile(); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("repeated confirmed-attempt reconcile status=%d body=%s", code, body)
+	}
+	reconciled := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+	if reconciled.Status != restjobs.StatusSucceeded || reconciled.Provider == nil || reconciled.Provider.Number != 72 {
+		t.Fatalf("reconciled confirmed provider result=%+v", reconciled)
+	}
+	if _, err := os.Stat(outcomesPath + ".read-only-lookup"); err != nil {
+		t.Fatalf("provider was not confirmed by read-only reconciliation: %v", err)
+	}
+	providerRecord, err := os.ReadFile(outcomesPath + ".confirmed.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record uncertainProviderRecord
+	if err := json.Unmarshal(providerRecord, &record); err != nil || record.Creates != 1 || record.Attempts != 1 {
+		t.Fatalf("provider create record=%+v err=%v", record, err)
+	}
+	harnessRuns, err := os.ReadFile(harnessCount)
+	if err != nil || string(harnessRuns) != string(harnessRunsBeforeReconcile) {
+		t.Fatalf("reconciliation reran harness: before=%q after=%q err=%v", harnessRunsBeforeReconcile, harnessRuns, err)
 	}
 }
 

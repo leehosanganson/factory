@@ -595,7 +595,7 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 		return ErrInvalidTransition
 	}
 	var attempt ProviderAttempt
-	if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) || !attempt.Uncertain || outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
+	if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) || outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
 		return ErrInvalidInput
 	}
 	now := time.Now().UTC()
