@@ -22,7 +22,9 @@ type ResultExecutor interface {
 }
 
 type ProviderOutcomeExecutor interface{ RequiresProviderOutcome() bool }
-type ResultCompletionExecutor interface{ CompleteResult(restjobs.Snapshot) error }
+type ResultCompletionExecutor interface {
+	CompleteResult(context.Context, restjobs.Snapshot) error
+}
 
 // CoordinatorConfig selects the maximum number of executor goroutines. The
 // manager independently enforces its own MaxConcurrentJobs bound.
@@ -139,7 +141,8 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 			if outcome == nil || c.manager.RecordProviderOutcome(job.ID, *outcome) != nil {
 				return
 			}
-			if completion, ok := c.executor.(ResultCompletionExecutor); ok && completion.CompleteResult(job) != nil {
+			job.Provider = outcome
+			if completion, ok := c.executor.(ResultCompletionExecutor); ok && completion.CompleteResult(c.ctx, job) != nil {
 				return
 			}
 			status = restjobs.StatusSucceeded
