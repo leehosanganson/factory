@@ -231,6 +231,37 @@ func (m *Manager) VerifyResultDirectory(path string) error {
 	return verifyProtectedDir(path)
 }
 
+// RetainedWorkspace returns the validated original worktree for an operator
+// reconciliation without creating or mutating job workspace state.
+func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
+	if !validJobID(jobID) {
+		return Workspace{}, errors.New("invalid job ID")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.verifyRepository(); err != nil {
+		return Workspace{}, err
+	}
+	if err := m.verifyRoot(); err != nil {
+		return Workspace{}, err
+	}
+	jobDir := filepath.Join(m.root, jobID)
+	if err := verifyProtectedDir(jobDir); err != nil {
+		return Workspace{}, errors.New("retained job workspace is unavailable")
+	}
+	if err := verifyExpectedWorkspace(jobDir); err != nil {
+		return Workspace{}, errors.New("retained job workspace is unavailable")
+	}
+	worktree := filepath.Join(jobDir, "worktree")
+	if err := registeredWorktree(m.repoRoot, worktree); err != nil {
+		return Workspace{}, errors.New("retained job worktree is unavailable")
+	}
+	if err := verifyWorktreeDir(worktree); err != nil {
+		return Workspace{}, errors.New("retained job worktree is unavailable")
+	}
+	return Workspace{JobID: jobID, WorktreePath: worktree, StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output")}, nil
+}
+
 // MarkSucceeded atomically records trusted completion metadata with mode 0600.
 // Failed/canceled jobs must not call this method and therefore remain retained.
 func (m *Manager) MarkSucceeded(jobID string) error {

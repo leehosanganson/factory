@@ -118,6 +118,31 @@ func TestHealthAndReadinessAreMinimalAndUnauthenticated(t *testing.T) {
 	}
 }
 
+func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("reconcile-route", restjobs.Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := atomic.Int32{}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	handler.config.ReconcileProvider = func(context.Context, string) error {
+		called.Add(1)
+		return restjobs.ErrInvalidTransition
+	}
+	if response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", "", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated reconciliation status=%d", response.Code)
+	}
+	response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", "", true)
+	assertError(t, response, http.StatusConflict, "reconciliation_not_allowed")
+	if called.Load() != 1 || strings.Contains(response.Body.String(), "secret") {
+		t.Fatalf("reconcile callback count=%d response=%s", called.Load(), response.Body.String())
+	}
+	if response := request(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/reconcile", "", true); response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("reconcile GET status=%d", response.Code)
+	}
+}
+
 func TestAuthenticationPrecedesJobPathResolution(t *testing.T) {
 	handler := newTestHandler(t, newTestManager(t, managerConfig(2, 2, 2)), func() bool { return true })
 	for _, path := range []string{"/v1/jobs", "/v1/jobs/unknown", "/v1/jobs/unknown/nope"} {

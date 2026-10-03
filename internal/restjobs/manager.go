@@ -91,8 +91,16 @@ type Config struct {
 	RegistryBytes     int64
 }
 
-// Snapshot is a copy of the public job state and is safe to serialize after the
-// manager lock has been released.
+// ProviderAttempt is durable identity captured immediately before the provider write.
+type ProviderAttempt struct {
+	Provider   string `json:"provider"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Commit     string `json:"commit"`
+	Uncertain  bool   `json:"uncertain"`
+}
+
+// ProviderOutcome is a validated provider-side PR result.
 type ProviderOutcome struct {
 	Provider   string `json:"provider"`
 	Repository string `json:"repository"`
@@ -103,6 +111,8 @@ type ProviderOutcome struct {
 	State      string `json:"state"`
 }
 
+// Snapshot is a copy of the public job state and is safe to serialize after the
+// manager lock has been released.
 type Snapshot struct {
 	ID        string           `json:"id"`
 	Request   Request          `json:"request"`
