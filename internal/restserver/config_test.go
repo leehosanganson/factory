@@ -117,6 +117,28 @@ func TestLoadConfigAcceptsBoundedOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadConfigReportsSanitizedFieldForWrongTypes(t *testing.T) {
+	valid := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"api_key_file":"/run/key"`
+	cases := []struct {
+		name, json, field, secret string
+	}{
+		{"root credential field", `{` + strings.Replace(valid, `"api_key_file":"/run/key"`, `"api_key_file":["api-secret-value"]`, 1) + `}`, "api_key_file", "api-secret-value"},
+		{"provider credential field", `{` + valid + `,"provider":{"backend":"github","token_file":["provider-secret-value"],"base_branch":"main","repositories":{"widget":"acme/widget"}}}`, "provider.token_file", "provider-secret-value"},
+		{"SQLite field", `{` + valid + `,"persistence":{"backend":"sqlite","path":["database-path"]}}`, "persistence.path", "database-path"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeConfig(t, tc.json))
+			if err == nil || !strings.Contains(err.Error(), tc.field) || !strings.Contains(err.Error(), "invalid type") {
+				t.Fatalf("LoadConfig() error = %v, want sanitized invalid-type diagnostic for %s", err, tc.field)
+			}
+			if strings.Contains(err.Error(), tc.secret) {
+				t.Fatalf("LoadConfig() error exposed config value: %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadConfigRejectsStrictSchemaViolations(t *testing.T) {
 	valid := `"mode":"local_process","listen_address":"127.0.0.1:8080","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"api_key_file":"/run/key"`
 	cases := []struct {
