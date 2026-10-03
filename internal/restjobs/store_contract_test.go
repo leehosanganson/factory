@@ -100,12 +100,19 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		if err := store.AddEvent(job.ID, "verification", "tests passed"); err != nil {
 			t.Fatal(err)
 		}
+		verification := VerificationEvidence{
+			Checks:      []VerificationCheck{{Name: "check-01", Outcome: "passed"}},
+			Limitations: []string{LimitationAgentNotVerdict},
+		}
+		if err := store.RecordVerificationEvidence(job.ID, verification); err != nil {
+			t.Fatal(err)
+		}
 		if err := store.Finish(job.ID, StatusSucceeded); err != nil {
 			t.Fatal(err)
 		}
 		got, err := store.Get(job.ID)
-		if err != nil || got.Status != StatusSucceeded {
-			t.Fatalf("Get() = (%+v, %v), want succeeded", got, err)
+		if err != nil || got.Status != StatusSucceeded || got.Verification == nil || len(got.Verification.Checks) != 1 || got.Verification.Checks[0] != verification.Checks[0] || len(got.Verification.Limitations) != 1 || got.Verification.Limitations[0] != LimitationAgentNotVerdict {
+			t.Fatalf("Get() = (%+v, %v), want succeeded job with durable verification evidence", got, err)
 		}
 		history, err := store.History(job.ID)
 		if err != nil || len(history.Events) != 4 || history.Events[2].Type != "verification" || history.Events[3].Type != string(StatusSucceeded) {

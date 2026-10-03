@@ -32,7 +32,7 @@ The binary is written to `./bin/factory`. Configuration and state are stored out
 
 ## Local REST server
 
-The server accepts authenticated job requests, executes configured workflows in isolated workspaces, and exposes status and bounded history. It supports volatile in-memory state or configured SQLite persistence, plus optional GitHub pull-request publication. See [REST server operations](docs/features/rest-server-operations.md) for readiness, backup/restore, restart recovery, and capacity guidance.
+The server accepts authenticated job requests, executes configured workflows in isolated workspaces, and exposes status, bounded history, and safe structured verification evidence with explicit limitations. Job inspection includes the confirmed PR identity/URL when configured; it never exposes raw logs, check output, or host paths. It supports volatile in-memory state or configured SQLite persistence, plus optional GitHub pull-request publication. See [REST server operations](docs/features/rest-server-operations.md) for readiness, backup/restore, restart recovery, and capacity guidance.
 
 ```sh
 factory server --config /absolute/path/to/server.json

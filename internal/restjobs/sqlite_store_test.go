@@ -457,6 +457,40 @@ func TestSQLiteStoreRejectsInvalidPathAndUnavailableDatabase(t *testing.T) {
 	}
 }
 
+func TestSQLiteStorePersistsVerificationEvidenceAcrossRestart(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("verification-key", Request{Repository: "widget", Task: "verify"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	want := VerificationEvidence{
+		Checks:      []VerificationCheck{{Name: "check-01", Outcome: VerificationPassed}},
+		Limitations: []string{LimitationAgentNotVerdict},
+	}
+	if err := store.RecordVerificationEvidence(job.ID, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	got, err := reopened.Get(job.ID)
+	if err != nil || got.Verification == nil || len(got.Verification.Checks) != 1 || got.Verification.Checks[0] != want.Checks[0] || len(got.Verification.Limitations) != 1 || got.Verification.Limitations[0] != want.Limitations[0] {
+		t.Fatalf("verification evidence = (%+v,%v)", got.Verification, err)
+	}
+}
+
 func TestSQLiteStorePersistsProviderOutcomeAcrossRestart(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())

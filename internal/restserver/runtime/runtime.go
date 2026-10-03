@@ -167,6 +167,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		executor, err = restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
 			Server: config, Workflow: workflowConfig, Workspaces: workspaces, Provider: publisher,
 			RecordProviderAttempt: recordProviderAttempt, MarkProviderAttemptUncertain: markProviderAttemptUncertain,
+			RecordVerificationEvidence: manager.RecordVerificationEvidence,
 		})
 		if err != nil {
 			closeStore()

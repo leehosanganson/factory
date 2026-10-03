@@ -37,6 +37,7 @@ type FactoryExecutorConfig struct {
 	Workflow                     factory.Config
 	Workspaces                   map[string]WorkspaceManager
 	WorkflowObserver             factory.WorkflowObserver
+	RecordVerificationEvidence   func(string, restjobs.VerificationEvidence) error
 	Provider                     restprovider.Publisher
 	RecordProviderAttempt        func(string, restjobs.ProviderAttempt) error
 	MarkProviderAttemptUncertain func(string) error
@@ -57,6 +58,7 @@ type FactoryExecutor struct {
 	agent                        func(factory.Config, []string, io.Writer) factory.Agent
 	validateRepositoryRoot       func(context.Context, string) error
 	observer                     factory.WorkflowObserver
+	recordVerificationEvidence   func(string, restjobs.VerificationEvidence) error
 	provider                     restprovider.Publisher
 	recordProviderAttempt        func(string, restjobs.ProviderAttempt) error
 	markProviderAttemptUncertain func(string) error
@@ -115,7 +117,7 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain,
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, recordVerificationEvidence: config.RecordVerificationEvidence, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain,
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -204,6 +206,19 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 	if job.ID == "" || job.Request.Task == "" {
 		return nil, errExecutionFailed
 	}
+	evidence := restjobs.VerificationEvidence{
+		Checks:      make([]restjobs.VerificationCheck, len(e.workflow.PipelineChecks)),
+		Limitations: []string{restjobs.LimitationAgentNotVerdict},
+	}
+	for index := range evidence.Checks {
+		evidence.Checks[index] = restjobs.VerificationCheck{Name: fmt.Sprintf("check-%02d", index+1), Outcome: restjobs.VerificationNotCompleted}
+	}
+	if len(evidence.Checks) == 0 {
+		evidence.Limitations = append(evidence.Limitations, restjobs.LimitationNoChecksConfigured)
+	}
+	if e.recordVerificationEvidence != nil && e.recordVerificationEvidence(job.ID, evidence) != nil {
+		return nil, errExecutionFailed
+	}
 	root, ok := e.server.Repositories[job.Request.Repository]
 	workspaceManager := e.workspaces[job.Request.Repository]
 	if !ok || workspaceManager == nil || e.validateRepositoryRoot(jobCtx, root) != nil {
@@ -229,12 +244,33 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 	workflowConfig.StateDir = workspace.StatePath
 	workflowConfig.AutoPublish = false
 	workflowConfig.ParallelImplementation = nil
+	completedChecks := 0
+	observer := factory.WorkflowObserverFunc(func(event factory.WorkflowEvent) error {
+		if event.Type == "check.completed" && completedChecks < len(evidence.Checks) {
+			outcome := restjobs.VerificationFailed
+			switch event.Outcome {
+			case "success":
+				outcome = restjobs.VerificationPassed
+			case "canceled":
+				outcome = restjobs.VerificationCanceled
+			}
+			evidence.Checks[completedChecks].Outcome = outcome
+			completedChecks++
+			if e.recordVerificationEvidence != nil && e.recordVerificationEvidence(job.ID, evidence) != nil {
+				return errExecutionFailed
+			}
+		}
+		if e.observer != nil {
+			return e.observer.ObserveWorkflowEvent(event)
+		}
+		return nil
+	})
 	workflow := factory.Workflow{
 		Agent: e.agent(workflowConfig, append([]string(nil), e.env...), capture), Config: workflowConfig,
 		In: strings.NewReader(""), Out: io.Discard, Workdir: workspace.WorktreePath,
 		Stages: []string{"requirements", "implement", "review", "document"},
 		Gate:   false, RequireComplete: true, OutputWriter: capture, DisableTranscripts: true,
-		DisableStateTask: true, PipelineCheckEnv: append([]string(nil), e.env...), Observer: e.observer,
+		DisableStateTask: true, PipelineCheckEnv: append([]string(nil), e.env...), Observer: observer,
 	}
 	runErr := workflow.RunContext(jobCtx, job.Request.Task)
 	flushErr := capture.Flush()

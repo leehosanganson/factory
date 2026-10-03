@@ -647,6 +647,11 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		t.Fatal(err)
 	}
 	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	checkPath := filepath.Join(t.TempDir(), "verify-check.sh")
+	if err := os.WriteFile(checkPath, []byte("#!/bin/sh\nprintf 'private verification transcript marker\\n'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.VerificationChecks = [][]string{{checkPath}}
 	configPath := filepath.Join(t.TempDir(), "server.json")
 	configData, err := json.Marshal(config)
 	if err != nil {
@@ -756,6 +761,18 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 	}
 	for _, id := range ids {
 		waitForProcessJob(t, client, baseURL, id, apiKey)
+		job, responseBody := getProcessJobResponse(t, client, baseURL, id, apiKey)
+		if job.Verification == nil || len(job.Verification.Checks) != 1 || job.Verification.Checks[0] != (restjobs.VerificationCheck{Name: "check-01", Outcome: restjobs.VerificationPassed}) {
+			t.Fatalf("inspectable verification evidence = %+v, want passed check-01", job.Verification)
+		}
+		if job.Verification == nil || len(job.Verification.Limitations) != 1 || job.Verification.Limitations[0] != restjobs.LimitationAgentNotVerdict {
+			t.Fatalf("verification limitations = %+v, want agent-verdict limitation", job.Verification)
+		}
+		for _, forbidden := range []string{"private verification transcript marker", checkPath, "workflow.log", "pipeline-check-01.log", root} {
+			if strings.Contains(responseBody, forbidden) {
+				t.Fatalf("job inspection exposed private verification data %q: %s", forbidden, responseBody)
+			}
+		}
 		history := getProcessHistory(t, client, baseURL, id, apiKey)
 		if len(history.Events) < 3 || history.Events[0].Type != "queued" || history.Events[1].Type != "running" {
 			t.Fatalf("job history is not inspectable: %+v", history)
@@ -858,9 +875,9 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		t.Fatalf("HTTP idempotency retry after process restart=%+v err=%v, want original job %q", replayed, err, expectedAfterRestart.ID)
 	}
 	restartedJob := getProcessJob(t, client, restartedURL, replayed.ID, apiKey)
-	if restartedJob.ID != expectedAfterRestart.ID || restartedJob.Status != expectedAfterRestart.Status || restartedJob.Status != restjobs.StatusSucceeded || restartedJob.Provider == nil || expectedAfterRestart.Provider == nil || *restartedJob.Provider != *expectedAfterRestart.Provider {
+	if restartedJob.ID != expectedAfterRestart.ID || restartedJob.Status != expectedAfterRestart.Status || restartedJob.Status != restjobs.StatusSucceeded || restartedJob.Provider == nil || expectedAfterRestart.Provider == nil || *restartedJob.Provider != *expectedAfterRestart.Provider || restartedJob.Verification == nil || expectedAfterRestart.Verification == nil || len(restartedJob.Verification.Checks) != len(expectedAfterRestart.Verification.Checks) || len(restartedJob.Verification.Checks) != 1 || restartedJob.Verification.Checks[0] != expectedAfterRestart.Verification.Checks[0] || len(restartedJob.Verification.Limitations) != len(expectedAfterRestart.Verification.Limitations) || restartedJob.Verification.Limitations[0] != expectedAfterRestart.Verification.Limitations[0] {
 		stopRestarted()
-		t.Fatalf("HTTP replay changed successful provider job: before=%+v after=%+v", expectedAfterRestart, restartedJob)
+		t.Fatalf("HTTP replay changed successful provider/verification outcome: before=%+v after=%+v", expectedAfterRestart, restartedJob)
 	}
 	createsAfterReplay, err := os.ReadFile(outcomesPath)
 	if err != nil {
@@ -1615,6 +1632,12 @@ func getProcessHistory(t *testing.T, client *http.Client, baseURL, id, apiKey st
 
 func getProcessJob(t *testing.T, client *http.Client, baseURL, id, apiKey string) restjobs.Snapshot {
 	t.Helper()
+	job, _ := getProcessJobResponse(t, client, baseURL, id, apiKey)
+	return job
+}
+
+func getProcessJobResponse(t *testing.T, client *http.Client, baseURL, id, apiKey string) (restjobs.Snapshot, string) {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/jobs/"+id, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1628,11 +1651,15 @@ func getProcessJob(t *testing.T, client *http.Client, baseURL, id, apiKey string
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("job inspect status=%d", resp.StatusCode)
 	}
-	var job restjobs.Snapshot
-	if err := json.NewDecoder(resp.Body).Decode(&job); err != nil {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return job
+	var job restjobs.Snapshot
+	if err := json.Unmarshal(body, &job); err != nil {
+		t.Fatal(err)
+	}
+	return job, string(body)
 }
 
 func waitForProcessJob(t *testing.T, client *http.Client, baseURL, id, apiKey string) {
