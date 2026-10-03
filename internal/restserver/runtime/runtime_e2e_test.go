@@ -373,7 +373,7 @@ func TestRESTServerProcessHelper(t *testing.T) {
 		return listener, nil
 	}
 	if err := run(ctx, config, runtimeOptions{Publisher: publisher, Listen: listen}); err != nil {
-		os.Exit(12)
+		t.Fatalf("REST server helper runtime failed: %v", err)
 	}
 	os.Exit(0)
 }
