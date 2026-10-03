@@ -8,7 +8,7 @@ This section describes implemented behavior, distinct from the remaining target 
 - [PR monitor](monitor.md) — detached, guarded maintenance of an existing open pull request.
 - [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, opt-in foreground GitHub issue polling, and version-pinned human-direction records; requests remain queued because no autonomous worker is implemented.
 - [REST job server](rest-server.md) — current authenticated job execution, persistence modes, provider PR writes, readiness, and graceful runtime lifecycle.
-- [REST server operations](rest-server-operations.md) — health/readiness probes, backup/restore, restart recovery classification, limits, and trusted-network operations.
+- [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, backup/restore, restart recovery classification, limits, and trusted-network operations.
 
 ## Shared behavior
 

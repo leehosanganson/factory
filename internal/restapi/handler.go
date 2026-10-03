@@ -3,6 +3,7 @@ package restapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/leehosanganson/factory/internal/restjobs"
@@ -101,7 +103,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !isJobsPath(r.URL.Path) {
+	if !isJobsPath(r.URL.Path) && r.URL.Path != "/v1/operations" {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -116,6 +118,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	path := r.URL.Path
 	switch {
+	case path == "/v1/operations":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.getOperations(w, r)
 	case path == "/v1/jobs":
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
@@ -145,6 +153,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	}
+}
+
+func (h *Handler) getOperations(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	summary, err := h.manager.OperationalSummary(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred.")
+		return
+	}
+	writeJSON(w, http.StatusOK, summary)
 }
 
 func isJobsPath(path string) bool {

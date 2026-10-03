@@ -26,6 +26,7 @@ The current route shape is the target unless a reviewed contract change supersed
 - `POST /v1/jobs` submits a bounded request for a configured repository alias and task; a positive issue number may be optional context, not a separate issue-polling workflow.
 - `GET /v1/jobs/{id}` returns the job status.
 - `GET /v1/jobs/{id}/history` returns bounded lifecycle events and a truncation indicator.
+- `GET /v1/operations` returns bearer-authenticated aggregate counts and capacity indicators only; it never returns job IDs, request payloads, events, provider details, or credentials.
 
 All job routes require bearer authentication. Requests cannot select arbitrary filesystem paths, executables, shell text, or verification commands. The server owns repository/provider configuration and enforces request, task, concurrency, time, history, and output bounds. Preserve strict JSON validation, safe generic errors, secret/path redaction, exact route/method behavior, and the current loopback listener default.
 
@@ -64,7 +65,7 @@ Delivery gates for the target MVP:
 3. Define/configure the code-repository provider interface and credential boundary. (Implemented.)
 4. Implement idempotent branch/PR reconciliation, create/update, and durable recording of the confirmed result. (Implemented; see the server configuration and operations guides.)
 5. Exercise end-to-end request-to-PR behavior including concurrent admission, process restart, duplicate requests, workflow/provider failure, and durable outcome checks. (Core request-to-PR and concurrency path implemented; additional cancellation and uncertain-write fault injection remain.)
-6. Document memory-mode volatility, SQLite setup/recovery, backup/retention, security boundaries, and provider configuration. (Configuration and operations guides available; backup/restore drill and aggregate observability remain.)
+6. Document memory-mode volatility, SQLite setup/recovery, backup/retention, security boundaries, and provider configuration. (Configuration and operations guides available; backup/restore drill and count-only aggregate operational status are implemented.)
 
 These are implementation gates, not claims of release dates. Completed steps describe merged behavior; remaining details above identify work not yet implemented or verified. Issue polling/reconciliation, provider events, additional hosting/fleet layers, UI, merge, release, and deployment are not prerequisites for this MVP. If issue intake is added later, it feeds the same REST job lifecycle rather than creating a second autonomous issue-to-PR product.
 

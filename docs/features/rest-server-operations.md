@@ -10,6 +10,27 @@ This guide applies to the single-server REST job service. See [REST server setup
 
 Keep probes on a trusted network boundary. They expose only bounded status—not credentials, filesystem paths, job contents, or provider diagnostics.
 
+## Aggregate operational status
+
+Authenticated clients can request `GET /v1/operations` with the same bearer token used for job routes. It returns only aggregate counts and configured capacity indicators, for example:
+
+```json
+{
+  "retained_records": 12,
+  "record_limit": 1000,
+  "queue_capacity": 8,
+  "queued": 2,
+  "running": 3,
+  "succeeded": 5,
+  "failed": 1,
+  "canceled": 1,
+  "queue_saturated": false,
+  "recovery_needed": 0
+}
+```
+
+The response contains no job IDs, task or repository values, event history, provider data, or credentials. `recovery_needed` counts SQLite jobs found running when this store instance opened; these may have external side effects and require operator reconciliation. It is always zero for the volatile memory store, which starts empty. This endpoint is a snapshot for operational visibility, not a health/readiness probe or a correctness verdict. A store query error returns a generic internal error without storage details.
+
 ## Persistence and backup
 
 Memory mode is volatile: jobs, idempotency keys, and history are lost on process restart. Use it for local development and tests, not as a durable queue.

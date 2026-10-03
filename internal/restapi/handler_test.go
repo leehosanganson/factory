@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -132,6 +133,71 @@ func TestAuthenticationPrecedesJobPathResolution(t *testing.T) {
 	handler.ServeHTTP(response, r)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("duplicate Authorization headers status = %d", response.Code)
+	}
+}
+
+func TestOperationsSummaryIsAuthenticatedBoundedAndSanitized(t *testing.T) {
+	manager := newTestManager(t, managerConfig(1, 3, 4))
+	running, _, err := manager.Admit("summary-1", restjobs.Request{Repository: "widget", Task: "top-secret task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := manager.Admit("summary-2", restjobs.Request{Repository: "widget", Task: "another hidden task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEvent(running.ID, "secret", "private event transcript"); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	if response := request(handler, http.MethodGet, "/v1/operations", "", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated operations status=%d, body=%s", response.Code, response.Body.String())
+	}
+	response := request(handler, http.MethodGet, "/v1/operations", "", true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("operations response = %d %s", response.Code, response.Body.String())
+	}
+	var summary restjobs.OperationalSummary
+	if err := json.Unmarshal(response.Body.Bytes(), &summary); err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		"retained_records": true, "record_limit": true, "queue_capacity": true,
+		"queued": true, "running": true, "succeeded": true, "failed": true,
+		"canceled": true, "queue_saturated": true, "recovery_needed": true,
+	}
+	for field := range fields {
+		if !allowed[field] {
+			t.Errorf("operations response contains unexpected field %q", field)
+		}
+	}
+	if len(fields) != len(allowed) {
+		t.Errorf("operations response fields = %v, want exactly %d count-only fields", fields, len(allowed))
+	}
+	if summary.RetainedRecords != 2 || summary.Queued != 1 || summary.Running != 1 || summary.RecoveryNeeded != 0 || !summary.QueueSaturated {
+		t.Fatalf("operations summary = %+v", summary)
+	}
+	for _, secret := range []string{running.ID, queued.ID, "top-secret task", "another hidden task", "private event transcript", "summary-1"} {
+		if strings.Contains(response.Body.String(), secret) {
+			t.Errorf("operations response leaked %q: %s", secret, response.Body.String())
+		}
+	}
+}
+
+func TestOperationsSummaryStoreFailureIsSanitized(t *testing.T) {
+	manager := errorSummaryManager{Manager: newTestManager(t, managerConfig(1, 1, 1)), err: errors.New("/private/store.db credential=never-log")}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	response := request(handler, http.MethodGet, "/v1/operations", "", true)
+	assertError(t, response, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(response.Body.String(), "private/store.db") || strings.Contains(response.Body.String(), "never-log") {
+		t.Fatalf("operations error leaked internal details: %s", response.Body.String())
 	}
 }
 
@@ -329,10 +395,12 @@ func TestMethodsPathsAndAllowHeaders(t *testing.T) {
 		{http.MethodPost, "/healthz", "GET", 405, false},
 		{http.MethodPost, "/readyz", "GET", 405, false},
 		{http.MethodGet, "/v1/jobs", "POST", 405, true},
+		{http.MethodPost, "/v1/operations", "GET", 405, true},
 		{http.MethodPost, "/v1/jobs/id", "GET", 405, true},
 		{http.MethodPost, "/v1/jobs/id/history", "GET", 405, true},
 		{http.MethodGet, "/v1/jobs/id/unknown", "", 404, true},
 		{http.MethodGet, "/v1/jobsx", "", 404, false},
+		{http.MethodGet, "/v1/operations/extra", "", 404, true},
 		{http.MethodGet, "/v1/jobs/%69d", "", 404, true},
 	} {
 		t.Run(fmt.Sprintf("%s %s", tc.method, tc.path), func(t *testing.T) {
@@ -353,6 +421,15 @@ type errorManager struct {
 }
 
 func (m errorManager) Get(id string) (restjobs.Snapshot, error) { return restjobs.Snapshot{}, m.getErr }
+
+type errorSummaryManager struct {
+	restjobs.Manager
+	err error
+}
+
+func (m errorSummaryManager) OperationalSummary(context.Context) (restjobs.OperationalSummary, error) {
+	return restjobs.OperationalSummary{}, m.err
+}
 
 func postJob(handler http.Handler, body, key string) *httptest.ResponseRecorder {
 	return postJobWithHeaders(handler, body, key)
