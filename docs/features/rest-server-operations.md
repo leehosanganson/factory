@@ -61,34 +61,64 @@ factory server backup --config /absolute/path/to/server.json --destination /secu
 
 The backup file is written with owner-only permissions. Restore by placing a copy at a new private database path, updating `persistence.path` in a disposable config, and starting the server with that config. Verify health/readiness and inspect representative job status/history. Do not point a live server at the source backup.
 
-## First request and recovery drill
+## Clean setup and first client request
 
-After creating the placeholder-only [server config](rest-server-config.md), start the service:
+This walkthrough starts with a trusted local checkout and an installed harness executable. Use a dedicated service account where practical: the server runs its configured workflow with that account's local authority, and neither the process nor a container is a security sandbox. Keep the repository, harness, config, API key, and any provider credentials operator-controlled.
 
-```sh
-factory server --config /absolute/path/to/server.json
-```
+1. Prepare an exact Git working-tree root for the configured repository alias. The server rejects paths that are not the canonical checkout root. Install the configured harness and make sure it can run non-interactively as the service account.
+2. Create private state and secret directories, then generate a fresh shared API key. These commands print no credential:
 
-For SQLite recovery, create an online backup without starting the server:
+   ```sh
+   umask 077
+   install -d -m 700 /var/lib/factory /var/lib/factory/secrets
+   install -m 600 /dev/null /var/lib/factory/secrets/api-key
+   openssl rand -hex 32 > /var/lib/factory/secrets/api-key
+   chmod 600 /var/lib/factory/secrets/api-key
+   ```
 
-```sh
-factory server backup --config /absolute/path/to/server.json --destination /secure/backup/path/jobs.db
-```
+   If enabling GitHub PR publication, provision a least-privilege GitHub token into `/var/lib/factory/secrets/github-token` using the operator's secret manager. Do not put the token value in JSON, shell arguments, repository remote URLs, or task text. Both credential files must be private regular files owned by the effective service user; restart the server after rotating them.
+3. Create `/var/lib/factory/server.json` using the complete [server config example](rest-server-config.md) as a template. Replace the repository checkout, harness executable, API-key path, SQLite path, and (if enabled) GitHub token path and repository mapping with operator-selected values. `/var/lib/factory` is private for the SQLite file and config. Keep the listener at its loopback default unless operator-managed network controls are in place. With `umask 077` still set, create and edit the config file:
 
-In another terminal, confirm probes and submit a bounded job. Create a mode-`0600` curl header file containing `Authorization: Bearer` followed by the protected API key. Keep this file outside the repository, avoid logging it, and remove it when finished.
+   ```sh
+   $EDITOR /var/lib/factory/server.json
+   ```
 
-```sh
-curl --fail-with-body --silent --show-error http://127.0.0.1:8080/healthz
-curl --fail-with-body --silent --show-error http://127.0.0.1:8080/readyz
-curl --fail-with-body --silent --show-error \\
-  --header @/secure/path/factory-curl-headers \\
-  -H 'Content-Type: application/json' \\
-  -H 'Idempotency-Key: operator-smoke-001' \\
-  -d '{"repository":"widget","task":"Review the configured repository and summarize the current test status."}' \\
-  http://127.0.0.1:8080/v1/jobs
-```
+   The JSON uses fixed executable/argv values, including `{system_prompt}` and `{task}` exactly once each; do not replace these placeholders with shell text. The example's verification commands are trusted operator settings, not caller-supplied checks. Validate the complete schema and startup dependencies by launching the server; invalid or unavailable settings fail before it accepts jobs, with sanitized diagnostics.
+4. Start the service as the account that owns the secret files and repository. Keep it running in this terminal or under the operator's process supervisor:
 
-Record the returned job `id`, then inspect it using `GET /v1/jobs/{id}` and `GET /v1/jobs/{id}/history`, with the same bearer header. Retry an uncertain client submission with the same idempotency key, not a new one. For durable deployments, verify status/history after a clean restart and test backup restoration against a disposable copy. Never use production credentials or repositories for recovery tests.
+   ```sh
+   factory server --config /var/lib/factory/server.json
+   ```
+
+5. In another terminal, confirm liveness and readiness. Build a private curl header file without displaying the key, then submit one bounded request with a stable idempotency key:
+
+   ```sh
+   umask 077
+   { printf 'Authorization: Bearer '; tr -d '\r\n' < /var/lib/factory/secrets/api-key; printf '\n'; } > /var/lib/factory/curl-headers
+   chmod 600 /var/lib/factory/curl-headers
+   base_url=http://127.0.0.1:8080
+
+   curl --fail-with-body --silent --show-error "$base_url/healthz"
+   curl --fail-with-body --silent --show-error "$base_url/readyz"
+   curl --fail-with-body --silent --show-error --write-out '\nHTTP %{http_code}\n' \
+     --header @/var/lib/factory/curl-headers \
+     -H 'Content-Type: application/json' \
+     -H 'Idempotency-Key: operator-smoke-001' \
+     -d '{"repository":"widget","task":"Review the configured repository and summarize the current test status."}' \
+     "$base_url/v1/jobs"
+   ```
+
+   A successful submission returns HTTP `202` with a job ID and inspection links; this confirms admission, not completion. Copy the returned ID into `job_id`, then use these authenticated requests to inspect the job and its bounded history:
+
+   ```sh
+   job_id='<job-id-from-response>'
+   curl --fail-with-body --silent --show-error --header @/var/lib/factory/curl-headers "$base_url/v1/jobs/$job_id"
+   curl --fail-with-body --silent --show-error --header @/var/lib/factory/curl-headers "$base_url/v1/jobs/$job_id/history"
+   ```
+
+   A terminal `succeeded` status is the completed-job result. When GitHub is configured, it includes the confirmed PR outcome; without a provider, the current server does not publish a PR. If the request's outcome is uncertain, retry with the same idempotency key. Remove the temporary header file when finished and never print or log it.
+
+For durable deployments, also verify status/history after a clean restart and perform the [backup and restore drill](#backup-and-restore) using a disposable database copy. Never use production credentials or repositories for recovery tests.
 
 This guide describes behavior available after the REST SQLite and provider changes merged. It does not claim fleet coordination, automatic recovery of interrupted running work, or merge/release/deploy behavior.
 
