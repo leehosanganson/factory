@@ -559,7 +559,7 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	if !status.Terminal() {
 		return ErrInvalidTransition
 	}
-	if err := s.checkAccepting(); err != nil {
+	if err := s.checkOpen(); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
