@@ -1,10 +1,12 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -184,6 +186,102 @@ func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down")
 	}
+}
+
+func TestRunLogsSelectedPersistenceAfterListenerReadiness(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		backend string
+	}{
+		{name: "memory defaults", backend: restserver.PersistenceBackendMemory},
+		{name: "selected SQLite", backend: restserver.PersistenceBackendSQLite},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, key := runtimeFixture(t)
+			providerTokenPath := filepath.Join(t.TempDir(), "private-provider-token-path")
+			if err := os.WriteFile(providerTokenPath, []byte("private-provider-token-secret"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if test.backend == restserver.PersistenceBackendSQLite {
+				config.Persistence = restserver.PersistenceConfig{
+					Backend: test.backend,
+					Path:    filepath.Join(t.TempDir(), "private-sqlite-path", "jobs.db"),
+				}
+				config.Provider = restserver.ProviderConfig{
+					Backend: "github", TokenFile: providerTokenPath,
+					BaseBranch: "main", Repositories: map[string]string{"trusted": "owner/private-config-repository"},
+				}
+				if err := os.MkdirAll(filepath.Dir(config.Persistence.Path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			resultsBase := testResultsBase(t)
+			var output bytes.Buffer
+			listenerReady := make(chan net.Listener, 1)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan error, 1)
+			go func() {
+				done <- run(ctx, config, runtimeOptions{
+					Log:         log.New(&output, "", 0),
+					Publisher:   readyPublisherForRuntimeTest(),
+					ResultsBase: resultsBase,
+					Listen: func(network, _ string) (net.Listener, error) {
+						listener, err := net.Listen(network, "127.0.0.1:0")
+						if err == nil {
+							listenerReady <- listener
+						}
+						return listener, err
+					},
+				})
+			}()
+			var listener net.Listener
+			select {
+			case listener = <-listenerReady:
+			case err := <-done:
+				t.Fatalf("server exited before listener startup: %v", err)
+			case <-time.After(10 * time.Second):
+				t.Fatal("server did not start a listener")
+			}
+			response, err := http.Get("http://" + listener.Addr().String() + "/healthz")
+			if err != nil {
+				t.Fatalf("GET /healthz: %v", err)
+			}
+			body, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK || string(body) != "{\"status\":\"ok\"}\n" {
+				t.Fatalf("health response = %d %q", response.StatusCode, body)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("server shutdown error: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("server did not shut down")
+			}
+
+			want := "REST server ready; persistence backend: " + test.backend + "\n"
+			if got := output.String(); got != want {
+				t.Fatalf("startup log = %q, want exactly %q", got, want)
+			}
+			for _, secret := range []string{key, "private-provider-token-secret", config.Persistence.Path, providerTokenPath, "owner/private-config-repository", config.APIKeyFile, config.Harness.Executable, config.Repositories["trusted"], config.ListenAddress} {
+				if secret != "" && strings.Contains(output.String(), secret) {
+					t.Errorf("startup log disclosed %q: %q", secret, output.String())
+				}
+			}
+		})
+	}
+}
+
+func readyPublisherForRuntimeTest() *readinessPublisher {
+	publisher := &readinessPublisher{}
+	publisher.up.Store(true)
+	return publisher
 }
 
 func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
@@ -650,7 +748,9 @@ func TestRunConfiguredSQLiteStartupFailureDoesNotOpenListener(t *testing.T) {
 		Path:    filepath.Join(t.TempDir(), "missing-parent", "jobs.db"),
 	}
 	listenerCalled := false
+	var output bytes.Buffer
 	err := run(context.Background(), config, runtimeOptions{
+		Log: log.New(&output, "", 0),
 		Listen: func(string, string) (net.Listener, error) {
 			listenerCalled = true
 			return nil, errors.New("listener should not be reached")
@@ -658,6 +758,9 @@ func TestRunConfiguredSQLiteStartupFailureDoesNotOpenListener(t *testing.T) {
 	})
 	if err == nil || listenerCalled {
 		t.Fatalf("SQLite startup error=%v listener called=%v; configured storage failure must abort before accepting jobs", err, listenerCalled)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("startup log before listener readiness = %q, want none", output.String())
 	}
 }
 
