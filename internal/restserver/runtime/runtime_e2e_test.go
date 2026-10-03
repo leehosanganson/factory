@@ -165,6 +165,56 @@ func (p *e2ePublisher) Publish(ctx context.Context, request restprovider.Publish
 	return outcome, nil
 }
 
+func TestRESTServerProcessRejectsUnavailableSQLiteBeforeListening(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, _ := runtimeFixture(t)
+	config.Persistence = restserver.PersistenceConfig{
+		Backend: restserver.PersistenceBackendSQLite,
+		Path:    filepath.Join(t.TempDir(), "missing-parent", "jobs.db"),
+	}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := filepath.Join(t.TempDir(), "listener")
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+filepath.Join(t.TempDir(), "outcomes.jsonl"))
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	select {
+	case err := <-done:
+		if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 12 {
+			t.Fatalf("server process exit=%v, want configured SQLite startup failure", err)
+		}
+	case <-time.After(10 * time.Second):
+		_ = child.Process.Kill()
+		<-done
+		t.Fatal("server process did not fail promptly with unavailable configured SQLite")
+	}
+	if _, err := os.Stat(readyPath); !os.IsNotExist(err) {
+		t.Fatalf("server published a listener despite unavailable configured SQLite: stat err=%v", err)
+	}
+}
+
 func TestRESTServerProcessRejectsAndRetriesAtQueueCapacity(t *testing.T) {
 	if testing.Short() {
 		t.Skip("process-level REST E2E")
