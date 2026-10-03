@@ -606,7 +606,7 @@ func (m *LocalManager) RecordVerificationEvidence(id string, evidence Verificati
 	nextCharge := verificationEvidenceBytes(&evidence)
 	if nextCharge > previousCharge {
 		delta := nextCharge - previousCharge
-		if !m.makeByteRoomLocked(delta) {
+		if !m.makeByteRoomLocked(delta, entry) {
 			return ErrRegistryFull
 		}
 		entry.accountedBytes += delta
@@ -769,13 +769,34 @@ func (m *LocalManager) makeRoomLocked(needed uint64) bool {
 	return true
 }
 
-func (m *LocalManager) makeByteRoomLocked(needed uint64) bool {
+func (m *LocalManager) makeByteRoomLocked(needed uint64, protected *job) bool {
 	limit := uint64(m.config.RegistryBytes)
 	if m.registryBytes > limit || needed > limit {
 		return false
 	}
+	available := limit - m.registryBytes
+	if needed <= available {
+		return true
+	}
+
+	deficit := needed - available
+	var reclaimable uint64
+	for _, entry := range m.jobs {
+		if entry == protected || !entry.snapshot.Status.Terminal() {
+			continue
+		}
+		if entry.accountedBytes >= deficit-reclaimable {
+			reclaimable = deficit
+			break
+		}
+		reclaimable += entry.accountedBytes
+	}
+	if reclaimable < deficit {
+		return false
+	}
+
 	for needed > limit-m.registryBytes {
-		if !m.evictOldestTerminalExceptLocked(nil) {
+		if !m.evictOldestTerminalExceptLocked(protected) {
 			return false
 		}
 	}
