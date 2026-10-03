@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -340,24 +341,63 @@ func TestSQLiteStoreCloseCancelsQueuedButPreservesRunningForRecovery(t *testing.
 
 func TestSQLiteStoreConcurrentConnectionsShareIdempotency(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
-	first, err := OpenSQLiteStore(path, testConfig())
-	if err != nil {
-		t.Fatal(err)
+	stores := make([]*SQLiteStore, 2)
+	for i := range stores {
+		store, err := OpenSQLiteStore(path, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = store
+		defer store.CloseStore()
 	}
-	defer first.CloseStore()
-	second, err := OpenSQLiteStore(path, testConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.CloseStore()
 
-	job, replay, err := first.Admit("shared-key", Request{Repository: "widget", Task: "same"})
-	if err != nil || replay {
-		t.Fatalf("first admission = (%+v, %v, %v)", job, replay, err)
+	type admission struct {
+		job    Snapshot
+		replay bool
+		err    error
 	}
-	again, replay, err := second.Admit("shared-key", Request{Repository: "widget", Task: "same"})
-	if err != nil || !replay || again.ID != job.ID {
-		t.Fatalf("cross-connection replay = (%+v, %v, %v)", again, replay, err)
+	const callers = 16
+	start := make(chan struct{})
+	results := make(chan admission, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(store *SQLiteStore) {
+			defer wg.Done()
+			<-start
+			job, replay, err := store.Admit("shared-key", Request{Repository: "widget", Task: "same"})
+			results <- admission{job: job, replay: replay, err: err}
+		}(stores[i%len(stores)])
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	var firstID string
+	newAdmissions := 0
+	for result := range results {
+		if result.err != nil {
+			t.Errorf("concurrent cross-connection admission: %v", result.err)
+			continue
+		}
+		if firstID == "" {
+			firstID = result.job.ID
+		}
+		if result.job.ID != firstID {
+			t.Errorf("concurrent admissions returned IDs %q and %q", firstID, result.job.ID)
+		}
+		if !result.replay {
+			newAdmissions++
+		}
+	}
+	if firstID == "" {
+		t.Fatal("no concurrent admission returned a job")
+	}
+	if newAdmissions != 1 {
+		t.Errorf("new admissions = %d, want exactly one", newAdmissions)
+	}
+	if _, _, err := stores[0].Admit("shared-key", Request{Repository: "widget", Task: "different"}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Errorf("changed-payload replay error = %v, want conflict", err)
 	}
 }
 

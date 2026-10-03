@@ -123,7 +123,7 @@ func ensureProviderColumn(ctx context.Context, db *sql.DB) error {
 
 func sqliteDSN(path string) (string, error) {
 	if path == ":memory:" {
-		return "file:factory-memory?mode=memory&cache=shared&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", nil
+		return "file:factory-memory?mode=memory&cache=shared&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate", nil
 	}
 	if !filepath.IsAbs(path) {
 		return "", errors.New("SQLite database path must be absolute")
@@ -149,7 +149,7 @@ func sqliteDSN(path string) (string, error) {
 	if err != nil {
 		return "", errors.New("resolve SQLite database path")
 	}
-	return "file:" + url.PathEscape(abs) + "?mode=rwc&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)", nil
+	return "file:" + url.PathEscape(abs) + "?mode=rwc&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate", nil
 }
 
 func ensurePrivateSQLiteFile(path string) error {
