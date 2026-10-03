@@ -144,6 +144,10 @@ func LoadConfig(path string) (Config, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil {
+		var typeError *json.UnmarshalTypeError
+		if errors.As(err, &typeError) && typeError.Field != "" {
+			return Config{}, fmt.Errorf("parse REST server config: field %s has invalid type", typeError.Field)
+		}
 		return Config{}, fmt.Errorf("parse REST server config: invalid JSON schema")
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
