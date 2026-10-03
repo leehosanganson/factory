@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -69,6 +70,32 @@ type uncertainProviderRecord struct {
 
 func (p *uncertainE2EPublisher) Ping(context.Context) error { return nil }
 
+func (p *uncertainE2EPublisher) Reconcile(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	if err := ctx.Err(); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	data, err := os.ReadFile(p.path + ".uncertain.json")
+	if err != nil {
+		return restprovider.Outcome{}, fmt.Errorf("fake provider unavailable")
+	}
+	var record uncertainProviderRecord
+	if err := json.Unmarshal(data, &record); err != nil || record.JobID != request.JobID || record.Repository != request.Repository || record.Branch != request.Branch || record.Commit != request.Commit {
+		return restprovider.Outcome{}, fmt.Errorf("fake provider identity mismatch")
+	}
+	mode, _ := os.ReadFile(p.path + ".reconcile-mode")
+	switch strings.TrimSpace(string(mode)) {
+	case "outage", "missing", "multiple", "malformed":
+		return restprovider.Outcome{}, fmt.Errorf("fake provider could not confirm PR")
+	case "mismatch":
+		record.Outcome.Commit = "different-commit"
+	case "repository":
+		record.Outcome.Repository = "other/repository"
+	case "branch":
+		record.Outcome.Branch = "other-branch"
+	}
+	return record.Outcome, nil
+}
+
 func (p *uncertainE2EPublisher) Publish(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
 	path := p.path + ".uncertain.json"
 	data, err := os.ReadFile(path)
@@ -91,7 +118,7 @@ func (p *uncertainE2EPublisher) Publish(ctx context.Context, request restprovide
 			return restprovider.Outcome{}, err
 		}
 		<-ctx.Done()
-		return restprovider.Outcome{}, fmt.Errorf("provider response was lost after create")
+		return restprovider.Outcome{}, fmt.Errorf("%w: fake response was lost after create", restprovider.ErrUncertain)
 	}
 	if err != nil {
 		return restprovider.Outcome{}, err
@@ -615,7 +642,9 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
 	config.Limits.JobTimeout = "2s"
 	harness := filepath.Join(t.TempDir(), "harness.sh")
-	if err := os.WriteFile(harness, []byte("#!/bin/sh\nprintf 'verified\\n' >> result.txt\n"), 0o700); err != nil {
+	harnessCount := filepath.Join(t.TempDir(), "harness-count")
+	harnessScript := fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\nprintf 'verified\\n' >> result.txt\n", harnessCount)
+	if err := os.WriteFile(harness, []byte(harnessScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
@@ -702,6 +731,11 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	if record.JobID != admitted.ID || record.Creates != 1 || record.Attempts != 1 || record.Outcome.Number != 71 {
 		t.Fatalf("fake provider create record=%+v", record)
 	}
+	harnessRuns, err := os.ReadFile(harnessCount)
+	if err != nil || len(harnessRuns) == 0 {
+		t.Fatalf("harness run count unavailable: %q %v", harnessRuns, err)
+	}
+	initialHarnessRuns := string(harnessRuns)
 	failed := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
 	if failed.Status != restjobs.StatusFailed || failed.Provider != nil {
 		t.Fatalf("job reported success despite ambiguous provider timeout: %+v", failed)
@@ -778,30 +812,84 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	}
 	restarted.Process = nil
 
-	// An explicit retry with the durable job/branch identity finds the already
-	// created PR. It returns the same outcome and does not create a duplicate.
-	publisher := &uncertainE2EPublisher{path: outcomesPath}
-	retryOutcome, err := publisher.Publish(context.Background(), restprovider.PublishRequest{
-		JobID: record.JobID, Repository: record.Repository, Worktree: filepath.Join(workspace, "worktree"),
-		Branch: record.Branch, Commit: record.Commit, Title: "publish with uncertain response", BaseBranch: "main",
-	})
-	if err != nil || retryOutcome.Number != record.Outcome.Number || retryOutcome.URL != record.Outcome.URL {
-		t.Fatalf("explicit provider reconciliation outcome=%+v err=%v", retryOutcome, err)
+	// Explicit operator action reconciles by the persisted identity through the
+	// restarted process, records a single audit event, and never calls Publish.
+	restarted, restartedDone, restartedURL = startServer()
+	operatorReconcile := func(auth string) (int, string) {
+		req, requestErr := http.NewRequest(http.MethodPost, restartedURL+"/v1/jobs/"+admitted.ID+"/reconcile", nil)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		if auth != "" {
+			req.Header.Set("Authorization", "Bearer "+auth)
+		}
+		resp, requestErr := client.Do(req)
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(body)
+	}
+	if code, _ := operatorReconcile(""); code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated reconcile status=%d", code)
+	}
+	for _, mode := range []string{"mismatch", "repository", "branch", "missing", "multiple", "outage", "malformed"} {
+		if err := os.WriteFile(outcomesPath+".reconcile-mode", []byte(mode), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code, body := operatorReconcile(apiKey); code != http.StatusConflict || strings.Contains(body, "fake provider") || strings.Contains(body, "provider-test-token") {
+			t.Fatalf("%s reconciliation status=%d body=%s", mode, code, body)
+		}
+		unchanged := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
+		if unchanged.Status != restjobs.StatusFailed || unchanged.Provider != nil {
+			t.Fatalf("%s reconciliation changed job: %+v", mode, unchanged)
+		}
+		if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+			t.Fatalf("%s reconciliation removed evidence: %v", mode, err)
+		}
+	}
+	if err := os.Remove(outcomesPath + ".reconcile-mode"); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if code, body := operatorReconcile(apiKey); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("authenticated reconcile status=%d body=%s", code, body)
+	}
+	if code, body := operatorReconcile(apiKey); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
+		t.Fatalf("repeated reconcile status=%d body=%s", code, body)
+	}
+	reconciled := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
+	if reconciled.Status != restjobs.StatusSucceeded || reconciled.Provider == nil || reconciled.Provider.Number != record.Outcome.Number {
+		t.Fatalf("reconciled job=%+v", reconciled)
+	}
+	reconciledHistory := getProcessHistory(t, client, restartedURL, admitted.ID, apiKey)
+	reconciledEvents := 0
+	for _, event := range reconciledHistory.Events {
+		if event.Type == "provider_reconciled" {
+			reconciledEvents++
+		}
+	}
+	if reconciledEvents != 1 {
+		t.Fatalf("reconciliation audit count=%d history=%+v", reconciledEvents, reconciledHistory)
 	}
 	recordData, err = os.ReadFile(recordPath)
-	if err != nil {
+	if err != nil || json.Unmarshal(recordData, &record) != nil || record.Creates != 1 || record.Attempts != 1 {
+		t.Fatalf("reconciliation reran publish or duplicated create: record=%+v err=%v", record, err)
+	}
+	harnessRuns, err = os.ReadFile(harnessCount)
+	if err != nil || string(harnessRuns) != initialHarnessRuns {
+		t.Fatalf("reconciliation reran harness: before=%q after=%q err=%v", initialHarnessRuns, harnessRuns, err)
+	}
+	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
+		t.Fatalf("reconciliation removed retained workspace: %v", err)
+	}
+	if err := restarted.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(recordData, &record); err != nil {
-		t.Fatal(err)
+	if err := <-restartedDone; err != nil {
+		t.Fatalf("reconciled server shutdown: %v", err)
 	}
-	if record.Creates != 1 || record.Attempts != 2 {
-		t.Fatalf("reconciliation duplicated create or did not retry: %+v", record)
-	}
-	stillUnresolved, err := persisted.Get(admitted.ID)
-	if err != nil || stillUnresolved.Status != restjobs.StatusFailed || stillUnresolved.Provider != nil {
-		t.Fatalf("unrecorded retry result changed job state: %+v err=%v", stillUnresolved, err)
-	}
+	restarted.Process = nil
 }
 
 func initE2ERepository(t *testing.T, root string) {

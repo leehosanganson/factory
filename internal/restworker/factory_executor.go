@@ -33,11 +33,13 @@ type WorkspaceManager interface {
 // FactoryExecutorConfig contains trusted server settings and non-public Factory
 // workflow settings such as verification checks and prompt overrides.
 type FactoryExecutorConfig struct {
-	Server           restserver.Config
-	Workflow         factory.Config
-	Workspaces       map[string]WorkspaceManager
-	WorkflowObserver factory.WorkflowObserver
-	Provider         restprovider.Publisher
+	Server                       restserver.Config
+	Workflow                     factory.Config
+	Workspaces                   map[string]WorkspaceManager
+	WorkflowObserver             factory.WorkflowObserver
+	Provider                     restprovider.Publisher
+	RecordProviderAttempt        func(string, restjobs.ProviderAttempt) error
+	MarkProviderAttemptUncertain func(string) error
 
 	// ValidateRepositoryRoot replaces Git-backed repository validation when set.
 	// It must honor ctx; this seam is intended for tests and controlled callers.
@@ -47,15 +49,17 @@ type FactoryExecutorConfig struct {
 // FactoryExecutor adapts one REST job to Factory's requirements, implement,
 // review, and document workflow. It never publishes changes.
 type FactoryExecutor struct {
-	server                 restserver.Config
-	workflow               factory.Config
-	workspaces             map[string]WorkspaceManager
-	timeout                time.Duration
-	env                    []string
-	agent                  func(factory.Config, []string, io.Writer) factory.Agent
-	validateRepositoryRoot func(context.Context, string) error
-	observer               factory.WorkflowObserver
-	provider               restprovider.Publisher
+	server                       restserver.Config
+	workflow                     factory.Config
+	workspaces                   map[string]WorkspaceManager
+	timeout                      time.Duration
+	env                          []string
+	agent                        func(factory.Config, []string, io.Writer) factory.Agent
+	validateRepositoryRoot       func(context.Context, string) error
+	observer                     factory.WorkflowObserver
+	provider                     restprovider.Publisher
+	recordProviderAttempt        func(string, restjobs.ProviderAttempt) error
+	markProviderAttemptUncertain func(string) error
 }
 
 // NewFactoryExecutor validates the trusted configuration and builds the
@@ -111,7 +115,7 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, provider: config.Provider,
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain,
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -150,6 +154,40 @@ func (e *FactoryExecutor) CompleteResult(ctx context.Context, job restjobs.Snaps
 		return errExecutionFailed
 	}
 	return nil
+}
+
+func (e *FactoryExecutor) ReconcileProvider(ctx context.Context, job restjobs.Snapshot, attempt restjobs.ProviderAttempt, reconciler restprovider.Reconciler) (restjobs.ProviderOutcome, error) {
+	if ctx == nil || ctx.Err() != nil || job.ID == "" || job.Status != restjobs.StatusFailed || reconciler == nil || !attempt.Uncertain || attempt.Provider != "github" || attempt.Repository != e.server.Provider.Repositories[job.Request.Repository] || attempt.Branch != restprovider.JobBranch(job.ID) {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	workspaceManager := e.workspaces[job.Request.Repository]
+	retained, ok := workspaceManager.(interface {
+		RetainedWorkspace(string) (restworkspace.Workspace, error)
+	})
+	if !ok || workspaceManager == nil || e.validateRepositoryRoot(ctx, e.server.Repositories[job.Request.Repository]) != nil {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	workspace, err := retained.RetainedWorkspace(job.ID)
+	if err != nil {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	branch, err := providerGitCommand(ctx, workspace.WorktreePath, "branch", "--show-current").Output()
+	if err != nil || strings.TrimSpace(string(branch)) != attempt.Branch {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	commit, err := providerGitCommand(ctx, workspace.WorktreePath, "rev-parse", "--verify", "HEAD").Output()
+	if err != nil || strings.TrimSpace(string(commit)) != attempt.Commit {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	published, err := reconciler.Reconcile(ctx, restprovider.PublishRequest{
+		JobID: job.ID, Repository: attempt.Repository, Worktree: workspace.WorktreePath,
+		Branch: attempt.Branch, Commit: attempt.Commit, Title: job.Request.Task,
+		Summary: "Factory completed configured workflow and verification checks.", BaseBranch: e.server.Provider.BaseBranch,
+	})
+	if err != nil || published.Provider != attempt.Provider || published.Repository != attempt.Repository || published.Branch != attempt.Branch || published.Commit != attempt.Commit || published.State != "open" {
+		return restjobs.ProviderOutcome{}, errExecutionFailed
+	}
+	return restjobs.ProviderOutcome{Provider: published.Provider, Repository: published.Repository, Number: published.Number, URL: published.URL, Branch: published.Branch, Commit: published.Commit, State: published.State}, nil
 }
 
 func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) error {
@@ -211,8 +249,16 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 			return nil, errExecutionFailed
 		}
 		branch := restprovider.JobBranch(job.ID)
-		published, err := e.provider.Publish(jobCtx, restprovider.PublishRequest{JobID: job.ID, Repository: e.server.Provider.Repositories[job.Request.Repository], Worktree: workspace.WorktreePath, Branch: branch, Commit: commit, Title: job.Request.Task, Summary: "Factory completed configured workflow and verification checks.", BaseBranch: e.server.Provider.BaseBranch})
+		repository := e.server.Provider.Repositories[job.Request.Repository]
+
+		if e.recordProviderAttempt != nil && e.recordProviderAttempt(job.ID, restjobs.ProviderAttempt{Provider: "github", Repository: repository, Branch: branch, Commit: commit}) != nil {
+			return nil, errExecutionFailed
+		}
+		published, err := e.provider.Publish(jobCtx, restprovider.PublishRequest{JobID: job.ID, Repository: repository, Worktree: workspace.WorktreePath, Branch: branch, Commit: commit, Title: job.Request.Task, Summary: "Factory completed configured workflow and verification checks.", BaseBranch: e.server.Provider.BaseBranch})
 		if err != nil {
+			if errors.Is(err, restprovider.ErrUncertain) && e.markProviderAttemptUncertain != nil {
+				_ = e.markProviderAttemptUncertain(job.ID)
+			}
 			return nil, errExecutionFailed
 		}
 		providerOutcome = &restjobs.ProviderOutcome{Provider: published.Provider, Repository: published.Repository, Number: published.Number, URL: published.URL, Branch: published.Branch, Commit: published.Commit, State: published.State}

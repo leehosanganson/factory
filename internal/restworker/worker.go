@@ -138,7 +138,10 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 				}
 				return
 			}
-			if outcome == nil || c.manager.RecordProviderOutcome(job.ID, *outcome) != nil {
+			if outcome == nil {
+				return
+			}
+			if c.manager.RecordProviderOutcome(job.ID, *outcome) != nil {
 				return
 			}
 			job.Provider = outcome

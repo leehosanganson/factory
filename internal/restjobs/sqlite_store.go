@@ -440,6 +440,188 @@ func (s *SQLiteStore) CloseStore() error {
 	return s.db.Close()
 }
 
+func validateProviderAttempt(attempt ProviderAttempt) error {
+	if attempt.Provider != "github" || !validRepositoryName(attempt.Repository) || attempt.Branch == "" || attempt.Commit == "" || len(attempt.Commit) > 64 {
+		return ErrInvalidInput
+	}
+	return nil
+}
+
+func (s *SQLiteStore) RecordProviderAttempt(id string, attempt ProviderAttempt) error {
+	if err := validateProviderAttempt(attempt); err != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
+		return ErrInvalidInput
+	}
+	if err := s.checkAccepting(); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(attempt)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	var status string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return errors.New("read SQLite job state")
+	}
+	if status != string(StatusRunning) {
+		return ErrInvalidTransition
+	}
+	var existing string
+	err = tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&existing)
+	if err == nil {
+		if existing != string(encoded) {
+			return ErrInvalidTransition
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("read SQLite provider attempt")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_attempts(job_id,attempt_json,updated_at) VALUES(?,?,?)`, id, string(encoded), now); err != nil {
+		return errors.New("record SQLite provider attempt")
+	}
+	return tx.Commit()
+}
+
+func validCommitID(value string) bool {
+	return len(value) >= 7 && len(value) <= 64 && strings.Trim(value, "0123456789abcdefABCDEF") == ""
+}
+
+func (s *SQLiteStore) MarkProviderAttemptUncertain(id string) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	var attempt ProviderAttempt
+	var status, encoded string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return errors.New("read SQLite job state")
+	}
+	if status != string(StatusRunning) {
+		return ErrInvalidTransition
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidTransition
+	} else if err != nil {
+		return errors.New("read SQLite provider attempt")
+	}
+	if json.Unmarshal([]byte(encoded), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
+		return errors.New("SQLite provider attempt is invalid")
+	}
+	attempt.Uncertain = true
+	encodedBytes, _ := json.Marshal(attempt)
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_job_provider_attempts SET attempt_json=?,updated_at=? WHERE job_id=?`, string(encodedBytes), time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+		return errors.New("mark SQLite provider attempt uncertain")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) ProviderAttempt(id string) (ProviderAttempt, error) {
+	if err := s.checkOpen(); err != nil {
+		return ProviderAttempt{}, err
+	}
+	var encoded string
+	if err := s.db.QueryRow(`SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
+		var exists int
+		if queryErr := s.db.QueryRow(`SELECT COUNT(*) FROM factory_jobs WHERE id=?`, id).Scan(&exists); queryErr != nil {
+			return ProviderAttempt{}, errors.New("read SQLite provider attempt")
+		}
+		if exists == 0 {
+			return ProviderAttempt{}, ErrNotFound
+		}
+		return ProviderAttempt{}, ErrInvalidTransition
+	} else if err != nil {
+		return ProviderAttempt{}, errors.New("read SQLite provider attempt")
+	}
+	var attempt ProviderAttempt
+	if json.Unmarshal([]byte(encoded), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
+		return ProviderAttempt{}, errors.New("SQLite provider attempt is invalid")
+	}
+	return attempt, nil
+}
+
+func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcome) error {
+	if err := validateProviderOutcome(outcome); err != nil {
+		return ErrInvalidInput
+	}
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(outcome)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	var status, attemptJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return errors.New("read SQLite job state")
+	}
+	if status == string(StatusSucceeded) {
+		var previous string
+		if err := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=?`, id).Scan(&previous); err != nil || previous != string(encoded) {
+			return ErrInvalidTransition
+		}
+		return tx.Commit()
+	}
+	if status != string(StatusFailed) {
+		return ErrInvalidTransition
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&attemptJSON); err != nil {
+		return ErrInvalidTransition
+	}
+	var attempt ProviderAttempt
+	if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) || !attempt.Uncertain || outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
+		return ErrInvalidInput
+	}
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) VALUES(?,?,?)`, id, string(encoded), stamp); err != nil {
+		return errors.New("record SQLite provider outcome")
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='succeeded',updated_at=? WHERE id=? AND status='failed'`, stamp, id)
+	if err != nil {
+		return errors.New("finish reconciled SQLite job")
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrInvalidTransition
+	}
+	if err := insertEvent(ctx, tx, id, string(StatusSucceeded), "Job finished", now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite job completion")
+	}
+	if err := insertEvent(ctx, tx, id, "provider_reconciled", "Operator confirmed provider outcome", now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite reconciliation history")
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.New("commit SQLite provider reconciliation")
+	}
+	return nil
+}
+
 func (s *SQLiteStore) RecordProviderOutcome(id string, outcome ProviderOutcome) error {
 	if err := validateProviderOutcome(outcome); err != nil {
 		return ErrInvalidInput

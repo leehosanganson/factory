@@ -56,6 +56,24 @@ func NewGitHubPublisherWithTokenPush(token string, client *http.Client, push fun
 	return publisher
 }
 
+func (g *GitHubPublisher) Reconcile(ctx context.Context, request PublishRequest) (Outcome, error) {
+	if ctx == nil || ctx.Err() != nil || validateRequest(request) != nil || g == nil || g.client == nil || g.token == "" || validateProviderURL(g.apiURL) != nil {
+		return Outcome{}, errors.New("provider reconciliation is unavailable")
+	}
+	endpoint, err := url.JoinPath(g.apiURL, "repos", request.Repository, "pulls")
+	if err != nil {
+		return Outcome{}, errors.New("provider reconciliation is unavailable")
+	}
+	outcome, found, err := g.findJobPR(ctx, endpoint, request)
+	if err != nil {
+		return Outcome{}, errors.New("provider reconciliation is unavailable")
+	}
+	if !found {
+		return Outcome{}, errors.New("provider reconciliation is unresolved")
+	}
+	return outcome, nil
+}
+
 func (g *GitHubPublisher) Publish(ctx context.Context, request PublishRequest) (Outcome, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return Outcome{}, errors.New("provider request canceled")
@@ -145,21 +163,35 @@ func (g *GitHubPublisher) Publish(ctx context.Context, request PublishRequest) (
 }
 
 func (g *GitHubPublisher) findJobPR(ctx context.Context, endpoint string, request PublishRequest) (Outcome, bool, error) {
-	query := url.Values{"head": {strings.Split(request.Repository, "/")[0] + ":" + JobBranch(request.JobID)}, "state": {"all"}, "per_page": {"100"}}
-	var existing []PullRequest
-	if err := g.doJSON(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil, &existing); err != nil {
-		return Outcome{}, false, fmt.Errorf("reconcile GitHub pull request: %w", err)
-	}
-	for _, pr := range existing {
-		if pr.Head.Ref != JobBranch(request.JobID) {
-			continue
+	var match *PullRequest
+	for page := 1; page <= 10; page++ {
+		query := url.Values{"head": {strings.Split(request.Repository, "/")[0] + ":" + JobBranch(request.JobID)}, "state": {"all"}, "per_page": {"100"}, "page": {fmt.Sprint(page)}}
+		var existing []PullRequest
+		if err := g.doJSON(ctx, http.MethodGet, endpoint+"?"+query.Encode(), nil, &existing); err != nil {
+			return Outcome{}, false, fmt.Errorf("reconcile GitHub pull request: %w", err)
 		}
-		if !validPullRequest(pr, request, JobBranch(request.JobID)) {
-			return Outcome{}, false, errors.New("existing GitHub pull request does not match job identity")
+		for index := range existing {
+			pr := &existing[index]
+			if pr.Head.Ref != JobBranch(request.JobID) {
+				continue
+			}
+			if match != nil || !validPullRequest(*pr, request, JobBranch(request.JobID)) {
+				return Outcome{}, false, errors.New("existing GitHub pull request is ambiguous or does not match job identity")
+			}
+			copy := *pr
+			match = &copy
 		}
-		return outcomeFor(pr, request, JobBranch(request.JobID)), true, nil
+		if len(existing) < 100 {
+			break
+		}
+		if page == 10 {
+			return Outcome{}, false, errors.New("GitHub pull request lookup exceeded its safe page bound")
+		}
 	}
-	return Outcome{}, false, nil
+	if match == nil {
+		return Outcome{}, false, nil
+	}
+	return outcomeFor(*match, request, JobBranch(request.JobID)), true, nil
 }
 
 func validPullRequest(pr PullRequest, request PublishRequest, branch string) bool {
@@ -210,8 +242,15 @@ func (g *GitHubPublisher) doJSON(ctx context.Context, method, endpoint string, b
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("GitHub API returned HTTP %d", resp.StatusCode)
 	}
-	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil || len(bytes.TrimSpace(data)) == 0 || bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return errors.New("GitHub API response was malformed")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := decoder.Decode(target); err != nil {
+		return errors.New("GitHub API response was malformed")
+	}
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return errors.New("GitHub API response was malformed")
 	}
 	return nil

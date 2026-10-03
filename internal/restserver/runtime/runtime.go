@@ -44,6 +44,12 @@ type runtimeOptions struct {
 	SweepInterval   time.Duration
 }
 
+type sqliteProviderReconciliationStore interface {
+	Get(string) (restjobs.Snapshot, error)
+	ProviderAttempt(string) (restjobs.ProviderAttempt, error)
+	ReconcileProviderOutcome(string, restjobs.ProviderOutcome) error
+}
+
 // Run starts the REST server and blocks until ctx is canceled or serving fails.
 func closeLocalStore(store restjobs.Store) {
 	if closer, ok := store.(interface{ CloseStore() error }); ok {
@@ -152,8 +158,15 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	workflowConfig.ParallelImplementation = nil
 	executor := options.Executor
 	if executor == nil {
+		var recordProviderAttempt func(string, restjobs.ProviderAttempt) error
+		var markProviderAttemptUncertain func(string) error
+		if sqliteStore, ok := store.(*restjobs.SQLiteStore); ok {
+			recordProviderAttempt = sqliteStore.RecordProviderAttempt
+			markProviderAttemptUncertain = sqliteStore.MarkProviderAttemptUncertain
+		}
 		executor, err = restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
 			Server: config, Workflow: workflowConfig, Workspaces: workspaces, Provider: publisher,
+			RecordProviderAttempt: recordProviderAttempt, MarkProviderAttemptUncertain: markProviderAttemptUncertain,
 		})
 		if err != nil {
 			closeStore()
@@ -169,7 +182,43 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
-		Ready:               func() bool { return ready.Load() },
+		ReconcileProvider: func(requestCtx context.Context, id string) error {
+			sqliteStore, ok := store.(sqliteProviderReconciliationStore)
+			if !ok || publisher == nil {
+				return restjobs.ErrInvalidTransition
+			}
+			reconciler, ok := publisher.(restprovider.Reconciler)
+			if !ok {
+				return restjobs.ErrInvalidTransition
+			}
+			factoryExecutor, ok := executor.(*restworker.FactoryExecutor)
+			if !ok {
+				return restjobs.ErrInvalidTransition
+			}
+			job, getErr := sqliteStore.Get(id)
+			if getErr != nil {
+				return getErr
+			}
+			attempt, attemptErr := sqliteStore.ProviderAttempt(id)
+			if errors.Is(attemptErr, restjobs.ErrInvalidTransition) {
+				return restjobs.ErrInvalidTransition
+			}
+			if attemptErr != nil {
+				return attemptErr
+			}
+			if job.Status == restjobs.StatusSucceeded && job.Provider != nil && attempt.Uncertain && job.Provider.Provider == attempt.Provider && job.Provider.Repository == attempt.Repository && job.Provider.Branch == attempt.Branch && job.Provider.Commit == attempt.Commit {
+				return nil
+			}
+			if job.Status != restjobs.StatusFailed {
+				return restjobs.ErrInvalidTransition
+			}
+			outcome, reconcileErr := factoryExecutor.ReconcileProvider(requestCtx, job, attempt, reconciler)
+			if reconcileErr != nil {
+				return restjobs.ErrInvalidTransition
+			}
+			return sqliteStore.ReconcileProviderOutcome(id, outcome)
+		},
+		Ready: func() bool { return ready.Load() },
 		ReadyError: func() error {
 			if !ready.Load() {
 				return errors.New("server not initialized")

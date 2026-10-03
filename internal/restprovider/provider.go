@@ -41,6 +41,10 @@ type Publisher interface {
 	Ping(context.Context) error
 }
 
+type Reconciler interface {
+	Reconcile(context.Context, PublishRequest) (Outcome, error)
+}
+
 func ValidRepository(value string) bool {
 	return repositoryPattern.MatchString(value) && !strings.Contains(value, "..")
 }

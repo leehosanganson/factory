@@ -46,6 +46,26 @@ func TestGitHubPublisherCreatesIdempotentJobPR(t *testing.T) {
 	}
 }
 
+func TestGitHubPublisherReconcileIsReadOnlyAndRequiresUniqueExactMatch(t *testing.T) {
+	gets, writes := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writes++
+			http.Error(w, "writes forbidden", http.StatusMethodNotAllowed)
+			return
+		}
+		gets++
+		_, _ = w.Write([]byte(`[{"number":19,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/19","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}]`))
+	}))
+	defer server.Close()
+	publisher := newGitHubPublisher("secret", server.Client(), server.URL, func(context.Context, string, string, string) error { writes++; return nil })
+	request := PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/private/worktree", Branch: JobBranch(testJobID), Commit: "commit-sha", Title: "task", BaseBranch: "main"}
+	outcome, err := publisher.Reconcile(context.Background(), request)
+	if err != nil || outcome.Number != 19 || gets != 1 || writes != 0 {
+		t.Fatalf("Reconcile=(%+v,%v) GET=%d writes=%d", outcome, err, gets, writes)
+	}
+}
+
 func TestGitHubPublisherRejectsUnmarkedExistingPullRequest(t *testing.T) {
 	request := PublishRequest{JobID: testJobID, Repository: "acme/widget", Commit: "commit-sha", BaseBranch: "main"}
 	pr := PullRequest{Number: 19, State: "open", URL: "https://github.com/acme/widget/pull/19"}
@@ -64,6 +84,26 @@ func TestGitHubPublisherRejectsInvalidRepositoryBeforePush(t *testing.T) {
 	_, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/../other", Worktree: "/tmp/worktree", Commit: "sha", Title: "title", BaseBranch: "main"})
 	if err == nil || called {
 		t.Fatalf("invalid scope: error=%v pushed=%v", err, called)
+	}
+}
+
+func TestGitHubPublisherReconcileRejectsDuplicateMatchesAndMalformedBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "duplicate", body: `[{"number":19,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/19","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}},{"number":20,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/20","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}]`},
+		{name: "malformed", body: `[{`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte(tc.body)) }))
+			defer server.Close()
+			publisher := newGitHubPublisher("secret", server.Client(), server.URL, func(context.Context, string, string, string) error { return nil })
+			_, err := publisher.Reconcile(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/private/worktree", Branch: JobBranch(testJobID), Commit: "commit-sha", Title: "task", BaseBranch: "main"})
+			if err == nil {
+				t.Fatal("ambiguous or malformed provider response was accepted")
+			}
+		})
 	}
 }
 
