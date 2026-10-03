@@ -31,6 +31,53 @@ func TestSQLiteStoreSatisfiesSharedContract(t *testing.T) {
 	})
 }
 
+func TestSQLiteStoreCapacityRejectedKeyCanBeReused(t *testing.T) {
+	config := Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 4}
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	first, _, err := store.Admit("first", Request{Repository: "widget", Task: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := store.Admit("queued", Request{Repository: "widget", Task: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Repository: "widget", Task: "retry after capacity frees"}
+	if _, _, err := store.Admit("retry-key", request); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("full capacity error = %v, want ErrQueueFull", err)
+	}
+	if _, err := store.Get("retry-key"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("capacity-rejected request was recorded: %v", err)
+	}
+	if err := store.Finish(first.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := store.ClaimNext()
+	if err != nil || claimed.ID != queued.ID {
+		t.Fatalf("claim after capacity frees = (%+v, %v), want %q", claimed, err, queued.ID)
+	}
+	if err := store.Finish(queued.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	retryRequest := Request{Repository: "widget", Task: "updated retry after capacity frees"}
+	retried, replay, err := store.Admit("retry-key", retryRequest)
+	if err != nil || replay {
+		t.Fatalf("retry after capacity frees = (%+v, %v, %v), want new admission", retried, replay, err)
+	}
+	again, replay, err := store.Admit("retry-key", retryRequest)
+	if err != nil || !replay || again.ID != retried.ID {
+		t.Fatalf("accepted retry replay = (%+v, %v, %v), want same job replay", again, replay, err)
+	}
+}
+
 func TestSQLiteStoreEnforcesRetainedRecordLimitWithoutEvictingTerminalHistory(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4})
 	if err != nil {
