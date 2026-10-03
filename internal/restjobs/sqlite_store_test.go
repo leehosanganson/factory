@@ -53,6 +53,59 @@ func TestSQLiteStoreEnforcesRetainedRecordLimitWithoutEvictingTerminalHistory(t 
 	}
 }
 
+func TestSQLiteOperationalSummaryCountsStatusesAndRecoveryNeeded(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	config := Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 3, MaxEventsPerJob: 4}
+	seed, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, _, err := seed.Admit("summary-running", Request{Repository: "widget", Task: "private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	queued, _, err := store.Admit("summary-queued", Request{Repository: "widget", Task: "private queue item"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.OperationalSummary(context.Background())
+	if err != nil || summary.RetainedRecords != 2 || summary.Queued != 1 || summary.Running != 1 || summary.RecoveryNeeded != 1 || !summary.QueueSaturated {
+		t.Fatalf("summary = (%+v, %v)", summary, err)
+	}
+	if _, err := store.OperationalSummary(nil); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("OperationalSummary(nil) error = %v, want ErrInvalidInput", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.OperationalSummary(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("OperationalSummary(canceled context) error = %v, want context.Canceled", err)
+	}
+	if err := store.Finish(running.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(queued.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	summary, err = store.OperationalSummary(context.Background())
+	if err != nil || summary.RetainedRecords != 2 || summary.Queued != 0 || summary.Running != 0 || summary.Succeeded != 1 || summary.Failed != 1 || summary.RecoveryNeeded != 0 || summary.QueueSaturated {
+		t.Fatalf("terminal summary = (%+v, %v)", summary, err)
+	}
+}
+
 func TestSQLiteStoreBackupRejectsReplacingItsSource(t *testing.T) {
 	dir := privateSQLiteDir(t)
 	path := filepath.Join(dir, "jobs.db")

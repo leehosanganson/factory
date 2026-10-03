@@ -126,6 +126,20 @@ type History struct {
 	Truncated bool    `json:"truncated"`
 }
 
+// OperationalSummary reports bounded aggregate job state without job payloads.
+type OperationalSummary struct {
+	RetainedRecords int  `json:"retained_records"`
+	RecordLimit     int  `json:"record_limit"`
+	QueueCapacity   int  `json:"queue_capacity"`
+	Queued          int  `json:"queued"`
+	Running         int  `json:"running"`
+	Succeeded       int  `json:"succeeded"`
+	Failed          int  `json:"failed"`
+	Canceled        int  `json:"canceled"`
+	QueueSaturated  bool `json:"queue_saturated"`
+	RecoveryNeeded  int  `json:"recovery_needed"`
+}
+
 // RecoveryReport classifies retained work after opening a store. Only queued
 // work is safe to resume automatically; running work may have performed
 // external side effects and requires reconciliation.
@@ -156,6 +170,7 @@ type Store interface {
 	RecordProviderOutcome(id string, outcome ProviderOutcome) error
 	Finish(id string, terminalStatus Status) error
 	Recover(ctx context.Context) (RecoveryReport, error)
+	OperationalSummary(ctx context.Context) (OperationalSummary, error)
 }
 
 // Manager is retained as the executor-facing name for the Store contract.
@@ -420,6 +435,39 @@ func (m *LocalManager) History(id string) (History, error) {
 // Recover classifies retained records without mutating them. The local backend
 // starts empty after process launch; durable implementations use the same
 // contract to identify queued work and interrupted work requiring reconciliation.
+func (m *LocalManager) OperationalSummary(ctx context.Context) (OperationalSummary, error) {
+	if ctx == nil {
+		return OperationalSummary{}, ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return OperationalSummary{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	summary := OperationalSummary{RetainedRecords: len(m.jobs), RecordLimit: m.config.MaxRecords, QueueCapacity: m.config.QueueCapacity, QueueSaturated: len(m.queue) >= m.config.QueueCapacity}
+	for _, entry := range m.jobs {
+		if err := ctx.Err(); err != nil {
+			return OperationalSummary{}, err
+		}
+		switch RecoveryDispositionFor(entry.snapshot.Status) {
+		case RecoveryResume:
+			summary.Queued++
+		case RecoveryNeedsOperator:
+			summary.Running++
+		case RecoveryRetainTerminal:
+			switch entry.snapshot.Status {
+			case StatusSucceeded:
+				summary.Succeeded++
+			case StatusFailed:
+				summary.Failed++
+			case StatusCanceled:
+				summary.Canceled++
+			}
+		}
+	}
+	return summary, nil
+}
+
 func (m *LocalManager) Recover(ctx context.Context) (RecoveryReport, error) {
 	if ctx == nil {
 		return RecoveryReport{}, ErrInvalidInput

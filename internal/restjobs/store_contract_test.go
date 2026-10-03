@@ -134,6 +134,58 @@ func TestLocalStoreRecoveryReportsQueuedAsResumableAndRunningAsUncertain(t *test
 	}
 }
 
+func TestLocalManagerOperationalSummaryIsBoundedAndAggregated(t *testing.T) {
+	store, err := NewManager(Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 3, MaxEventsPerJob: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := store.Admit("summary-1", Request{Repository: "widget", Task: "secret task one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.Admit("summary-2", Request{Repository: "widget", Task: "secret task two"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.OperationalSummary(context.Background())
+	if err != nil || before.RetainedRecords != 2 || before.RecordLimit != 3 || before.QueueCapacity != 1 || before.Queued != 1 || before.Running != 1 || !before.QueueSaturated {
+		t.Fatalf("summary with active and queued jobs = (%+v, %v)", before, err)
+	}
+	if _, err := store.OperationalSummary(nil); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("OperationalSummary(nil) error = %v, want ErrInvalidInput", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := store.OperationalSummary(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("OperationalSummary(canceled context) error = %v, want context.Canceled", err)
+	}
+	if err := store.Finish(first.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(second.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	third, _, err := store.Admit("summary-3", Request{Repository: "widget", Task: "secret task three"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.OperationalSummary(context.Background())
+	if err != nil || summary.RetainedRecords != 3 || summary.Queued != 1 || summary.Running != 0 || summary.Succeeded != 1 || summary.Failed != 1 || summary.Canceled != 0 || !summary.QueueSaturated {
+		t.Fatalf("terminal/queued summary = (%+v, %v)", summary, err)
+	}
+	store.Close()
+	afterClose, err := store.OperationalSummary(context.Background())
+	if err != nil || afterClose.Canceled != 1 || afterClose.QueueSaturated {
+		t.Fatalf("summary after queued cancellation = (%+v, %v), third=%s", afterClose, err, third.ID)
+	}
+}
+
 func TestStoreRecoveryHonorsCanceledContext(t *testing.T) {
 	store, err := NewManager(testConfig())
 	if err != nil {

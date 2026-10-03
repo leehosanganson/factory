@@ -30,15 +30,17 @@ const sqliteBusyTimeout = 5 * time.Second
 // jobs remain running and require operator reconciliation; they are never
 // blindly re-queued because external effects may already have happened.
 type SQLiteStore struct {
-	db        *sql.DB
-	dbPath    string
-	config    Config
-	mu        sync.Mutex
-	closed    bool
-	dbClosed  bool
-	closeCh   chan struct{}
-	closeDone chan struct{}
-	closeOnce sync.Once
+	db             *sql.DB
+	dbPath         string
+	config         Config
+	mu             sync.Mutex
+	recoveryMu     sync.RWMutex
+	recoveryNeeded map[string]struct{}
+	closed         bool
+	dbClosed       bool
+	closeCh        chan struct{}
+	closeDone      chan struct{}
+	closeOnce      sync.Once
 }
 
 var _ Store = (*SQLiteStore)(nil)
@@ -83,6 +85,27 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	store.recoveryNeeded = make(map[string]struct{})
+	recoveryRows, err := db.QueryContext(ctx, `SELECT id FROM factory_jobs WHERE status='running'`)
+	if err != nil {
+		_ = db.Close()
+		return nil, errors.New("read SQLite recovery-needed jobs")
+	}
+	for recoveryRows.Next() {
+		var id string
+		if err := recoveryRows.Scan(&id); err != nil {
+			_ = recoveryRows.Close()
+			_ = db.Close()
+			return nil, errors.New("read SQLite recovery-needed jobs")
+		}
+		store.recoveryNeeded[id] = struct{}{}
+	}
+	if err := recoveryRows.Err(); err != nil {
+		_ = recoveryRows.Close()
+		_ = db.Close()
+		return nil, errors.New("read SQLite recovery-needed jobs")
+	}
+	_ = recoveryRows.Close()
 	return store, nil
 }
 
@@ -565,6 +588,9 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite job completion")
 	}
+	s.recoveryMu.Lock()
+	delete(s.recoveryNeeded, id)
+	s.recoveryMu.Unlock()
 	return nil
 }
 
@@ -602,6 +628,41 @@ func (s *SQLiteStore) Recover(ctx context.Context) (RecoveryReport, error) {
 		return RecoveryReport{}, errors.New("recover SQLite jobs")
 	}
 	return report, nil
+}
+
+func (s *SQLiteStore) OperationalSummary(ctx context.Context) (OperationalSummary, error) {
+	if ctx == nil {
+		return OperationalSummary{}, ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return OperationalSummary{}, err
+	}
+	if err := s.checkOpen(); err != nil {
+		return OperationalSummary{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return OperationalSummary{}, err
+	}
+	s.recoveryMu.RLock()
+	summaryRecoveryCount := len(s.recoveryNeeded)
+	s.recoveryMu.RUnlock()
+	var summary OperationalSummary
+	summary.RecordLimit = s.config.MaxRecords
+	summary.QueueCapacity = s.config.QueueCapacity
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN status='queued' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='running' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='succeeded' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END),0),
+		COALESCE(SUM(CASE WHEN status='canceled' THEN 1 ELSE 0 END),0)
+		FROM factory_jobs`).Scan(&summary.RetainedRecords, &summary.Queued, &summary.Running, &summary.Succeeded, &summary.Failed, &summary.Canceled); err != nil {
+		return OperationalSummary{}, errors.New("read SQLite operational summary")
+	}
+	// Count records found running when the store opened. Newly started jobs are
+	// running but have not been interrupted and do not need reconciliation.
+	summary.RecoveryNeeded = summaryRecoveryCount
+	summary.QueueSaturated = summary.Queued >= summary.QueueCapacity
+	return summary, nil
 }
 
 // Backup writes a transactionally consistent copy of the SQLite store using
