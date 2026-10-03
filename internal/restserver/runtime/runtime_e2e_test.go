@@ -508,6 +508,7 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 			t.Fatalf("job history is not inspectable: %+v", history)
 		}
 	}
+	expectedAfterRestart := getProcessJob(t, client, baseURL, jobIDs["task-first"], apiKey)
 	startedData, err := os.ReadFile(outcomesPath + ".started")
 	if err != nil {
 		t.Fatal(err)
@@ -553,6 +554,80 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		t.Fatalf("server process exit: %v", err)
 	}
 	child.Process = nil
+
+	createsBeforeRestart, err := os.ReadFile(outcomesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedBeforeRestart, err := os.ReadFile(outcomesPath + ".started")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedReady := filepath.Join(readyDir, "listener-restarted")
+	restartedLogPath := filepath.Join(t.TempDir(), "server-restarted.log")
+	restartedLog, err := os.Create(restartedLogPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedChild := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	restartedChild.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+restartedReady, "FACTORY_E2E_OUTCOMES="+outcomesPath)
+	restartedChild.Stdout, restartedChild.Stderr = restartedLog, restartedLog
+	if err := restartedChild.Start(); err != nil {
+		_ = restartedLog.Close()
+		t.Fatal(err)
+	}
+	restartedDone := make(chan error, 1)
+	restartedExited := make(chan struct{})
+	go func() {
+		defer close(restartedExited)
+		restartedDone <- restartedChild.Wait()
+		_ = restartedLog.Close()
+	}()
+	restartedStopped := false
+	stopRestarted := func() {
+		if restartedStopped {
+			return
+		}
+		restartedStopped = true
+		_ = restartedChild.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-restartedExited:
+		case <-time.After(2 * time.Second):
+			_ = restartedChild.Process.Kill()
+			<-restartedExited
+		}
+	}
+	defer stopRestarted()
+	restartedURL := waitForProcessURL(t, restartedDone, restartedReady, restartedLogPath)
+	replayed, err := submitProcessJob(client, restartedURL, apiKey, "first", "task-first", "key-first")
+	if err != nil || replayed.StatusCode != http.StatusAccepted || !replayed.Replayed || replayed.ID != expectedAfterRestart.ID {
+		stopRestarted()
+		t.Fatalf("HTTP idempotency retry after process restart=%+v err=%v, want original job %q", replayed, err, expectedAfterRestart.ID)
+	}
+	restartedJob := getProcessJob(t, client, restartedURL, replayed.ID, apiKey)
+	if restartedJob.ID != expectedAfterRestart.ID || restartedJob.Status != expectedAfterRestart.Status || restartedJob.Status != restjobs.StatusSucceeded || restartedJob.Provider == nil || expectedAfterRestart.Provider == nil || *restartedJob.Provider != *expectedAfterRestart.Provider {
+		stopRestarted()
+		t.Fatalf("HTTP replay changed successful provider job: before=%+v after=%+v", expectedAfterRestart, restartedJob)
+	}
+	createsAfterReplay, err := os.ReadFile(outcomesPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAfterReplay, err := os.ReadFile(outcomesPath + ".started")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(createsAfterReplay) != string(createsBeforeRestart) || string(startedAfterReplay) != string(startedBeforeRestart) {
+		t.Fatalf("HTTP replay caused fake-provider create: before=%q after=%q", createsBeforeRestart, createsAfterReplay)
+	}
+	if err := restartedChild.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-restartedDone; err != nil {
+		restartedStopped = true
+		t.Fatalf("restarted server process exit: %v", err)
+	}
+	restartedStopped = true
 	persisted, err := restworker.NewLocalJobManager(config)
 	if err != nil {
 		t.Fatal(err)
