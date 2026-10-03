@@ -141,9 +141,9 @@ func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
 // generic because lower layers can include paths, command output, or secrets.
 func (e *FactoryExecutor) RequiresProviderOutcome() bool { return e.provider != nil }
 
-func (e *FactoryExecutor) CompleteResult(job restjobs.Snapshot) error {
-	if e.provider != nil {
-		return errors.New("successful provider jobs require verified outcome recording first")
+func (e *FactoryExecutor) CompleteResult(ctx context.Context, job restjobs.Snapshot) error {
+	if ctx == nil || ctx.Err() != nil || e.provider == nil || job.Provider == nil {
+		return errExecutionFailed
 	}
 	workspaceManager := e.workspaces[job.Request.Repository]
 	if workspaceManager == nil || workspaceManager.MarkSucceeded(job.ID) != nil {

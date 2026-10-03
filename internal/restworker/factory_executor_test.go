@@ -64,11 +64,19 @@ func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t 
 	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
 		return restprovider.Outcome{}, nil
 	})
-	if err := executor.CompleteResult(executorJob("protect provider side effect")); err == nil {
-		t.Fatal("provider-configured job marked complete without outcome persistence")
+	if err := executor.CompleteResult(context.Background(), executorJob("protect provider side effect")); err == nil {
+		t.Fatal("provider-configured job marked complete without persisted outcome")
 	}
 	if manager.markedID != "" {
 		t.Fatalf("workspace marked complete prematurely: %q", manager.markedID)
+	}
+	job := executorJob("complete after durable provider outcome")
+	job.Provider = &restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}
+	if err := executor.CompleteResult(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if manager.markedID != executorJobID {
+		t.Fatalf("workspace completion after outcome persistence = %q", manager.markedID)
 	}
 }
 
