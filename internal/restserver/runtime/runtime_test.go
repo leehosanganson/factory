@@ -643,6 +643,24 @@ func TestRunRecordsExecutorFailureWithoutExposingDetails(t *testing.T) {
 	}
 }
 
+func TestRunConfiguredSQLiteStartupFailureDoesNotOpenListener(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	config.Persistence = restserver.PersistenceConfig{
+		Backend: restserver.PersistenceBackendSQLite,
+		Path:    filepath.Join(t.TempDir(), "missing-parent", "jobs.db"),
+	}
+	listenerCalled := false
+	err := run(context.Background(), config, runtimeOptions{
+		Listen: func(string, string) (net.Listener, error) {
+			listenerCalled = true
+			return nil, errors.New("listener should not be reached")
+		},
+	})
+	if err == nil || listenerCalled {
+		t.Fatalf("SQLite startup error=%v listener called=%v; configured storage failure must abort before accepting jobs", err, listenerCalled)
+	}
+}
+
 func TestRunValidatesRepositoriesBeforeOpeningListener(t *testing.T) {
 	config, _ := runtimeFixture(t)
 	config.Repositories["trusted"] = filepath.Join(t.TempDir(), "missing")
