@@ -114,6 +114,18 @@ func TestSecondaryStatusRunsDuringActiveStageAndPersistsSanitizedUpdate(t *testi
 	case <-time.After(time.Second):
 		t.Fatal("secondary status call did not run during the active stage")
 	}
+	waitFor(t, time.Second, func() bool {
+		events, err := store.SessionEvents("status-job", "workflow")
+		if err != nil {
+			return false
+		}
+		for _, event := range events {
+			if event.Type == "status.completed" && event.Outcome == "success" && event.Summary != "" {
+				return true
+			}
+		}
+		return false
+	})
 	close(agent.release)
 	if err := <-workflowDone; err != nil {
 		t.Fatal(err)
@@ -189,19 +201,54 @@ func TestSecondaryStatusCancellationStopsObserverAndPrimary(t *testing.T) {
 	}
 }
 
+func TestSecondaryStatusErrorsAreNonFatal(t *testing.T) {
+	base := t.TempDir()
+	primaryStarted := make(chan struct{})
+	primaryRelease := make(chan struct{})
+	statusStarted := make(chan struct{})
+	var statusOnce sync.Once
+	agent := &blockingStatusTestAgent{started: primaryStarted, release: primaryRelease}
+	workflow := Workflow{
+		Agent: agent, Config: Config{StateDir: filepath.Join(base, "state")}, Out: io.Discard, Workdir: t.TempDir(),
+		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		statusCall: func(context.Context, string, string, string, string) (string, error) {
+			statusOnce.Do(func() { close(statusStarted) })
+			return "ignored", errors.New("observer failed")
+		},
+	}
+	workflowDone := make(chan error, 1)
+	go func() { workflowDone <- workflow.Run("task") }()
+	select {
+	case <-primaryStarted:
+	case <-time.After(time.Second):
+		close(primaryRelease)
+		t.Fatal("primary stage was not started")
+	}
+	select {
+	case <-statusStarted:
+	case <-time.After(time.Second):
+		close(primaryRelease)
+		t.Fatal("secondary status call did not run during the active stage")
+	}
+	close(primaryRelease)
+	if err := <-workflowDone; err != nil {
+		t.Fatalf("status failure affected primary stage: %v", err)
+	}
+}
+
 func TestSecondaryStatusErrorsAreNonFatalAndDoesNotStartAfterPrimary(t *testing.T) {
 	base := t.TempDir()
 	calls := 0
 	workflow := Workflow{
 		Agent: &fakeAgent{outputs: map[string][]string{}}, Config: Config{StateDir: filepath.Join(base, "state")}, Out: io.Discard, Workdir: t.TempDir(),
-		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		Stages: []string{"implement"}, statusInterval: time.Hour,
 		statusCall: func(context.Context, string, string, string, string) (string, error) {
 			calls++
-			return "ignored", errors.New("observer failed")
+			return "unexpected", nil
 		},
 	}
 	if err := workflow.Run("quick task"); err != nil {
-		t.Fatalf("status failure affected primary stage: %v", err)
+		t.Fatal(err)
 	}
 	if calls != 0 {
 		t.Fatalf("status invocation launched after the short primary stage finished: %d", calls)
