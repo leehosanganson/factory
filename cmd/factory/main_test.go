@@ -30,6 +30,119 @@ func TestPrivateJobWorkerInvocationRequiresStoreRoot(t *testing.T) {
 	}
 }
 
+func TestDoctorProcessChecksSetupWithoutSideEffects(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "factory")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory CLI: %v\n%s", err, output)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		config        string
+		tools         []string
+		want          []string
+		omit          []string
+		wantExitError bool
+	}{
+		{
+			name:          "invalid config is sanitized",
+			config:        `{"command":"secret-agent-path","args":["{system_prompt}","{task}"],"state_dir":"/secret/state","agent_timeout":"not-a-duration"}`,
+			want:          []string{"config: invalid"},
+			omit:          []string{"secret-agent-path", "/secret/state", "not-a-duration"},
+			wantExitError: true,
+		},
+		{
+			name:          "missing agent executable",
+			config:        `{"command":"factory-doctor-missing-agent","args":["{system_prompt}","{task}"],"auto_publish":false}`,
+			tools:         []string{"git"},
+			want:          []string{"config: valid", "agent executable: missing", "git: available", "gh: skipped"},
+			wantExitError: true,
+		},
+		{
+			name:          "gh is required by default",
+			tools:         []string{"pi", "git"},
+			want:          []string{"config: valid", "agent executable: available", "git: available", "gh: missing"},
+			wantExitError: true,
+		},
+		{
+			name:  "healthy default config",
+			tools: []string{"pi", "git", "gh"},
+			want:  []string{"config: valid", "agent executable: available", "git: available", "gh: available"},
+			omit:  []string{"skipped"},
+		},
+		{
+			name:   "gh is skipped when publication is disabled",
+			config: `{"command":"pi","args":["{system_prompt}","{task}"],"auto_publish":false}`,
+			tools:  []string{"pi", "git"},
+			want:   []string{"config: valid", "agent executable: available", "git: available", "gh: skipped (auto_publish is false)"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			configHome := filepath.Join(root, "config")
+			configDir := filepath.Join(configHome, "factory")
+			fakeBin := filepath.Join(root, "bin")
+			stateHome := filepath.Join(root, "state")
+			target := filepath.Join(root, "target")
+			for _, dir := range []string{configDir, fakeBin, target} {
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.config != "" {
+				if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(tc.config), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			targetFile := filepath.Join(target, "keep.txt")
+			if err := os.WriteFile(targetFile, []byte("unchanged"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, tool := range tc.tools {
+				if err := os.WriteFile(filepath.Join(fakeBin, tool), []byte("#!/bin/sh\nprintf invoked > \"$FACTORY_DOCTOR_MARKER\"\n"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			command := exec.Command(binary, "doctor")
+			command.Dir = target
+			command.Env = []string{
+				"XDG_CONFIG_HOME=" + configHome,
+				"XDG_STATE_HOME=" + stateHome,
+				"PATH=" + fakeBin,
+				"FACTORY_DOCTOR_MARKER=" + filepath.Join(root, "tool-invoked"),
+			}
+			output, err := command.CombinedOutput()
+			if (err != nil) != tc.wantExitError {
+				t.Fatalf("factory doctor error = %v, want exit-error %v; output: %s", err, tc.wantExitError, output)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(string(output), want) {
+					t.Errorf("factory doctor output missing %q: %s", want, output)
+				}
+			}
+			for _, omitted := range tc.omit {
+				if strings.Contains(string(output), omitted) {
+					t.Errorf("factory doctor output leaked %q: %s", omitted, output)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(root, "tool-invoked")); !os.IsNotExist(err) {
+				t.Errorf("doctor invoked a configured tool: stat error=%v", err)
+			}
+			if _, err := os.Stat(stateHome); !os.IsNotExist(err) {
+				t.Errorf("doctor created state: stat error=%v", err)
+			}
+			if data, err := os.ReadFile(targetFile); err != nil || string(data) != "unchanged" {
+				t.Errorf("doctor changed target file: data=%q err=%v", data, err)
+			}
+			if entries, err := os.ReadDir(target); err != nil || len(entries) != 1 || entries[0].Name() != "keep.txt" {
+				t.Errorf("doctor changed target directory entries: entries=%v err=%v", entries, err)
+			}
+		})
+	}
+}
+
 func TestVersionCommandReportsLinkedVersion(t *testing.T) {
 	originalVersion := version
 	t.Cleanup(func() { version = originalVersion })

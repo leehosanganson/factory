@@ -17,6 +17,17 @@ The REST server supports volatile memory mode and optional SQLite persistence, w
 - [Roadmap](docs/roadmap/roadmap.md) — unified product direction and later possibilities.
 - [Issue context integration](docs/roadmap/rest-job-lifecycle.md) — later issue-intake option feeding the same job lifecycle.
 
+## First task
+
+Install the configured agent (the default is `pi`), then copy `config.json.example` to `~/.config/factory/config.json` and adjust it if needed. Run the read-only setup check before starting a task:
+
+```sh
+factory doctor
+factory implement "Describe the change and how it should be verified"
+```
+
+`factory doctor` validates the config and checks whether the configured agent executable and `git` are on `PATH`; it checks `gh` only when `auto_publish` is enabled. It does not invoke those tools, contact GitHub, create state, or access the target checkout. See [implementation workflow](docs/features/implementation.md) for publication behavior and configuration details.
+
 ## Build and verify
 
 Go 1.26.3 or later is required. Linux and macOS are supported. The Makefile provides `make build`, `make test`, `make fmt`, `make vet`, and `make clean`.
