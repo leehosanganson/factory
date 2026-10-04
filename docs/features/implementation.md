@@ -10,6 +10,8 @@ For the current CLI implementation workflow, automatic publication is enabled by
 
 Both the default detached-and-attached `factory implement <description>` path and `factory implement --detach <description>` run publication in the detached worker. Gated `factory implement --gate <description>` runs the isolated workflow and publisher in the foreground, with stage approvals. Every implementation mode—including `auto_publish: false`—requires the target to be a Git checkout root on a named branch. The clean-checkout requirement applies only when automatic publication is enabled. The workflow runs in a separate Git worktree and task branch named `factory-implement-<id>`; the invoking checkout's files, branch, and HEAD are not used for generated changes or changed by publication.
 
+Configure `pipeline_checks` with the checks appropriate for the project (for example, `make test` where that target is meaningful). `factory doctor` reports only their count; it does not run or display command arguments or paths. When `auto_publish` is enabled and no checks are configured, doctor gives an advisory that verification confidence is incomplete. This is informational, not a policy or blocking requirement. With `auto_publish: false`, it reports the count without suggesting publication risk.
+
 After all workflow stages and configured `pipeline_checks` succeed, Factory:
 
 1. Revalidates that the invoking checkout remains clean and its branch and HEAD still match the captured baseline, and verifies the isolated worktree and task branch.

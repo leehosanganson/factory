@@ -397,6 +397,11 @@ func runDoctor(out io.Writer) error {
 	} else {
 		fmt.Fprintln(out, "gh: skipped (auto_publish is false)")
 	}
+	fmt.Fprintf(out, "pipeline checks: %d configured", len(cfg.PipelineChecks))
+	if len(cfg.PipelineChecks) == 0 && cfg.AutoPublish {
+		fmt.Fprint(out, " (advisory: verification confidence is incomplete with auto_publish enabled)")
+	}
+	fmt.Fprintln(out)
 	if failed {
 		return fmt.Errorf("doctor found missing required executables")
 	}
