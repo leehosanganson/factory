@@ -1,0 +1,7 @@
+# Issue #127 GitHub adapter validation session
+
+- **Scope:** Added deterministic tests of the production GitHub REST adapter against `httptest`; did not run a live GitHub account test or create remote resources.
+- **Observation:** Existing process-level uncertain-write tests exercised a fake publisher, while adapter tests did not model an accepted `POST /pulls` whose response was lost and whose subsequent read-only lookup was unavailable. The new fixture verifies the adapter remains uncertain after the lost response and failed lookups, then maps a later PR response only when repository, job marker, branch, base, commit, and URL agree.
+- **Safety/evidence:** The test records one POST total, disallows all other writes, and checks sanitized errors and read-only reconciliation. No credentials were needed and no external writes were attempted.
+- **Validation boundary:** Roadmap docs now distinguish adapter-level REST simulation from process-level fake-provider E2E and explicitly defer live account/repository validation. A safe ephemeral repository provisioning/cleanup mechanism was not in scope and live validation is not required.
+- **Friction/idea:** `make help` is not a supported target; the Makefile targets are directly listed in `Makefile`. For testing provider-adapter behavior without account side effects, an injectable local HTTP endpoint and transport-level failure simulation are sufficient for this acceptance case.

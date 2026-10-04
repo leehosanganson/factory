@@ -196,6 +196,137 @@ func runTestGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+func TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI(t *testing.T) {
+	const token = "provider-test-secret"
+	var gets, posts, writes int
+	var created PullRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token || r.Header.Get("Accept") != "application/vnd.github+json" || r.Header.Get("X-GitHub-Api-Version") != "2022-11-28" {
+			t.Error("GitHub API authentication or version headers missing or incorrect")
+		}
+		if r.URL.Path != "/repos/acme/widget/pulls" {
+			t.Errorf("GitHub API path=%q", r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodGet:
+			gets++
+			if r.URL.Query().Get("head") != "acme:"+JobBranch(testJobID) || r.URL.Query().Get("state") != "all" || r.URL.Query().Get("per_page") != "100" || r.URL.Query().Get("page") != "1" {
+				t.Errorf("GitHub lookup query=%v", r.URL.Query())
+			}
+			if gets == 1 {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			if gets == 2 || gets == 3 {
+				// The create was accepted, but both automatic and operator lookups
+				// initially fail. The response body deliberately contains the token.
+				http.Error(w, "temporary provider outage containing "+token, http.StatusServiceUnavailable)
+				return
+			}
+			_ = json.NewEncoder(w).Encode([]PullRequest{created})
+		case http.MethodPost:
+			posts++
+			var payload map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Errorf("decode create request: %v", err)
+				return
+			}
+			if payload["title"] != "Implement safely" || payload["head"] != JobBranch(testJobID) || payload["base"] != "main" || payload["body"] != "Verified outcome\n\n<!-- factory-job:"+testJobID+" -->" {
+				t.Errorf("GitHub create payload=%v", payload)
+			}
+			created = PullRequest{Number: 42, State: "open", Body: payload["body"], URL: "https://github.com/acme/widget/pull/42"}
+			created.Head.Ref = payload["head"]
+			created.Head.SHA = "0123456789abcdef"
+			created.Base.Ref = payload["base"]
+			created.Base.Repo.FullName = "acme/widget"
+			// Model GitHub committing the PR before the response is lost in transit.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("hijack accepted create response: %v", err)
+				return
+			}
+			_ = conn.Close()
+		default:
+			writes++
+			t.Errorf("unexpected GitHub API write method %s", r.Method)
+			http.Error(w, "writes forbidden", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	publisher := newGitHubPublisher(token, server.Client(), server.URL, func(context.Context, string, string, string) error { return nil })
+	request := PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/private/worktree", Commit: "0123456789abcdef", Title: "Implement safely", Summary: "Verified outcome", BaseBranch: "main"}
+	if _, err := publisher.Publish(context.Background(), request); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("Publish() error=%v, want uncertain after accepted create and failed lookup", err)
+	} else if strings.Contains(err.Error(), token) {
+		t.Fatalf("uncertain create error leaked provider token: %v", err)
+	}
+	if _, err := publisher.Reconcile(context.Background(), request); err == nil || strings.Contains(err.Error(), token) {
+		t.Fatalf("unresolved read-only Reconcile() error=%v, want a sanitized failure", err)
+	}
+	outcome, err := publisher.Reconcile(context.Background(), request)
+	if err != nil {
+		t.Fatalf("read-only Reconcile() error=%v", err)
+	}
+	want := Outcome{Provider: "github", Repository: "acme/widget", Number: 42, URL: "https://github.com/acme/widget/pull/42", Branch: JobBranch(testJobID), Commit: "0123456789abcdef", State: "open"}
+	if outcome != want {
+		t.Fatalf("Reconcile() outcome=%+v, want %+v", outcome, want)
+	}
+	if gets != 4 || posts != 1 || writes != 0 {
+		t.Fatalf("GitHub API calls: GET=%d POST=%d other writes=%d; want 4, 1, 0", gets, posts, writes)
+	}
+}
+
+func TestGitHubPublisherReconcileRejectsMismatchedGitHubResponsesReadOnly(t *testing.T) {
+	valid := `{"number":42,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/42","head":{"ref":"factory/job/` + testJobID + `","sha":"0123456789abcdef"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}`
+	for _, tc := range []struct {
+		name         string
+		status       int
+		body         string
+		wantMismatch string
+		wantErr      string
+	}{
+		{name: "permission denied", status: http.StatusForbidden, body: `{"message":"secret provider detail"}`, wantErr: "provider reconciliation is unavailable"},
+		{name: "rate limited", status: http.StatusTooManyRequests, body: `{"message":"secret provider detail"}`, wantErr: "provider reconciliation is unavailable"},
+		{name: "malformed response", status: http.StatusOK, body: `[{`, wantErr: "provider reconciliation is unavailable"},
+		{name: "repository mismatch", status: http.StatusOK, body: strings.Replace(valid, `"full_name":"acme/widget"`, `"full_name":"other/widget"`, 1), wantMismatch: `"full_name":"other/widget"`, wantErr: "provider reconciliation is unavailable"},
+		{name: "branch mismatch", status: http.StatusOK, body: strings.Replace(valid, `"ref":"factory/job/`+testJobID+`"`, `"ref":"factory/job/other"`, 1), wantMismatch: `"ref":"factory/job/other"`, wantErr: "provider reconciliation is unavailable"},
+	} {
+		if tc.wantMismatch != "" && (tc.body == valid || !strings.Contains(tc.body, tc.wantMismatch)) {
+			t.Fatalf("%s fixture does not contain its intended mismatch %q", tc.name, tc.wantMismatch)
+		}
+		t.Run(tc.name, func(t *testing.T) {
+			var writes int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					writes++
+					http.Error(w, "writes forbidden", http.StatusMethodNotAllowed)
+					return
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			publisher := newGitHubPublisher("provider-test-secret", server.Client(), server.URL, func(context.Context, string, string, string) error {
+				writes++
+				return nil
+			})
+			request := PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/private/worktree", Branch: JobBranch(testJobID), Commit: "0123456789abcdef", Title: "task", BaseBranch: "main"}
+			_, err := publisher.Reconcile(context.Background(), request)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) || strings.Contains(err.Error(), "provider-test-secret") || strings.Contains(err.Error(), "secret provider detail") {
+				t.Fatalf("Reconcile() error=%v, want sanitized %q", err, tc.wantErr)
+			}
+			if writes != 0 {
+				t.Fatalf("read-only reconciliation performed %d provider writes", writes)
+			}
+		})
+	}
+}
+
 func TestGitHubPublisherReconcilesAfterAmbiguousCreate(t *testing.T) {
 	gets, posts := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
