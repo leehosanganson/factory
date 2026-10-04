@@ -1237,10 +1237,17 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := filepath.Join(root, "agent")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\ncase \"$1\" in *'Propose a concise slug'*) printf 'test-detached\\n'; exit 0 ;; esac\n: > \"$FACTORY_TEST_STARTED\"\nwhile [ ! -f \"$FACTORY_TEST_RELEASE\" ]; do sleep 0.02; done\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncase \"$1\" in *'Propose a concise slug'*) printf 'test-detached\\n'; exit 0 ;; esac\n: > \"$FACTORY_TEST_STARTED\"\nwhile [ ! -f \"$FACTORY_TEST_RELEASE\" ]; do sleep 0.02; done\nprintf 'PASS\\nfake-agent-output\\n'\nprintf 'generated\\n' > generated.txt\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":false}`, script, state)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":true}`, script, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(root, "factory")
@@ -1286,7 +1293,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 
 	command := exec.Command(binary, "implement", "-d", "test", "detached")
 	command.Dir = target
-	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_RELEASE="+releaseWorker, "FACTORY_TEST_STARTED="+workerStarted)
+	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_RELEASE="+releaseWorker, "FACTORY_TEST_STARTED="+workerStarted, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var commandOutput bytes.Buffer
 	command.Stdout, command.Stderr = &commandOutput, &commandOutput
 	var commandDone chan error
@@ -1491,6 +1498,57 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	}
 	if err := waitForCompletion(10 * time.Second); err != nil {
 		t.Fatal(err)
+	}
+	job, found, err = findJob()
+	if err != nil || !found {
+		t.Fatalf("completed detached job state=%+v found=%t err=%v", job, found, err)
+	}
+
+	runCLI := func(args ...string) string {
+		t.Helper()
+		inspect := exec.Command(binary, args...)
+		inspect.Dir = target
+		inspect.Env = command.Env
+		output, err := inspect.CombinedOutput()
+		if err != nil {
+			t.Fatalf("factory %v: %v\n%s", args, err, output)
+		}
+		return string(output)
+	}
+	details := runCLI("job", "get", job.ID, "--details")
+	for _, want := range []string{
+		"Status: complete",
+		"Worktree: " + job.Worktree,
+		"Work branch: " + job.WorkBranch,
+		"Publication: unpublished",
+		"Publication summary:",
+	} {
+		if !strings.Contains(details, want) {
+			t.Errorf("separate-process job details omitted %q: %s", want, details)
+		}
+	}
+	if info, err := os.Stat(job.Worktree); err != nil || !info.IsDir() {
+		t.Errorf("unpublished recovery worktree was not retained at %q: %v", job.Worktree, err)
+	}
+	logs := runCLI("job", "logs", job.ID, "--session", "workflow")
+	foundAgentOutput := false
+	for _, line := range strings.Split(logs, "\n") {
+		_, event, ok := strings.Cut(line, "stage=")
+		if !ok {
+			continue
+		}
+		_, transcript, ok := strings.Cut(event, " ")
+		if !ok || transcript == "" {
+			continue
+		}
+		data, err := os.ReadFile(transcript)
+		if err == nil && strings.Contains(string(data), "fake-agent-output") {
+			foundAgentOutput = true
+			break
+		}
+	}
+	if !foundAgentOutput {
+		t.Errorf("separate-process workflow log did not expose a retained agent transcript containing fake-agent-output: %s", logs)
 	}
 }
 
