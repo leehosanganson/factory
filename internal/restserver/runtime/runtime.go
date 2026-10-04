@@ -315,6 +315,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
 	ready.Store(true)
+	logger.Printf("REST server ready; persistence backend: %s", config.Persistence.Backend)
 
 	var serveErr error
 	select {
