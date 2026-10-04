@@ -26,7 +26,7 @@ factory doctor
 factory implement "Describe the change and how it should be verified"
 ```
 
-`factory doctor` validates the config and checks whether the configured agent executable and `git` are on `PATH`; it checks `gh` only when `auto_publish` is enabled. It does not invoke those tools, contact GitHub, create state, or access the target checkout. See [implementation workflow](docs/features/implementation.md) for publication behavior and configuration details.
+`factory doctor` validates the config and checks whether the configured agent executable and `git` are on `PATH`; it checks `gh` only when `auto_publish` is enabled. It reports the number of configured `pipeline_checks` but never displays or runs their commands. With publication enabled, no configured checks is an advisory that verification confidence is incomplete, not a blocker. Configure project-appropriate checks (for example, `make test`) in `pipeline_checks`; doctor does not recommend publication-risk remediation when `auto_publish` is disabled. It does not invoke configured tools, contact GitHub, create state, or access the target checkout. See [implementation workflow](docs/features/implementation.md) for publication behavior and configuration details.
 
 ## Build and verify
 

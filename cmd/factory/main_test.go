@@ -66,16 +66,24 @@ func TestDoctorProcessChecksSetupWithoutSideEffects(t *testing.T) {
 			wantExitError: true,
 		},
 		{
-			name:  "healthy default config",
+			name:  "healthy default config reports no checks as advisory",
 			tools: []string{"pi", "git", "gh"},
-			want:  []string{"config: valid", "agent executable: available", "git: available", "gh: available"},
+			want:  []string{"config: valid", "agent executable: available", "git: available", "gh: available", "pipeline checks: 0 configured", "advisory", "confidence"},
 			omit:  []string{"skipped"},
 		},
 		{
-			name:   "gh is skipped when publication is disabled",
+			name:   "configured checks are counted without exposing or running them",
+			config: `{"command":"pi","args":["{system_prompt}","{task}"],"auto_publish":true,"pipeline_checks":[["private-check-path","private-check-argument"],["private-check-path","private-check-token"]]}`,
+			tools:  []string{"pi", "git", "gh", "private-check-path"},
+			want:   []string{"config: valid", "pipeline checks: 2 configured"},
+			omit:   []string{"private-check-argument", "private-check-path", "private-check-token", "advisory"},
+		},
+		{
+			name:   "gh and pipeline advisory are skipped when publication is disabled",
 			config: `{"command":"pi","args":["{system_prompt}","{task}"],"auto_publish":false}`,
 			tools:  []string{"pi", "git"},
-			want:   []string{"config: valid", "agent executable: available", "git: available", "gh: skipped (auto_publish is false)"},
+			want:   []string{"config: valid", "agent executable: available", "git: available", "gh: skipped (auto_publish is false)", "pipeline checks: 0 configured"},
+			omit:   []string{"advisory", "confidence", "publication risk"},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
