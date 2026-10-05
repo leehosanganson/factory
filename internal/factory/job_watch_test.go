@@ -144,6 +144,7 @@ func TestJobWatchNextActionHintsArePhaseAwareAndDoNotEchoTaskContent(t *testing.
 		name   string
 		job    JobRecord
 		want   string
+		exact  string
 		secret string
 	}{
 		{
@@ -163,6 +164,24 @@ func TestJobWatchNextActionHintsArePhaseAwareAndDoNotEchoTaskContent(t *testing.
 			want: "factory job get failed --details` and `factory job logs failed",
 		},
 		{
+			name: "interrupted implementation is inspectable but never replayed",
+			job: JobRecord{
+				ID: "interrupted", Type: implementationJobType, Status: "interrupted",
+				TaskDescription: "secret task description", Worktree: "/private/worktree", WorkBranch: "factory/secret-branch",
+			},
+			exact:  "Factory will not replay this interrupted job. Inspect details with `factory job get interrupted --details` and workflow logs with `factory job logs interrupted --session workflow`; inspect any retained worktree and branch shown in the details before deciding what to preserve.",
+			secret: "secret",
+		},
+		{
+			name: "interrupted tidy is inspectable but never replayed",
+			job: JobRecord{
+				ID: "interrupted-tidy", Type: tidyJobType, Status: "interrupted",
+				TaskDescription: "secret tidy description",
+			},
+			exact:  "Factory will not replay this interrupted job. Inspect details with `factory job get interrupted-tidy --details` and workflow logs with `factory job logs interrupted-tidy --session workflow`; inspect any retained worktree and branch shown in the details before deciding what to preserve.",
+			secret: "secret",
+		},
+		{
 			name: "active implementation",
 			job:  JobRecord{ID: "active", Type: implementationJobType, Status: "running"},
 			want: "No action needed; let the job continue",
@@ -171,7 +190,10 @@ func TestJobWatchNextActionHintsArePhaseAwareAndDoNotEchoTaskContent(t *testing.
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			hint := jobWatchNextAction(tc.job)
-			if !strings.Contains(hint, tc.want) {
+			if tc.exact != "" && hint != tc.exact {
+				t.Fatalf("next action = %q, want exactly %q", hint, tc.exact)
+			}
+			if tc.want != "" && !strings.Contains(hint, tc.want) {
 				t.Fatalf("next action = %q, want %q", hint, tc.want)
 			}
 			if tc.secret != "" && strings.Contains(hint, tc.secret) {

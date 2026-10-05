@@ -74,7 +74,12 @@ func jobWatchNextAction(job JobRecord) string {
 		}
 	}
 	switch job.Status {
-	case "failed", "interrupted", "stopped", "cancelled":
+	case "interrupted":
+		if job.Type == implementationJobType || job.Type == tidyJobType {
+			return fmt.Sprintf("Factory will not replay this interrupted job. Inspect details with `factory job get %s --details` and workflow logs with `factory job logs %s --session workflow`; inspect any retained worktree and branch shown in the details before deciding what to preserve.", job.ID, job.ID)
+		}
+		return fmt.Sprintf("Inspect with `factory job get %s --details` and `factory job logs %s`.", job.ID, job.ID)
+	case "failed", "stopped", "cancelled":
 		return fmt.Sprintf("Inspect with `factory job get %s --details` and `factory job logs %s`.", job.ID, job.ID)
 	case "complete":
 		if job.Type == implementationJobType && job.Worktree != "" {
