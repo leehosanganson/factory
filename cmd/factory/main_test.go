@@ -1217,7 +1217,7 @@ func runTestGit(t *testing.T, args ...string) string {
 	return string(output)
 }
 
-func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
+func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 	root, err := os.MkdirTemp("", "factory detached worker test-")
 	if err != nil {
 		t.Fatal(err)
@@ -1239,6 +1239,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	}
 	releaseWorker := filepath.Join(state, "release-worker")
 	workerStarted := filepath.Join(state, "worker-started")
+	ghCalled := filepath.Join(state, "gh-called")
 	configHome := filepath.Join(root, "config")
 	factoryConfig := filepath.Join(configHome, "factory")
 	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
@@ -1255,7 +1256,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\n: > \"$FACTORY_TEST_GH_CALLED\"\nexit 1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	binary := filepath.Join(root, "factory")
@@ -1286,6 +1287,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v\n%s", err, output)
 	}
+	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
 	target, err = filepath.EvalSymlinks(target)
 	if err != nil {
 		t.Fatal(err)
@@ -1301,7 +1303,7 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 
 	command := exec.Command(binary, "implement", "-d", "test", "detached")
 	command.Dir = target
-	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_RELEASE="+releaseWorker, "FACTORY_TEST_STARTED="+workerStarted, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_RELEASE="+releaseWorker, "FACTORY_TEST_STARTED="+workerStarted, "FACTORY_TEST_GH_CALLED="+ghCalled, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	var commandOutput bytes.Buffer
 	command.Stdout, command.Stderr = &commandOutput, &commandOutput
 	var commandDone chan error
@@ -1367,9 +1369,6 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 		return fmt.Errorf("detached job did not reach status %q, clear its worker record, and release its target lock within %s", requiredStatus, timeout)
-	}
-	waitForCompletion := func(timeout time.Duration) error {
-		return waitForShutdown(timeout, "complete")
 	}
 	t.Cleanup(func() {
 		if commandDone == nil {
@@ -1501,17 +1500,6 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 		unlock()
 		t.Fatal("worker gate was reached without the worker holding its target lock")
 	}
-	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
-		t.Fatalf("release detached worker: %v", err)
-	}
-	if err := waitForCompletion(10 * time.Second); err != nil {
-		t.Fatal(err)
-	}
-	job, found, err = findJob()
-	if err != nil || !found {
-		t.Fatalf("completed detached job state=%+v found=%t err=%v", job, found, err)
-	}
-
 	runCLI := func(args ...string) string {
 		t.Helper()
 		inspect := exec.Command(binary, args...)
@@ -1523,40 +1511,55 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 		}
 		return string(output)
 	}
+	stopOutput := runCLI("job", "stop", job.ID)
+	if !strings.Contains(stopOutput, "Stop requested for job "+job.ID) {
+		t.Fatalf("separate-process stop output = %q", stopOutput)
+	}
+	if !store.StopRequested(job.ID) {
+		t.Fatal("separate-process stop command did not persist a stop request")
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release detached worker after stop request: %v", err)
+	}
+	if err := waitForShutdown(10*time.Second, "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	job, found, err = findJob()
+	if err != nil || !found {
+		t.Fatalf("stopped detached job state=%+v found=%t err=%v", job, found, err)
+	}
 	details := runCLI("job", "get", job.ID, "--details")
 	for _, want := range []string{
-		"Status: complete",
+		"Status: stopped",
 		"Worktree: " + job.Worktree,
 		"Work branch: " + job.WorkBranch,
-		"Publication: unpublished",
-		"Publication summary:",
 	} {
 		if !strings.Contains(details, want) {
 			t.Errorf("separate-process job details omitted %q: %s", want, details)
 		}
 	}
 	if info, err := os.Stat(job.Worktree); err != nil || !info.IsDir() {
-		t.Errorf("unpublished recovery worktree was not retained at %q: %v", job.Worktree, err)
+		t.Errorf("stopped implementation worktree was not retained at %q: %v", job.Worktree, err)
+	}
+	workflowLogPath, err := store.SessionLogPath(job.ID, "workflow")
+	if err != nil {
+		t.Fatalf("locate retained workflow log: %v", err)
+	}
+	if info, err := os.Stat(workflowLogPath); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Errorf("stopped job workflow log was not retained at %q: %v", workflowLogPath, err)
 	}
 	logs := runCLI("job", "logs", job.ID, "--session", "workflow")
-	foundAgentOutput := false
-	for _, line := range strings.Split(logs, "\n") {
-		_, event, ok := strings.Cut(line, "stage=")
-		if !ok {
-			continue
-		}
-		_, transcript, ok := strings.Cut(event, " ")
-		if !ok || transcript == "" {
-			continue
-		}
-		data, err := os.ReadFile(transcript)
-		if err == nil && strings.Contains(string(data), "fake-agent-output") {
-			foundAgentOutput = true
-			break
-		}
+	if strings.TrimSpace(logs) == "" {
+		t.Error("separate-process workflow log was empty after stop")
 	}
-	if !foundAgentOutput {
-		t.Errorf("separate-process workflow log did not expose a retained agent transcript containing fake-agent-output: %s", logs)
+	if _, err := os.Stat(ghCalled); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("PR publication unexpectedly invoked fake gh: stat err=%v", err)
+	}
+	if head := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); head != initialHead {
+		t.Errorf("stopped job changed target checkout HEAD: got %s, want %s", head, initialHead)
+	}
+	if status := strings.TrimSpace(runTestGit(t, "-C", target, "status", "--porcelain")); status != "" {
+		t.Errorf("stopped job changed target checkout: %s", status)
 	}
 }
 
