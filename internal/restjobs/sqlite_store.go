@@ -1166,7 +1166,11 @@ func (s *SQLiteStore) Ping(ctx context.Context) error {
 	if err := s.checkOpen(); err != nil {
 		return err
 	}
-	if err := s.db.PingContext(ctx); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("SQLite job store is unavailable")
+	}
+	if err := tx.Rollback(); err != nil {
 		return errors.New("SQLite job store is unavailable")
 	}
 	return nil
