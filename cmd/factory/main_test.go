@@ -1217,6 +1217,233 @@ func runTestGit(t *testing.T, args ...string) string {
 	return string(output)
 }
 
+func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	configHome := filepath.Join(root, "config")
+	configDir := filepath.Join(configHome, "factory")
+	for _, dir := range []string{state, configDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agent := filepath.Join(root, "agent")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'PASS\\n'\nprintf 'generated\\n' > generated.txt\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":true}`, agent, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main", target}, {"-C", target, "config", "user.name", "Factory Test"}, {"-C", target, "config", "user.email", "factory-test@example.invalid"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", target, "add", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	remote := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+		t.Fatalf("init local bare remote: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", remote).CombinedOutput(); err != nil {
+		t.Fatalf("add local origin: %v\n%s", err, output)
+	}
+	target, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	initialStatus := runTestGit(t, "-C", target, "status", "--porcelain")
+
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitCalls := filepath.Join(state, "git-calls")
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitWrapper := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %q\nexec %q \"$@\"\n", gitCalls, gitPath)
+	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte(gitWrapper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ghCalls := filepath.Join(state, "gh-calls")
+	ghStub := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" > %q\nprintf 'https://github.com/example/repo/pull/149\\n'\n", ghCalls)
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte(ghStub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	binary := filepath.Join(root, "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+	env := make([]string, 0, len(os.Environ())+5)
+	for _, item := range os.Environ() {
+		key, _, _ := strings.Cut(item, "=")
+		switch key {
+		case "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR", "GH_HOST":
+			continue
+		}
+		env = append(env, item)
+	}
+	env = append(env, "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "GH_CONFIG_DIR="+filepath.Join(root, "empty-gh-config"), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	command := exec.Command(binary, "implement", "-d", "persist published handoff")
+	command.Dir = target
+	command.Env = env
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("start detached implementation: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "Started implementation job") {
+		t.Fatalf("detached start output = %q", output)
+	}
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job factory.JobRecord
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err := store.ListJobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(jobs) == 1 && jobs[0].TaskDescription == "persist published handoff" {
+			job = jobs[0]
+			if job.Status == "complete" {
+				if _, err := store.ReadWorker(job.ID); errors.Is(err, os.ErrNotExist) {
+					break
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if job.ID == "" || job.Status != "complete" {
+		t.Fatalf("detached job did not complete: %+v", job)
+	}
+	job, err = store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantPRURL = "https://github.com/example/repo/pull/149"
+	if job.PublicationStatus != "published" || !strings.Contains(job.PublicationSummary, wantPRURL) {
+		t.Fatalf("persisted publication outcome = status %q summary %q", job.PublicationStatus, job.PublicationSummary)
+	}
+	if _, err := os.Stat(job.Worktree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("published worktree was not cleaned up: %v", err)
+	}
+	if got := strings.TrimSpace(runTestGit(t, "--git-dir", remote, "for-each-ref", "--format=%(refname:short)")); got != job.WorkBranch || got == "main" {
+		t.Fatalf("local bare remote branch = %q, want isolated job branch %q", got, job.WorkBranch)
+	}
+	if calls, err := os.ReadFile(gitCalls); err != nil || !strings.Contains(string(calls), "push --porcelain") {
+		t.Fatalf("local git wrapper did not observe branch push: calls=%q err=%v", calls, err)
+	}
+	if calls, err := os.ReadFile(ghCalls); err != nil || !strings.HasPrefix(string(calls), "pr create ") {
+		t.Fatalf("fake gh did not observe PR creation: calls=%q err=%v", calls, err)
+	}
+
+	inspect := exec.Command(binary, "job", "get", job.ID, "--details")
+	inspect.Dir = target
+	inspect.Env = env
+	details, err := inspect.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-process job details: %v\n%s", err, details)
+	}
+	for _, want := range []string{"Status: complete", "Publication: published", wantPRURL} {
+		if !strings.Contains(string(details), want) {
+			t.Errorf("fresh-process details omitted %q: %s", want, details)
+		}
+	}
+	if got := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); got != initialHead {
+		t.Errorf("invoking checkout HEAD changed: got %s want %s", got, initialHead)
+	}
+	if got := runTestGit(t, "-C", target, "status", "--porcelain"); got != initialStatus {
+		t.Errorf("invoking checkout status changed: got %q want %q", got, initialStatus)
+	}
+
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\necho unavailable >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	failedCommand := exec.Command(binary, "implement", "-d", "failed published handoff")
+	failedCommand.Dir = target
+	failedCommand.Env = env
+	if output, err := failedCommand.CombinedOutput(); err != nil || !strings.Contains(string(output), "Started implementation job") {
+		t.Fatalf("start detached publication-failure job: %v\n%s", err, output)
+	}
+	var failedJob factory.JobRecord
+	deadline = time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err := store.ListJobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range jobs {
+			if candidate.TaskDescription == "failed published handoff" {
+				failedJob = candidate
+			}
+		}
+		if failedJob.ID != "" && failedJob.Status == "complete" {
+			if _, err := store.ReadWorker(failedJob.ID); errors.Is(err, os.ErrNotExist) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if failedJob.ID == "" || failedJob.Status != "complete" || failedJob.PublicationStatus != "unpublished" {
+		t.Fatalf("publication failure job outcome = %+v", failedJob)
+	}
+	failedJob, err = store.GetJob(failedJob.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(failedJob.PublicationSummary, wantPRURL) {
+		t.Fatalf("failed publication persisted a false PR URL: %q", failedJob.PublicationSummary)
+	}
+	if info, err := os.Stat(failedJob.Worktree); err != nil || !info.IsDir() {
+		t.Fatalf("failed publication recovery worktree was not retained at %q: %v", failedJob.Worktree, err)
+	}
+	inspectFailed := exec.Command(binary, "job", "get", failedJob.ID, "--details")
+	inspectFailed.Dir = target
+	inspectFailed.Env = env
+	failedDetails, err := inspectFailed.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-process failed job details: %v\n%s", err, failedDetails)
+	}
+	if !strings.Contains(string(failedDetails), "Publication: unpublished") || strings.Contains(string(failedDetails), wantPRURL) {
+		t.Errorf("failed publication details claim a PR handoff: %s", failedDetails)
+	}
+	if got := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); got != initialHead {
+		t.Errorf("failed publication changed invoking checkout HEAD: got %s want %s", got, initialHead)
+	}
+	if got := runTestGit(t, "-C", target, "status", "--porcelain"); got != initialStatus {
+		t.Errorf("failed publication changed invoking checkout status: got %q want %q", got, initialStatus)
+	}
+}
+
 func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 	root, err := os.MkdirTemp("", "factory detached worker test-")
 	if err != nil {
