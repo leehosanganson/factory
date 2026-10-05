@@ -2,6 +2,7 @@
 
 This section describes implemented behavior, distinct from the remaining target MVP requirements in the [roadmap](../roadmap/roadmap.md). Factory currently provides a CLI and a local REST job server with volatile memory or optional SQLite persistence and configured provider PR operations. Factory does not provide a fleet coordinator, generic arbitrary-command `run`, or job chaining.
 
+- [Primary Factory-to-Pi workflow](primary-workflow.md) — setup, implementation, detached-job handoff, and recovery.
 - [Implementation workflow](implementation.md) — requirements, implementation, review, and documentation, with optional approval gates and eligible parallel implementation.
 - [Tidy workflow](tidy.md) — repository review/fix/document/verify, with foreground publishing safeguards and a nonpublishing detached mode.
 - [Detached jobs](jobs.md) — durable lifecycle for detached implementation, tidy, and monitor jobs.

@@ -7,6 +7,7 @@ The REST server supports volatile memory mode and optional SQLite persistence, w
 ## Documentation
 
 - [Implemented features](docs/features/README.md) — current CLI and REST server capabilities.
+- [Primary Factory-to-Pi workflow](docs/features/primary-workflow.md) — setup, implementation, detached-job handoff, and recovery.
 - [REST server operations](docs/features/rest-server-operations.md) — health/readiness, backup/restore, restart recovery, limits, and trusted-network operations.
 - [REST job contract](docs/roadmap/rest-api-contract.md) — target request-to-PR lifecycle, persistence modes, and delivery gates.
 - [Agent guidance](AGENTS.md) — repository workflow and verification conventions.
@@ -19,14 +20,7 @@ The REST server supports volatile memory mode and optional SQLite persistence, w
 
 ## First task
 
-Install the configured agent (the default is `pi`), then copy `config.json.example` to `~/.config/factory/config.json` and adjust it if needed. Run the read-only setup check before starting a task:
-
-```sh
-factory doctor
-factory implement "Describe the change and how it should be verified"
-```
-
-`factory doctor` validates the config and checks whether the configured agent executable and `git` are on `PATH`; it checks `gh` only when `auto_publish` is enabled. It reports the number of configured `pipeline_checks` but never displays or runs their commands. With publication enabled, no configured checks is an advisory that verification confidence is incomplete, not a blocker. Configure project-appropriate checks (for example, `make test`) in `pipeline_checks`; doctor does not recommend publication-risk remediation when `auto_publish` is disabled. It does not invoke configured tools, contact GitHub, create state, or access the target checkout. See [implementation workflow](docs/features/implementation.md) for publication behavior and configuration details.
+See the [primary Factory-to-Pi workflow](docs/features/primary-workflow.md) for setup diagnostics, project-appropriate checks, implementation, job handoff, and recovery guidance.
 
 ## Build and verify
 
