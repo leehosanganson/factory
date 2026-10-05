@@ -4,13 +4,13 @@ Use this guide for a bounded engineering task in a repository you trust. It conn
 
 ## Check setup and verification
 
-Install the configured agent (Pi by default), copy [`config.json.example`](../../config.json.example) to `~/.config/factory/config.json`, and set the agent command/arguments and checks appropriate to the project. For a repository with a `make test` target, set the top-level `pipeline_checks` property to `[ ["make", "test"] ]`. Choose commands the repository actually supports; do not assume every project has `make test`. Then run:
+Install the configured agent (Pi by default), copy [`config.json.example`](../../config.json.example) to `~/.config/factory/config.json`, and set the agent command/arguments and checks appropriate to the project. The copied example already includes `pipeline_checks: [["make", "test"]]`; replace it with checks this repository supports, or remove it when there is no suitable check. For a repository with a `make test` target, set the top-level `pipeline_checks` property to `[ ["make", "test"] ]`. Choose commands the repository actually supports; do not assume every project has `make test`. Then run:
 
 ```sh
 factory doctor
 ```
 
-Doctor validates Factory's configuration and checks the configured agent executable and `git`; it checks `gh` when `auto_publish` is enabled. It reports how many `pipeline_checks` are configured, but does not display or run them. With publication enabled, zero checks is an advisory about verification confidence, not a blocker. Doctor does not access the target checkout, run tools, contact GitHub, or create state. Correct any invalid configuration or missing prerequisite before starting work.
+Doctor validates Factory's configuration and checks whether the configured agent executable and `git` are available on `PATH`; it checks `gh` when `auto_publish` is enabled. It reports only how many `pipeline_checks` are configured; it does not display those commands, check whether they are supported, or run them. With publication enabled, zero checks is an advisory about verification confidence, not a blocker. Doctor does not access the target checkout, run tools, contact GitHub, or create state. Correct any invalid configuration or missing prerequisite before starting work.
 
 ## Run an implementation
 
