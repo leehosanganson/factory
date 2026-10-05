@@ -37,6 +37,41 @@ func GitPushBranchWithToken(ctx context.Context, token, repository, worktree, br
 	return nil
 }
 
+func GitDeleteBranchWithToken(ctx context.Context, token, repository, worktree, branch, expectedSHA string) error {
+	if ctx == nil || ctx.Err() != nil || !ValidRepository(repository) || !filepath.IsAbs(worktree) || !IsJobBranch(branch) || !isGitObjectID(expectedSHA) {
+		return errors.New("invalid GitHub branch deletion request")
+	}
+	remote, err := gitOutput(ctx, worktree, "remote", "get-url", "--push", "--all", "origin")
+	if err != nil || strings.Count(remote, "\n") != 1 || !strings.HasSuffix(remote, "\n") {
+		return errors.New("GitHub branch deletion remote is ambiguous")
+	}
+	remote = strings.TrimSuffix(remote, "\n")
+	if !MatchesGitHubRepository(remote, repository) {
+		return errors.New("GitHub branch deletion remote does not match the configured repository")
+	}
+	args := []string{"push", "--porcelain", "--no-follow-tags", "--force-with-lease=refs/heads/" + branch + ":" + expectedSHA, remote, ":refs/heads/" + branch}
+	if token != "" {
+		helper := "!f() { printf 'username=x-access-token\\npassword=%s\\n' \"$FACTORY_GITHUB_TOKEN\"; }; f"
+		args = append([]string{"-c", "core.hooksPath=/dev/null", "-c", "credential.helper=", "-c", "credential.helper=" + helper}, args...)
+	}
+	if _, err := gitOutputWithToken(ctx, worktree, token, args...); err != nil {
+		return errors.New("GitHub branch deletion failed")
+	}
+	return nil
+}
+
+func isGitObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9' || character >= 'a' && character <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 func gitOutput(ctx context.Context, worktree string, args ...string) (string, error) {
 	return gitOutputWithToken(ctx, worktree, "", args...)
 }
