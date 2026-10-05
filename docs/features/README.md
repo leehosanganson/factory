@@ -10,6 +10,7 @@ This section describes implemented behavior, distinct from the remaining target 
 - [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, opt-in foreground GitHub issue polling, and version-pinned human-direction records; requests remain queued because no autonomous worker is implemented.
 - [REST job server](rest-server.md) — current authenticated job execution, persistence modes, provider PR writes, readiness, and graceful runtime lifecycle.
 - [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, backup/restore, restart recovery classification, limits, and trusted-network operations.
+- [Manual GitHub App live-provider test](github-app-live-test.md) — guarded opt-in live verification in a dedicated sandbox; not run by default CI.
 
 ## Shared behavior
 

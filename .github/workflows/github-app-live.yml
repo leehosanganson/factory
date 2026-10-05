@@ -1,0 +1,74 @@
+name: GitHub App live provider verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_sandbox:
+        description: "Confirm this run may create a disposable PR only in the protected sandbox repository"
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-app-live-sandbox
+  cancel-in-progress: false
+
+jobs:
+  live-test:
+    if: inputs.confirm_sandbox && github.ref == 'refs/heads/main'
+    name: Publish, reconcile, and clean up in disposable sandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    environment:
+      name: github-app-live-sandbox
+      url: https://github.com/${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+          cache: true
+
+      - name: Mint and mask installation token
+        env:
+          FACTORY_LIVE_GITHUB_OPT_IN: ${{ inputs.confirm_sandbox }}
+          FACTORY_LIVE_GITHUB_REPOSITORY: ${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY }}
+          FACTORY_LIVE_GITHUB_ALLOWED_REPOSITORY: ${{ vars.FACTORY_LIVE_GITHUB_ALLOWED_REPOSITORY }}
+          FACTORY_LIVE_GITHUB_OWNER: ${{ vars.FACTORY_LIVE_GITHUB_OWNER }}
+          FACTORY_LIVE_GITHUB_APPROVED_ORGANIZATION: ${{ vars.FACTORY_LIVE_GITHUB_APPROVED_ORGANIZATION }}
+          FACTORY_LIVE_GITHUB_REPOSITORY_NAME: ${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY_NAME }}
+          FACTORY_LIVE_GITHUB_APP_ID: ${{ secrets.FACTORY_LIVE_GITHUB_APP_ID }}
+          FACTORY_LIVE_GITHUB_PRIVATE_KEY: ${{ secrets.FACTORY_LIVE_GITHUB_PRIVATE_KEY }}
+          FACTORY_LIVE_GITHUB_INSTALLATION_ID: ${{ secrets.FACTORY_LIVE_GITHUB_INSTALLATION_ID }}
+        run: go run ./cmd/factory-live-github mint-token
+
+      - name: Exercise production publisher and read-only reconciliation
+        id: live
+        env:
+          FACTORY_LIVE_GITHUB_OPT_IN: ${{ inputs.confirm_sandbox }}
+          FACTORY_LIVE_GITHUB_REPOSITORY: ${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY }}
+          FACTORY_LIVE_GITHUB_ALLOWED_REPOSITORY: ${{ vars.FACTORY_LIVE_GITHUB_ALLOWED_REPOSITORY }}
+          FACTORY_LIVE_GITHUB_OWNER: ${{ vars.FACTORY_LIVE_GITHUB_OWNER }}
+          FACTORY_LIVE_GITHUB_APPROVED_ORGANIZATION: ${{ vars.FACTORY_LIVE_GITHUB_APPROVED_ORGANIZATION }}
+          FACTORY_LIVE_GITHUB_REPOSITORY_NAME: ${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY_NAME }}
+        run: go test ./internal/livegithub -run '^TestLiveGitHubPublishReconcile$' -count=1 -v
+
+      - name: Close exact owned PR and delete exact owned branch
+        if: always()
+        env:
+          FACTORY_LIVE_GITHUB_OPT_IN: ${{ inputs.confirm_sandbox }}
+          FACTORY_LIVE_GITHUB_REPOSITORY: ${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY }}
+          FACTORY_LIVE_GITHUB_ALLOWED_REPOSITORY: ${{ vars.FACTORY_LIVE_GITHUB_ALLOWED_REPOSITORY }}
+          FACTORY_LIVE_GITHUB_OWNER: ${{ vars.FACTORY_LIVE_GITHUB_OWNER }}
+          FACTORY_LIVE_GITHUB_APPROVED_ORGANIZATION: ${{ vars.FACTORY_LIVE_GITHUB_APPROVED_ORGANIZATION }}
+          FACTORY_LIVE_GITHUB_REPOSITORY_NAME: ${{ vars.FACTORY_LIVE_GITHUB_REPOSITORY_NAME }}
+          FACTORY_LIVE_GITHUB_CLEANUP: "true"
+        run: go test ./internal/livegithub -run '^TestCleanupFromWorkflowEnvironment$' -count=1 -v

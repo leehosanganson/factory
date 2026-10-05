@@ -349,3 +349,42 @@ func TestGitHubPublisherReconcilesAfterAmbiguousCreate(t *testing.T) {
 		t.Fatalf("out=%+v err=%v GET=%d POST=%d", out, err, gets, posts)
 	}
 }
+
+type providerRoundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f providerRoundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestGitHubPublisherReconcilesAfterForwardedCreateResponseIsLostWithoutRetry(t *testing.T) {
+	gets, posts := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			gets++
+			if gets == 1 {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
+			_, _ = w.Write([]byte(`[{"number":29,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/29","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}]`))
+			return
+		}
+		posts++
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"number":29,"state":"open"}`))
+	}))
+	defer server.Close()
+	transport := providerRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		response, err := http.DefaultTransport.RoundTrip(request)
+		if err == nil && request.Method == http.MethodPost {
+			response.Body.Close()
+			return nil, errors.New("response deliberately lost after remote create")
+		}
+		return response, err
+	})
+	client := &http.Client{Transport: transport}
+	publisher := newGitHubPublisher("secret", client, server.URL, func(context.Context, string, string, string) error { return nil })
+	out, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "task", BaseBranch: "main"})
+	if err != nil || out.Number != 29 || posts != 1 || gets != 2 {
+		t.Fatalf("out=%+v err=%v GET=%d POST=%d; expected one forwarded create and exact read-only reconciliation", out, err, gets, posts)
+	}
+}
