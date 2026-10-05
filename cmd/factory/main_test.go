@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1788,6 +1789,377 @@ func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 	if status := strings.TrimSpace(runTestGit(t, "-C", target, "status", "--porcelain")); status != "" {
 		t.Errorf("stopped job changed target checkout: %s", status)
 	}
+}
+
+func TestDetachedImplementCrashIsInspectableAndNotReplayed(t *testing.T) {
+	root, err := os.MkdirTemp("", "factory detached crash test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserveRoot := true
+	t.Cleanup(func() {
+		if preserveRoot {
+			t.Errorf("preserving detached crash test evidence: %s", root)
+			return
+		}
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove detached crash test directory: %v", err)
+		}
+	})
+
+	state := filepath.Join(root, "state")
+	configHome := filepath.Join(root, "config")
+	configDir := filepath.Join(configHome, "factory")
+	fakeBin := filepath.Join(root, "bin")
+	for _, dir := range []string{state, configDir, fakeBin} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gate := filepath.Join(state, "release-agent")
+	abort := filepath.Join(state, "abort-agent")
+	started := filepath.Join(state, "agent-started")
+	agentExited := filepath.Join(state, "agent-exited")
+	agentPID := filepath.Join(state, "agent-pid")
+	invocations := filepath.Join(state, "implement-invocations")
+	ghInvoked := filepath.Join(state, "gh-invoked")
+	agent := filepath.Join(root, "agent")
+	script := "#!/bin/sh\ncase \"$1\" in\n  slug) printf 'crash-recovery\\n'; exit 0 ;;\n  implement) printf 'called\\n' >> \"$FACTORY_TEST_INVOCATIONS\"; printf '%s\\n' \"$$\" > \"$FACTORY_TEST_AGENT_PID\"; printf 'crash artifact\\n' > generated.txt; : > \"$FACTORY_TEST_STARTED\"; while [ ! -f \"$FACTORY_TEST_GATE\" ]; do if [ -f \"$FACTORY_TEST_ABORT\" ]; then exit 23; fi; sleep 0.02; done; printf 'PASS\\n'; : > \"$FACTORY_TEST_AGENT_EXITED\" ;;\n  *) printf 'PASS\\n' ;;\nesac\n"
+	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf(`{"command":%q,"args":["{stage}","{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"2m","auto_publish":true}`, agent, state)
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\nprintf invoked > \"$FACTORY_TEST_GH_INVOKED\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main", target}, {"-C", target, "config", "user.name", "Factory Test"}, {"-C", target, "config", "user.email", "factory-test@example.invalid"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", target, "add", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	initialStatus := runTestGit(t, "-C", target, "status", "--porcelain")
+	target, err = filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binary := filepath.Join(root, "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+	env := append(os.Environ(),
+		"XDG_CONFIG_HOME="+configHome,
+		"XDG_STATE_HOME="+state,
+		"FACTORY_TEST_GATE="+gate,
+		"FACTORY_TEST_ABORT="+abort,
+		"FACTORY_TEST_STARTED="+started,
+		"FACTORY_TEST_AGENT_EXITED="+agentExited,
+		"FACTORY_TEST_AGENT_PID="+agentPID,
+		"FACTORY_TEST_INVOCATIONS="+invocations,
+		"FACTORY_TEST_GH_INVOKED="+ghInvoked,
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := exec.Command(binary, "implement", "--detach", "test", "crash", "recovery")
+	start.Dir, start.Env = target, env
+	output, err := start.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Started implementation job") {
+		t.Fatalf("start detached implementation: %v\n%s", err, output)
+	}
+	var job factory.JobRecord
+	var worker factory.WorkerRecord
+	shutdownVerified := false
+	defer func() {
+		if shutdownVerified {
+			return
+		}
+		_ = os.WriteFile(abort, nil, 0o600)
+		_ = os.WriteFile(gate, nil, 0o600)
+		deadline := time.Now().Add(15 * time.Second)
+		for time.Now().Before(deadline) {
+			if job.ID == "" {
+				jobs, listErr := store.ListJobs()
+				if listErr == nil {
+					for _, candidate := range jobs {
+						if candidate.TaskDescription == "test crash recovery" {
+							job = candidate
+							break
+						}
+					}
+				}
+			}
+			if job.ID != "" {
+				current, getErr := store.GetJob(job.ID)
+				if getErr == nil && current.Status != "queued" && current.Status != "running" {
+					_, workerErr := store.ReadWorker(job.ID)
+					unlock, acquired, lockErr := store.TryLockTarget(target)
+					if acquired {
+						unlock()
+					}
+					processExited := worker.PID == 0 || waitForTestProcessExit(worker.PID, 100*time.Millisecond) == nil
+					if errors.Is(workerErr, os.ErrNotExist) && lockErr == nil && acquired && processExited {
+						shutdownVerified = true
+						preserveRoot = false
+						return
+					}
+				}
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Errorf("worker shutdown could not be verified; preserving test evidence: %s", root)
+	}()
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err := store.ListJobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range jobs {
+			if candidate.TaskDescription == "test crash recovery" {
+				job = candidate
+			}
+		}
+		if job.ID != "" && job.Status == "running" {
+			if _, err := os.Stat(started); err == nil {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if job.ID == "" || job.Status != "running" || job.Worktree == "" || job.WorkBranch == "" {
+		t.Fatalf("detached job did not start with its recovery worktree: %+v", job)
+	}
+	worker, err = store.ReadWorker(job.ID)
+	if err != nil || worker.ID != job.ID || worker.PID <= 0 || time.Since(worker.HeartbeatAt) > time.Minute {
+		t.Fatalf("live worker record = %+v, err=%v", worker, err)
+	}
+	if err := waitForTestProcessLive(worker.PID, 5*time.Second); err != nil {
+		t.Fatalf("worker record PID %d is not live: %v", worker.PID, err)
+	}
+	workerProcess, err := os.FindProcess(worker.PID)
+	if err != nil {
+		t.Fatalf("find worker process %d: %v", worker.PID, err)
+	}
+	if err := workerProcess.Kill(); err != nil {
+		t.Fatalf("kill only worker PID %d: %v", worker.PID, err)
+	}
+	if err := waitForTestProcessExit(worker.PID, 10*time.Second); err != nil {
+		t.Fatalf("observe killed worker termination: %v", err)
+	}
+	// Let the already-started fake agent exit normally; do not kill the test CLI
+	// harness or any process group as part of simulating the worker crash.
+	worker, err = store.ReadWorker(job.ID)
+	if err != nil || worker.PID <= 0 || time.Since(worker.HeartbeatAt) > time.Minute {
+		t.Fatalf("worker record after process exit = %+v, err=%v", worker, err)
+	}
+	if err := os.WriteFile(gate, nil, 0o600); err != nil {
+		t.Fatalf("release fake agent after worker termination: %v", err)
+	}
+	if err := waitForTestFile(t, agentExited, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	pidData, err := os.ReadFile(agentPID)
+	if err != nil {
+		t.Fatalf("read fake agent PID: %v", err)
+	}
+	fakeAgentPID, err := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if err != nil {
+		t.Fatalf("parse fake agent PID %q: %v", pidData, err)
+	}
+	if err := waitForTestProcessExit(fakeAgentPID, 5*time.Second); err != nil {
+		t.Fatalf("fake agent process was not reaped: %v", err)
+	}
+	if got, err := os.ReadFile(invocations); err != nil || strings.Count(string(got), "called\n") != 1 {
+		t.Fatalf("implementation invocation marker after crash = %q, err=%v; want exactly one invocation", got, err)
+	}
+
+	lockDeadline := time.Now().Add(10 * time.Second)
+	for {
+		unlock, acquired, err := store.TryLockTarget(target)
+		if err != nil {
+			t.Fatalf("poll target lock release: %v", err)
+		}
+		if acquired {
+			unlock()
+			break
+		}
+		if time.Now().After(lockDeadline) {
+			t.Fatal("worker termination did not release target lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	job, err = store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != "running" {
+		t.Fatalf("crashed job before orphan grace period = %q, want running", job.Status)
+	}
+	workflow, err := store.GetSession(job.ID, "workflow")
+	if err != nil || workflow.Status != "running" {
+		t.Fatalf("workflow session before orphan grace period = %+v, err=%v", workflow, err)
+	}
+	preGraceInspect := exec.Command(binary, "job", "get", job.ID, "--details")
+	preGraceInspect.Dir, preGraceInspect.Env = target, env
+	preGraceDetails, err := preGraceInspect.CombinedOutput()
+	if err != nil || !strings.Contains(string(preGraceDetails), "Status: running") {
+		t.Fatalf("pre-grace job get details = %v\n%s; want running", err, preGraceDetails)
+	}
+	job, err = store.GetJob(job.ID)
+	if err != nil || job.Status != "running" {
+		t.Fatalf("job get reconciled before stale activity grace period: job=%+v err=%v", job, err)
+	}
+	lastActivity := job.UpdatedAt
+	if worker.HeartbeatAt.After(lastActivity) {
+		lastActivity = worker.HeartbeatAt
+	}
+	graceDeadline := lastActivity.Add(30*time.Second + 100*time.Millisecond)
+	if delay := time.Until(graceDeadline); delay > 0 {
+		time.Sleep(delay)
+	}
+
+	inspect := exec.Command(binary, "job", "get", job.ID, "--details")
+	inspect.Dir, inspect.Env = target, env
+	details, err := inspect.CombinedOutput()
+	if err != nil {
+		t.Fatalf("post-crash job get --details: %v\n%s", err, details)
+	}
+	job, err = store.GetJob(job.ID)
+	if err != nil || job.Status != "interrupted" {
+		t.Fatalf("reconciled crash job = %+v, err=%v; want interrupted", job, err)
+	}
+	workflow, err = store.GetSession(job.ID, "workflow")
+	if err != nil || workflow.Status != "interrupted" {
+		t.Fatalf("reconciled workflow session = %+v, err=%v; want interrupted", workflow, err)
+	}
+	if !strings.Contains(string(details), "Status: interrupted") || !strings.Contains(string(details), "Session: workflow (interrupted)") {
+		t.Fatalf("job details did not consistently report interrupted lifecycle: %s", details)
+	}
+	if _, err := store.ReadWorker(job.ID); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("worker record after recovery = %v, want removed", err)
+	}
+	if got, err := os.ReadFile(invocations); err != nil || strings.Count(string(got), "called\n") != 1 {
+		t.Errorf("implementation was replayed after recovery: invocation marker=%q err=%v", got, err)
+	}
+	if info, err := os.Stat(job.Worktree); err != nil || !info.IsDir() {
+		t.Errorf("crash recovery worktree not retained at %q: %v", job.Worktree, err)
+	}
+	if _, err := exec.Command("git", "-C", target, "show-ref", "--verify", "refs/heads/"+job.WorkBranch).CombinedOutput(); err != nil {
+		t.Errorf("crash recovery branch %q not retained: %v", job.WorkBranch, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(job.Worktree, "generated.txt")); err != nil || string(got) != "crash artifact\n" {
+		t.Errorf("crash artifact not retained: %q err=%v", got, err)
+	}
+	workflowLog, err := store.SessionLogPath(job.ID, "workflow")
+	if err != nil {
+		t.Fatalf("locate workflow log: %v", err)
+	}
+	if info, err := os.Stat(workflowLog); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Errorf("crash workflow log not retained at %q: %v", workflowLog, err)
+	}
+	logs := exec.Command(binary, "job", "logs", job.ID, "--session", "workflow")
+	logs.Dir, logs.Env = target, env
+	logOutput, err := logs.CombinedOutput()
+	if err != nil || strings.TrimSpace(string(logOutput)) == "" {
+		t.Errorf("crash workflow logs not inspectable: err=%v output=%s", err, logOutput)
+	}
+	if _, err := os.Stat(ghInvoked); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("crashed job invoked fake gh: %v", err)
+	}
+	if got := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); got != initialHead {
+		t.Errorf("crashed job changed target HEAD: got %s, want %s", got, initialHead)
+	}
+	if got := runTestGit(t, "-C", target, "status", "--porcelain"); got != initialStatus {
+		t.Errorf("crashed job changed target worktree: got %q, want %q", got, initialStatus)
+	}
+	if err := waitForTestProcessExit(worker.PID, 10*time.Second); err != nil {
+		t.Fatalf("worker did not remain terminated: %v", err)
+	}
+	shutdownVerified = true
+	preserveRoot = false
+}
+
+func waitForTestFile(t *testing.T, path string, timeout time.Duration) error {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("file %s did not appear within %s", path, timeout)
+}
+
+func waitForTestProcessLive(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		output, err := exec.Command("ps", "-o", "stat=", "-p", fmt.Sprint(pid)).CombinedOutput()
+		if err == nil {
+			state := strings.TrimSpace(string(output))
+			if state != "" && !strings.HasPrefix(state, "Z") {
+				return nil
+			}
+		} else if len(bytes.TrimSpace(output)) != 0 {
+			return fmt.Errorf("inspect PID %d: %w: %s", pid, err, output)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("PID %d was not observed live within %s", pid, timeout)
+}
+
+func waitForTestProcessExit(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		output, err := exec.Command("ps", "-o", "stat=", "-p", fmt.Sprint(pid)).CombinedOutput()
+		if err != nil {
+			if len(bytes.TrimSpace(output)) == 0 {
+				return nil
+			}
+			return fmt.Errorf("inspect PID %d: %w: %s", pid, err, output)
+		}
+		state := strings.TrimSpace(string(output))
+		if state == "" || strings.HasPrefix(state, "Z") {
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("PID %d remained live after %s", pid, timeout)
 }
 
 func TestDetachedImplementFailureIsInspectableAndRetainsRecoveryWorktree(t *testing.T) {
