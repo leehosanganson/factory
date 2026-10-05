@@ -66,4 +66,15 @@ git -C <worktree-path> diff
 
 Details and the publication summary identify retained recovery artifacts and the reason publication did not complete. No automatic retry occurs. Keep needed changes and coordinate any manual recovery; do not assume a repeated push/PR operation is safe. A no-op makes no commit or PR. Successful publication normally removes its temporary worktree; failed work and unpublished output are retained for inspection. Avoid removing a worktree until its contents and any uncommitted changes have been reviewed.
 
+If a detached implementation or tidy worker crashes, Factory waits until its last recorded activity is at least 30 seconds old before classifying the job as `interrupted`. This delay allows an active worker to refresh its activity; `interrupted` is not a retry/resume signal, and Factory will not replay the job. Inspect before deciding what to preserve:
+
+```sh
+factory job get <job-id> --details
+factory job logs <job-id> --session workflow
+git -C <worktree-path> status --short
+git -C <worktree-path> diff
+```
+
+Use the details to confirm whether a worktree and branch were retained; do not assume these artifacts exist for every job. Review and preserve useful changes. Do not force-remove the worktree or delete its branch as part of interruption recovery.
+
 Factory runs agents and repository-controlled content with the local process account's authority. A process, worktree, Nix shell, or container is not a security sandbox; only use repositories and tools you trust. `factory work` commands submit and inspect issue-work requests or record human direction; they do not start engineering or create PRs.
