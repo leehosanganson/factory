@@ -1560,6 +1560,298 @@ func TestDetachedImplementCLIReturnsBeforeWorkerCompletes(t *testing.T) {
 	}
 }
 
+func TestDetachedImplementFailureIsInspectableAndRetainsRecoveryWorktree(t *testing.T) {
+	root, err := os.MkdirTemp("", "factory detached failure test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeRoot := true
+	t.Cleanup(func() {
+		if !removeRoot {
+			t.Errorf("preserving detached failure test directory because worker shutdown could not be verified: %s", root)
+			return
+		}
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove detached failure test directory: %v", err)
+		}
+	})
+
+	state := filepath.Join(root, "state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	releaseWorker := filepath.Join(state, "release-worker")
+	workerStarted := filepath.Join(state, "worker-started")
+	ghInvoked := filepath.Join(state, "gh-invoked")
+	configHome := filepath.Join(root, "config")
+	factoryConfig := filepath.Join(configHome, "factory")
+	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(root, "agent")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\ncase \"$1\" in\n  slug) printf 'failure-test\\n'; exit 0 ;;\n  requirements) printf 'PASS\\n'; exit 0 ;;\n  implement) : > \"$FACTORY_TEST_STARTED\"; while [ ! -f \"$FACTORY_TEST_RELEASE\" ]; do sleep 0.02; done; printf 'simulated implementation failure\\n' >&2; printf 'retained recovery artifact\\n' > generated.txt; exit 23 ;;\nesac\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{stage}","{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":true}`, script, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\nprintf invoked > \"$FACTORY_TEST_GH_INVOKED\"\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(root, "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main", target}, {"-C", target, "config", "user.name", "Factory Test"}, {"-C", target, "config", "user.email", "factory-test@example.invalid"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", target, "add", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	remote := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+		t.Fatalf("initialize origin: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", remote).CombinedOutput(); err != nil {
+		t.Fatalf("git remote add: %v\n%s", err, output)
+	}
+	target, err = filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := append(os.Environ(),
+		"XDG_CONFIG_HOME="+configHome,
+		"XDG_STATE_HOME="+state,
+		"FACTORY_TEST_RELEASE="+releaseWorker,
+		"FACTORY_TEST_STARTED="+workerStarted,
+		"FACTORY_TEST_GH_INVOKED="+ghInvoked,
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	command := exec.Command(binary, "implement", "--detach", "test", "detached", "failure")
+	command.Dir = target
+	command.Env = env
+	var commandOutput bytes.Buffer
+	command.Stdout, command.Stderr = &commandOutput, &commandOutput
+	if err := command.Start(); err != nil {
+		t.Fatalf("start detached implement: %v", err)
+	}
+	removeRoot = false
+	commandDone := make(chan error, 1)
+	go func() { commandDone <- command.Wait() }()
+	commandExited := false
+	defer func() {
+		_ = os.WriteFile(releaseWorker, nil, 0o600)
+		if !commandExited {
+			select {
+			case <-commandDone:
+				commandExited = true
+			case <-time.After(5 * time.Second):
+				if err := command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					t.Errorf("kill detached CLI during cleanup: %v", err)
+				}
+				select {
+				case <-commandDone:
+					commandExited = true
+				case <-time.After(5 * time.Second):
+					t.Errorf("detached CLI remains unreaped; preserving temporary directory %s", root)
+					return
+				}
+			}
+		}
+		job, found, err := findFailedImplementTestJob(t, store, target)
+		if err != nil || !found {
+			t.Errorf("could not locate detached job to verify worker shutdown; preserving temporary directory %s: job=%+v found=%t err=%v", root, job, found, err)
+			return
+		}
+		if job.Status == "queued" || job.Status == "running" {
+			if err := store.RequestStop(job.ID); err != nil {
+				t.Errorf("request detached worker cancellation; preserving temporary directory %s: %v", root, err)
+				return
+			}
+		}
+		if err := waitFailedImplementTestShutdown(store, target, job.ID, 10*time.Second); err != nil {
+			t.Errorf("worker shutdown could not be verified; preserving temporary directory %s: %v", root, err)
+			return
+		}
+		removeRoot = true
+	}()
+	select {
+	case err := <-commandDone:
+		commandExited = true
+		if err != nil {
+			t.Fatalf("detached implement: %v\n%s", err, commandOutput.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("detached CLI did not return within 10s: %s", commandOutput.String())
+	}
+	if !strings.Contains(commandOutput.String(), "Started implementation job") {
+		t.Fatalf("detached command did not report job start: %q", commandOutput.String())
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(workerStarted); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("check fake worker start marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake worker did not reach its gate after detached CLI exited")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	job, found, err := findFailedImplementTestJob(t, store, target)
+	if err != nil || !found {
+		t.Fatalf("find detached failure job: job=%+v found=%t err=%v", job, found, err)
+	}
+	if job.Status != "running" {
+		t.Fatalf("job status at fake worker gate = %q, want running", job.Status)
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release fake worker: %v", err)
+	}
+	if err := waitFailedImplementTestShutdown(store, target, job.ID, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	job, err = store.GetJob(job.ID)
+	if err != nil || job.Status != "failed" {
+		t.Fatalf("terminal job = %+v, err=%v; want failed", job, err)
+	}
+
+	inspect := exec.Command(binary, "job", "get", job.ID, "--details")
+	inspect.Dir, inspect.Env = target, env
+	details, err := inspect.CombinedOutput()
+	if err != nil {
+		t.Fatalf("factory job get --details: %v\n%s", err, details)
+	}
+	for _, want := range []string{"Status: failed", "Worktree: " + job.Worktree, "Work branch: " + job.WorkBranch, "Job log path:"} {
+		if !strings.Contains(string(details), want) {
+			t.Errorf("separate-process job details omitted %q: %s", want, details)
+		}
+	}
+	if job.Worktree == "" || job.WorkBranch == "" {
+		t.Fatalf("failed job did not retain worktree/branch metadata: %+v", job)
+	}
+	if info, err := os.Stat(job.Worktree); err != nil || !info.IsDir() {
+		t.Errorf("failed job worktree was not retained at %q: %v", job.Worktree, err)
+	}
+	if _, err := exec.Command("git", "-C", target, "show-ref", "--verify", "refs/heads/"+job.WorkBranch).CombinedOutput(); err != nil {
+		t.Errorf("failed job branch %q was not retained: %v", job.WorkBranch, err)
+	}
+	if got := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); got != initialHead {
+		t.Errorf("failed implementation changed target HEAD: got %s want %s", got, initialHead)
+	}
+	if status := strings.TrimSpace(runTestGit(t, "-C", target, "status", "--porcelain")); status != "" {
+		t.Errorf("failed implementation changed target files: %s", status)
+	}
+	if got, err := os.ReadFile(filepath.Join(job.Worktree, "generated.txt")); err != nil || string(got) != "retained recovery artifact\n" {
+		t.Errorf("failed implementation artifact not retained: %q err=%v", got, err)
+	}
+	if job.PublicationStatus == "published" || strings.Contains(string(details), "Publication: published") || strings.Contains(string(details), "Published implementation PR") {
+		t.Errorf("failed job claimed successful publication: job=%+v details=%s", job, details)
+	}
+	if _, err := os.Stat(ghInvoked); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("fake gh was invoked for failed workflow: stat err=%v", err)
+	}
+	if refs := strings.TrimSpace(runTestGit(t, "--git-dir", remote, "for-each-ref", "--format=%(refname:short)")); refs != "" {
+		t.Errorf("failed workflow published remote refs: %s", refs)
+	}
+	logs := exec.Command(binary, "job", "logs", job.ID, "--session", "workflow")
+	logs.Dir, logs.Env = target, env
+	logOutput, err := logs.CombinedOutput()
+	if err != nil || !strings.Contains(string(logOutput), "stage.failed") || !strings.Contains(string(logOutput), "stage=implement") {
+		t.Errorf("failed workflow logs are not inspectable: err=%v output=%s", err, logOutput)
+	}
+	if _, err := store.ReadWorker(job.ID); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("terminal failed worker record was not cleared: %v", err)
+	}
+	unlock, acquired, err := store.TryLockTarget(target)
+	if err != nil {
+		t.Fatalf("check target lock after failed worker: %v", err)
+	}
+	if !acquired {
+		t.Fatal("terminal failed worker did not release target lock")
+	}
+	unlock()
+}
+
+func findFailedImplementTestJob(t *testing.T, store *factory.JobStore, target string) (factory.JobRecord, bool, error) {
+	t.Helper()
+	jobs, err := store.ListJobs()
+	if err != nil {
+		return factory.JobRecord{}, false, err
+	}
+	var found factory.JobRecord
+	for _, job := range jobs {
+		if job.TaskDescription != "test detached failure" || !sameResolvedTestPath(t, job.TargetPath, target) {
+			continue
+		}
+		if found.ID != "" {
+			return factory.JobRecord{}, false, fmt.Errorf("multiple detached failure jobs found: %s and %s", found.ID, job.ID)
+		}
+		found = job
+	}
+	return found, found.ID != "", nil
+}
+
+func waitFailedImplementTestShutdown(store *factory.JobStore, target, id string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		job, err := store.GetJob(id)
+		if err != nil {
+			return fmt.Errorf("read job during worker shutdown: %w", err)
+		}
+		if job.Status != "queued" && job.Status != "running" {
+			if _, err := store.ReadWorker(id); errors.Is(err, os.ErrNotExist) {
+				unlock, acquired, err := store.TryLockTarget(target)
+				if err != nil {
+					return fmt.Errorf("check target lock after worker shutdown: %w", err)
+				}
+				if acquired {
+					unlock()
+					return nil
+				}
+			} else if err != nil {
+				return fmt.Errorf("read worker record after shutdown: %w", err)
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("detached worker %s did not reach terminal status and clear its worker record/target lock within %s", id, timeout)
+}
+
 func TestDetachedTidyCLIUsesDefaultDescriptionAndNeverPublishes(t *testing.T) {
 	state := t.TempDir()
 	configHome := t.TempDir()
