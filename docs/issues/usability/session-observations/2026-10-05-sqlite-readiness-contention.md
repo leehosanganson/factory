@@ -1,0 +1,6 @@
+# SQLite readiness under a write lock
+
+- **Task:** Issue #159 added a real-process SQLite contention check and corrected configured-store readiness to detect a competing `BEGIN IMMEDIATE` lock before job routes run.
+- **Verified observation:** `PingContext` alone returned healthy under the independent writer lock, so `/readyz` returned `200` even though job admission could not write. Beginning then rolling back a transaction returned `503 not_ready`; with the driver's five-second busy timeout, the observed readiness response took about 4.9 seconds. `/healthz` remained `200`. After releasing the lock, readiness returned `200` and retrying the same idempotency key was admitted once.
+- **Friction:** existing process E2Es had assertions for route-level reconciliation conflicts during SQLite locks. Once readiness correctly gated those routes first, the contractually correct response was `503 not_ready`; updating the expectations aligned the coverage with the documented order. A listener-marker file is briefly visible before its contents are written, so the process URL helper now waits for a nonempty marker.
+- **Concrete improvement idea:** preserve a process-level regression for readiness and admission under actual SQLite contention; keep the driver timeout behavior explicit in operations guidance rather than lowering it without evidence.

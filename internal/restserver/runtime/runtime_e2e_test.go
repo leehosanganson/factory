@@ -780,6 +780,128 @@ func TestRESTServerProcessRecoversQueuedAndRetainsInterruptedRunningSQLiteJobs(t
 	child = nil
 }
 
+func TestRESTServerProcessSQLiteWriteLockFailsReadinessAndAdmission(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	stateDir := testResultsBase(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+	harness := filepath.Join(t.TempDir(), "readiness-harness.sh")
+	if err := os.WriteFile(harness, []byte("#!/bin/sh\nprintf verified > result.txt\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readyPath := filepath.Join(t.TempDir(), "listener")
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_NO_PROVIDER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath)
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	childDone := make(chan error, 1)
+	go func() {
+		childDone <- child.Wait()
+		_ = logFile.Close()
+	}()
+	client := &http.Client{Timeout: 8 * time.Second}
+	defer func() {
+		if child.ProcessState == nil {
+			_ = child.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-childDone:
+			case <-time.After(5 * time.Second):
+				_ = child.Process.Kill()
+				<-childDone
+			}
+		}
+	}()
+	baseURL := waitForProcessURL(t, childDone, readyPath, logPath)
+	locked := lockSQLiteWrites(t, config.Persistence.Path)
+	lockHeld := true
+	defer func() {
+		if lockHeld {
+			locked()
+		}
+	}()
+	request := func(method, path, body string) (int, string, time.Duration, error) {
+		t.Helper()
+		started := time.Now()
+		req, err := http.NewRequest(method, baseURL+path, strings.NewReader(body))
+		if err != nil {
+			return 0, "", time.Since(started), err
+		}
+		if path == "/v1/jobs" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", "sqlite-lock-readiness")
+		}
+		resp, err := client.Do(req)
+		elapsed := time.Since(started)
+		if err != nil {
+			return 0, "", elapsed, err
+		}
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(data), elapsed, err
+	}
+	if code, body, elapsed, err := request(http.MethodGet, "/healthz", ""); err != nil || code != http.StatusOK {
+		t.Fatalf("health under SQLite write lock status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
+	}
+	if code, body, elapsed, err := request(http.MethodGet, "/readyz", ""); err != nil || code != http.StatusServiceUnavailable || !strings.Contains(body, `"status":"not_ready"`) || elapsed > 7*time.Second {
+		t.Fatalf("readiness under SQLite write lock status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
+	}
+	const submission = `{"repository":"trusted","task":"run after SQLite recovery"}`
+	if code, body, elapsed, err := request(http.MethodPost, "/v1/jobs", submission); err != nil || code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"not_ready"`) || elapsed > 7*time.Second {
+		t.Fatalf("admission under SQLite write lock status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
+	}
+	locked()
+	lockHeld = false
+	if code, body, elapsed, err := request(http.MethodGet, "/readyz", ""); err != nil || code != http.StatusOK || !strings.Contains(body, `"status":"ready"`) {
+		t.Fatalf("readiness after SQLite lock release status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
+	}
+	code, body, elapsed, err := request(http.MethodPost, "/v1/jobs", submission)
+	if err != nil || code != http.StatusAccepted {
+		t.Fatalf("admission after SQLite lock release status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
+	}
+	var admitted struct {
+		Job      restjobs.Snapshot `json:"job"`
+		Replayed bool              `json:"replayed"`
+	}
+	if err := json.Unmarshal([]byte(body), &admitted); err != nil || admitted.Job.ID == "" || admitted.Replayed {
+		t.Fatalf("same-key retry after lock release was not a fresh admission: response=%s err=%v", body, err)
+	}
+	code, body, elapsed, err = request(http.MethodPost, "/v1/jobs", submission)
+	var replayed struct {
+		Job      restjobs.Snapshot `json:"job"`
+		Replayed bool              `json:"replayed"`
+	}
+	decodeErr := json.Unmarshal([]byte(body), &replayed)
+	if err != nil || decodeErr != nil || code != http.StatusAccepted || !replayed.Replayed || replayed.Job.ID != admitted.Job.ID {
+		t.Fatalf("admission idempotency after recovery status=%d body=%s elapsed=%s err=%v decodeErr=%v", code, body, elapsed, err, decodeErr)
+	}
+}
+
 func TestRESTServerProcessRejectsUnavailableSQLiteBeforeListening(t *testing.T) {
 	if testing.Short() {
 		t.Skip("process-level REST E2E")
@@ -1730,7 +1852,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 			unlockSQLite()
 		}
 	}()
-	if code, body := operatorReconcile(apiKey); code != http.StatusConflict || strings.Contains(body, "SQLite") || strings.Contains(body, "provider-test-token") {
+	if code, body := operatorReconcile(apiKey); code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"not_ready"`) || strings.Contains(body, "SQLite") || strings.Contains(body, "provider-test-token") {
 		t.Fatalf("reconciliation during SQLite write outage status=%d body=%s", code, body)
 	}
 	lockedJob, err := providerAttemptStore.Get(admitted.ID)
@@ -1983,9 +2105,9 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 		t.Fatalf("provider-attempt job accepted status-only disposition status=%d", code)
 	}
 	lockWrites := lockSQLiteWrites(t, config.Persistence.Path)
-	if code, _ := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict {
+	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"not_ready"`) {
 		lockWrites()
-		t.Fatalf("SQLite-lock reconcile status=%d", code)
+		t.Fatalf("SQLite-lock reconcile status=%d body=%s", code, body)
 	}
 	lockWrites()
 	if job := getProcessJob(t, client, baseURL, providerJob.ID, apiKey); job.Status != restjobs.StatusRunning || job.Provider != nil || job.Verification == nil {
@@ -2034,7 +2156,7 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	lookupCalls, err := os.ReadFile(outcomesPath + ".reconcile-lookups")
-	if err != nil || string(lookupCalls) != providerJob.ID+"\n"+providerJob.ID+"\n"+providerJob.ID+"\n"+providerJob.ID+"\n" {
+	if err != nil || string(lookupCalls) != providerJob.ID+"\n"+providerJob.ID+"\n"+providerJob.ID+"\n" {
 		t.Fatalf("read-only provider lookup calls=%q err=%v", lookupCalls, err)
 	}
 	var provider uncertainProviderRecord
@@ -2130,7 +2252,7 @@ func waitForProcessURL(t *testing.T, childDone <-chan error, readyPath, logPath 
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if data, err := os.ReadFile(readyPath); err == nil {
+		if data, err := os.ReadFile(readyPath); err == nil && strings.TrimSpace(string(data)) != "" {
 			return "http://" + strings.TrimSpace(string(data))
 		}
 		select {
