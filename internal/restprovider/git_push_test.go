@@ -144,11 +144,13 @@ func setupDeleteBranchRemote(t *testing.T, race bool) (repository, worktree, bar
 	runGit(t, root, "init", "--bare", "-q", bare)
 	seed := filepath.Join(root, "seed")
 	runGit(t, root, "init", "-q", seed)
+	runGit(t, seed, "config", "user.name", "Factory")
+	runGit(t, seed, "config", "user.email", "factory@localhost")
 	if err := os.WriteFile(filepath.Join(seed, "file"), []byte("expected"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	runGit(t, seed, "add", "file")
-	runGit(t, seed, "-c", "user.name=Factory", "-c", "user.email=factory@localhost", "commit", "-qm", "expected")
+	runGit(t, seed, "commit", "-qm", "expected")
 	expectedSHA = strings.TrimSpace(string(gitOutputForTest(t, seed, "rev-parse", "HEAD")))
 	if err := os.WriteFile(filepath.Join(seed, "file"), []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
