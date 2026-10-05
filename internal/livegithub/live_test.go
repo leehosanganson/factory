@@ -37,6 +37,7 @@ func TestLiveGitHubPublishReconcile(t *testing.T) {
 	defer cancel()
 	cleanupClient := safeHTTPClient(20 * time.Second)
 	commit := ""
+	worktree := ""
 	cleanupToken := cfg.Token
 	t.Cleanup(func() {
 		if commit == "" {
@@ -48,14 +49,14 @@ func TestLiveGitHubPublishReconcile(t *testing.T) {
 			t.Errorf("bounded cleanup has no pre-minted sandbox-scoped token")
 			return
 		}
-		if err := cleanupOwnedPullRequest(cleanupCtx, cleanupClient, cleanupToken, cfg.Repository, cfg.ApprovedOrganization, jobID, commit, "https://api.github.com"); err != nil {
+		if err := cleanupOwnedPullRequest(cleanupCtx, cleanupClient, cleanupToken, cfg.Repository, cfg.ApprovedOrganization, worktree, jobID, commit, "https://api.github.com"); err != nil {
 			t.Errorf("bounded cleanup of only this run's PR/branch failed: %v", err)
 		}
 	})
 	if err := verifyApprovedOrganization(ctx, safeHTTPClient(20*time.Second), cfg.Token, cfg.Repository, cfg.ApprovedOrganization, "https://api.github.com"); err != nil {
 		t.Fatalf("sandbox repository organization identity could not be confirmed: %v", err)
 	}
-	worktree := prepareWorktree(t, cfg.Repository, cfg.Token)
+	worktree = prepareWorktree(t, cfg.Repository, cfg.Token)
 	request := restprovider.PublishRequest{
 		JobID: jobID, Repository: cfg.Repository, Worktree: worktree,
 		Commit:     gitTest(t, ctx, worktree, "rev-parse", "HEAD"),
@@ -122,10 +123,13 @@ func TestCleanupOwnedPullRequestOnlyMutatesExactRunIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commit := strings.Repeat("a", 40)
-	var closed, deleted bool
+	worktree, bare := testCleanupWorktree(t, "sandbox-owner/test-factory-live-sandbox", jobID)
+	commit := gitTest(t, context.Background(), worktree, "rev-parse", "HEAD")
+	var closed bool
 	server := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/sandbox-owner/test-factory-live-sandbox":
+			_, _ = io.WriteString(w, `{"full_name":"sandbox-owner/test-factory-live-sandbox","owner":{"login":"`+approvedOrganization+`","type":"Organization"}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/sandbox-owner/test-factory-live-sandbox/pulls":
 			_, _ = io.WriteString(w, `[{"number":1,"state":"open","body":"<!-- factory-job:`+jobID+` -->","html_url":"https://github.com/sandbox-owner/test-factory-live-sandbox/pull/1","head":{"ref":"factory/job/`+jobID+`","sha":"`+commit+`"},"base":{"ref":"main","repo":{"full_name":"sandbox-owner/test-factory-live-sandbox"}}}]`)
 		case r.Method == http.MethodPatch && r.URL.Path == "/repos/sandbox-owner/test-factory-live-sandbox/pulls/1":
@@ -133,9 +137,8 @@ func TestCleanupOwnedPullRequestOnlyMutatesExactRunIdentity(t *testing.T) {
 			_, _ = io.WriteString(w, `{"number":1,"state":"closed","body":"<!-- factory-job:`+jobID+` -->","html_url":"https://github.com/sandbox-owner/test-factory-live-sandbox/pull/1","head":{"ref":"factory/job/`+jobID+`","sha":"`+commit+`"},"base":{"ref":"main","repo":{"full_name":"sandbox-owner/test-factory-live-sandbox"}}}`)
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/sandbox-owner/test-factory-live-sandbox/git/ref/heads/factory/job/"+jobID:
 			_, _ = io.WriteString(w, `{"object":{"sha":"`+commit+`"}}`)
-		case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/git/refs/heads/factory/job/"+jobID):
-			deleted = true
-			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			t.Errorf("cleanup used unconditional REST branch deletion: %s %s", r.Method, r.URL.Path)
 		default:
 			t.Errorf("unexpected cleanup request: %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", http.StatusBadRequest)
@@ -143,12 +146,49 @@ func TestCleanupOwnedPullRequestOnlyMutatesExactRunIdentity(t *testing.T) {
 	})
 	defer server.Close()
 	client := &http.Client{Timeout: time.Second}
-	if err := cleanupOwnedPullRequest(context.Background(), client, "token", "sandbox-owner/test-factory-live-sandbox", approvedOrganization, jobID, commit, server.URL); err != nil {
+	if err := cleanupOwnedPullRequest(context.Background(), client, "token", "sandbox-owner/test-factory-live-sandbox", approvedOrganization, worktree, jobID, commit, server.URL); err != nil {
 		t.Fatal(err)
 	}
-	if !closed || !deleted {
-		t.Fatalf("cleanup did not close and delete exact owned resources: closed=%v deleted=%v", closed, deleted)
+	if !closed {
+		t.Fatalf("cleanup did not close exact owned pull request: closed=%v", closed)
 	}
+	command := exec.Command("git", "--git-dir", bare, "show-ref", "--verify", "refs/heads/"+restprovider.JobBranch(jobID))
+	if output, err := command.CombinedOutput(); err == nil {
+		t.Fatalf("CAS cleanup left branch in bare remote: %s", output)
+	}
+}
+
+func testCleanupWorktree(t *testing.T, repository, jobID string) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	bare := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	if output, err := exec.Command("git", "init", "--bare", "-q", bare).CombinedOutput(); err != nil {
+		t.Fatalf("initialize test bare remote: %v: %s", err, output)
+	}
+	if output, err := exec.Command("git", "init", "-q", seed).CombinedOutput(); err != nil {
+		t.Fatalf("initialize test seed: %v: %s", err, output)
+	}
+	if err := os.WriteFile(filepath.Join(seed, "file"), []byte("owned commit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, context.Background(), seed, "add", "file")
+	command := exec.Command("git", "-C", seed, "-c", "user.name=Factory", "-c", "user.email=factory@localhost", "commit", "-qm", "owned commit")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("create test commit: %v: %s", err, output)
+	}
+	commit := gitTest(t, context.Background(), seed, "rev-parse", "HEAD")
+	branch := restprovider.JobBranch(jobID)
+	gitTest(t, context.Background(), seed, "push", bare, "HEAD:refs/heads/"+branch)
+	worktree := filepath.Join(root, "worktree")
+	gitTest(t, context.Background(), seed, "worktree", "add", "--detach", "-q", worktree, commit)
+	gitTest(t, context.Background(), worktree, "remote", "add", "origin", "git@github.com:"+repository+".git")
+	sshPath := filepath.Join(root, "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\nexec git-receive-pack "+bare+"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, context.Background(), worktree, "config", "core.sshCommand", sshPath)
+	return worktree, bare
 }
 
 func TestCleanupRefusesMultiplePRsWithSameOwnedIdentity(t *testing.T) {
@@ -164,7 +204,7 @@ func TestCleanupRefusesMultiplePRsWithSameOwnedIdentity(t *testing.T) {
 		t.Errorf("cleanup wrote after finding duplicate owned PRs: %s %s", r.Method, r.URL.Path)
 	})
 	defer server.Close()
-	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, jobID, strings.Repeat("a", 40), server.URL); err == nil {
+	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, t.TempDir(), jobID, strings.Repeat("a", 40), server.URL); err == nil {
 		t.Fatal("cleanup accepted multiple PRs with the same owned identity")
 	}
 }
@@ -182,7 +222,7 @@ func TestCleanupRefusesUnmarkedPRUsingTheRunBranch(t *testing.T) {
 		t.Errorf("cleanup mutated unmarked PR: %s %s", r.Method, r.URL.Path)
 	})
 	defer server.Close()
-	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, jobID, strings.Repeat("a", 40), server.URL); err == nil {
+	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, t.TempDir(), jobID, strings.Repeat("a", 40), server.URL); err == nil {
 		t.Fatal("cleanup accepted an unmarked PR sharing this run's branch")
 	}
 }
@@ -200,7 +240,7 @@ func TestCleanupRefusesPullRequestBranchIdentityMismatch(t *testing.T) {
 		t.Errorf("cleanup mutated mismatched PR: %s %s", r.Method, r.URL.Path)
 	})
 	defer server.Close()
-	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, jobID, strings.Repeat("a", 40), server.URL); err == nil {
+	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, t.TempDir(), jobID, strings.Repeat("a", 40), server.URL); err == nil {
 		t.Fatal("cleanup accepted a PR whose branch was tied to a different commit")
 	}
 }
@@ -215,7 +255,7 @@ func TestCleanupRefusesMalformedCommitBeforeNetwork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := cleanupOwnedPullRequest(context.Background(), client, "token", sandboxRepo, approvedOrganization, jobID, "not-a-git-sha", "https://api.github.com"); err == nil || called {
+	if err := cleanupOwnedPullRequest(context.Background(), client, "token", sandboxRepo, approvedOrganization, t.TempDir(), jobID, "not-a-git-sha", "https://api.github.com"); err == nil || called {
 		t.Fatalf("cleanup accepted malformed commit or issued request: err=%v called=%v", err, called)
 	}
 }
@@ -235,7 +275,7 @@ func TestCleanupRefusesOrganizationMismatchBeforeMutations(t *testing.T) {
 		_, _ = io.WriteString(w, `{"full_name":"`+sandboxRepo+`","owner":{"login":"another-org","type":"Organization"}}`)
 	}))
 	defer server.Close()
-	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, jobID, strings.Repeat("a", 40), server.URL); err == nil || mutations != 0 {
+	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", sandboxRepo, approvedOrganization, t.TempDir(), jobID, strings.Repeat("a", 40), server.URL); err == nil || mutations != 0 {
 		t.Fatalf("cleanup accepted organization mismatch or continued to mutations: err=%v mutations=%d", err, mutations)
 	}
 }
@@ -253,7 +293,7 @@ func TestCleanupRefusesBranchWithUnexpectedCommit(t *testing.T) {
 		t.Errorf("cleanup wrote after branch identity mismatch: %s %s", r.Method, r.URL.Path)
 	})
 	defer server.Close()
-	if err := deleteOwnedBranch(context.Background(), server.Client(), "token", "sandbox-owner/test-factory-live-sandbox", restprovider.JobBranch(jobID), strings.Repeat("a", 40), server.URL); err == nil {
+	if err := deleteOwnedBranch(context.Background(), server.Client(), "token", "sandbox-owner/test-factory-live-sandbox", t.TempDir(), restprovider.JobBranch(jobID), strings.Repeat("a", 40), server.URL); err == nil {
 		t.Fatal("cleanup accepted a branch whose commit did not match this run")
 	}
 }
@@ -282,7 +322,10 @@ func TestCleanupFromWorkflowEnvironment(t *testing.T) {
 	if !isGitCommitID(commit) {
 		t.Fatal("workflow cleanup commit identity is malformed")
 	}
-	if err := cleanupOwnedPullRequest(ctx, safeHTTPClient(20*time.Second), cfg.Token, cfg.Repository, cfg.ApprovedOrganization, jobID, commit, "https://api.github.com"); err != nil {
+	worktree := t.TempDir()
+	gitTest(t, ctx, worktree, "init", "-q")
+	gitTest(t, ctx, worktree, "remote", "add", "origin", "https://github.com/"+cfg.Repository+".git")
+	if err := cleanupOwnedPullRequest(ctx, safeHTTPClient(20*time.Second), cfg.Token, cfg.Repository, cfg.ApprovedOrganization, worktree, jobID, commit, "https://api.github.com"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -372,8 +415,8 @@ func workflowJobID(runID, attempt string) (string, error) {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", hash[0:4], hash[4:6], hash[6:8], hash[8:10], hash[10:16]), nil
 }
 
-func cleanupOwnedPullRequest(ctx context.Context, client *http.Client, token, repository, approvedOrganization, jobID, expectedCommit, apiOrigin string) error {
-	if ctx == nil || ctx.Err() != nil || client == nil || token == "" || !restprovider.ValidRepository(repository) || !validRepositoryComponent(approvedOrganization) || !restprovider.JobIDValid(jobID) || !isGitCommitID(expectedCommit) || !validAPIOrigin(apiOrigin) {
+func cleanupOwnedPullRequest(ctx context.Context, client *http.Client, token, repository, approvedOrganization, worktree, jobID, expectedCommit, apiOrigin string) error {
+	if ctx == nil || ctx.Err() != nil || client == nil || token == "" || !restprovider.ValidRepository(repository) || !filepath.IsAbs(worktree) || !validRepositoryComponent(approvedOrganization) || !restprovider.JobIDValid(jobID) || !isGitCommitID(expectedCommit) || !validAPIOrigin(apiOrigin) {
 		return errors.New("live GitHub cleanup configuration is invalid")
 	}
 	if err := verifyApprovedOrganization(ctx, client, token, repository, approvedOrganization, apiOrigin); err != nil {
@@ -434,7 +477,7 @@ func cleanupOwnedPullRequest(ctx context.Context, client *http.Client, token, re
 			}
 		}
 	}
-	return deleteOwnedBranch(ctx, client, token, repository, restprovider.JobBranch(jobID), expectedCommit, apiOrigin)
+	return deleteOwnedBranch(ctx, client, token, repository, worktree, restprovider.JobBranch(jobID), expectedCommit, apiOrigin)
 }
 
 var errGitHubNotFound = errors.New("GitHub resource not found")
@@ -479,11 +522,7 @@ func verifyApprovedOrganization(ctx context.Context, client *http.Client, token,
 	return nil
 }
 
-func deleteOwnedBranch(ctx context.Context, client *http.Client, token, repository, branch, expectedCommit, apiOrigin string) error {
-	endpoint, err := url.JoinPath(apiOrigin, "repos", repository, "git", "refs", "heads", branch)
-	if err != nil {
-		return errors.New("live GitHub cleanup branch endpoint is invalid")
-	}
+func deleteOwnedBranch(ctx context.Context, client *http.Client, token, repository, worktree, branch, expectedCommit, apiOrigin string) error {
 	refEndpoint, err := url.JoinPath(apiOrigin, "repos", repository, "git", "ref", "heads", branch)
 	if err != nil {
 		return errors.New("live GitHub cleanup branch verification endpoint is invalid")
@@ -502,21 +541,8 @@ func deleteOwnedBranch(ctx context.Context, client *http.Client, token, reposito
 	if !isGitCommitID(expectedCommit) || ref.Object.SHA != expectedCommit {
 		return errors.New("live GitHub cleanup refused to delete a branch not matching this run's commit")
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
-	if err != nil {
-		return errors.New("live GitHub cleanup branch request is invalid")
-	}
-	setGitHubHeaders(request, token)
-	response, err := client.Do(request)
-	if err != nil {
-		return errors.New("live GitHub cleanup branch deletion failed")
-	}
-	defer response.Body.Close()
-	if response.StatusCode == http.StatusNotFound {
-		return nil
-	}
-	if response.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("live GitHub cleanup branch deletion returned HTTP %d", response.StatusCode)
+	if err := restprovider.GitDeleteBranchWithToken(ctx, token, repository, worktree, branch, expectedCommit); err != nil {
+		return errors.New("live GitHub cleanup branch deletion failed; the branch may have changed and was not deleted")
 	}
 	return nil
 }

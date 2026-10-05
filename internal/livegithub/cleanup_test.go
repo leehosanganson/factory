@@ -23,7 +23,7 @@ func TestCleanupRefusesMatchingBranchWithDifferentPRIdentity(t *testing.T) {
 		t.Errorf("cleanup wrote after mismatched PR: %s %s", r.Method, r.URL.Path)
 	})
 	defer server.Close()
-	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", "sandbox-owner/test-factory-live-sandbox", approvedOrganization, jobID, "expected", server.URL); err == nil {
+	if err := cleanupOwnedPullRequest(context.Background(), server.Client(), "token", "sandbox-owner/test-factory-live-sandbox", approvedOrganization, t.TempDir(), jobID, "expected", server.URL); err == nil {
 		t.Fatal("cleanup accepted a PR with the run branch but an unrelated marker and commit")
 	}
 }
