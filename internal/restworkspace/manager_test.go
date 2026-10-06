@@ -631,9 +631,15 @@ func TestNewRejectsExistingBroadResultsRootWithoutChangingMode(t *testing.T) {
 	if err := os.Mkdir(broad, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(broad, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	before, err := os.Stat(broad)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if before.Mode().Perm() != 0o755 {
+		t.Fatalf("fixture results root mode = %o, want 755", before.Mode().Perm())
 	}
 	if _, err := New(Config{RepositoryRoot: repo, ResultsRoot: broad, Now: func() time.Time { return now }}); err == nil {
 		t.Fatal("accepted existing non-private results root")
@@ -654,6 +660,16 @@ func TestNewRejectsBroadResultsParentWithoutChangingModes(t *testing.T) {
 	if err := os.Mkdir(parent, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode().Perm() != 0o755 {
+		t.Fatalf("fixture parent mode = %o, want 755", before.Mode().Perm())
+	}
 	root := filepath.Join(parent, "server-results")
 	if _, err := New(Config{RepositoryRoot: repo, ResultsRoot: root, Now: func() time.Time { return now }}); err == nil {
 		t.Fatal("accepted results root without a private server-specific parent")
@@ -662,8 +678,8 @@ func TestNewRejectsBroadResultsParentWithoutChangingModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o755 {
-		t.Fatalf("existing parent mode changed to %o", info.Mode().Perm())
+	if info.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("existing parent mode changed from %o to %o", before.Mode().Perm(), info.Mode().Perm())
 	}
 	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("results root should not have been created under a broad parent: %v", err)
