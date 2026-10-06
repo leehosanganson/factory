@@ -69,7 +69,10 @@ func (h *Handler) ready() bool {
 }
 
 func (h *Handler) readinessError(ctx context.Context) error {
-	if h.config.Ready != nil && !h.config.Ready() {
+	if h.config.Ready == nil {
+		return nil
+	}
+	if !h.config.Ready() {
 		return errors.New("server not ready")
 	}
 	select {
