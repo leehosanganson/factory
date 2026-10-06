@@ -25,7 +25,7 @@ See the [primary Factory-to-Pi workflow](docs/features/primary-workflow.md) for 
 
 ## Build and verify
 
-Go 1.26.3 or later is required. Linux and macOS are supported. The Makefile provides `make build`, `make test`, `make fmt`, `make vet`, and `make clean`.
+Go 1.26.3 or later is required. Linux and macOS are supported. The Makefile provides `make build`, `make test`, `make fmt`, `make vet`, `make clean`, and `make help` (which lists the targets and their descriptions).
 
 ```sh
 make build
