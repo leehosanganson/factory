@@ -246,11 +246,11 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			return nil
 		},
 		Ready: func() bool { return ready.Load() },
-		ReadyError: func() error {
+		ReadyError: func(requestCtx context.Context) error {
 			if !ready.Load() {
 				return errors.New("server not initialized")
 			}
-			probeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			probeCtx, cancel := context.WithTimeout(requestCtx, 2*time.Second)
 			defer cancel()
 			if readyCheck != nil {
 				if err := readyCheck(probeCtx); err != nil {

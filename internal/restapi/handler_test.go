@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restserver"
@@ -29,7 +30,7 @@ func newTestHandler(t *testing.T, manager restjobs.Manager, ready func() bool) *
 		MaxTaskBytes:        128,
 		RepositoryAliases:   map[string]struct{}{"widget": {}},
 		Ready:               ready,
-		ReadyError:          func() error { return nil },
+		ReadyError:          func(context.Context) error { return nil },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +90,115 @@ func TestNotReadyRejectsJobOperationsBeforeAuthentication(t *testing.T) {
 		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"not_ready"`) {
 			t.Errorf("%s %s while not ready = %d %s", tc.method, tc.path, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestReadinessBoundsConcurrentChecksAndRejectsExcessPromptly(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 2))
+	key, err := restserver.LoadAPIKey(writeAPIKey(t, testAPIKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, readinessConcurrencyLimit)
+	release := make(chan struct{})
+	var active atomic.Int32
+	var maximum atomic.Int32
+	handler, err := New(manager, key, Config{
+		MaxRequestBodyBytes: 256,
+		MaxTaskBytes:        128,
+		RepositoryAliases:   map[string]struct{}{"widget": {}},
+		Ready:               func() bool { return true },
+		ReadyError: func(context.Context) error {
+			inFlight := active.Add(1)
+			defer active.Add(-1)
+			for prior := maximum.Load(); inFlight > prior && !maximum.CompareAndSwap(prior, inFlight); prior = maximum.Load() {
+			}
+			started <- struct{}{}
+			<-release
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	admitted := make(chan *httptest.ResponseRecorder, readinessConcurrencyLimit)
+	for range readinessConcurrencyLimit {
+		go func() { admitted <- request(handler, http.MethodGet, "/readyz", "", false) }()
+	}
+	for range readinessConcurrencyLimit {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("readiness check did not start")
+		}
+	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+		want   string
+	}{
+		{method: http.MethodGet, path: "/readyz", want: `{"status":"not_ready"}`},
+		{method: http.MethodGet, path: "/v1/jobs/unknown", want: `{"error":{"code":"not_ready","message":"The server is not accepting requests."}}`},
+	} {
+		startedAt := time.Now()
+		response := request(handler, tc.method, tc.path, tc.body, false)
+		if response.Code != http.StatusServiceUnavailable || strings.TrimSpace(response.Body.String()) != tc.want {
+			t.Errorf("excess %s %s response=%d %q", tc.method, tc.path, response.Code, response.Body.String())
+		}
+		if elapsed := time.Since(startedAt); elapsed > 100*time.Millisecond {
+			t.Errorf("excess %s %s waited %s for readiness capacity", tc.method, tc.path, elapsed)
+		}
+	}
+	if got := maximum.Load(); got != readinessConcurrencyLimit {
+		t.Fatalf("maximum concurrent checks=%d, want bounded at %d", got, readinessConcurrencyLimit)
+	}
+	close(release)
+	for range readinessConcurrencyLimit {
+		response := <-admitted
+		if response.Code != http.StatusOK {
+			t.Errorf("admitted readiness status=%d, want 200", response.Code)
+		}
+	}
+}
+
+func TestReadinessCheckUsesRequestContextAndReleasesCapacity(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 2))
+	handler := newTestHandler(t, manager, func() bool { return true })
+	started := make(chan struct{})
+	handler.config.ReadyError = func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	response := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/readyz", nil).WithContext(ctx)
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(response, req)
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("readiness check did not start")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("canceled readiness handler did not return")
+	}
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("canceled readiness status=%d, want 503", response.Code)
+	}
+	handler.config.ReadyError = func(context.Context) error { return nil }
+	recovered := request(handler, http.MethodGet, "/readyz", "", false)
+	if recovered.Code != http.StatusOK {
+		t.Fatalf("readiness after cancellation status=%d, want 200", recovered.Code)
 	}
 }
 

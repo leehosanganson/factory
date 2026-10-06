@@ -22,8 +22,9 @@ import (
 // to callers. Ready must report whether the server is accepting requests; a nil
 // callback is not ready.
 const (
-	maxRequestBodyBytes = 2 << 20
-	maxTaskBytes        = 256 << 10
+	maxRequestBodyBytes       = 2 << 20
+	maxTaskBytes              = 256 << 10
+	readinessConcurrencyLimit = 4
 )
 
 // Config bounds requests and exposes only operator-approved repository aliases.
@@ -32,17 +33,17 @@ type Config struct {
 	MaxTaskBytes        int
 	RepositoryAliases   map[string]struct{}
 	Ready               func() bool
-	ReadyError          func() error
+	ReadyError          func(context.Context) error
 	ReconcileProvider   func(context.Context, string) error
 	ResolveInterrupted  func(context.Context, string, restjobs.InterruptedDisposition) error
 }
 
 // Handler serves the REST API using the supplied manager and immutable API key.
 type Handler struct {
-	manager    restjobs.Manager
-	key        restserver.APIKey
-	config     Config
-	readyError func() error
+	manager         restjobs.Manager
+	key             restserver.APIKey
+	config          Config
+	readinessChecks chan struct{}
 }
 
 var _ http.Handler = (*Handler)(nil)
@@ -60,19 +61,25 @@ func New(manager restjobs.Manager, key restserver.APIKey, config Config) (*Handl
 		aliases[alias] = struct{}{}
 	}
 	config.RepositoryAliases = aliases
-	return &Handler{manager: manager, key: key, config: config}, nil
+	return &Handler{manager: manager, key: key, config: config, readinessChecks: make(chan struct{}, readinessConcurrencyLimit)}, nil
 }
 
 func (h *Handler) ready() bool {
 	return h.config.Ready != nil && h.config.Ready()
 }
 
-func (h *Handler) readinessError() error {
+func (h *Handler) readinessError(ctx context.Context) error {
 	if h.config.Ready != nil && !h.config.Ready() {
 		return errors.New("server not ready")
 	}
+	select {
+	case h.readinessChecks <- struct{}{}:
+		defer func() { <-h.readinessChecks }()
+	default:
+		return errors.New("readiness capacity exhausted")
+	}
 	if h.config.ReadyError != nil {
-		return h.config.ReadyError()
+		return h.config.ReadyError(ctx)
 	}
 	return nil
 }
@@ -93,14 +100,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		if h.config.Ready == nil || h.readinessError() != nil {
+		if h.config.Ready == nil || h.readinessError(r.Context()) != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
 		} else {
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 		}
 		return
 	}
-	if h.readinessError() != nil {
+	if h.readinessError(r.Context()) != nil {
 		writeError(w, http.StatusServiceUnavailable, "not_ready", "The server is not accepting requests.")
 		return
 	}

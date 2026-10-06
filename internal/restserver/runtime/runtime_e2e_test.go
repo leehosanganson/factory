@@ -871,6 +871,46 @@ func TestRESTServerProcessSQLiteWriteLockFailsReadinessAndAdmission(t *testing.T
 	if code, body, elapsed, err := request(http.MethodGet, "/readyz", ""); err != nil || code != http.StatusServiceUnavailable || !strings.Contains(body, `"status":"not_ready"`) || elapsed > 7*time.Second {
 		t.Fatalf("readiness under SQLite write lock status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
 	}
+
+	type readinessResult struct {
+		status  int
+		body    string
+		elapsed time.Duration
+		err     error
+	}
+	const concurrentProbes = 12
+	startProbes := make(chan struct{})
+	probeResults := make(chan readinessResult, concurrentProbes)
+	for range concurrentProbes {
+		go func() {
+			<-startProbes
+			status, body, elapsed, err := request(http.MethodGet, "/readyz", "")
+			probeResults <- readinessResult{status: status, body: body, elapsed: elapsed, err: err}
+		}()
+	}
+	close(startProbes)
+	if code, body, elapsed, err := request(http.MethodGet, "/healthz", ""); err != nil || code != http.StatusOK || elapsed > time.Second {
+		t.Fatalf("health alongside concurrent SQLite probes status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
+	}
+	var slow, prompt int
+	for range concurrentProbes {
+		result := <-probeResults
+		if result.err != nil || result.status != http.StatusServiceUnavailable || !strings.Contains(result.body, `"status":"not_ready"`) {
+			t.Fatalf("concurrent readiness under SQLite lock status=%d body=%s elapsed=%s err=%v", result.status, result.body, result.elapsed, result.err)
+		}
+		if result.elapsed > 6*time.Second {
+			t.Fatalf("admitted readiness check exceeded bounded response time: %s", result.elapsed)
+		}
+		if result.elapsed > time.Second {
+			slow++
+		} else {
+			prompt++
+		}
+	}
+	if slow == 0 || slow > 4 || prompt == 0 {
+		t.Fatalf("concurrent readiness checks: admitted slow=%d (limit 4), promptly rejected=%d; want both", slow, prompt)
+	}
+
 	const submission = `{"repository":"trusted","task":"run after SQLite recovery"}`
 	if code, body, elapsed, err := request(http.MethodPost, "/v1/jobs", submission); err != nil || code != http.StatusServiceUnavailable || !strings.Contains(body, `"code":"not_ready"`) || elapsed > 7*time.Second {
 		t.Fatalf("admission under SQLite write lock status=%d body=%s elapsed=%s err=%v", code, body, elapsed, err)
