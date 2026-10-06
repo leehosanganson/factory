@@ -1,4 +1,4 @@
-.PHONY: build test fmt vet clean
+.PHONY: build test fmt vet clean help
 
 build:
 	mkdir -p bin
@@ -15,3 +15,12 @@ vet:
 
 clean:
 	rm -rf bin
+
+help:
+	@printf '%-8s %s\n' \
+		build 'Compile the Factory CLI' \
+		test 'Run all Go tests' \
+		fmt 'Format Go source files' \
+		vet 'Run go vet' \
+		clean 'Remove build artifacts' \
+		help 'List available Make targets'
