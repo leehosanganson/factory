@@ -202,6 +202,23 @@ func TestReadinessCheckUsesRequestContextAndReleasesCapacity(t *testing.T) {
 	}
 }
 
+func TestRoutesWithoutReadinessCallbackSkipReadinessChecks(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 2))
+	handler := newTestHandler(t, manager, nil)
+	var readinessChecks atomic.Int32
+	handler.config.ReadyError = func(context.Context) error {
+		readinessChecks.Add(1)
+		return errors.New("unexpected readiness check")
+	}
+	response := request(handler, http.MethodGet, "/v1/jobs/unknown", "", false)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("route without readiness callback status=%d body=%s, want 401", response.Code, response.Body.String())
+	}
+	if got := readinessChecks.Load(); got != 0 {
+		t.Fatalf("readiness checks without Ready callback=%d, want 0", got)
+	}
+}
+
 func TestHealthAndReadinessAreMinimalAndUnauthenticated(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 2))
 	ready := false
