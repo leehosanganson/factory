@@ -41,6 +41,7 @@ type SQLiteStore struct {
 	closeCh        chan struct{}
 	closeDone      chan struct{}
 	closeOnce      sync.Once
+	serverLock     *os.File
 }
 
 var _ Store = (*SQLiteStore)(nil)
@@ -106,6 +107,36 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 		return nil, errors.New("read SQLite recovery-needed jobs")
 	}
 	_ = recoveryRows.Close()
+	return store, nil
+}
+
+// OpenSQLiteServerStore opens a SQLite store while holding exclusive ownership
+// of its database file for this server process. Administrative store openings
+// may continue to use OpenSQLiteStore without claiming server ownership.
+func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
+	if path == ":memory:" {
+		return nil, errors.New("SQLite server database must be file-backed")
+	}
+	if _, err := sqliteDSN(path); err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateSQLiteFile(path); err != nil {
+		return nil, err
+	}
+	lock, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, errors.New("open SQLite server ownership lock")
+	}
+	if err := lockSQLiteServerFile(lock); err != nil {
+		_ = lock.Close()
+		return nil, errors.New("SQLite database is already owned by another server")
+	}
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		_ = unlockSQLiteServerFile(lock)
+		return nil, err
+	}
+	store.serverLock = lock
 	return store, nil
 }
 
@@ -455,8 +486,18 @@ func (s *SQLiteStore) CloseStore() error {
 		return nil
 	}
 	s.dbClosed = true
+	lock := s.serverLock
+	s.serverLock = nil
 	s.mu.Unlock()
-	return s.db.Close()
+	dbErr := s.db.Close()
+	var lockErr error
+	if lock != nil {
+		lockErr = unlockSQLiteServerFile(lock)
+	}
+	if dbErr != nil {
+		return dbErr
+	}
+	return lockErr
 }
 
 func validateProviderAttempt(attempt ProviderAttempt) error {

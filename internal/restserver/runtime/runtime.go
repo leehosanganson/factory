@@ -82,7 +82,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	openStore := options.OpenStore
 	if openStore == nil {
-		openStore = restworker.NewLocalJobManager
+		openStore = restworker.NewLocalServerJobManager
 	}
 	store, err := openStore(config)
 	if err != nil {
