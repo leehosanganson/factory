@@ -416,6 +416,10 @@ func TestServerDoctorProcessIsLocalOnlyAndReadOnly(t *testing.T) {
 	if err := os.Mkdir(repository, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	repository, err := filepath.EvalSymlinks(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test"}} {
 		command := exec.Command("git", append([]string{"-C", repository}, args...)...)
 		if output, err := command.CombinedOutput(); err != nil {
