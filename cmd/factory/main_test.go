@@ -270,7 +270,8 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		omit []string
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
-		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "server-only JSON config"}, omit: []string{"api-key-value"}},
+		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server doctor --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "server-only JSON config", "provider reachability is not tested"}, omit: []string{"api-key-value"}},
+		{name: "server doctor help", args: []string{"server", "doctor", "--help"}, want: []string{"REST server preflight", "factory server doctor --config <absolute-path>", "Local-only, read-only", "Provider reachability is not tested", "no database is opened or created"}, omit: []string{"api-key-value"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "{repo}"}, omit: []string{"factory run", "Monitor management", "Example:"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
@@ -398,6 +399,165 @@ func TestServerBackupCommandCreatesSQLiteBackupWithoutLaunchingServer(t *testing
 	got, err := restored.Get(job.ID)
 	if err != nil || got.Status != restjobs.StatusRunning {
 		t.Fatalf("backup changed running job state: (%+v, %v); want running state preserved", got, err)
+	}
+}
+
+func TestServerDoctorProcessIsLocalOnlyAndReadOnly(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "factory")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory CLI: %v\n%s", err, output)
+	}
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repository := filepath.Join(root, "repo")
+	if err := os.Mkdir(repository, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repository, err := filepath.EvalSymlinks(repository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Test"}} {
+		command := exec.Command("git", append([]string{"-C", repository}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	apiKey := filepath.Join(root, "api-key")
+	providerToken := filepath.Join(root, "provider-token")
+	for _, path := range []string{apiKey, providerToken} {
+		if err := os.WriteFile(path, []byte("preflight-secret"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	harness := filepath.Join(root, "harness")
+	if err := os.WriteFile(harness, []byte("do not execute"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := restserver.DefaultConfig()
+	config.Repositories = map[string]string{"private-alias": repository}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{system_prompt}", "{task}"}}
+	config.APIKeyFile = apiKey
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"private-alias": "acme/private-repo"}}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(root, "sqlite", "jobs.db")}
+	if err := os.Mkdir(filepath.Dir(config.Persistence.Path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "server.json")
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(repository, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name        string
+		configPath  string
+		want        []string
+		omit        []string
+		wantFailure bool
+	}{
+		{name: "valid", configPath: configPath, want: []string{"config: valid", "local prerequisites: available", "provider reachability: not tested", "database, listener, and workflow: not started"}, omit: []string{root, "preflight-secret", "private-repo"}},
+		{name: "missing config", configPath: filepath.Join(root, "missing-secret-config-path.json"), want: []string{"config: invalid"}, omit: []string{root, "missing-secret-config-path"}, wantFailure: true},
+		{name: "malformed config", configPath: filepath.Join(root, "malformed.json"), want: []string{"config: invalid"}, omit: []string{root}, wantFailure: true},
+		{name: "unreadable config target", configPath: filepath.Join(root, "config-directory"), want: []string{"config: invalid"}, omit: []string{root}, wantFailure: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "malformed config" {
+				if err := os.WriteFile(tc.configPath, []byte(`{"api_key_file":"secret-config-value"`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				tc.omit = append(tc.omit, "secret-config-value")
+			}
+			if tc.name == "unreadable config target" {
+				if err := os.Mkdir(tc.configPath, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			command := exec.Command(binary, "server", "doctor", "--config", tc.configPath)
+			command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+filepath.Join(root, "xdg-config"), "XDG_STATE_HOME="+filepath.Join(root, "xdg-state"))
+			output, err := command.CombinedOutput()
+			if (err != nil) != tc.wantFailure {
+				t.Fatalf("doctor error = %v; output=%s", err, output)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(string(output), want) {
+					t.Errorf("output missing %q: %s", want, output)
+				}
+			}
+			for _, omitted := range tc.omit {
+				if strings.Contains(string(output), omitted) {
+					t.Errorf("output leaked %q: %s", omitted, output)
+				}
+			}
+		})
+	}
+	missingConfig := config
+	missingConfig.APIKeyFile = filepath.Join(root, "missing-api-key-secret-path")
+	missingConfig.Provider.TokenFile = filepath.Join(root, "missing-provider-token-secret-path")
+	missingConfig.Persistence.Path = filepath.Join(root, "missing-sqlite-parent-secret-path", "jobs.db")
+	missingConfigPath := filepath.Join(root, "missing-targets.json")
+	missingData, err := json.Marshal(missingConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(missingConfigPath, missingData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(binary, "server", "doctor", "--config", missingConfigPath)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("preflight with missing local targets succeeded: %s", output)
+	}
+	for _, want := range []string{"api_key_file: unavailable or invalid", "provider.token_file: unavailable or invalid", "persistence.path: unavailable or unsafe", "provider reachability: not tested"} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("missing-target output missing %q: %s", want, output)
+		}
+	}
+	for _, secretPath := range []string{missingConfig.APIKeyFile, missingConfig.Provider.TokenFile, filepath.Dir(missingConfig.Persistence.Path)} {
+		if strings.Contains(string(output), secretPath) {
+			t.Errorf("preflight output exposed configured path %q: %s", secretPath, output)
+		}
+	}
+	if _, err := os.Stat(missingConfig.Persistence.Path); !os.IsNotExist(err) {
+		t.Fatalf("preflight created SQLite file: stat error=%v", err)
+	}
+	if entries, err := os.ReadDir(filepath.Dir(config.Persistence.Path)); err != nil || len(entries) != 0 {
+		t.Fatalf("preflight changed configured SQLite directory: entries=%v err=%v", entries, err)
+	}
+	if _, err := os.Stat(filepath.Dir(missingConfig.Persistence.Path)); !os.IsNotExist(err) {
+		t.Fatalf("preflight created SQLite parent: stat error=%v", err)
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "unchanged" {
+		t.Fatalf("preflight changed repository sentinel: data=%q err=%v", data, err)
+	}
+	if err := os.Chmod(apiKey, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(providerToken, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	insecureConfig := filepath.Join(root, "insecure-targets.json")
+	if err := os.WriteFile(insecureConfig, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command = exec.Command(binary, "server", "doctor", "--config", insecureConfig)
+	output, err = command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "api_key_file: unavailable or invalid") || !strings.Contains(string(output), "provider.token_file: unavailable or invalid") {
+		t.Fatalf("preflight did not reject broadly readable secrets: err=%v output=%s", err, output)
+	}
+	for _, path := range []string{filepath.Join(root, "xdg-config"), filepath.Join(root, "xdg-state"), filepath.Join(root, "tool-invoked")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("preflight created or executed into %q: stat error=%v", path, err)
+		}
 	}
 }
 

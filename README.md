@@ -41,7 +41,8 @@ The binary is written to `./bin/factory`. Configuration and state are stored out
 The server accepts authenticated job requests, executes configured workflows in isolated workspaces, and exposes status, bounded history, and safe structured verification evidence with explicit limitations. Job inspection includes the confirmed PR identity/URL when configured; it never exposes raw logs, check output, or host paths. It supports volatile in-memory state or configured SQLite persistence, plus optional GitHub pull-request publication. See [REST server operations](docs/features/rest-server-operations.md) for readiness, backup/restore, restart recovery, and capacity guidance.
 
 ```sh
+factory server doctor --config /absolute/path/to/server.json
 factory server --config /absolute/path/to/server.json
 ```
 
-See [REST job server](docs/features/rest-server.md) for current setup and limits. Do not expose the service beyond a trusted network without appropriate authentication and network controls; local-process/container execution is not a security sandbox.
+Run `factory server doctor --config /absolute/path/to/server.json` for a local-only, read-only preflight of strict configuration and local prerequisites. It does not test provider reachability and does not open/create SQLite, start a listener, or run the workflow. See [REST job server](docs/features/rest-server.md) for current setup and limits. Do not expose the service beyond a trusted network without appropriate authentication and network controls; local-process/container execution is not a security sandbox.

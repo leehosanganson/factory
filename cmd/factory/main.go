@@ -64,6 +64,19 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return runDoctor(out)
 		case "server":
+			if len(args) > 1 && args[1] == "doctor" {
+				configPath, err := parseServerDoctorOptions(args[2:])
+				if err != nil {
+					return err
+				}
+				config, err := restserver.LoadConfig(configPath)
+				if err != nil {
+					fmt.Fprintln(out, "REST server preflight (local-only)")
+					fmt.Fprintln(out, "config: invalid")
+					return fmt.Errorf("REST server config is missing or invalid")
+				}
+				return runServerDoctor(out, config)
+			}
 			if len(args) > 1 && args[1] == "backup" {
 				configPath, destination, err := parseServerBackupOptions(args[2:])
 				if err != nil {
@@ -215,7 +228,7 @@ func commandHelpRequested(args []string) bool {
 		return false
 	}
 	if args[0] == "server" {
-		return len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help")
+		return len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") || len(args) == 3 && args[1] == "doctor" && (args[2] == "-h" || args[2] == "--help" || args[2] == "help")
 	}
 	switch args[0] {
 	case "implement", "tidy", "job", "run", "monitor", "work", "doctor":
@@ -265,12 +278,19 @@ func printCommandHelp(out io.Writer, args []string) {
 		title = "Issue work requests"
 		commands, paragraphs = workHelp(subcommand)
 	case "server":
+		if subcommand == "doctor" {
+			title = "REST server preflight"
+			commands = []helpCommand{{"factory server doctor --config <absolute-path>", "Check strict config and local prerequisites without starting the server."}}
+			paragraphs = []string{"Local-only, read-only checks. Provider reachability is not tested; no database is opened or created and no listener or workflow is started."}
+			break
+		}
 		title = "REST API server"
 		commands = []helpCommand{
 			{"factory server --config <absolute-path>", "Start the local REST job service using a server-only JSON config."},
+			{"factory server doctor --config <absolute-path>", "Check local config and prerequisites without starting the server."},
 			{"factory server backup --config <absolute-path> --destination <absolute-path>", "Create a consistent SQLite online backup."},
 		}
-		paragraphs = []string{"The REST API uses a shared API key and executes the configured Factory workflow locally. See docs/features/rest-server-operations.md for backup and recovery guidance."}
+		paragraphs = []string{"The REST API uses a shared API key and executes the configured Factory workflow locally. Server doctor is local-only; provider reachability is not tested. See docs/features/rest-server-operations.md for backup and recovery guidance."}
 	}
 	width := detectHelpWidth(out)
 	_, noColor := os.LookupEnv("NO_COLOR")
@@ -404,6 +424,32 @@ func runDoctor(out io.Writer) error {
 	fmt.Fprintln(out)
 	if failed {
 		return fmt.Errorf("doctor found missing required executables")
+	}
+	return nil
+}
+
+func parseServerDoctorOptions(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--config" || !filepath.IsAbs(args[1]) {
+		return "", fmt.Errorf("usage: factory server doctor --config <absolute-path>")
+	}
+	return args[1], nil
+}
+
+func runServerDoctor(out io.Writer, config restserver.Config) error {
+	fmt.Fprintln(out, "REST server preflight (local-only)")
+	fmt.Fprintln(out, "config: valid")
+	issues := restserver.CheckLocalPrerequisites(config)
+	if len(issues) == 0 {
+		fmt.Fprintln(out, "local prerequisites: available")
+	} else {
+		for _, issue := range issues {
+			fmt.Fprintf(out, "local prerequisite: %s\n", issue)
+		}
+	}
+	fmt.Fprintln(out, "provider reachability: not tested")
+	fmt.Fprintln(out, "database, listener, and workflow: not started")
+	if len(issues) != 0 {
+		return fmt.Errorf("REST server preflight found unavailable local prerequisites")
 	}
 	return nil
 }
