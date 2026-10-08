@@ -111,8 +111,8 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 }
 
 // OpenSQLiteServerStore opens a SQLite store while holding exclusive ownership
-// of its database file for this server process. Administrative store openings
-// may continue to use OpenSQLiteStore without claiming server ownership.
+// through a separate lock file for this server process. Administrative store
+// openings may continue to use OpenSQLiteStore without claiming server ownership.
 func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
 	if path == ":memory:" {
 		return nil, errors.New("SQLite server database must be file-backed")
@@ -123,7 +123,15 @@ func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
 	if err := ensurePrivateSQLiteFile(path); err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(path, os.O_RDWR, 0)
+	lockPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, errors.New("resolve SQLite server ownership lock")
+	}
+	lockPath += ".server-lock"
+	if err := ensurePrivateSQLiteFile(lockPath); err != nil {
+		return nil, errors.New("prepare SQLite server ownership lock")
+	}
+	lock, err := os.OpenFile(lockPath, os.O_RDWR, 0)
 	if err != nil {
 		return nil, errors.New("open SQLite server ownership lock")
 	}
