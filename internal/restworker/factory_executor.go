@@ -128,6 +128,17 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 // server settings. A configured SQLite failure is returned directly; there is
 // no fallback to volatile memory.
 func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
+	return newLocalJobManager(config, false)
+}
+
+// NewLocalServerJobManager opens the configured store with server ownership
+// semantics, preventing a second process from running startup recovery against
+// a database owned by a live REST server.
+func NewLocalServerJobManager(config restserver.Config) (restjobs.Store, error) {
+	return newLocalJobManager(config, true)
+}
+
+func newLocalJobManager(config restserver.Config, server bool) (restjobs.Store, error) {
 	if err := config.Validate(); err != nil {
 		return nil, errors.New("invalid REST job manager configuration")
 	}
@@ -137,6 +148,9 @@ func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
 		MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
 	}
 	if config.Persistence.Backend == restserver.PersistenceBackendSQLite {
+		if server {
+			return restjobs.OpenSQLiteServerStore(config.Persistence.Path, limits)
+		}
 		return restjobs.OpenSQLiteStore(config.Persistence.Path, limits)
 	}
 	return restjobs.NewManager(limits)

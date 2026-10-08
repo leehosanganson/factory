@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -572,6 +574,27 @@ func TestSQLiteStoreCloseCancelsQueuedButPreservesRunning(t *testing.T) {
 	}
 }
 
+func TestSQLiteServerStoreReleasesOwnershipOnClose(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	first, err := OpenSQLiteServerStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenSQLiteServerStore(path, testConfig()); err == nil {
+		t.Fatal("second server store opened while ownership was held")
+	}
+	if err := first.CloseStore(); err != nil {
+		t.Fatalf("close first server store: %v", err)
+	}
+	second, err := OpenSQLiteServerStore(path, testConfig())
+	if err != nil {
+		t.Fatalf("open server store after orderly close: %v", err)
+	}
+	if err := second.CloseStore(); err != nil {
+		t.Fatalf("close second server store: %v", err)
+	}
+}
+
 func TestSQLiteStoreOpenRejectsNonPrivateDirectoryAndFile(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o755); err != nil {
@@ -620,4 +643,98 @@ func TestSQLiteStoreWaitClaimReturnsOnClose(t *testing.T) {
 		t.Fatal("WaitClaim did not wake after Close")
 	}
 	_ = store.CloseStore()
+}
+
+func TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit(t *testing.T) {
+	if os.Getenv("FACTORY_SQLITE_LOCK_HELPER") == "1" {
+		store, err := OpenSQLiteServerStore(os.Getenv("FACTORY_SQLITE_LOCK_PATH"), testConfig())
+		if os.Getenv("FACTORY_SQLITE_LOCK_COMPETITOR") == "1" {
+			if err == nil {
+				_ = store.CloseStore()
+				t.Fatal("competing process opened the live SQLite store")
+			}
+			if !strings.Contains(err.Error(), "already owned by another server") {
+				t.Fatalf("competing process error = %v, want ownership conflict", err)
+			}
+			return
+		}
+		if err != nil {
+			t.Fatalf("owner open SQLite store: %v", err)
+		}
+		job, _, err := store.Admit("live-process-job", Request{Repository: "widget", Task: "remain live while owner holds the database"})
+		if err != nil {
+			t.Fatalf("owner admit job: %v", err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatalf("owner claim job: %v", err)
+		}
+		if err := os.WriteFile(os.Getenv("FACTORY_SQLITE_LOCK_READY"), []byte(job.ID), 0o600); err != nil {
+			t.Fatalf("owner signal readiness: %v", err)
+		}
+		select {}
+	}
+
+	dir := privateSQLiteDir(t)
+	path := filepath.Join(dir, "jobs.db")
+	ready := filepath.Join(dir, "owner-ready")
+	owner := exec.Command(os.Args[0], "-test.run=^TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit$")
+	owner.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_PATH="+path, "FACTORY_SQLITE_LOCK_READY="+ready)
+	if err := owner.Start(); err != nil {
+		t.Fatalf("start owner process: %v", err)
+	}
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- owner.Wait() }()
+	t.Cleanup(func() {
+		if owner.ProcessState == nil {
+			_ = owner.Process.Kill()
+			<-ownerDone
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if owner.ProcessState != nil {
+			t.Fatalf("owner process exited before readiness: %v", <-ownerDone)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	jobID, err := os.ReadFile(ready)
+	if err != nil {
+		t.Fatalf("owner did not become ready: %v", err)
+	}
+
+	competitor := exec.Command(os.Args[0], "-test.run=^TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit$")
+	competitor.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_COMPETITOR=1", "FACTORY_SQLITE_LOCK_PATH="+path)
+	if output, err := competitor.CombinedOutput(); err != nil {
+		t.Fatalf("competing process should fail closed cleanly: %v: %s", err, output)
+	}
+	observer, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatalf("open read-only test observer: %v", err)
+	}
+	live, err := observer.Get(string(jobID))
+	_ = observer.CloseStore()
+	if err != nil || live.Status != StatusRunning {
+		t.Fatalf("live job after rejected competitor = (%+v, %v), want running", live, err)
+	}
+
+	if err := owner.Process.Kill(); err != nil {
+		t.Fatalf("kill owner to simulate unclean exit: %v", err)
+	}
+	<-ownerDone
+	store, err := OpenSQLiteServerStore(path, testConfig())
+	if err != nil {
+		t.Fatalf("reopen after owner exit: %v", err)
+	}
+	defer store.CloseStore()
+	job, err := store.Get(string(jobID))
+	if err != nil || job.Status != StatusRunning {
+		t.Fatalf("running job after unclean exit = (%+v, %v)", job, err)
+	}
+	report, err := store.Recover(context.Background())
+	if err != nil || len(report.NeedsOperator) != 1 || report.NeedsOperator[0].ID != string(jobID) || len(report.Resume) != 0 {
+		t.Fatalf("unclean-exit recovery = (%+v, %v), want live job held for operator", report, err)
+	}
 }
