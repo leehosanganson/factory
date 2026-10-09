@@ -36,6 +36,8 @@ func TestValidateImplementationPlanEnforcesDAGAndNonOverlappingBoundedScopes(t *
 		{"cycle", `{"subtasks":[{"id":"a","task":"A","files":["a.go"],"depends_on":["b"]},{"id":"b","task":"B","files":["b.go"],"depends_on":["a"]}]}`, "cycle"},
 		{"unknown dependency", `{"subtasks":[{"id":"a","task":"A","files":["a.go"],"depends_on":["missing"]},{"id":"b","task":"B","files":["b.go"],"depends_on":[]}]}`, "unknown"},
 		{"overlap", `{"subtasks":[{"id":"a","task":"A","files":["pkg/a.go"],"depends_on":[]},{"id":"b","task":"B","files":["pkg/a.go"],"depends_on":[]}]}`, "overlaps"},
+		{"case-only overlap", `{"subtasks":[{"id":"a","task":"A","files":["Config.go"],"depends_on":[]},{"id":"b","task":"B","files":["config.go"],"depends_on":[]}]}`, "case-insensitive"},
+		{"case-insensitive directory overlap", `{"subtasks":[{"id":"a","task":"A","files":["Pkg"],"depends_on":[]},{"id":"b","task":"B","files":["pkg/a.go"],"depends_on":[]}]}`, "case-insensitive"},
 		{"directory overlap", `{"subtasks":[{"id":"a","task":"A","files":["pkg"],"depends_on":[]},{"id":"b","task":"B","files":["pkg/a.go"],"depends_on":[]}]}`, "overlap"},
 		{"path traversal", `{"subtasks":[{"id":"a","task":"A","files":["../outside"],"depends_on":[]},{"id":"b","task":"B","files":["b.go"],"depends_on":[]}]}`, "path"},
 		{"extra fields", `{"subtasks":[{"id":"a","task":"A","files":["a.go"],"depends_on":[],"command":"rm -rf /"},{"id":"b","task":"B","files":["b.go"],"depends_on":[]}]}`, "unknown field"},
@@ -47,6 +49,34 @@ func TestValidateImplementationPlanEnforcesDAGAndNonOverlappingBoundedScopes(t *
 				t.Fatalf("invalid plan error = %v, want containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestValidateImplementationPlanRejectsPathsAliasingOnCaseInsensitiveFilesystem(t *testing.T) {
+	root := t.TempDir()
+	upper := filepath.Join(root, "Config.go")
+	lower := filepath.Join(root, "config.go")
+	if err := os.WriteFile(upper, []byte("probe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	upperInfo, err := os.Stat(upper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lowerInfo, err := os.Stat(lower)
+	if os.IsNotExist(err) {
+		t.Skip("temporary filesystem is case-sensitive")
+	}
+	if err != nil {
+		t.Fatalf("stat case-aliased path: %v", err)
+	}
+	if !os.SameFile(upperInfo, lowerInfo) {
+		t.Fatalf("case-variant paths unexpectedly refer to different files on this filesystem")
+	}
+
+	plan := `{"subtasks":[{"id":"a","task":"A","files":["Config.go"],"depends_on":[]},{"id":"b","task":"B","files":["config.go"],"depends_on":[]}]}`
+	if _, err := validateImplementationPlan([]byte(plan)); err == nil || !strings.Contains(err.Error(), "case-insensitive") {
+		t.Fatalf("aliased plan error = %v, want case-insensitive collision rejection", err)
 	}
 }
 
