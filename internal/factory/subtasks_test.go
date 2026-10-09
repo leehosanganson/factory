@@ -429,6 +429,64 @@ func TestParallelImplementationObserverFailureAfterIntegrationRollsBackTarget(t 
 	}
 }
 
+func TestParallelImplementationPersistsRollbackFailureAfterObserverError(t *testing.T) {
+	dir := initTestGitRepo(t)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	observerErr := errors.New("integration observer failed")
+	workflow := Workflow{
+		Agent:  &parallelWorkflowAgent{},
+		Config: Config{StateDir: stateDir, ParallelImplementation: &ParallelImplementationConfig{Enabled: true}},
+		In:     strings.NewReader(""), Out: ioDiscard{}, Workdir: dir, Stages: []string{"implement"},
+		Observer: WorkflowObserverFunc(func(event WorkflowEvent) error {
+			if event.Type != "subtask.integrated" {
+				return nil
+			}
+			output := filepath.Join(dir, "feature-one.txt")
+			if err := os.Remove(output); err != nil {
+				return fmt.Errorf("prepare rollback failure: %w", err)
+			}
+			if err := os.Mkdir(output, 0o700); err != nil {
+				return fmt.Errorf("prepare rollback failure: %w", err)
+			}
+			if err := os.WriteFile(filepath.Join(output, "sentinel"), []byte("retain"), 0o600); err != nil {
+				return fmt.Errorf("prepare rollback failure: %w", err)
+			}
+			return observerErr
+		}),
+	}
+
+	err := workflow.Run("rollback failure after integration observer error")
+	if err == nil || !strings.Contains(err.Error(), observerErr.Error()) || !strings.Contains(err.Error(), filepath.Join(dir, "feature-one.txt")) {
+		t.Fatalf("workflow error = %v, want observer and rollback failures", err)
+	}
+	if data, readErr := os.ReadFile(filepath.Join(dir, "feature-one.txt", "sentinel")); readErr != nil || string(data) != "retain" {
+		t.Fatalf("rollback-failure sentinel = %q, %v; want retained fixture proving restoration failed", data, readErr)
+	}
+
+	state := workflowRunState(t, stateDir)
+	if state.Status != "failed" || state.SubtaskPlanStatus != "failed" {
+		t.Fatalf("persisted workflow/plan status = %q/%q, want failed/failed", state.Status, state.SubtaskPlanStatus)
+	}
+	for _, record := range state.Subtasks {
+		if record.Status != "rollback_failed" || !strings.Contains(record.Outcome, "rollback failed") || len(record.Outcome) > evaluatorOutputLimit {
+			t.Errorf("persisted subtask outcome after failed restoration = %+v, want bounded rollback_failed outcome", record)
+		}
+	}
+
+	events, readErr := os.ReadFile(filepath.Join(stateDir, "runs", state.ID, "workflow-events.jsonl"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	rollbackEvent := strings.Index(string(events), `"type":"subtask.rollback_failed"`)
+	failedTransition := strings.LastIndex(string(events), `"type":"workflow.transition"`)
+	if rollbackEvent < 0 || failedTransition < 0 || rollbackEvent >= failedTransition {
+		t.Fatalf("rollback failure event must precede final workflow transition: %s", events)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(string(events)), `"type":"workflow.transition","stage":"implement","message":"failed"}`) {
+		t.Fatalf("final persisted event does not identify workflow failure: %s", events)
+	}
+}
+
 func TestParallelImplementationLaterWaveFailureLeavesTargetUnchanged(t *testing.T) {
 	dir := initTestGitRepo(t)
 	before := gitWorktreeSnapshot(t, dir)
