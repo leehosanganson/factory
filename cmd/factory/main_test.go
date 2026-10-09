@@ -1951,6 +1951,358 @@ func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 	}
 }
 
+func TestFreshProcessAttachFollowsRunningDetachedImplementation(t *testing.T) {
+	root, err := os.MkdirTemp("", "factory detached attach test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserveRoot := false
+	var attachCommand *exec.Cmd
+	var attachDone chan error
+	var attachExited bool
+	var workerStarted, attachStarted, workerLogPathFile, releaseWorker, ghInvoked string
+	var state, target string
+	var store *factory.JobStore
+	var jobID string
+	var workerPID int
+	var attachOutput *os.File
+	t.Cleanup(func() {
+		if releaseWorker != "" {
+			if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+				t.Errorf("release detached worker during cleanup: %v", err)
+				preserveRoot = true
+			}
+		}
+		if attachDone != nil && !attachExited {
+			select {
+			case <-attachDone:
+				attachExited = true
+			case <-time.After(15 * time.Second):
+				if attachCommand != nil && attachCommand.Process != nil {
+					if err := attachCommand.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+						t.Errorf("kill attached CLI during cleanup: %v", err)
+					}
+				}
+				select {
+				case <-attachDone:
+					attachExited = true
+				case <-time.After(5 * time.Second):
+					t.Errorf("attached CLI remains unreaped; preserving temporary directory %s", root)
+					preserveRoot = true
+				}
+			}
+		}
+		if attachOutput != nil {
+			if err := attachOutput.Close(); err != nil {
+				t.Errorf("close attach output: %v", err)
+			}
+		}
+		if store != nil && jobID != "" {
+			shutdownErr := waitFailedImplementTestShutdown(store, target, jobID, 15*time.Second)
+			if shutdownErr != nil {
+				job, err := store.GetJob(jobID)
+				if err == nil && (job.Status == "queued" || job.Status == "running") {
+					if err := store.RequestStop(jobID); err != nil {
+						shutdownErr = errors.Join(shutdownErr, fmt.Errorf("request cooperative worker stop: %w", err))
+					} else {
+						shutdownErr = waitFailedImplementTestShutdown(store, target, jobID, 15*time.Second)
+					}
+				} else if err != nil {
+					shutdownErr = errors.Join(shutdownErr, fmt.Errorf("read job before cooperative stop: %w", err))
+				}
+			}
+			if shutdownErr != nil {
+				t.Errorf("could not verify detached worker shutdown; preserving temporary directory %s: %v", root, shutdownErr)
+				preserveRoot = true
+			} else if workerPID > 0 {
+				if err := waitForTestProcessExit(workerPID, 10*time.Second); err != nil {
+					t.Errorf("worker PID %d did not exit; preserving temporary directory %s: %v", workerPID, root, err)
+					preserveRoot = true
+				}
+			}
+		}
+		if preserveRoot {
+			t.Errorf("preserving detached attach test diagnostics: %s (job %s, started marker %s, release marker %s, provider tripwire %s)", root, jobID, workerStarted, releaseWorker, ghInvoked)
+			return
+		}
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove detached attach test directory: %v", err)
+		}
+	})
+
+	state = filepath.Join(root, "state")
+	configHome := filepath.Join(root, "config")
+	configDir := filepath.Join(configHome, "factory")
+	fakeBin := filepath.Join(root, "bin")
+	for _, dir := range []string{state, configDir, fakeBin} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	releaseWorker = filepath.Join(state, "release-implement")
+	workerStarted = filepath.Join(state, "implement-started")
+	attachStarted = filepath.Join(state, "attach-started")
+	workerLogPathFile = filepath.Join(state, "worker-log-path")
+	ghInvoked = filepath.Join(state, "gh-invoked")
+	agent := filepath.Join(root, "fake-agent")
+	script := `#!/bin/sh
+case "$1" in
+  implement) printf 'ATTACH_STAGE_LOG_ONLY_MARKER\n'; : > "$FACTORY_TEST_STARTED"; while [ ! -f "$FACTORY_TEST_WORKER_LOG_PATH_FILE" ]; do sleep 0.02; done; worker_log=$(cat "$FACTORY_TEST_WORKER_LOG_PATH_FILE"); printf 'ATTACH_PREEXISTING_WORKER_EVENT\n' >> "$worker_log"; while [ ! -f "$FACTORY_TEST_ATTACH_STARTED" ]; do sleep 0.02; done; printf 'ATTACH_WORKER_LOG_EVENT\n' >> "$worker_log"; while [ ! -f "$FACTORY_TEST_RELEASE" ]; do sleep 0.02; done; printf 'ATTACH_COMPLETION_MARKER\nPASS\n' ;;
+  *) printf 'PASS\n' ;;
+esac
+`
+	if err := os.WriteFile(agent, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf(`{"command":%q,"args":["{stage}","{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":false}`, agent, state)
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte(`#!/bin/sh
+printf invoked > "$FACTORY_TEST_GH_INVOKED"
+exit 1
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	target = filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main", target}, {"-C", target, "config", "user.name", "Factory Test"}, {"-C", target, "config", "user.email", "factory-test@example.invalid"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", target, "add", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	initialStatus := runTestGit(t, "-C", target, "status", "--porcelain")
+	target, err = filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	binary := filepath.Join(root, "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+	env := append(os.Environ(),
+		"XDG_CONFIG_HOME="+configHome,
+		"XDG_STATE_HOME="+state,
+		"FACTORY_TEST_STARTED="+workerStarted,
+		"FACTORY_TEST_ATTACH_STARTED="+attachStarted,
+		"FACTORY_TEST_WORKER_LOG_PATH_FILE="+workerLogPathFile,
+		"FACTORY_TEST_RELEASE="+releaseWorker,
+		"FACTORY_TEST_GH_INVOKED="+ghInvoked,
+		"PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"),
+	)
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := exec.Command(binary, "implement", "--detach", "attach", "process", "test")
+	start.Dir, start.Env = target, env
+	startOutput, err := start.CombinedOutput()
+	if err != nil || !strings.Contains(string(startOutput), "Started implementation job") {
+		t.Fatalf("start detached implementation: %v\n%s", err, startOutput)
+	}
+	preserveRoot = true
+	fields := strings.Fields(string(startOutput))
+	if len(fields) < 4 {
+		t.Fatalf("unexpected detached start output: %q", startOutput)
+	}
+	jobID = strings.TrimSuffix(fields[3], ".")
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if _, err := os.Stat(workerStarted); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("check implementation start marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			job, getErr := store.GetJob(jobID)
+			workerLog, logErr := os.ReadFile(filepath.Join(storeRoot, jobID, "worker.log"))
+			t.Fatalf("fake implementation agent did not reach its gate: job=%+v jobErr=%v workerLog=%q logErr=%v", job, getErr, workerLog, logErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	job, err := store.GetJob(jobID)
+	if err != nil || job.Status != "running" {
+		t.Fatalf("detached job at implementation gate = %+v, err=%v", job, err)
+	}
+	worker, err := store.ReadWorker(jobID)
+	if err != nil || worker.PID <= 0 {
+		t.Fatalf("read detached worker record: %+v, err=%v", worker, err)
+	}
+	workerPID = worker.PID
+
+	jobLogPath, err := store.JobLogPath(jobID)
+	if err != nil {
+		t.Fatalf("locate detached worker log: %v", err)
+	}
+	if err := os.WriteFile(workerLogPathFile, []byte(jobLogPath), 0o600); err != nil {
+		t.Fatalf("provide fake agent worker log path: %v", err)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		jobLog, err := os.ReadFile(jobLogPath)
+		if err != nil {
+			t.Fatalf("read pre-attach worker log: %v", err)
+		}
+		if strings.Contains(string(jobLog), "ATTACH_PREEXISTING_WORKER_EVENT\n") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("already-running fake worker did not append its pre-attach event: %q", jobLog)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	attachPath := filepath.Join(root, "attach-output.log")
+	attachOutput, err = os.Create(attachPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachCommand = exec.Command(binary, "job", "attach", jobID)
+	attachCommand.Dir, attachCommand.Env = target, env
+	attachCommand.Stdout, attachCommand.Stderr = attachOutput, attachOutput
+	if err := attachCommand.Start(); err != nil {
+		t.Fatalf("start fresh-process attach: %v", err)
+	}
+	attachDone = make(chan error, 1)
+	go func() { attachDone <- attachCommand.Wait() }()
+
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		output, err := os.ReadFile(attachPath)
+		if err != nil {
+			t.Fatalf("read pre-existing attach output: %v", err)
+		}
+		if strings.Contains(string(output), "ATTACH_PREEXISTING_WORKER_EVENT\n") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fresh attach did not follow the already-running worker event: attach=%q", output)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case err := <-attachDone:
+		attachExited = true
+		t.Fatalf("fresh attach exited while the detached implementation was still gated: %v", err)
+	default:
+	}
+	if err := os.WriteFile(attachStarted, nil, 0o600); err != nil {
+		t.Fatalf("signal fresh-process attach is following worker output: %v", err)
+	}
+
+	deadline = time.Now().Add(10 * time.Second)
+	for {
+		output, err := os.ReadFile(attachPath)
+		if err != nil {
+			t.Fatalf("read incremental attach output: %v", err)
+		}
+		if strings.Contains(string(output), "ATTACH_WORKER_LOG_EVENT\n") {
+			if strings.Contains(string(output), "implement completed") {
+				t.Fatalf("attach observed implementation completion before the fake worker was released: %q", output)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			jobLog, logErr := os.ReadFile(jobLogPath)
+			t.Fatalf("fresh attach did not receive the exact worker-log event before release: attach=%q workerLog=%q logErr=%v", output, jobLog, logErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	select {
+	case err := <-attachDone:
+		attachExited = true
+		t.Fatalf("fresh attach exited while the detached implementation was still gated: %v", err)
+	default:
+	}
+	if _, err := os.Stat(releaseWorker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker was released before incremental output was observed: %v", err)
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release fake implementation agent: %v", err)
+	}
+	select {
+	case err := <-attachDone:
+		attachExited = true
+		if err != nil {
+			t.Fatalf("fresh-process attach: %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("fresh-process attach did not exit after implementation completion")
+	}
+	if err := attachOutput.Close(); err != nil {
+		t.Fatalf("close attach output: %v", err)
+	}
+	attachOutput = nil
+	transcript, err := os.ReadFile(attachPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transcript), "ATTACH_WORKER_LOG_EVENT\n") || !strings.Contains(string(transcript), "implement completed") {
+		t.Fatalf("attach transcript did not follow the worker-log event through completion: %s", transcript)
+	}
+	implementationLogs, err := filepath.Glob(filepath.Join(state, "runs", "*", "02-implement.log"))
+	if err != nil || len(implementationLogs) != 1 {
+		t.Fatalf("implementation stage logs = %v, err=%v; want exactly one", implementationLogs, err)
+	}
+	implementationLog, err := os.ReadFile(implementationLogs[0])
+	if err != nil || !strings.Contains(string(implementationLog), "ATTACH_STAGE_LOG_ONLY_MARKER") || !strings.Contains(string(implementationLog), "ATTACH_COMPLETION_MARKER") {
+		t.Fatalf("fake agent stage-log markers were not recorded in its stage log: %q err=%v", implementationLog, err)
+	}
+	if err := waitFailedImplementTestShutdown(store, target, jobID, 15*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForTestProcessExit(workerPID, 10*time.Second); err != nil {
+		t.Fatalf("detached worker PID %d did not exit: %v", workerPID, err)
+	}
+
+	inspect := exec.Command(binary, "job", "get", jobID, "--details")
+	inspect.Dir, inspect.Env = target, env
+	details, err := inspect.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-process job get --details: %v\n%s", err, details)
+	}
+	for _, want := range []string{"Status: complete", "Description: attach process test", "Job log path:"} {
+		if !strings.Contains(string(details), want) {
+			t.Errorf("fresh-process details omitted %q: %s", want, details)
+		}
+	}
+	if _, err := os.Stat(ghInvoked); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("provider tripwire was invoked despite publication being disabled: %v", err)
+	}
+	if head := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); head != initialHead {
+		t.Errorf("detached implementation changed target checkout HEAD: got %s, want %s", head, initialHead)
+	}
+	if status := runTestGit(t, "-C", target, "status", "--porcelain"); status != initialStatus {
+		t.Errorf("detached implementation changed target checkout status: got %q, want %q", status, initialStatus)
+	}
+	preserveRoot = false
+}
+
 func TestDetachedImplementCrashIsInspectableAndNotReplayed(t *testing.T) {
 	root, err := os.MkdirTemp("", "factory detached crash test-")
 	if err != nil {
