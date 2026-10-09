@@ -3,6 +3,7 @@ package restjobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -592,6 +593,143 @@ func TestSQLiteServerStoreReleasesOwnershipOnClose(t *testing.T) {
 	}
 	if err := second.CloseStore(); err != nil {
 		t.Fatalf("close second server store: %v", err)
+	}
+}
+
+func TestSQLiteServerRejectsPathReplacementWhileOwnerLive(t *testing.T) {
+	const (
+		helperResultStart = "FACTORY_SQLITE_PATH_REPLACEMENT_RESULT_BEGIN"
+		helperResultEnd   = "FACTORY_SQLITE_PATH_REPLACEMENT_RESULT_END"
+	)
+	if role := os.Getenv("FACTORY_SQLITE_PATH_REPLACEMENT_HELPER"); role != "" {
+		path := os.Getenv("FACTORY_SQLITE_PATH_REPLACEMENT_PATH")
+		store, err := OpenSQLiteServerStore(path, testConfig())
+		if role == "competitor" {
+			if err != nil {
+				fmt.Printf("\n%s\nB_OPEN_ERROR: %v\n%s\n", helperResultStart, err, helperResultEnd)
+				return
+			}
+			fmt.Printf("\n%s\nB_OPENED\n%s\n", helperResultStart, helperResultEnd)
+			_ = store.CloseStore()
+			return
+		}
+		if err != nil {
+			t.Fatalf("open live owner store: %v", err)
+		}
+		job, _, err := store.Admit("original-live-job", Request{Repository: "widget", Task: "remain running while the configured path is replaced"})
+		if err != nil {
+			t.Fatalf("admit live owner job: %v", err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatalf("claim live owner job: %v", err)
+		}
+		if err := os.WriteFile(os.Getenv("FACTORY_SQLITE_PATH_REPLACEMENT_READY"), []byte(job.ID), 0o600); err != nil {
+			t.Fatalf("signal live owner readiness: %v", err)
+		}
+		select {}
+	}
+
+	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", cacheDir)
+	subprocessEnv := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != "HOME" && key != "XDG_CACHE_HOME" {
+			subprocessEnv = append(subprocessEnv, entry)
+		}
+	}
+	subprocessEnv = append(subprocessEnv, "HOME="+root, "XDG_CACHE_HOME="+cacheDir)
+
+	configuredDir := filepath.Join(root, "configured")
+	if err := os.Mkdir(configuredDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(configuredDir, "jobs.db")
+	ready := filepath.Join(root, "owner-ready")
+	owner := exec.Command(os.Args[0], "-test.run=^TestSQLiteServerRejectsPathReplacementWhileOwnerLive$")
+	owner.Env = append(subprocessEnv, "FACTORY_SQLITE_PATH_REPLACEMENT_HELPER=owner", "FACTORY_SQLITE_PATH_REPLACEMENT_PATH="+path, "FACTORY_SQLITE_PATH_REPLACEMENT_READY="+ready)
+	if err := owner.Start(); err != nil {
+		t.Fatalf("start owner process: %v", err)
+	}
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- owner.Wait() }()
+	t.Cleanup(func() {
+		if owner.ProcessState == nil {
+			_ = owner.Process.Kill()
+			<-ownerDone
+		}
+	})
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if owner.ProcessState != nil {
+			t.Fatalf("owner process exited before readiness: %v", <-ownerDone)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	jobID, err := os.ReadFile(ready)
+	if err != nil {
+		t.Fatalf("owner did not become ready: %v", err)
+	}
+
+	replacementDir := filepath.Join(root, "replacement")
+	if err := os.Mkdir(replacementDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	replacementPath := filepath.Join(replacementDir, "jobs.db")
+	replacement, err := OpenSQLiteStore(replacementPath, testConfig())
+	if err != nil {
+		t.Fatalf("initialize replacement database: %v", err)
+	}
+	if err := replacement.CloseStore(); err != nil {
+		t.Fatalf("close replacement database: %v", err)
+	}
+	parkedDir := filepath.Join(root, "original")
+	if err := os.Rename(configuredDir, parkedDir); err != nil {
+		t.Fatalf("move live database directory aside: %v", err)
+	}
+	if err := os.Mkdir(configuredDir, 0o700); err != nil {
+		t.Fatalf("recreate configured database directory: %v", err)
+	}
+	if err := os.Rename(replacementPath, path); err != nil {
+		t.Fatalf("bind replacement database at configured path: %v", err)
+	}
+
+	competitor := exec.Command(os.Args[0], "-test.run=^TestSQLiteServerRejectsPathReplacementWhileOwnerLive$")
+	competitor.Env = append(subprocessEnv, "FACTORY_SQLITE_PATH_REPLACEMENT_HELPER=competitor", "FACTORY_SQLITE_PATH_REPLACEMENT_PATH="+path)
+	output, err := competitor.CombinedOutput()
+	if err != nil {
+		t.Fatalf("replacement-path competitor process: %v: %s", err, output)
+	}
+	outputText := string(output)
+	startMarker := helperResultStart + "\n"
+	start := strings.Index(outputText, startMarker)
+	if start < 0 {
+		t.Fatalf("replacement-path competitor output missing start marker: %q", outputText)
+	}
+	start += len(startMarker)
+	endMarker := "\n" + helperResultEnd
+	end := strings.Index(outputText[start:], endMarker)
+	if end < 0 {
+		t.Fatalf("replacement-path competitor output missing end marker: %q", outputText)
+	}
+	result := strings.TrimSpace(outputText[start : start+end])
+	if !strings.HasPrefix(result, "B_OPEN_ERROR: ") || !strings.Contains(result, "already owned by another server") {
+		t.Fatalf("replacement-path open result = %s, want ownership conflict", result)
+	}
+
+	original, err := OpenSQLiteStore(filepath.Join(parkedDir, "jobs.db"), testConfig())
+	if err != nil {
+		t.Fatalf("observe original live database after competitor attempt: %v", err)
+	}
+	live, err := original.Get(string(jobID))
+	_ = original.CloseStore()
+	if err != nil || live.Status != StatusRunning {
+		t.Fatalf("original live job after competitor attempt = (%+v, %v), want running", live, err)
 	}
 }
 
