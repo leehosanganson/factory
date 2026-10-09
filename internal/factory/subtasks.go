@@ -135,6 +135,14 @@ func validateImplementationPlan(data []byte) (implementationPlan, error) {
 			if err := validateSubtaskPath(file); err != nil {
 				return plan, fmt.Errorf("subtask %q: %w", task.ID, err)
 			}
+			for existing := range claimed {
+				if strings.EqualFold(existing, file) && existing != file {
+					return plan, fmt.Errorf("subtask file scopes collide on case-insensitive filesystems: %q and %q", existing, file)
+				}
+				if caseInsensitiveDirectoryOverlap(existing, file) {
+					return plan, fmt.Errorf("subtask file scopes overlap on case-insensitive filesystems: %q and %q", existing, file)
+				}
+			}
 			if seenFiles[file] {
 				return plan, fmt.Errorf("subtask %q declares file %q more than once", task.ID, file)
 			}
@@ -237,6 +245,11 @@ func validateSubtaskPath(path string) error {
 		}
 	}
 	return nil
+}
+
+func caseInsensitiveDirectoryOverlap(a, b string) bool {
+	lowerA, lowerB := strings.ToLower(a), strings.ToLower(b)
+	return strings.HasPrefix(lowerA, lowerB+"/") || strings.HasPrefix(lowerB, lowerA+"/")
 }
 
 // implementationWaves validates the dependency DAG and returns stable topological waves.
