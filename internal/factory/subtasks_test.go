@@ -366,6 +366,21 @@ func TestParallelImplementationObserverFailureAfterIntegrationRollsBackTarget(t 
 	if state.Status != "failed" || state.SubtaskPlanStatus != "failed" {
 		t.Fatalf("persisted workflow/plan status = %q/%q, want failed/failed", state.Status, state.SubtaskPlanStatus)
 	}
+	for _, record := range state.Subtasks {
+		if record.Status != "rolled_back" || record.Outcome == "" || len(record.Outcome) > evaluatorOutputLimit {
+			t.Errorf("persisted subtask outcome after target rollback = %+v, want bounded rolled_back outcome", record)
+		}
+	}
+	events, err := os.ReadFile(filepath.Join(stateDir, "runs", state.ID, "workflow-events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(events), `"type":"subtask.rolled_back"`); got != len(state.Subtasks) {
+		t.Fatalf("persisted subtask rollback events = %d, want %d", got, len(state.Subtasks))
+	}
+	if !strings.HasSuffix(strings.TrimSpace(string(events)), `"type":"workflow.transition","stage":"implement","message":"failed"}`) {
+		t.Fatalf("final persisted event does not identify workflow failure: %s", events)
+	}
 }
 
 func TestParallelImplementationLaterWaveFailureLeavesTargetUnchanged(t *testing.T) {
