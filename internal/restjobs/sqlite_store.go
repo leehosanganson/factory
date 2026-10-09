@@ -41,7 +41,7 @@ type SQLiteStore struct {
 	closeCh        chan struct{}
 	closeDone      chan struct{}
 	closeOnce      sync.Once
-	serverLock     *os.File
+	serverLocks    []*os.File
 }
 
 var _ Store = (*SQLiteStore)(nil)
@@ -110,10 +110,11 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 	return store, nil
 }
 
-// OpenSQLiteServerStore opens a SQLite store while holding an exclusive lock
-// keyed by the database file identity. Hard-link aliases therefore share server
-// ownership without locking SQLite's own database file. Administrative store
-// openings may continue to use OpenSQLiteStore without claiming server ownership.
+// OpenSQLiteServerStore opens a SQLite store while holding exclusive locks keyed
+// by the database file identity and configured path. Hard-link aliases therefore
+// share ownership, and replacing the database at its configured path cannot
+// bypass a live server's lock. Administrative store openings may continue to use
+// OpenSQLiteStore without claiming server ownership.
 func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
 	if path == ":memory:" {
 		return nil, errors.New("SQLite server database must be file-backed")
@@ -128,24 +129,61 @@ func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
 	if err != nil {
 		return nil, errors.New("resolve SQLite server ownership lock")
 	}
-	if err := ensurePrivateSQLiteFile(lockPath); err != nil {
-		return nil, errors.New("prepare SQLite server ownership lock")
-	}
-	lock, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	pathLockPath, err := sqliteServerPathLockPath(path)
 	if err != nil {
-		return nil, errors.New("open SQLite server ownership lock")
+		return nil, errors.New("resolve SQLite server path ownership lock")
 	}
-	if err := lockSQLiteServerFile(lock); err != nil {
-		_ = lock.Close()
-		return nil, errors.New("SQLite database is already owned by another server")
+	locks := make([]*os.File, 0, 2)
+	for _, candidate := range []string{lockPath, pathLockPath} {
+		if err := ensurePrivateSQLiteFile(candidate); err != nil {
+			closeSQLiteServerLocks(locks)
+			return nil, errors.New("prepare SQLite server ownership lock")
+		}
+		lock, err := os.OpenFile(candidate, os.O_RDWR, 0)
+		if err != nil {
+			closeSQLiteServerLocks(locks)
+			return nil, errors.New("open SQLite server ownership lock")
+		}
+		if err := lockSQLiteServerFile(lock); err != nil {
+			_ = lock.Close()
+			closeSQLiteServerLocks(locks)
+			return nil, errors.New("SQLite database is already owned by another server")
+		}
+		locks = append(locks, lock)
 	}
 	store, err := OpenSQLiteStore(path, config)
 	if err != nil {
-		_ = unlockSQLiteServerFile(lock)
+		closeSQLiteServerLocks(locks)
 		return nil, err
 	}
-	store.serverLock = lock
+	store.serverLocks = locks
 	return store, nil
+}
+
+func sqliteServerPathLockPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheDir) == "" {
+		return "", errors.New("private cache directory is unavailable")
+	}
+	lockDir := filepath.Join(cacheDir, "factory", "sqlite-locks")
+	if err := os.MkdirAll(lockDir, 0o700); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(lockDir, 0o700); err != nil {
+		return "", err
+	}
+	key := sha256.Sum256([]byte(filepath.Clean(abs)))
+	return filepath.Join(lockDir, "path-"+hex.EncodeToString(key[:])+".lock"), nil
+}
+
+func closeSQLiteServerLocks(locks []*os.File) {
+	for _, lock := range locks {
+		_ = unlockSQLiteServerFile(lock)
+	}
 }
 
 func ensureProviderColumn(ctx context.Context, db *sql.DB) error {
@@ -494,13 +532,15 @@ func (s *SQLiteStore) CloseStore() error {
 		return nil
 	}
 	s.dbClosed = true
-	lock := s.serverLock
-	s.serverLock = nil
+	locks := s.serverLocks
+	s.serverLocks = nil
 	s.mu.Unlock()
 	dbErr := s.db.Close()
 	var lockErr error
-	if lock != nil {
-		lockErr = unlockSQLiteServerFile(lock)
+	for _, lock := range locks {
+		if err := unlockSQLiteServerFile(lock); err != nil && lockErr == nil {
+			lockErr = err
+		}
 	}
 	if dbErr != nil {
 		return dbErr
