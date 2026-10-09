@@ -1119,18 +1119,80 @@ func TestJobListLimitShowsNewestJobsAndOmittedLimitRemainsUnbounded(t *testing.T
 	}
 }
 
-func TestJobListRejectsInvalidLimits(t *testing.T) {
+func TestJobListFiltersBeforeApplyingLimit(t *testing.T) {
+	state := t.TempDir()
+	target := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().Add(-5 * time.Minute)
+	jobs := []JobRecord{
+		{ID: "matching-old", Type: implementationJobType, Status: "running", TargetPath: target, CreatedAt: createdAt},
+		{ID: "wrong-status", Type: implementationJobType, Status: "complete", TargetPath: target, CreatedAt: createdAt.Add(time.Minute)},
+		{ID: "wrong-type", Type: tidyJobType, Status: "running", TargetPath: target, CreatedAt: createdAt.Add(2 * time.Minute)},
+		{ID: "matching-new", Type: implementationJobType, Status: "running", TargetPath: target, CreatedAt: createdAt.Add(3 * time.Minute)},
+	}
+	for _, job := range jobs {
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var output bytes.Buffer
+	if err := JobCommand([]string{"list", "--status", "running", "--type", "implementation", "--limit", "1"}, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("filtered job list: %v", err)
+	}
+	if !strings.Contains(output.String(), "matching-new") || strings.Contains(output.String(), "matching-old") || strings.Contains(output.String(), "wrong-status") || strings.Contains(output.String(), "wrong-type") {
+		t.Fatalf("filtered newest-one output = %q", output.String())
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want []string
+		omit []string
+	}{
+		{name: "status only", args: []string{"list", "--status", "running"}, want: []string{"matching-old", "wrong-type", "matching-new"}, omit: []string{"wrong-status"}},
+		{name: "type only", args: []string{"list", "--type", "tidy"}, want: []string{"wrong-type"}, omit: []string{"matching-old", "wrong-status", "matching-new"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			output.Reset()
+			if err := JobCommand(tc.args, Config{StateDir: state}, target, strings.NewReader(""), &output); err != nil {
+				t.Fatalf("filtered job list: %v", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(output.String(), want) {
+					t.Errorf("filtered output omitted %q: %s", want, output.String())
+				}
+			}
+			for _, omitted := range tc.omit {
+				if strings.Contains(output.String(), omitted) {
+					t.Errorf("filtered output included %q: %s", omitted, output.String())
+				}
+			}
+		})
+	}
+}
+
+func TestJobListRejectsInvalidOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		args []string
 		want string
 	}{
-		{name: "missing value", args: []string{"list", "--limit"}, want: "usage: factory job list [--limit <n>]"},
-		{name: "duplicate", args: []string{"list", "--limit", "1", "--limit", "2"}, want: "--limit may only be specified once"},
-		{name: "zero", args: []string{"list", "--limit", "0"}, want: "--limit must be a positive integer"},
-		{name: "negative", args: []string{"list", "--limit", "-1"}, want: "--limit must be a positive integer"},
-		{name: "noninteger", args: []string{"list", "--limit", "1.5"}, want: "--limit must be a positive integer"},
-		{name: "unknown option", args: []string{"list", "--other"}, want: "usage: factory job list [--limit <n>]"},
+		{name: "missing limit", args: []string{"list", "--limit"}, want: "--limit requires a positive integer"},
+		{name: "duplicate limit", args: []string{"list", "--limit", "1", "--limit", "2"}, want: "--limit may only be specified once"},
+		{name: "zero limit", args: []string{"list", "--limit", "0"}, want: "--limit must be a positive integer"},
+		{name: "negative limit", args: []string{"list", "--limit", "-1"}, want: "--limit must be a positive integer"},
+		{name: "noninteger limit", args: []string{"list", "--limit", "1.5"}, want: "--limit must be a positive integer"},
+		{name: "missing status", args: []string{"list", "--status"}, want: "--status requires one of"},
+		{name: "invalid status", args: []string{"list", "--status", "unknown"}, want: "invalid --status"},
+		{name: "duplicate status", args: []string{"list", "--status", "running", "--status", "failed"}, want: "--status may only be specified once"},
+		{name: "missing type", args: []string{"list", "--type"}, want: "--type requires one of"},
+		{name: "invalid type", args: []string{"list", "--type", "unknown"}, want: "invalid --type"},
+		{name: "duplicate type", args: []string{"list", "--type", "tidy", "--type", "monitor"}, want: "--type may only be specified once"},
+		{name: "unknown option", args: []string{"list", "--other"}, want: "unknown job list argument"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var output bytes.Buffer
@@ -1142,6 +1204,24 @@ func TestJobListRejectsInvalidLimits(t *testing.T) {
 				t.Fatalf("invalid job list arguments printed output: %q", output.String())
 			}
 		})
+	}
+}
+
+func TestJobListFiltersToNoJobs(t *testing.T) {
+	state := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateJob(JobRecord{ID: "completed-tidy", Type: tidyJobType, Status: "complete", TargetPath: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	if err := JobCommand([]string{"list", "--type", "monitor"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output); err != nil {
+		t.Fatalf("empty matching list returned error: %v", err)
+	}
+	if output.String() != "No jobs.\n" {
+		t.Fatalf("empty matching output = %q, want No jobs", output.String())
 	}
 }
 
