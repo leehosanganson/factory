@@ -1022,6 +1022,52 @@ func TestJobListPrintsReadableJobsAlongsideReconciliationErrors(t *testing.T) {
 	}
 }
 
+func TestJobListLimitReconcilesEveryPersistedJobBeforeLimitingOutput(t *testing.T) {
+	state := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdAt := time.Now().Add(-6 * time.Minute)
+	const count = 24
+	for index := 0; index < count; index++ {
+		id := fmt.Sprintf("history-%02d", index)
+		if err := store.CreateJob(JobRecord{
+			ID: id, Type: tidyJobType, Status: "complete", TargetPath: t.TempDir(),
+			CreatedAt: createdAt.Add(time.Duration(index) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var output bytes.Buffer
+	if err := JobCommand([]string{"list", "--limit", "3"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output); err != nil {
+		t.Fatalf("limited job list: %v", err)
+	}
+	jobs, err := store.ListJobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != count {
+		t.Fatalf("retained job count = %d, want %d", len(jobs), count)
+	}
+	for index, job := range jobs {
+		wantID := fmt.Sprintf("history-%02d", count-index-1)
+		if job.ID != wantID || job.Status != "complete" {
+			t.Errorf("persisted job %d = (%s, %s), want (%s, complete)", index, job.ID, job.Status, wantID)
+		}
+		if index < 3 && !strings.Contains(output.String(), wantID) {
+			t.Errorf("limited output omitted newest job %s: %q", wantID, output.String())
+		}
+		if index >= 3 && strings.Contains(output.String(), wantID) {
+			t.Errorf("limited output included older job %s: %q", wantID, output.String())
+		}
+	}
+	if lines := strings.Split(strings.TrimSpace(output.String()), "\n"); len(lines) != 4 {
+		t.Fatalf("limited list printed %d lines, want header plus three jobs: %q", len(lines), output.String())
+	}
+}
+
 func TestJobListLimitShowsNewestJobsAndOmittedLimitRemainsUnbounded(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()
