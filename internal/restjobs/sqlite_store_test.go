@@ -630,6 +630,18 @@ func TestSQLiteServerRejectsPathReplacementWhileOwnerLive(t *testing.T) {
 	}
 
 	root := t.TempDir()
+	cacheDir := filepath.Join(root, "cache")
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CACHE_HOME", cacheDir)
+	subprocessEnv := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != "HOME" && key != "XDG_CACHE_HOME" {
+			subprocessEnv = append(subprocessEnv, entry)
+		}
+	}
+	subprocessEnv = append(subprocessEnv, "HOME="+root, "XDG_CACHE_HOME="+cacheDir)
+
 	configuredDir := filepath.Join(root, "configured")
 	if err := os.Mkdir(configuredDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -637,7 +649,7 @@ func TestSQLiteServerRejectsPathReplacementWhileOwnerLive(t *testing.T) {
 	path := filepath.Join(configuredDir, "jobs.db")
 	ready := filepath.Join(root, "owner-ready")
 	owner := exec.Command(os.Args[0], "-test.run=^TestSQLiteServerRejectsPathReplacementWhileOwnerLive$")
-	owner.Env = append(os.Environ(), "FACTORY_SQLITE_PATH_REPLACEMENT_HELPER=owner", "FACTORY_SQLITE_PATH_REPLACEMENT_PATH="+path, "FACTORY_SQLITE_PATH_REPLACEMENT_READY="+ready)
+	owner.Env = append(subprocessEnv, "FACTORY_SQLITE_PATH_REPLACEMENT_HELPER=owner", "FACTORY_SQLITE_PATH_REPLACEMENT_PATH="+path, "FACTORY_SQLITE_PATH_REPLACEMENT_READY="+ready)
 	if err := owner.Start(); err != nil {
 		t.Fatalf("start owner process: %v", err)
 	}
@@ -688,7 +700,7 @@ func TestSQLiteServerRejectsPathReplacementWhileOwnerLive(t *testing.T) {
 	}
 
 	competitor := exec.Command(os.Args[0], "-test.run=^TestSQLiteServerRejectsPathReplacementWhileOwnerLive$")
-	competitor.Env = append(os.Environ(), "FACTORY_SQLITE_PATH_REPLACEMENT_HELPER=competitor", "FACTORY_SQLITE_PATH_REPLACEMENT_PATH="+path)
+	competitor.Env = append(subprocessEnv, "FACTORY_SQLITE_PATH_REPLACEMENT_HELPER=competitor", "FACTORY_SQLITE_PATH_REPLACEMENT_PATH="+path)
 	output, err := competitor.CombinedOutput()
 	if err != nil {
 		t.Fatalf("replacement-path competitor process: %v: %s", err, output)
