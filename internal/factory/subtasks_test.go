@@ -58,6 +58,63 @@ func oversizedPlanJSON() string {
 	return string(data)
 }
 
+func TestApplyStagedSubtaskFilesRollsBackPartialIntegration(t *testing.T) {
+	targetRoot := t.TempDir()
+	stagingRoot := t.TempDir()
+	firstTarget := filepath.Join(targetRoot, "a", "first.txt")
+	if err := os.MkdirAll(filepath.Dir(firstTarget), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstTarget, []byte("original first content"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedTarget := filepath.Join(targetRoot, "unrelated.txt")
+	if err := os.WriteFile(unrelatedTarget, []byte("unrelated content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstStaged := filepath.Join(stagingRoot, "a", "first.txt")
+	if err := os.MkdirAll(filepath.Dir(firstStaged), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstStaged, []byte("replacement first content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondTarget := filepath.Join(targetRoot, "z", "nested", "second.txt")
+	if err := os.MkdirAll(filepath.Dir(secondTarget), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secondTarget, []byte("pre-existing second content"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	secondStaged := filepath.Join(stagingRoot, "z", "nested", "second.txt")
+	if err := os.MkdirAll(filepath.Dir(secondStaged), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-target", secondStaged); err != nil {
+		t.Skipf("create dangling symlink source: %v", err)
+	}
+
+	_, err := applyStagedSubtaskFiles(targetRoot, stagingRoot, map[string]string{
+		"a/first.txt":         "first-digest",
+		"z/nested/second.txt": "second-digest",
+	})
+	if err == nil {
+		t.Fatal("partial staged integration succeeded despite the dangling symlink source")
+	}
+	if data, readErr := os.ReadFile(firstTarget); readErr != nil || string(data) != "original first content" {
+		t.Errorf("first target after rollback = %q, %v; want original bytes", data, readErr)
+	}
+	if info, statErr := os.Stat(firstTarget); statErr != nil || info.Mode().Perm() != 0o640 {
+		t.Errorf("first target mode after rollback = %v, %v; want 0640", info, statErr)
+	}
+	if data, readErr := os.ReadFile(unrelatedTarget); readErr != nil || string(data) != "unrelated content" {
+		t.Errorf("unrelated target after rollback = %q, %v; want unchanged content", data, readErr)
+	}
+	if data, readErr := os.ReadFile(secondTarget); readErr != nil || string(data) != "pre-existing second content" {
+		t.Errorf("pre-existing second target after rollback = %q, %v; want original content", data, readErr)
+	}
+}
+
 func TestParallelImplementationRecognizesSymlinkedTemporaryRoot(t *testing.T) {
 	realRoot := initTestGitRepo(t)
 	alias := filepath.Join(t.TempDir(), "repo-alias")
