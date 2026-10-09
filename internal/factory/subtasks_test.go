@@ -3,6 +3,7 @@ package factory
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -300,6 +301,40 @@ func TestParallelImplementationPreservesModeChanges(t *testing.T) {
 	info, err := os.Stat(filepath.Join(dir, "feature-one.txt"))
 	if err != nil || info.Mode().Perm() != 0o755 {
 		t.Fatalf("integrated mode = %v, %v; want 0755", info, err)
+	}
+}
+
+func TestParallelImplementationObserverFailureAfterIntegrationRollsBackTarget(t *testing.T) {
+	dir := initTestGitRepo(t)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	before := gitWorktreeSnapshot(t, dir)
+	observerErr := errors.New("integration observer failed")
+	observerCalls := 0
+	workflow := Workflow{
+		Agent:  &parallelWorkflowAgent{},
+		Config: Config{StateDir: stateDir, ParallelImplementation: &ParallelImplementationConfig{Enabled: true}},
+		In:     strings.NewReader(""), Out: ioDiscard{}, Workdir: dir, Stages: []string{"implement"},
+		Observer: WorkflowObserverFunc(func(event WorkflowEvent) error {
+			if event.Type == "subtask.integrated" {
+				observerCalls++
+				return observerErr
+			}
+			return nil
+		}),
+	}
+
+	if err := workflow.Run("rollback after integration observer failure"); err == nil || !strings.Contains(err.Error(), observerErr.Error()) {
+		t.Fatalf("workflow error = %v, want observer error", err)
+	}
+	if observerCalls != 1 {
+		t.Fatalf("integration observer calls = %d, want 1", observerCalls)
+	}
+	if after := gitWorktreeSnapshot(t, dir); after != before {
+		t.Fatalf("target changed after integration observer failure: before %q, after %q", before, after)
+	}
+	state := workflowRunState(t, stateDir)
+	if state.Status != "failed" || state.SubtaskPlanStatus != "failed" {
+		t.Fatalf("persisted workflow/plan status = %q/%q, want failed/failed", state.Status, state.SubtaskPlanStatus)
 	}
 }
 
