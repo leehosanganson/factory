@@ -13,6 +13,7 @@
   "auto_publish": true,
   "agent_timeout": "60m",
   "monitor_timeout": "",
+  "detached_job_max_concurrency": 4,
   "pipeline_checks": [
     ["make", "test"]
   ],

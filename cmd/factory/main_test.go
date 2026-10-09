@@ -67,9 +67,16 @@ func TestDoctorProcessChecksSetupWithoutSideEffects(t *testing.T) {
 			wantExitError: true,
 		},
 		{
+			name:   "doctor reports configured detached cap without config details",
+			config: `{"command":"pi","args":["{system_prompt}","{task}","secret-argument"],"auto_publish":false,"detached_job_max_concurrency":2}`,
+			tools:  []string{"pi", "git"},
+			want:   []string{"detached job concurrency: 2"},
+			omit:   []string{"secret-argument"},
+		},
+		{
 			name:  "healthy default config reports no checks as advisory",
 			tools: []string{"pi", "git", "gh"},
-			want:  []string{"config: valid", "agent executable: available", "git: available", "gh: available", "pipeline checks: 0 configured", "advisory", "confidence"},
+			want:  []string{"config: valid", "agent executable: available", "git: available", "gh: available", "detached job concurrency: unlimited (not configured)", "pipeline checks: 0 configured", "advisory", "confidence"},
 			omit:  []string{"skipped"},
 		},
 		{

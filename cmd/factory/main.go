@@ -328,6 +328,7 @@ func jobHelp(subcommand string) ([]helpCommand, []string) {
 		{"factory job attach <id>", "Follow worker output."},
 		{"factory job stop <id>", "Request cancellation."},
 		{"factory job watch <id>...", "Refresh selected job status and latest activity, with monitor phase, check freshness, and recent events."},
+		{"Configuration: detached_job_max_concurrency", "Optional active detached-job cap (1–64) across shared state; omitted means unlimited. Independent of implementation subtask parallelism."},
 		{"Configuration: worktree_parent", "Parent path template for implementation and monitor worktrees; {repo} is the primary checkout name."},
 	}
 	return selectCommandHelp(all, subcommand, "")
@@ -402,6 +403,11 @@ func runDoctor(out io.Writer) error {
 		return fmt.Errorf("doctor could not load a valid config")
 	}
 	fmt.Fprintln(out, "config: valid")
+	if cfg.DetachedJobMaxConcurrency == nil {
+		fmt.Fprintln(out, "detached job concurrency: unlimited (not configured)")
+	} else {
+		fmt.Fprintf(out, "detached job concurrency: %d\n", *cfg.DetachedJobMaxConcurrency)
+	}
 
 	failed := false
 	check := func(label, executable string) {

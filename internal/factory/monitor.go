@@ -873,6 +873,15 @@ func startMonitorLegacy(args []string, cfg Config, workdir, root string, out io.
 		return err
 	}
 	defer unlock()
+	store, err := NewJobStore(root)
+	if err != nil {
+		return err
+	}
+	unlockCapacity, err := lockDetachedJobCapacity(store, cfg)
+	if err != nil {
+		return err
+	}
+	defer unlockCapacity()
 	jobs, _ := loadJobs(root)
 	for _, j := range jobs {
 		if j.Repo == baseRepo && j.PR == info.Number && isMonitorActive(j.Status) && (j.Status == "queued" || workerFresh(j) && processAlive(j.PID)) {
@@ -884,10 +893,6 @@ func startMonitorLegacy(args []string, cfg Config, workdir, root string, out io.
 		return err
 	}
 	dir := filepath.Join(root, id)
-	store, err := NewJobStore(root)
-	if err != nil {
-		return err
-	}
 	if err := os.MkdirAll(filepath.Join(store.Root(), id), 0o700); err != nil {
 		return err
 	}

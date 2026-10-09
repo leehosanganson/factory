@@ -405,6 +405,32 @@ func StartWorkflowJob(cfg Config, target, description, jobType string) (string, 
 	return startWorkflowJob(store, cfg, target, description, jobType)
 }
 
+func lockDetachedJobCapacity(store *JobStore, cfg Config) (func(), error) {
+	if cfg.DetachedJobMaxConcurrency == nil {
+		return func() {}, nil
+	}
+	if *cfg.DetachedJobMaxConcurrency < 1 || *cfg.DetachedJobMaxConcurrency > maxDetachedJobConcurrency {
+		return nil, fmt.Errorf("detached_job_max_concurrency must be between 1 and %d when set", maxDetachedJobConcurrency)
+	}
+	unlock, err := store.LockDetachedJobAdmission()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.DetachedJobMaxConcurrency == nil {
+		return unlock, nil
+	}
+	active, err := store.ActiveDetachedJobCount()
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	if active >= *cfg.DetachedJobMaxConcurrency {
+		unlock()
+		return nil, fmt.Errorf("detached job concurrency limit reached (%d active); inspect with `factory job list` and retry after an active job finishes or is safely reconciled", active)
+	}
+	return unlock, nil
+}
+
 func startImplementationJob(store *JobStore, cfg Config, target, description string) (string, error) {
 	return startWorkflowJob(store, cfg, target, description, implementationJobType)
 }
@@ -414,6 +440,9 @@ func startTidyJob(store *JobStore, cfg Config, target, description string) (stri
 }
 
 func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType string) (string, error) {
+	if cfg.DetachedJobMaxConcurrency != nil && (*cfg.DetachedJobMaxConcurrency < 1 || *cfg.DetachedJobMaxConcurrency > maxDetachedJobConcurrency) {
+		return "", fmt.Errorf("detached_job_max_concurrency must be between 1 and %d when set", maxDetachedJobConcurrency)
+	}
 	if jobType != implementationJobType && jobType != tidyJobType {
 		return "", fmt.Errorf("unsupported workflow job type %q", jobType)
 	}
@@ -445,6 +474,11 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 		return "", err
 	}
 	defer unlockRepository()
+	unlockCapacity, err := lockDetachedJobCapacity(store, cfg)
+	if err != nil {
+		return "", err
+	}
+	defer unlockCapacity()
 	var unlockBranch func()
 	if jobType == implementationJobType && branch != "" {
 		unlockBranch, err = store.LockBranch(branchRepository, branch)

@@ -175,6 +175,11 @@ func startMonitor(args []string, cfg Config, workdir, root string, out io.Writer
 		return err
 	}
 	defer unlockAdmission()
+	unlockCapacity, err := lockDetachedJobCapacity(store, cfg)
+	if err != nil {
+		return err
+	}
+	defer unlockCapacity()
 	branchUnlock, acquired, err := store.TryLockBranch(commonRepository, info.HeadRefName)
 	if err != nil {
 		return err
