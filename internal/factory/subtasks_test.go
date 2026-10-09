@@ -89,6 +89,52 @@ func oversizedPlanJSON() string {
 	return string(data)
 }
 
+func TestApplyStagedSubtaskFilesRollsBackEarlierFilesWhenLaterSourceIsMissing(t *testing.T) {
+	targetRoot := t.TempDir()
+	stagingRoot := t.TempDir()
+	firstTarget := filepath.Join(targetRoot, "a", "existing.txt")
+	if err := os.MkdirAll(filepath.Dir(firstTarget), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstTarget, []byte("original"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	firstStaged := filepath.Join(stagingRoot, "a", "existing.txt")
+	if err := os.MkdirAll(filepath.Dir(firstStaged), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstStaged, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := filepath.Join(targetRoot, "unrelated.txt")
+	if err := os.WriteFile(unrelated, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := applyStagedSubtaskFiles(targetRoot, stagingRoot, map[string]string{
+		"a/existing.txt": "first-digest",
+		"z/missing.txt":  "second-digest",
+	})
+	if err == nil || !strings.Contains(err.Error(), "z/missing.txt") {
+		t.Fatalf("staged application error = %v; want missing later source error", err)
+	}
+	if data, readErr := os.ReadFile(firstTarget); readErr != nil || string(data) != "original" {
+		t.Errorf("earlier target = %q, %v; want original bytes", data, readErr)
+	}
+	if info, statErr := os.Stat(firstTarget); statErr != nil || info.Mode().Perm() != 0o640 {
+		t.Errorf("earlier target mode = %v, %v; want 0640", info, statErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(targetRoot, "z")); !os.IsNotExist(statErr) {
+		t.Errorf("new parent directory remains after rollback: %v", statErr)
+	}
+	if data, readErr := os.ReadFile(unrelated); readErr != nil || string(data) != "untouched" {
+		t.Errorf("unrelated target = %q, %v; want unchanged", data, readErr)
+	}
+	if data, readErr := os.ReadFile(firstStaged); readErr != nil || string(data) != "replacement" {
+		t.Errorf("staged source = %q, %v; want retained", data, readErr)
+	}
+}
+
 func TestApplyStagedSubtaskFilesRejectsSymlinkedTargetParent(t *testing.T) {
 	targetRoot := t.TempDir()
 	externalRoot := t.TempDir()

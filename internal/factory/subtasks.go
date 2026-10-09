@@ -880,6 +880,13 @@ func applyStagedSubtaskFiles(targetRoot, stagingRoot string, staged map[string]s
 	var createdDirs []string
 	for _, path := range paths {
 		target := filepath.Join(targetRoot, filepath.FromSlash(path))
+		source := filepath.Join(stagingRoot, filepath.FromSlash(path))
+		if staged[path] != "deleted" {
+			if _, err := os.Lstat(source); err != nil {
+				rollbackErr := rollbackSubtaskFiles(targetRoot, snapshots, applied, createdDirs)
+				return nil, errors.Join(fmt.Errorf("staged source %q: %w", path, err), rollbackErr)
+			}
+		}
 		missing, err := missingParentDirectories(targetRoot, target)
 		if err != nil {
 			rollbackErr := rollbackSubtaskFiles(targetRoot, snapshots, applied, createdDirs)
