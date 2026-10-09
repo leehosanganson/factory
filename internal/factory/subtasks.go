@@ -394,10 +394,38 @@ func (w Workflow) runParallelImplementation(ctx context.Context, task, stageLog,
 	var rollbackApplied func() error
 	defer func() {
 		if resultErr != nil && rollbackApplied != nil {
-			resultErr = errors.Join(resultErr, rollbackApplied())
+			rollbackErr := rollbackApplied()
+			if rollbackErr != nil {
+				resultErr = errors.Join(resultErr, rollbackErr)
+			}
+			for i := range state.Subtasks {
+				record := &state.Subtasks[i]
+				if record.Status != "integrated" && record.Status != "staged" {
+					continue
+				}
+				record.Status = "rolled_back"
+				record.Outcome = "target integration rolled back after workflow failure"
+				if rollbackErr != nil {
+					record.Status = "rollback_failed"
+					record.Outcome = boundedOutput("target integration rollback failed: "+rollbackErr.Error(), evaluatorOutputLimit)
+				}
+			}
+			if err := writeState(runDir, state); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("persist subtask rollback outcome: %w", err))
+			}
+			for _, record := range state.Subtasks {
+				if record.Status != "rolled_back" && record.Status != "rollback_failed" {
+					continue
+				}
+				eventType := "subtask.rolled_back"
+				if record.Status == "rollback_failed" {
+					eventType = "subtask.rollback_failed"
+				}
+				if err := persistWorkflowEvent(runDir, WorkflowEvent{RunID: state.ID, Type: eventType, Stage: "implement", Message: record.ID + ": " + record.Status, Outcome: record.Outcome}); err != nil {
+					resultErr = errors.Join(resultErr, err)
+				}
+			}
 		}
-	}()
-	defer func() {
 		for i := range state.Subtasks {
 			if state.Subtasks[i].Worktree != "" {
 				_, cleanupErr := gitOutput(root, "worktree", "remove", "--force", state.Subtasks[i].Worktree)
