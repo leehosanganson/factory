@@ -72,17 +72,27 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		fmt.Fprintf(out, "Started %s job %s\n", args[1], id)
 		return nil
 	case "list":
-		limit, err := parseJobListLimit(args[1:])
+		options, err := parseJobListOptions(args[1:])
 		if err != nil {
 			return err
 		}
 		jobs, err := store.reconcileJobs()
-		if len(jobs) == 0 && err == nil {
-			fmt.Fprintln(out, "No jobs.")
-			return nil
+		if options.status != "" || options.jobType != "" {
+			filtered := make([]JobRecord, 0, len(jobs))
+			for _, job := range jobs {
+				if options.status != "" && job.Status != options.status || options.jobType != "" && job.Type != options.jobType {
+					continue
+				}
+				filtered = append(filtered, job)
+			}
+			jobs = filtered
 		}
-		if limit > 0 && len(jobs) > limit {
-			jobs = jobs[:limit]
+		if len(jobs) == 0 && (err == nil || options.status != "" || options.jobType != "") {
+			fmt.Fprintln(out, "No jobs.")
+			return err
+		}
+		if options.limit > 0 && len(jobs) > options.limit {
+			jobs = jobs[:options.limit]
 		}
 		writeJobTable(out, store, jobs)
 		return err
@@ -187,26 +197,69 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 	}
 }
 
-func parseJobListLimit(args []string) (int, error) {
-	if len(args) == 0 {
-		return 0, nil
-	}
-	if args[0] != "--limit" || len(args) < 2 || args[1] == "--limit" {
-		return 0, fmt.Errorf("usage: factory job list [--limit <n>]")
-	}
-	if len(args) > 2 {
-		for _, arg := range args[2:] {
-			if arg == "--limit" {
-				return 0, fmt.Errorf("--limit may only be specified once")
+type jobListOptions struct {
+	limit   int
+	status  string
+	jobType string
+}
+
+const jobListUsage = "factory job list [--limit <n>] [--status <status>] [--type <type>]"
+const jobListStatuses = "queued, running, complete, closed, failed, stopped, cancelled, interrupted, recoverable_failure"
+const jobListTypes = "implementation, tidy, monitor"
+
+func parseJobListOptions(args []string) (jobListOptions, error) {
+	var options jobListOptions
+	seen := make(map[string]bool, 3)
+	for i := 0; i < len(args); i++ {
+		flag := args[i]
+		if flag != "--limit" && flag != "--status" && flag != "--type" {
+			return jobListOptions{}, fmt.Errorf("unknown job list argument %q (usage: %s)", flag, jobListUsage)
+		}
+		if seen[flag] {
+			return jobListOptions{}, fmt.Errorf("%s may only be specified once", flag)
+		}
+		seen[flag] = true
+		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
+			switch flag {
+			case "--limit":
+				return jobListOptions{}, fmt.Errorf("--limit requires a positive integer")
+			case "--status":
+				return jobListOptions{}, fmt.Errorf("--status requires one of: %s", jobListStatuses)
+			default:
+				return jobListOptions{}, fmt.Errorf("--type requires one of: %s", jobListTypes)
 			}
 		}
-		return 0, fmt.Errorf("usage: factory job list [--limit <n>]")
+		value := args[i+1]
+		i++
+		switch flag {
+		case "--limit":
+			limit, err := strconv.Atoi(value)
+			if err != nil || limit <= 0 {
+				return jobListOptions{}, fmt.Errorf("--limit must be a positive integer")
+			}
+			options.limit = limit
+		case "--status":
+			if !containsJobListValue(jobListStatuses, value) {
+				return jobListOptions{}, fmt.Errorf("invalid --status %q (valid statuses: %s)", value, jobListStatuses)
+			}
+			options.status = value
+		case "--type":
+			if !containsJobListValue(jobListTypes, value) {
+				return jobListOptions{}, fmt.Errorf("invalid --type %q (valid types: %s)", value, jobListTypes)
+			}
+			options.jobType = value
+		}
 	}
-	limit, err := strconv.Atoi(args[1])
-	if err != nil || limit <= 0 {
-		return 0, fmt.Errorf("--limit must be a positive integer")
+	return options, nil
+}
+
+func containsJobListValue(values, value string) bool {
+	for _, candidate := range strings.Split(values, ", ") {
+		if value == candidate {
+			return true
+		}
 	}
-	return limit, nil
+	return false
 }
 
 func parseDetailsID(usage string, args []string) (string, bool, error) {
