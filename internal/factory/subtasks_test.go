@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -556,6 +557,73 @@ func TestSubtaskBaselineCapturesAndVerifiesTrackedSymlinkWithoutFollowingIt(t *t
 	}
 }
 
+func TestParallelImplementationPersistsCanceledWorkerWaveOutcomes(t *testing.T) {
+	dir := initTestGitRepo(t)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	before := gitWorktreeSnapshot(t, dir)
+	siblingStarted := make(chan struct{})
+	siblingCanceled := make(chan struct{})
+	agent := &parallelWorkflowAgent{
+		cancelSibling:       true,
+		cancellationBarrier: true,
+		siblingStarted:      siblingStarted,
+		siblingCanceledCh:   siblingCanceled,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	workflow := Workflow{
+		Agent: agent, Config: Config{StateDir: stateDir, ParallelImplementation: &ParallelImplementationConfig{Enabled: true, MaxConcurrency: 2}},
+		In: strings.NewReader(""), Out: ioDiscard{}, Workdir: dir, Stages: []string{"implement"},
+	}
+	if err := workflow.RunContext(ctx, "persist canceled worker wave outcomes"); err == nil || !strings.Contains(err.Error(), "wave failed") {
+		t.Fatalf("workflow error = %v, want worker-wave failure", err)
+	}
+	select {
+	case <-siblingCanceled:
+	default:
+		t.Fatal("sibling did not exit after wave cancellation")
+	}
+	if after := gitWorktreeSnapshot(t, dir); after != before {
+		t.Fatalf("target changed after failed worker wave: before %q, after %q", before, after)
+	}
+
+	state := workflowRunState(t, stateDir)
+	if state.Status != "failed" || len(state.Stages) != 1 || state.Stages[0].Status != "failed" || state.SubtaskPlanStatus != "failed" {
+		t.Fatalf("persisted workflow/stage/plan outcome = %q/%+v/%q, want failed/failed/failed", state.Status, state.Stages, state.SubtaskPlanStatus)
+	}
+	outcomes := make(map[string]SubtaskRecord, len(state.Subtasks))
+	for _, record := range state.Subtasks {
+		outcomes[record.ID] = record
+	}
+	if len(outcomes) != 2 || outcomes["one"].Status != "failed" || outcomes["one"].Outcome != "deliberate worker failure" {
+		t.Fatalf("initiating worker outcome = %+v, want failed with its deliberate error", outcomes["one"])
+	}
+	if outcomes["two"].Status != "failed" || outcomes["two"].Outcome != context.Canceled.Error() {
+		t.Fatalf("canceled sibling outcome = %+v, want failed with cancellation cause", outcomes["two"])
+	}
+	if outcomes["one"].EndedAt.IsZero() || outcomes["two"].EndedAt.IsZero() {
+		t.Fatalf("worker-wave outcomes lack end timestamps: %+v", outcomes)
+	}
+
+	data, err := os.ReadFile(filepath.Join(stateDir, "runs", state.ID, "workflow-events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var failedEvents []workflowEventRecord
+	for _, line := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		var event workflowEventRecord
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("decode persisted workflow event %q: %v", line, err)
+		}
+		if event.Type == "subtask.failed" {
+			failedEvents = append(failedEvents, event)
+		}
+	}
+	if len(failedEvents) != 2 || failedEvents[0].Message != "one: failed" || failedEvents[1].Message != "two: failed" {
+		t.Fatalf("persisted failed-subtask events = %+v, want events correlated to initiating and canceled records", failedEvents)
+	}
+}
+
 func TestParallelImplementationCancelsSiblingOnWorkerError(t *testing.T) {
 	dir := initTestGitRepo(t)
 	agent := &parallelWorkflowAgent{cancelSibling: true}
@@ -602,18 +670,21 @@ type ioDiscard struct{}
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
 
 type parallelWorkflowAgent struct {
-	active          int32
-	maxActive       int32
-	plannerCalls    int32
-	singleCalls     int32
-	writeUndeclared bool
-	writeIgnored    bool
-	modeChange      bool
-	dependencyPlan  bool
-	fourTaskPlan    bool
-	laterFail       bool
-	cancelSibling   bool
-	siblingCanceled int32
+	active              int32
+	maxActive           int32
+	plannerCalls        int32
+	singleCalls         int32
+	writeUndeclared     bool
+	writeIgnored        bool
+	modeChange          bool
+	dependencyPlan      bool
+	fourTaskPlan        bool
+	laterFail           bool
+	cancelSibling       bool
+	cancellationBarrier bool
+	siblingStarted      chan struct{}
+	siblingCanceledCh   chan struct{}
+	siblingCanceled     int32
 }
 
 func (a *parallelWorkflowAgent) Run(stage, prompt, task, workdir, logPath string) error {
@@ -662,18 +733,26 @@ func (a *parallelWorkflowAgent) RunWithOutputContext(ctx context.Context, stage,
 			}
 		}
 		if a.cancelSibling && strings.Contains(task, "feature one") {
-			deadline := time.Now().Add(time.Second)
-			for atomic.LoadInt32(&a.active) < 2 && time.Now().Before(deadline) {
-				time.Sleep(time.Millisecond)
+			if a.cancellationBarrier {
+				<-a.siblingStarted
 			}
 			return "", fmt.Errorf("deliberate worker failure")
 		}
-		wait := 50 * time.Millisecond
 		if a.cancelSibling && strings.Contains(task, "feature two") {
-			wait = time.Second
+			if a.cancellationBarrier {
+				close(a.siblingStarted)
+			}
+			select {
+			case <-ctx.Done():
+				atomic.AddInt32(&a.siblingCanceled, 1)
+				if a.cancellationBarrier {
+					close(a.siblingCanceledCh)
+				}
+				return "", ctx.Err()
+			}
 		}
 		select {
-		case <-time.After(wait):
+		case <-time.After(50 * time.Millisecond):
 		case <-ctx.Done():
 			if a.cancelSibling && strings.Contains(task, "feature two") {
 				atomic.AddInt32(&a.siblingCanceled, 1)
