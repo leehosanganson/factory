@@ -647,7 +647,7 @@ func TestSQLiteStoreWaitClaimReturnsOnClose(t *testing.T) {
 
 func TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit(t *testing.T) {
 	if os.Getenv("FACTORY_SQLITE_LOCK_HELPER") == "1" {
-		store, err := OpenSQLiteServerStore(os.Getenv("FACTORY_SQLITE_LOCK_PATH"), testConfig())
+		store, err := OpenSQLiteServerStore(os.Getenv("FACTORY_SQLITE_LOCK_OPEN_PATH"), testConfig())
 		if os.Getenv("FACTORY_SQLITE_LOCK_COMPETITOR") == "1" {
 			if err == nil {
 				_ = store.CloseStore()
@@ -676,9 +676,10 @@ func TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit(t *testi
 
 	dir := privateSQLiteDir(t)
 	path := filepath.Join(dir, "jobs.db")
+	alias := filepath.Join(dir, "jobs-alias.db")
 	ready := filepath.Join(dir, "owner-ready")
 	owner := exec.Command(os.Args[0], "-test.run=^TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit$")
-	owner.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_PATH="+path, "FACTORY_SQLITE_LOCK_READY="+ready)
+	owner.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_OPEN_PATH="+path, "FACTORY_SQLITE_LOCK_READY="+ready)
 	if err := owner.Start(); err != nil {
 		t.Fatalf("start owner process: %v", err)
 	}
@@ -705,10 +706,26 @@ func TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit(t *testi
 		t.Fatalf("owner did not become ready: %v", err)
 	}
 
+	if err := os.Link(path, alias); err != nil {
+		t.Fatalf("create hard-link alias: %v", err)
+	}
+	originalInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat database: %v", err)
+	}
+	aliasInfo, err := os.Stat(alias)
+	if err != nil || !os.SameFile(originalInfo, aliasInfo) {
+		t.Fatalf("database alias does not refer to the same file: stat err = %v", err)
+	}
 	competitor := exec.Command(os.Args[0], "-test.run=^TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit$")
-	competitor.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_COMPETITOR=1", "FACTORY_SQLITE_LOCK_PATH="+path)
+	competitor.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_COMPETITOR=1", "FACTORY_SQLITE_LOCK_OPEN_PATH="+alias)
 	if output, err := competitor.CombinedOutput(); err != nil {
 		t.Fatalf("competing process should fail closed cleanly: %v: %s", err, output)
+	}
+	samePathCompetitor := exec.Command(os.Args[0], "-test.run=^TestSQLiteStoreRejectsConcurrentProcessAndRecoversAfterUncleanExit$")
+	samePathCompetitor.Env = append(os.Environ(), "FACTORY_SQLITE_LOCK_HELPER=1", "FACTORY_SQLITE_LOCK_COMPETITOR=1", "FACTORY_SQLITE_LOCK_OPEN_PATH="+path)
+	if output, err := samePathCompetitor.CombinedOutput(); err != nil {
+		t.Fatalf("same-path competing process should fail closed cleanly: %v: %s", err, output)
 	}
 	observer, err := OpenSQLiteStore(path, testConfig())
 	if err != nil {

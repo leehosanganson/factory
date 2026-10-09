@@ -110,8 +110,9 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 	return store, nil
 }
 
-// OpenSQLiteServerStore opens a SQLite store while holding exclusive ownership
-// through a separate lock file for this server process. Administrative store
+// OpenSQLiteServerStore opens a SQLite store while holding an exclusive lock
+// keyed by the database file identity. Hard-link aliases therefore share server
+// ownership without locking SQLite's own database file. Administrative store
 // openings may continue to use OpenSQLiteStore without claiming server ownership.
 func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
 	if path == ":memory:" {
@@ -123,11 +124,10 @@ func OpenSQLiteServerStore(path string, config Config) (*SQLiteStore, error) {
 	if err := ensurePrivateSQLiteFile(path); err != nil {
 		return nil, err
 	}
-	lockPath, err := filepath.EvalSymlinks(path)
+	lockPath, err := sqliteServerLockPath(path)
 	if err != nil {
 		return nil, errors.New("resolve SQLite server ownership lock")
 	}
-	lockPath += ".server-lock"
 	if err := ensurePrivateSQLiteFile(lockPath); err != nil {
 		return nil, errors.New("prepare SQLite server ownership lock")
 	}
