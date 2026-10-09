@@ -58,6 +58,52 @@ func oversizedPlanJSON() string {
 	return string(data)
 }
 
+func TestApplyStagedSubtaskFilesRejectsSymlinkedTargetParent(t *testing.T) {
+	targetRoot := t.TempDir()
+	externalRoot := t.TempDir()
+	stagingRoot := t.TempDir()
+	sentinelPath := filepath.Join(externalRoot, "sentinel.txt")
+	if err := os.WriteFile(sentinelPath, []byte("preserve me"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(externalRoot, filepath.Join(targetRoot, "linked")); err != nil {
+		t.Skipf("directory symlinks unavailable: %v", err)
+	}
+
+	stagedPath := filepath.Join(stagingRoot, "linked", "output.txt")
+	if err := os.MkdirAll(filepath.Dir(stagedPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stagedPath, []byte("staged output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	safeStagedPath := filepath.Join(stagingRoot, "a-safe-output.txt")
+	if err := os.WriteFile(safeStagedPath, []byte("safe staged output"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := applyStagedSubtaskFiles(targetRoot, stagingRoot, map[string]string{
+		"a-safe-output.txt": "safe-digest",
+		"linked/output.txt": "linked-digest",
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsafe parent directory") {
+		t.Fatalf("staged application error = %v; want unsafe symlink-parent rejection", err)
+	}
+
+	if data, readErr := os.ReadFile(sentinelPath); readErr != nil || string(data) != "preserve me" {
+		t.Errorf("external sentinel = %q, %v; want unchanged sentinel", data, readErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(externalRoot, "output.txt")); !os.IsNotExist(statErr) {
+		t.Errorf("external output was created: %v", statErr)
+	}
+	if _, statErr := os.Lstat(filepath.Join(targetRoot, "a-safe-output.txt")); !os.IsNotExist(statErr) {
+		t.Errorf("partial target output was created: %v", statErr)
+	}
+	if data, readErr := os.ReadFile(stagedPath); readErr != nil || string(data) != "staged output" {
+		t.Errorf("staged source = %q, %v; want it retained unchanged", data, readErr)
+	}
+}
+
 func TestParallelImplementationRecognizesSymlinkedTemporaryRoot(t *testing.T) {
 	realRoot := initTestGitRepo(t)
 	alias := filepath.Join(t.TempDir(), "repo-alias")

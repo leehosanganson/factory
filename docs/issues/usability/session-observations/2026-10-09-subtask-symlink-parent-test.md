@@ -1,0 +1,5 @@
+# Session observation: parallel output symlink-parent test
+
+- **Scope:** Added the issue #189 focused test for staged output application below a symlinked target parent. Production behavior was unchanged.
+- **Evidence:** The test passed on the initial focused run and confirmed the existing fail-closed path preserves the external sentinel, creates no partial outputs, and retains staged input. Initial full `make test` failed once in `TestSecondaryStatusRunsDuringActiveStageAndPersistsSanitizedUpdate` with a status-invocation count mismatch; the named test passed 10 isolated repetitions and the canonical `umask 000; make test` subsequently passed. `make vet`, `make build`, and `git diff --check` passed.
+- **Friction:** The first `uv run go test` attempt was blocked by the environment's dynamically linked Python runtime; invoking the installed Go toolchain directly worked. The test-only gap was already handled by production code, so its focused test passed rather than providing a red-before-implementation signal.
