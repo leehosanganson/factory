@@ -1,0 +1,7 @@
+# Session observations — 2026-10-09 (PR #207 macOS CI investigation)
+
+- Verified the checkout was clean at PR #207 head `081648a1c2b3265d0ccd3dede80657068cd289f4`, based on `origin/main` `8137b00daac76b181a491c5b0ab7f305c86b5cf9`; the PR changes do not touch REST SQLite ownership code.
+- The existing `TestSQLiteServerRejectsPathReplacementWhileOwnerLive` regression already launches separate owner and competitor processes and checks the replacement-path ownership conflict. Its failure was not reproducible on this Linux host; a serialized 10-count run of the related lock tests passed. Darwin/macOS runtime execution is unavailable here.
+- Inspected Darwin's `syscall.Flock`, path-lock key construction, and the subprocess environment setup. The path-lock key is based on the cleaned absolute configured path and both child processes receive the same temporary `HOME`; Apple's flock documentation describes exclusive nonblocking conflict behavior. Darwin amd64 and arm64 test binaries cross-compiled successfully.
+- No production or test code was changed because local evidence did not identify a platform-specific defect, and changing lock primitives without a macOS reproduction would be speculative. `make test`, `make vet`, `make build`, and `git diff --check` passed; macOS runtime verification remains necessary to diagnose the reported CI failure conclusively.
+- No provider calls, publishing, or Git history changes were performed.
