@@ -93,6 +93,7 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 	want := map[string]string{
 		"GET /healthz":                            "healthCheck",
 		"GET /readyz":                             "readinessCheck",
+		"GET /v1/jobs":                            "listJobs",
 		"POST /v1/jobs":                           "createJob",
 		"GET /v1/jobs/{id}":                       "getJob",
 		"GET /v1/jobs/{id}/history":               "getJobHistory",

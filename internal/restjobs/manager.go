@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -181,6 +182,28 @@ type History struct {
 	Truncated bool    `json:"truncated"`
 }
 
+// JobSummary is the safe, compact representation returned by collection listing.
+type JobSummary struct {
+	ID        string    `json:"id"`
+	Status    Status    `json:"status"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// JobPage is an admission-ordered page bounded by SnapshotSequence. NextSequence
+// is a continuation cursor for a subsequent request.
+type JobPage struct {
+	Jobs             []JobSummary `json:"jobs"`
+	SnapshotSequence uint64       `json:"snapshot_sequence"`
+	NextSequence     uint64       `json:"next_sequence,omitempty"`
+	HasMore          bool         `json:"has_more"`
+}
+
+const (
+	DefaultJobListLimit = 50
+	MaxJobListLimit     = 100
+)
+
 // OperationalSummary reports bounded aggregate job state without job payloads.
 type OperationalSummary struct {
 	RetainedRecords int  `json:"retained_records"`
@@ -221,6 +244,7 @@ type Store interface {
 	WaitClaim(ctx context.Context) (Snapshot, error)
 	Close()
 	Get(id string) (Snapshot, error)
+	ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error)
 	History(id string) (History, error)
 	AddEvent(id, eventType, message string) error
 	RecordProviderOutcome(id string, outcome ProviderOutcome) error
@@ -486,6 +510,65 @@ func (m *LocalManager) Get(id string) (Snapshot, error) {
 		return Snapshot{}, ErrNotFound
 	}
 	return cloneSnapshot(entry.snapshot), nil
+}
+
+// ListJobs returns summaries in immutable admission order. The first page captures
+// a ceiling so subsequent admissions cannot shift a client's traversal.
+func (m *LocalManager) ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
+	if err := validateJobPageRequest(ctx, afterSequence, snapshotSequence, limit); err != nil {
+		return JobPage{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return JobPage{}, err
+	}
+	if snapshotSequence == 0 {
+		snapshotSequence = m.nextSequence
+	}
+	ordered := make([]*job, 0, limit+1)
+	for _, entry := range m.jobs {
+		if entry.sequence <= afterSequence || entry.sequence > snapshotSequence {
+			continue
+		}
+		index := sort.Search(len(ordered), func(i int) bool { return ordered[i].sequence >= entry.sequence })
+		if index >= limit+1 {
+			continue
+		}
+		ordered = append(ordered, nil)
+		copy(ordered[index+1:], ordered[index:])
+		ordered[index] = entry
+		if len(ordered) > limit+1 {
+			ordered = ordered[:limit+1]
+		}
+	}
+	page := JobPage{Jobs: make([]JobSummary, 0, limit), SnapshotSequence: snapshotSequence, HasMore: len(ordered) > limit}
+	if page.HasMore {
+		ordered = ordered[:limit]
+	}
+	for _, entry := range ordered {
+		page.Jobs = append(page.Jobs, summarize(entry.snapshot))
+		page.NextSequence = entry.sequence
+	}
+	if !page.HasMore {
+		page.NextSequence = 0
+	}
+	return page, nil
+}
+
+func validateJobPageRequest(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) error {
+	maxSequence := uint64(^uint64(0) >> 1)
+	if ctx == nil || limit < 1 || limit > MaxJobListLimit || afterSequence > maxSequence || snapshotSequence > maxSequence || (snapshotSequence == 0 && afterSequence != 0) || (snapshotSequence != 0 && afterSequence > snapshotSequence) {
+		return ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func summarize(snapshot Snapshot) JobSummary {
+	return JobSummary{ID: snapshot.ID, Status: snapshot.Status, CreatedAt: snapshot.CreatedAt, UpdatedAt: snapshot.UpdatedAt}
 }
 
 // History returns a defensive copy of the retained bounded event history.

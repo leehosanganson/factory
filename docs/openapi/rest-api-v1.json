@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -59,6 +59,25 @@
       }
     },
     "/v1/jobs": {
+      "get": {
+        "operationId": "listJobs",
+        "summary": "List retained job summaries",
+        "description": "Read-only bearer-authenticated listing ordered by immutable admission sequence, oldest first. The first request captures a snapshot_sequence ceiling; while has_more is true, continue with the returned next_sequence as after and the same snapshot_sequence. Jobs admitted later are excluded from that traversal and appear when starting again without cursors. Cursors are opaque to clients. Each page is bounded to 1–100 items (default 50); only id, status, created_at, and updated_at are returned, never request/task text, provider details, events, logs, or paths. Status and updated_at are a current per-page view; the snapshot boundary freezes membership, not lifecycle state. Retained terminal and interrupted jobs are included until store retention removes them.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "after", "in": "query", "required": false, "description": "The next_sequence returned by the preceding page.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
+          { "name": "snapshot", "in": "query", "required": false, "description": "The snapshot_sequence returned by the first page; required with after.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } }
+        ],
+        "responses": {
+          "200": { "description": "A bounded page of safe job summaries.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobPage" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "The request used an unsupported method; Allow lists GET and POST.", "headers": { "Allow": { "description": "Allowed methods for the collection path.", "schema": { "type": "string", "enum": [ "GET, POST" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      },
       "post": {
         "operationId": "createJob",
         "summary": "Submit a job",
@@ -389,6 +408,27 @@
               "history": { "type": "string" }
             }
           }
+        }
+      },
+      "JobPage": {
+        "type": "object",
+        "required": [ "jobs", "snapshot_sequence", "has_more" ],
+        "properties": {
+          "jobs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/JobSummary" } },
+          "snapshot_sequence": { "type": "integer", "format": "int64", "minimum": 0, "description": "Admission-sequence ceiling captured on the first page; zero denotes an empty store." },
+          "next_sequence": { "type": "integer", "format": "int64", "minimum": 1, "description": "Continuation cursor, present only when has_more is true." },
+          "has_more": { "type": "boolean" }
+        }
+      },
+      "JobSummary": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "id", "status", "created_at", "updated_at" ],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled" ] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" }
         }
       },
       "JobSnapshot": {

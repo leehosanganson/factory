@@ -428,6 +428,21 @@ func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 	if firstResponse.Job.ID == "" || firstResponse.Replayed {
 		t.Fatalf("first admission response=%v", first)
 	}
+	listRequest, err := http.NewRequest(http.MethodGet, baseURL+"/v1/jobs?limit=1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listRequest.Header.Set("Authorization", "Bearer "+key)
+	listResponse, err := client.Do(listRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var listed restjobs.JobPage
+	listBody, readErr := io.ReadAll(listResponse.Body)
+	listResponse.Body.Close()
+	if readErr != nil || json.Unmarshal(listBody, &listed) != nil || listResponse.StatusCode != http.StatusOK || len(listed.Jobs) != 1 || listed.Jobs[0].ID != firstResponse.Job.ID || strings.Contains(string(listBody), "review change") {
+		t.Fatalf("runtime list response status=%d body=%s err=%v", listResponse.StatusCode, listBody, readErr)
+	}
 	status, replay := submit()
 	var wasReplayed bool
 	if err := json.Unmarshal(replay["replayed"], &wasReplayed); err != nil {

@@ -26,6 +26,152 @@ import (
 	"github.com/leehosanganson/factory/internal/restworker"
 )
 
+func TestRESTServerJobListingProcessE2E(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process semantics")
+	}
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, apiKey := runtimeFixture(t)
+	privateState := filepath.Join(t.TempDir(), "private-state")
+	if err := os.Mkdir(privateState, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(privateState, "jobs.db")}
+	config.Limits.Workers = 1
+	config.Limits.QueueCapacity = 3
+	config.Limits.MaxRecords = 8
+	config.Limits.TaskBytes = 128
+	harness := filepath.Join(t.TempDir(), "harness.sh")
+	script := "#!/bin/sh\nif [ \"$1\" = hold-listing ]; then trap 'exit 0' TERM; while :; do sleep 1; done; fi\nexit 1\n"
+	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configFile := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configFile, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "factory")
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = root
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build server binary: %v: %s", err, output)
+	}
+	readyFile := filepath.Join(t.TempDir(), "ready-url")
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+testProcessStateHome(t), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_NO_PROVIDER=1", "FACTORY_E2E_REPORT_RUNTIME_ERRORS=1", "FACTORY_E2E_CONFIG="+configFile, "FACTORY_E2E_READY="+readyFile)
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait(); _ = logFile.Close() }()
+	defer func() {
+		if child != nil && child.Process != nil {
+			_ = child.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				_ = child.Process.Kill()
+				<-done
+			}
+		}
+	}()
+	baseURL := waitForProcessURL(t, done, readyFile, logPath)
+	client := &http.Client{Timeout: 3 * time.Second}
+	waitForStatus(t, baseURL+"/readyz", http.StatusOK)
+	first, err := submitProcessJob(client, baseURL, apiKey, "trusted", "first list task private", "listing-first")
+	if err != nil || first.ID == "" {
+		t.Fatalf("first synthetic admission=%+v err=%v", first, err)
+	}
+	waitForProcessFailure(t, client, baseURL, first.ID, apiKey)
+	second, err := submitProcessJob(client, baseURL, apiKey, "trusted", "hold-listing", "listing-second")
+	if err != nil || second.ID == "" {
+		t.Fatalf("second synthetic admission=%+v err=%v", second, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && getProcessJob(t, client, baseURL, second.ID, apiKey).Status != restjobs.StatusRunning {
+		time.Sleep(10 * time.Millisecond)
+	}
+	queued, err := submitProcessJob(client, baseURL, apiKey, "trusted", "queued list task private", "listing-third")
+	if err != nil || queued.ID == "" {
+		t.Fatalf("third synthetic admission=%+v err=%v", queued, err)
+	}
+	unauthorized, err := client.Get(baseURL + "/v1/jobs?limit=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated process list status=%d", unauthorized.StatusCode)
+	}
+	list := func(path string) (*http.Response, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response, data
+	}
+	response, body := list("/v1/jobs?limit=1")
+	var page restjobs.JobPage
+	if response.StatusCode != http.StatusOK || json.Unmarshal(body, &page) != nil || len(page.Jobs) != 1 || page.Jobs[0].ID != first.ID || page.Jobs[0].Status != restjobs.StatusFailed || !page.HasMore {
+		t.Fatalf("first process page status=%d body=%s", response.StatusCode, body)
+	}
+	if strings.Contains(string(body), "first list task private") || strings.Contains(string(body), "private") || strings.Contains(string(body), "provider") {
+		t.Fatalf("process page leaked private fields: %s", body)
+	}
+	third, err := submitProcessJob(client, baseURL, apiKey, "trusted", "admitted between pages private", "listing-fourth")
+	if err != nil || third.ID == "" {
+		t.Fatalf("concurrent process admission=%+v err=%v", third, err)
+	}
+	path := fmt.Sprintf("/v1/jobs?limit=1&after=%d&snapshot=%d", page.NextSequence, page.SnapshotSequence)
+	response, body = list(path)
+	var secondPage restjobs.JobPage
+	if response.StatusCode != http.StatusOK || json.Unmarshal(body, &secondPage) != nil || len(secondPage.Jobs) != 1 || secondPage.Jobs[0].ID != second.ID || secondPage.Jobs[0].Status != restjobs.StatusRunning || !secondPage.HasMore || strings.Contains(string(body), third.ID) {
+		t.Fatalf("continuation process page status=%d body=%s", response.StatusCode, body)
+	}
+	thirdPath := fmt.Sprintf("/v1/jobs?limit=1&after=%d&snapshot=%d", secondPage.NextSequence, secondPage.SnapshotSequence)
+	response, body = list(thirdPath)
+	var thirdPage restjobs.JobPage
+	if response.StatusCode != http.StatusOK || json.Unmarshal(body, &thirdPage) != nil || len(thirdPage.Jobs) != 1 || thirdPage.Jobs[0].ID != queued.ID || thirdPage.HasMore || strings.Contains(string(body), third.ID) {
+		t.Fatalf("third process page status=%d body=%s", response.StatusCode, body)
+	}
+	if status, _ := getProcessJobResponse(t, client, baseURL, second.ID, apiKey); status.Status != restjobs.StatusRunning {
+		t.Fatalf("running job changed after listing: %+v", status)
+	}
+	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("listing process server shutdown: %v", err)
+	}
+	child = nil
+}
+
 func TestRESTServerBackupRestoreProcessE2E(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("process-level REST E2E requires supported local process signal semantics")

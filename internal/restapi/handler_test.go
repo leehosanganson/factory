@@ -85,10 +85,43 @@ func TestNotReadyRejectsJobOperationsBeforeAuthentication(t *testing.T) {
 	}{
 		{method: http.MethodPost, path: "/v1/jobs"},
 		{method: http.MethodGet, path: "/v1/jobs/unknown"},
+		{method: http.MethodGet, path: "/v1/jobs"},
 	} {
 		response := request(handler, tc.method, tc.path, `{"repository":"widget","task":"task"}`, false)
 		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"not_ready"`) {
 			t.Errorf("%s %s while not ready = %d %s", tc.method, tc.path, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestListJobsRemainsAvailableAtAdmissionCapacity(t *testing.T) {
+	manager := newTestManager(t, managerConfig(1, 1, 2))
+	job, _, err := manager.Admit("list-at-capacity", restjobs.Request{Repository: "widget", Task: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	response := request(handler, http.MethodGet, "/v1/jobs", "", true)
+	var page restjobs.JobPage
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &page) != nil || len(page.Jobs) != 1 || page.Jobs[0].ID != job.ID {
+		t.Fatalf("listing at full admission capacity status=%d body=%s", response.Code, response.Body.String())
+	}
+	if _, _, err := manager.Admit("over-capacity", restjobs.Request{Repository: "widget", Task: "another"}); !errors.Is(err, restjobs.ErrQueueFull) {
+		t.Fatalf("admission at full capacity error=%v, want ErrQueueFull", err)
+	}
+}
+
+func TestListJobsMapsStoreCapacityAndInternalErrorsWithoutLeakage(t *testing.T) {
+	manager := newTestManager(t, managerConfig(1, 1, 2))
+	readyHandler := newTestHandler(t, errorManager{Manager: manager, listErr: restjobs.ErrRegistryFull}, func() bool { return true })
+	response := request(readyHandler, http.MethodGet, "/v1/jobs", "", true)
+	assertError(t, response, http.StatusServiceUnavailable, "registry_full")
+	failing := newTestHandler(t, errorManager{Manager: manager, listErr: errors.New("private /host/path provider secret")}, func() bool { return true })
+	response = request(failing, http.MethodGet, "/v1/jobs", "", true)
+	assertError(t, response, http.StatusInternalServerError, "internal_error")
+	for _, forbidden := range []string{"private", "/host/path", "provider", "secret"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("listing error leaked %q: %s", forbidden, response.Body.String())
 		}
 	}
 }
@@ -400,6 +433,87 @@ func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *test
 	}
 }
 
+func TestListJobsIsAuthenticatedBoundedAndReadOnly(t *testing.T) {
+	manager := newTestManager(t, managerConfig(3, 4, 8))
+	first, _, err := manager.Admit("list-first", restjobs.Request{Repository: "widget", Task: "must never appear in list"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := manager.Admit("list-second", restjobs.Request{Repository: "widget", Task: "another private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(first.ID, restjobs.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	if response := request(handler, http.MethodGet, "/v1/jobs?limit=1", "", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated list status=%d body=%s", response.Code, response.Body.String())
+	}
+	response := request(handler, http.MethodGet, "/v1/jobs?limit=1", "", true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", response.Code, response.Body.String())
+	}
+	var page restjobs.JobPage
+	if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Jobs) != 1 || page.Jobs[0].ID != first.ID || page.Jobs[0].Status != restjobs.StatusFailed || !page.HasMore || page.NextSequence == 0 || page.SnapshotSequence == 0 {
+		t.Fatalf("first page=%+v want oldest retained record and cursor", page)
+	}
+	if strings.Contains(response.Body.String(), "must never appear") || strings.Contains(response.Body.String(), "another private task") || strings.Contains(response.Body.String(), "request") || strings.Contains(response.Body.String(), "provider") {
+		t.Fatalf("list exposed payload or provider information: %s", response.Body.String())
+	}
+	third, _, err := manager.Admit("list-third", restjobs.Request{Repository: "widget", Task: "arrived between pages"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := fmt.Sprintf("/v1/jobs?limit=1&after=%d&snapshot=%d", page.NextSequence, page.SnapshotSequence)
+	response = request(handler, http.MethodGet, path, "", true)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), second.ID) || strings.Contains(response.Body.String(), third.ID) || strings.Contains(response.Body.String(), "arrived between pages") {
+		t.Fatalf("continuation status=%d body=%s; must include second and exclude later admission", response.Code, response.Body.String())
+	}
+	before, err := manager.Get(second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.History(second.ID); err != nil {
+		t.Fatal(err)
+	}
+	beforeList, err := manager.ListJobs(context.Background(), 0, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	continuation := fmt.Sprintf("/v1/jobs?limit=1&after=%d&snapshot=%d", page.NextSequence, page.SnapshotSequence)
+	if got := request(handler, http.MethodGet, continuation, "", true); got.Code != http.StatusOK {
+		t.Fatalf("read-only continuation status=%d body=%s", got.Code, got.Body.String())
+	}
+	afterList, err := manager.ListJobs(context.Background(), 0, 0, 100)
+	if err != nil || len(beforeList.Jobs) != len(afterList.Jobs) {
+		t.Fatalf("listing changed retained record set: before=%+v after=%+v err=%v", beforeList, afterList, err)
+	}
+	after, err := manager.Get(second.ID)
+	if err != nil || before.Status != after.Status || !before.UpdatedAt.Equal(after.UpdatedAt) {
+		t.Fatalf("listing mutated job state: before=%+v after=%+v err=%v", before, after, err)
+	}
+	for _, invalid := range []string{"0", "-1", "101", "nope"} {
+		if got := request(handler, http.MethodGet, "/v1/jobs?limit="+invalid, "", true); got.Code != http.StatusBadRequest {
+			t.Errorf("invalid limit %q status=%d body=%s", invalid, got.Code, got.Body.String())
+		}
+	}
+	for _, query := range []string{"after=1", "limit=1&after=2&snapshot=1", "limit=1&unknown=x", "limit=1&limit=2"} {
+		if got := request(handler, http.MethodGet, "/v1/jobs?"+query, "", true); got.Code != http.StatusBadRequest {
+			t.Errorf("invalid query %q status=%d body=%s", query, got.Code, got.Body.String())
+		}
+	}
+	if got := request(handler, http.MethodDelete, "/v1/jobs", "", true); got.Code != http.StatusMethodNotAllowed || got.Header().Get("Allow") != "GET, POST" {
+		t.Fatalf("collection DELETE status=%d allow=%q", got.Code, got.Header().Get("Allow"))
+	}
+}
+
 func TestAuthenticationPrecedesJobPathResolution(t *testing.T) {
 	handler := newTestHandler(t, newTestManager(t, managerConfig(2, 2, 2)), func() bool { return true })
 	for _, path := range []string{"/v1/jobs", "/v1/jobs/unknown", "/v1/jobs/unknown/nope"} {
@@ -676,7 +790,7 @@ func TestMethodsPathsAndAllowHeaders(t *testing.T) {
 	}{
 		{http.MethodPost, "/healthz", "GET", 405, false},
 		{http.MethodPost, "/readyz", "GET", 405, false},
-		{http.MethodGet, "/v1/jobs", "POST", 405, true},
+		{http.MethodDelete, "/v1/jobs", "GET, POST", 405, true},
 		{http.MethodPost, "/v1/operations", "GET", 405, true},
 		{http.MethodPost, "/v1/jobs/id", "GET", 405, true},
 		{http.MethodPost, "/v1/jobs/id/history", "GET", 405, true},
@@ -699,10 +813,17 @@ func TestMethodsPathsAndAllowHeaders(t *testing.T) {
 
 type errorManager struct {
 	restjobs.Manager
-	getErr error
+	getErr  error
+	listErr error
 }
 
 func (m errorManager) Get(id string) (restjobs.Snapshot, error) { return restjobs.Snapshot{}, m.getErr }
+func (m errorManager) ListJobs(context.Context, uint64, uint64, int) (restjobs.JobPage, error) {
+	if m.listErr != nil {
+		return restjobs.JobPage{}, m.listErr
+	}
+	return m.Manager.ListJobs(context.Background(), 0, 0, 1)
+}
 
 type errorSummaryManager struct {
 	restjobs.Manager

@@ -860,6 +860,57 @@ func (s *SQLiteStore) Get(id string) (Snapshot, error) {
 	return snapshot, nil
 }
 
+// ListJobs returns a bounded page in immutable admission order. The snapshot
+// ceiling prevents admissions after page one from entering a continuation.
+func (s *SQLiteStore) ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
+	if err := validateJobPageRequest(ctx, afterSequence, snapshotSequence, limit); err != nil {
+		return JobPage{}, err
+	}
+	if err := s.checkOpen(); err != nil {
+		return JobPage{}, err
+	}
+	if snapshotSequence == 0 {
+		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(queue_sequence),0) FROM factory_jobs`).Scan(&snapshotSequence); err != nil {
+			return JobPage{}, errors.New("read SQLite job listing snapshot")
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,status,created_at,updated_at,queue_sequence FROM factory_jobs WHERE queue_sequence>? AND queue_sequence<=? ORDER BY queue_sequence LIMIT ?`, afterSequence, snapshotSequence, limit+1)
+	if err != nil {
+		return JobPage{}, errors.New("read SQLite job listing")
+	}
+	defer rows.Close()
+	page := JobPage{Jobs: make([]JobSummary, 0, limit), SnapshotSequence: snapshotSequence}
+	for rows.Next() {
+		var summary JobSummary
+		var sequence uint64
+		var status string
+		var createdAt, updatedAt string
+		if err := rows.Scan(&summary.ID, &status, &createdAt, &updatedAt, &sequence); err != nil {
+			return JobPage{}, errors.New("decode SQLite job listing")
+		}
+		summary.Status = Status(status)
+		if summary.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt); err != nil {
+			return JobPage{}, errors.New("decode SQLite job listing")
+		}
+		if summary.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt); err != nil {
+			return JobPage{}, errors.New("decode SQLite job listing")
+		}
+		if len(page.Jobs) == limit {
+			page.HasMore = true
+			break
+		}
+		page.Jobs = append(page.Jobs, summary)
+		page.NextSequence = sequence
+	}
+	if err := rows.Err(); err != nil {
+		return JobPage{}, errors.New("read SQLite job listing")
+	}
+	if !page.HasMore {
+		page.NextSequence = 0
+	}
+	return page, nil
+}
+
 func (s *SQLiteStore) History(id string) (History, error) {
 	if _, err := s.Get(id); err != nil {
 		return History{}, err
