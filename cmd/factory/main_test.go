@@ -1395,8 +1395,8 @@ func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	agent := filepath.Join(root, "agent")
-	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'PASS\\n'\nprintf 'generated\\n' > generated.txt\n"), 0o700); err != nil {
+	agent := filepath.Join(root, "fake-pi")
+	if err := os.WriteFile(agent, []byte("#!/bin/sh\ncase \"$*\" in *'failed published handoff'*) printf 'PASS\\nFAILED_PI_TRANSCRIPT_MARKER\\n' ;; *) printf 'PASS\\nPI_WORKFLOW_TRANSCRIPT_MARKER\\n' ;; esac\nprintf 'generated\\n' > generated.txt\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":true}`, agent, state)), 0o600); err != nil {
@@ -1475,7 +1475,18 @@ func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
 	}
 	env = append(env, "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "GH_CONFIG_DIR="+filepath.Join(root, "empty-gh-config"), "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	command := exec.Command(binary, "implement", "-d", "persist published handoff")
+	doctor := exec.Command(binary, "doctor")
+	doctor.Dir, doctor.Env = target, env
+	doctorOutput, err := doctor.CombinedOutput()
+	if err != nil {
+		t.Fatalf("documented factory doctor command: %v\n%s", err, doctorOutput)
+	}
+	for _, want := range []string{"config: valid", "agent executable: available", "git: available", "gh: available", "pipeline checks: 0 configured"} {
+		if !strings.Contains(string(doctorOutput), want) {
+			t.Errorf("factory doctor output omitted %q: %s", want, doctorOutput)
+		}
+	}
+	command := exec.Command(binary, "implement", "--detach", "persist published handoff")
 	command.Dir = target
 	command.Env = env
 	output, err := command.CombinedOutput()
@@ -1553,7 +1564,9 @@ func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
 		t.Errorf("invoking checkout status changed: got %q want %q", got, initialStatus)
 	}
 
-	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte("#!/bin/sh\necho unavailable >&2\nexit 1\n"), 0o700); err != nil {
+	failedGHCalls := filepath.Join(state, "failed-gh-calls")
+	failedGH := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" > %q\necho unavailable >&2\nexit 1\n", failedGHCalls)
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte(failedGH), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	failedCommand := exec.Command(binary, "implement", "-d", "failed published handoff")
@@ -1594,6 +1607,9 @@ func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
 	if info, err := os.Stat(failedJob.Worktree); err != nil || !info.IsDir() {
 		t.Fatalf("failed publication recovery worktree was not retained at %q: %v", failedJob.Worktree, err)
 	}
+	if artifact, err := os.ReadFile(filepath.Join(failedJob.Worktree, "generated.txt")); err != nil || string(artifact) != "generated\n" {
+		t.Errorf("failed publication recovery artifact = %q, err=%v", artifact, err)
+	}
 	inspectFailed := exec.Command(binary, "job", "get", failedJob.ID, "--details")
 	inspectFailed.Dir = target
 	inspectFailed.Env = env
@@ -1603,6 +1619,45 @@ func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
 	}
 	if !strings.Contains(string(failedDetails), "Publication: unpublished") || strings.Contains(string(failedDetails), wantPRURL) {
 		t.Errorf("failed publication details claim a PR handoff: %s", failedDetails)
+	}
+	failedLogs := exec.Command(binary, "job", "logs", failedJob.ID, "--session", "workflow")
+	failedLogs.Dir, failedLogs.Env = target, env
+	failedLogOutput, err := failedLogs.CombinedOutput()
+	if err != nil || !strings.Contains(string(failedLogOutput), "stage.completed stage=implement") {
+		t.Errorf("fresh-process workflow logs omitted completed implementation event: err=%v output=%s", err, failedLogOutput)
+	}
+	stageLogs, err := filepath.Glob(filepath.Join(state, "runs", "*", "02-implement.log"))
+	if err != nil || len(stageLogs) != 2 {
+		t.Fatalf("implementation stage transcripts = %v, err=%v; want one per completed job", stageLogs, err)
+	}
+	foundFailedTranscript := false
+	for _, path := range stageLogs {
+		transcript, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read implementation transcript %q: %v", path, readErr)
+		}
+		if strings.Contains(string(transcript), "PI_WORKFLOW_TRANSCRIPT_MARKER") {
+			foundFailedTranscript = true
+		}
+	}
+	if !foundFailedTranscript {
+		t.Errorf("fake Pi transcript marker was not retained in implementation transcripts: %v", stageLogs)
+	}
+	foundFailureTranscript := false
+	for _, path := range stageLogs {
+		transcript, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatalf("read implementation transcript %q: %v", path, readErr)
+		}
+		if strings.Contains(string(transcript), "FAILED_PI_TRANSCRIPT_MARKER") {
+			foundFailureTranscript = true
+		}
+	}
+	if !foundFailureTranscript {
+		t.Errorf("unpublished fake Pi transcript marker was not retained: %v", stageLogs)
+	}
+	if calls, err := os.ReadFile(failedGHCalls); err != nil || !strings.Contains(string(calls), "pr create ") {
+		t.Errorf("failed publication did not use local gh tripwire: calls=%q err=%v", calls, err)
 	}
 	if got := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); got != initialHead {
 		t.Errorf("failed publication changed invoking checkout HEAD: got %s want %s", got, initialHead)
