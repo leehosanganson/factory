@@ -11,6 +11,19 @@ This guide applies to the single-server REST job service. See [REST server setup
 
 Keep probes on a trusted network boundary. They expose only bounded status—not credentials, filesystem paths, job contents, or provider diagnostics.
 
+## Bounded job listing
+
+Authenticated clients can rediscover retained job IDs with `GET /v1/jobs`. The endpoint is read-only and returns a summary containing only `id`, `status`, `created_at`, and `updated_at`; it never returns task/request text, provider details, events, logs, or paths. It includes queued, running (including interrupted SQLite jobs), and retained terminal records. SQLite retention is bounded by the configured record limit and refuses new admissions rather than evicting records; memory records may be evicted to stay within its bounded registry. Listing does not change job state, trigger recovery, or contact a provider.
+
+Pages default to 50 entries and accept `limit=1..100`. Results are ordered oldest admission first using an immutable store admission sequence (not timestamps, which can tie). The first response captures `snapshot_sequence`; while `has_more` is true, pass its `next_sequence` as `after` and repeat the same `snapshot` and `limit`:
+
+```text
+GET /v1/jobs?limit=50
+GET /v1/jobs?limit=50&after=<next_sequence>&snapshot=<snapshot_sequence>
+```
+
+The first page also returns an opaque-to-clients `next_sequence` only when another page is available. Both `after` and `snapshot` are required together, must be positive sequence values, and `after` cannot exceed `snapshot`; only `limit`, `after`, and `snapshot` are accepted. Invalid or repeated query parameters return sanitized `400 invalid_request`. Admission after the first page is excluded from that traversal, so it cannot shift page boundaries or cause duplicates; start a new request without cursors to see newer jobs. The snapshot freezes membership only: each page reports current status and `updated_at`, and records removed by memory retention may no longer appear. This is a bounded inspection view, not a transactional snapshot of all lifecycle fields.
+
 ## Aggregate operational status
 
 Authenticated clients can request `GET /v1/operations` with the same bearer token used for job routes. It returns only aggregate counts and configured capacity indicators, for example:

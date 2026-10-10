@@ -2,9 +2,12 @@ package restjobs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestLocalManagerSatisfiesStoreContract(t *testing.T) {
@@ -18,8 +21,137 @@ func TestLocalManagerSatisfiesStoreContract(t *testing.T) {
 	})
 }
 
+func setListTestCreatedAt(t *testing.T, store Store, ids ...string) {
+	t.Helper()
+	const tied = "2026-10-10T12:00:00Z"
+	switch typed := store.(type) {
+	case *LocalManager:
+		typed.mu.Lock()
+		for _, id := range ids {
+			entry := typed.jobs[id]
+			entry.snapshot.CreatedAt = time.Date(2026, 10, 10, 12, 0, 0, 0, time.UTC)
+		}
+		typed.mu.Unlock()
+	case *SQLiteStore:
+		for _, id := range ids {
+			if _, err := typed.db.Exec(`UPDATE factory_jobs SET created_at=? WHERE id=?`, tied, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	default:
+		t.Fatalf("unsupported test store %T", store)
+	}
+}
+
 func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 	t.Helper()
+	t.Run("bounded listing has stable admission order and snapshot boundary", func(t *testing.T) {
+		store := newStore(t)
+		first, _, err := store.Admit("list-first", Request{Repository: "widget", Task: "private first task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, _, err := store.Admit("list-second", Request{Repository: "widget", Task: "private second task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		setListTestCreatedAt(t, store, first.ID, second.ID)
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Finish(first.ID, StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.ListJobs(context.Background(), 0, 0, 1)
+		if err != nil || len(page.Jobs) != 1 || page.Jobs[0].ID != first.ID || !page.HasMore || page.SnapshotSequence == 0 || page.NextSequence == 0 {
+			t.Fatalf("first list page = (%+v, %v), want first admitted job and continuation", page, err)
+		}
+		startConcurrent := make(chan struct{})
+		listed := make(chan struct {
+			page JobPage
+			err  error
+		}, 1)
+		concurrentAdmission := make(chan error, 1)
+		go func() {
+			<-startConcurrent
+			result, err := store.ListJobs(context.Background(), page.NextSequence, page.SnapshotSequence, 1)
+			listed <- struct {
+				page JobPage
+				err  error
+			}{page: result, err: err}
+		}()
+		go func() {
+			<-startConcurrent
+			_, _, err := store.Admit("list-fourth", Request{Repository: "widget", Task: "concurrent admission"})
+			concurrentAdmission <- err
+		}()
+		close(startConcurrent)
+		nextResult := <-listed
+		if err := <-concurrentAdmission; err != nil {
+			t.Fatal(err)
+		}
+		next := nextResult.page
+		third, _, err := store.Admit("list-fresh", Request{Repository: "widget", Task: "fresh snapshot"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if nextResult.err != nil || len(next.Jobs) != 1 || next.Jobs[0].ID != second.ID || next.Jobs[0].Status != StatusRunning || next.HasMore {
+			t.Fatalf("continuation page = (%+v, %v), want second admitted job only", next, nextResult.err)
+		}
+		encoded, err := json.Marshal(next.Jobs[0])
+		if err != nil || strings.Contains(string(encoded), "private second task") || strings.Contains(string(encoded), "request") {
+			t.Fatalf("listed summary exposed request payload: %s err=%v", encoded, err)
+		}
+		all, err := store.ListJobs(context.Background(), 0, 0, 10)
+		if err != nil || len(all.Jobs) != 4 || all.Jobs[3].ID != third.ID {
+			t.Fatalf("fresh list = (%+v, %v), want concurrent admission on fresh snapshot", all, err)
+		}
+	})
+
+	t.Run("empty listing and terminal retention", func(t *testing.T) {
+		store := newStore(t)
+		empty, err := store.ListJobs(context.Background(), 0, 0, 2)
+		if err != nil || len(empty.Jobs) != 0 || empty.HasMore || empty.SnapshotSequence != 0 {
+			t.Fatalf("empty list = (%+v, %v), want an empty page", empty, err)
+		}
+		job, _, err := store.Admit("list-terminal", Request{Repository: "widget", Task: "terminal"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Finish(job.ID, StatusFailed); err != nil {
+			t.Fatal(err)
+		}
+		listed, err := store.ListJobs(context.Background(), 0, 0, 2)
+		if err != nil || len(listed.Jobs) != 1 || listed.Jobs[0].ID != job.ID || listed.Jobs[0].Status != StatusFailed {
+			t.Fatalf("terminal list = (%+v, %v), want retained failed job", listed, err)
+		}
+	})
+
+	t.Run("invalid pagination and canceled context are rejected", func(t *testing.T) {
+		store := newStore(t)
+		for _, tc := range []struct {
+			after, snapshot uint64
+			limit           int
+		}{
+			{limit: 0}, {limit: -1}, {after: 2, snapshot: 1, limit: 1}, {snapshot: ^uint64(0), limit: 1},
+		} {
+			if _, err := store.ListJobs(context.Background(), tc.after, tc.snapshot, tc.limit); !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("ListJobs(%d,%d,%d) error = %v, want ErrInvalidInput", tc.after, tc.snapshot, tc.limit, err)
+			}
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := store.ListJobs(ctx, 0, 0, 1); !errors.Is(err, context.Canceled) {
+			t.Errorf("ListJobs(canceled) error = %v, want context.Canceled", err)
+		}
+	})
+
 	t.Run("admission replay and conflict", func(t *testing.T) {
 		store := newStore(t)
 		first, replay, err := store.Admit("contract-key", Request{Repository: "widget", Task: "task"})

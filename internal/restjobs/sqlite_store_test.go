@@ -34,6 +34,73 @@ func TestSQLiteStoreSatisfiesSharedContract(t *testing.T) {
 	})
 }
 
+func TestSQLiteListingIncludesInterruptedAndTerminalJobsWithoutReplayingThem(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	config := testConfig()
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted, _, err := store.Admit("list-interrupted", Request{Repository: "widget", Task: "retained interrupted task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	terminal, _, err := store.Admit("list-terminal", Request{Repository: "widget", Task: "retained terminal task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(interrupted.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(terminal.ID, StatusCanceled); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	// A separate running record simulates an interrupted process after its
+	// database connection is closed without orderly lifecycle transitions.
+	queued, _, err := store.Admit("list-running", Request{Repository: "widget", Task: "interrupted task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	page, err := store.ListJobs(context.Background(), 0, 0, 10)
+	if err != nil || len(page.Jobs) != 3 {
+		t.Fatalf("retained SQLite jobs=(%+v,%v), want three", page, err)
+	}
+	foundRunning := false
+	foundTerminal := false
+	for _, summary := range page.Jobs {
+		foundRunning = foundRunning || (summary.ID == queued.ID && summary.Status == StatusRunning)
+		foundTerminal = foundTerminal || (summary.ID == terminal.ID && summary.Status == StatusCanceled)
+	}
+	if !foundRunning || !foundTerminal {
+		t.Fatalf("listing omitted interrupted or terminal records: %+v", page.Jobs)
+	}
+}
+
 func TestSQLiteCancellationRequestInterruptedByRestartIsNotAcceptedAsLive(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())

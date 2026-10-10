@@ -10,6 +10,8 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -138,8 +140,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.getOperations(w, r)
 	case path == "/v1/jobs":
+		if r.Method == http.MethodGet {
+			h.listJobs(w, r)
+			return
+		}
 		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 			return
 		}
 		h.createJob(w, r)
@@ -190,6 +196,63 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	}
+}
+
+func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
+	query, err := parseJobListQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	page, err := h.manager.ListJobs(ctx, query.after, query.snapshot, query.limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+type jobListQuery struct {
+	after    uint64
+	snapshot uint64
+	limit    int
+}
+
+func parseJobListQuery(r *http.Request) (jobListQuery, error) {
+	query := jobListQuery{limit: restjobs.DefaultJobListLimit}
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return jobListQuery{}, restjobs.ErrInvalidInput
+	}
+	for key, entries := range values {
+		if (key != "limit" && key != "after" && key != "snapshot") || len(entries) != 1 {
+			return jobListQuery{}, restjobs.ErrInvalidInput
+		}
+	}
+	if value, exists := values["limit"]; exists {
+		parsed, parseErr := strconv.Atoi(value[0])
+		if parseErr != nil || parsed < 1 || parsed > restjobs.MaxJobListLimit {
+			return jobListQuery{}, restjobs.ErrInvalidInput
+		}
+		query.limit = parsed
+	}
+	for key, target := range map[string]*uint64{"after": &query.after, "snapshot": &query.snapshot} {
+		if value, exists := values[key]; exists {
+			parsed, parseErr := strconv.ParseUint(value[0], 10, 64)
+			if parseErr != nil || parsed == 0 {
+				return jobListQuery{}, restjobs.ErrInvalidInput
+			}
+			*target = parsed
+		}
+	}
+	_, hasAfter := values["after"]
+	_, hasSnapshot := values["snapshot"]
+	if hasAfter != hasSnapshot || (hasAfter && query.after > query.snapshot) {
+		return jobListQuery{}, restjobs.ErrInvalidInput
+	}
+	return query, nil
 }
 
 func (h *Handler) getOperations(w http.ResponseWriter, r *http.Request) {
