@@ -33,6 +33,52 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadConfigAcceptsOptInParallelSubtasks(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		parallel        string
+		wantConcurrency int
+	}{
+		{"default concurrency", `{"enabled":true}`, 4},
+		{"minimum concurrency", `{"enabled":true,"max_concurrency":1}`, 1},
+		{"bounded concurrency", `{"enabled":true,"max_concurrency":2}`, 2},
+		{"maximum concurrency", `{"enabled":true,"max_concurrency":8}`, 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","parallel_subtasks":`+tc.parallel+`}`)
+			config, err := LoadConfig(path)
+			if err != nil {
+				t.Fatalf("LoadConfig() rejected parallel_subtasks: %v", err)
+			}
+			if config.ParallelSubtasks == nil || !config.ParallelSubtasks.Enabled {
+				t.Fatalf("parallel subtasks = %+v, want enabled", config.ParallelSubtasks)
+			}
+			concurrency := 4
+			if config.ParallelSubtasks.MaxConcurrency != nil {
+				concurrency = *config.ParallelSubtasks.MaxConcurrency
+			}
+			if concurrency != tc.wantConcurrency {
+				t.Fatalf("parallel concurrency = %d, want %d", concurrency, tc.wantConcurrency)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsInvalidParallelSubtasksConfig(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key"`
+	for _, parallel := range []string{
+		`{"enabled":true,"max_concurrency":0}`,
+		`{"enabled":true,"max_concurrency":9}`,
+		`{"enabled":true,"max_concurrency":null}`,
+		`{"enabled":true,"extra":true}`,
+		`{"enabled":"yes"}`,
+	} {
+		if _, err := LoadConfig(writeConfig(t, `{`+base+`,"parallel_subtasks":`+parallel+`}`)); err == nil {
+			t.Errorf("LoadConfig() accepted parallel_subtasks %s", parallel)
+		}
+	}
+}
+
 func TestLoadConfigSelectsMemoryPersistenceExplicitly(t *testing.T) {
 	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"memory"}}`)
 	config, err := LoadConfig(path)

@@ -542,6 +542,11 @@ func (p *uncertainE2EPublisher) Publish(ctx context.Context, request restprovide
 func (p *e2ePublisher) Ping(context.Context) error { return nil }
 
 func (p *e2ePublisher) Publish(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	if marker := os.Getenv("FACTORY_E2E_PROVIDER_REQUIRES_MARKER"); marker != "" {
+		if _, err := os.Stat(marker); err != nil {
+			return restprovider.Outcome{}, fmt.Errorf("required pre-publication integration marker is missing")
+		}
+	}
 	if request.JobID == "" {
 		return restprovider.Outcome{}, fmt.Errorf("missing job identity")
 	}
@@ -1106,6 +1111,211 @@ func TestRESTServerProcessRejectsAndRetriesAtQueueCapacity(t *testing.T) {
 	retried, err := submitProcessJob(client, baseURL, apiKey, "trusted", "retry-after-capacity", "capacity-retry")
 	if err != nil || retried.StatusCode != http.StatusAccepted || retried.ID == "" || retried.Replayed {
 		t.Fatalf("same-key retry after capacity freed=%+v err=%v, want new admission", retried, err)
+	}
+}
+
+func TestRESTServerProcessRunsParallelSubtasksBeforeSingleProviderPublication(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	config.Limits.Workers = 1
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	workRoot := filepath.Dir(config.Repositories["trusted"])
+	parallelBarrier := filepath.Join(t.TempDir(), "parallel-barrier")
+	if err := os.Mkdir(parallelBarrier, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plannerPlan := `{"subtasks":[{"id":"first","task":"write first","files":["first.txt"],"depends_on":[]},{"id":"second","task":"write second","files":["second.txt"],"depends_on":[]},{"id":"dependent","task":"write dependent","files":["dependent.txt"],"depends_on":["first","second"]}]}`
+	planPath := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(planPath, []byte(plannerPlan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	harness := filepath.Join(t.TempDir(), "pi-compatible-harness.sh")
+	barrier := parallelBarrier
+	script := fmt.Sprintf(`#!/bin/sh
+task=
+for arg in "$@"; do task=$arg; done
+case "$task" in
+  *"Create an implementation plan"*) cat %q; exit 0 ;;
+  *"write first"*) touch %q/first-started; while [ ! -e %q/second-started ]; do sleep 0.02; done; printf first > first.txt ;;
+  *"write second"*) touch %q/second-started; while [ ! -e %q/first-started ]; do sleep 0.02; done; printf second > second.txt ;;
+  *"write dependent"*) test -f first.txt || exit 41; test -f second.txt || exit 42; printf dependent > dependent.txt ;;
+esac
+case "$1" in *"Review the requested work"*) test -f first.txt && test -f second.txt && test -f dependent.txt || exit 44; touch %q/integrated;; esac
+`, planPath, barrier, barrier, barrier, barrier, barrier)
+	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{system_prompt}", "{task}"}}
+	maxConcurrency := 2
+	config.ParallelSubtasks = &restserver.ParallelSubtasksConfig{Enabled: true, MaxConcurrency: &maxConcurrency}
+	providerPath := filepath.Join(t.TempDir(), "provider-records")
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readyPath, logPath := filepath.Join(t.TempDir(), "listener"), filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Join(t.TempDir(), "state"), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerPath, "FACTORY_E2E_PROVIDER_REQUIRES_MARKER="+filepath.Join(barrier, "integrated"))
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait() }()
+	defer func() {
+		if child.Process != nil && child.ProcessState == nil {
+			_ = child.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				_ = child.Process.Kill()
+				<-done
+			}
+		}
+	}()
+	baseURL := waitForProcessURL(t, done, readyPath, logPath)
+	client := &http.Client{Timeout: 5 * time.Second}
+	admitted, err := submitProcessJob(client, baseURL, apiKey, "trusted", "implement three related files", "parallel-subtask-e2e")
+	if err != nil || admitted.StatusCode != http.StatusAccepted || admitted.ID == "" {
+		t.Fatalf("parallel job admission=%+v err=%v", admitted, err)
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	var completed restjobs.Snapshot
+	for time.Now().Before(deadline) {
+		completed = getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+		if completed.Status.Terminal() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if completed.Status != restjobs.StatusSucceeded || completed.Provider == nil {
+		t.Fatalf("parallel job outcome=%+v history=%+v", completed, getProcessHistory(t, client, baseURL, admitted.ID, apiKey))
+	}
+	for _, marker := range []string{"first-started", "second-started", "integrated"} {
+		if _, err := os.Stat(filepath.Join(barrier, marker)); err != nil {
+			t.Fatalf("parallel behavior marker %q missing: %v", marker, err)
+		}
+	}
+	providerRecord, err := os.ReadFile(providerPath)
+	if err != nil || strings.Count(string(providerRecord), `"job_id"`) != 1 {
+		t.Fatalf("provider publication records=%q err=%v, want exactly one publication after integration", providerRecord, err)
+	}
+	if _, err := os.Stat(filepath.Join(workRoot, "first.txt")); !os.IsNotExist(err) {
+		t.Fatalf("parallel changes escaped isolated job workspace: %v", err)
+	}
+}
+
+func TestRESTServerProcessKeepsParallelSubtasksSerialByDefaultAndWhenDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("process-level REST E2E")
+	}
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	for _, tc := range []struct {
+		name        string
+		parallel    *restserver.ParallelSubtasksConfig
+		plannerFail bool
+	}{
+		{name: "omitted"},
+		{name: "disabled", parallel: &restserver.ParallelSubtasksConfig{Enabled: false}},
+		{name: "enabled planner failure", parallel: &restserver.ParallelSubtasksConfig{Enabled: true}, plannerFail: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			config, apiKey := runtimeFixture(t)
+			config.Limits.Workers = 1
+			config.ParallelSubtasks = tc.parallel
+			providerToken := filepath.Join(t.TempDir(), "provider-token")
+			if err := os.WriteFile(providerToken, []byte("test-provider-token"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+			plannerCalled := filepath.Join(t.TempDir(), "planner-called")
+			harness := filepath.Join(t.TempDir(), "serial-harness.sh")
+			script := fmt.Sprintf("#!/bin/sh\ntask=\nfor arg in \"$@\"; do task=$arg; done\ncase \"$task\" in *\"Create an implementation plan\"*) touch %q; exit 42;; *serial-only*) printf serial > result.txt;; esac\n", plannerCalled)
+			if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{system_prompt}", "{task}"}}
+			providerPath := filepath.Join(t.TempDir(), "provider-records")
+			configPath := filepath.Join(t.TempDir(), "server.json")
+			configData, err := json.Marshal(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configPath, configData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			readyPath, logPath := filepath.Join(t.TempDir(), "listener"), filepath.Join(t.TempDir(), "server.log")
+			logFile, err := os.Create(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer logFile.Close()
+			child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+			child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Join(t.TempDir(), "state"), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerPath)
+			child.Stdout, child.Stderr = logFile, logFile
+			if err := child.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- child.Wait() }()
+			defer func() {
+				if child.Process != nil && child.ProcessState == nil {
+					_ = child.Process.Signal(syscall.SIGTERM)
+					select {
+					case <-done:
+					case <-time.After(3 * time.Second):
+						_ = child.Process.Kill()
+						<-done
+					}
+				}
+			}()
+			baseURL := waitForProcessURL(t, done, readyPath, logPath)
+			client := &http.Client{Timeout: 5 * time.Second}
+			admitted, err := submitProcessJob(client, baseURL, apiKey, "trusted", "serial-only implementation", "serial-"+tc.name)
+			if err != nil || admitted.StatusCode != http.StatusAccepted || admitted.ID == "" {
+				t.Fatalf("serial job admission=%+v err=%v", admitted, err)
+			}
+			wantStatus := restjobs.StatusSucceeded
+			if tc.plannerFail {
+				wantStatus = restjobs.StatusFailed
+			}
+			waitForBackupJob(t, client, baseURL, admitted.ID, apiKey, wantStatus)
+			_, plannerErr := os.Stat(plannerCalled)
+			if tc.plannerFail && plannerErr != nil {
+				t.Fatalf("planner was not called in enabled mode: %v", plannerErr)
+			}
+			if !tc.plannerFail && !os.IsNotExist(plannerErr) {
+				t.Fatalf("planner ran in %s mode: %v", tc.name, plannerErr)
+			}
+			providerRecord, err := os.ReadFile(providerPath)
+			if tc.plannerFail {
+				if !os.IsNotExist(err) {
+					t.Fatalf("failed planner published provider record=%q err=%v", providerRecord, err)
+				}
+			} else if err != nil || strings.Count(string(providerRecord), `"job_id"`) != 1 {
+				t.Fatalf("provider publication records=%q err=%v, want exactly one serial publication", providerRecord, err)
+			}
+		})
 	}
 }
 

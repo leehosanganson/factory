@@ -264,7 +264,6 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 	workflowConfig.PipelineChecks = cloneChecks(e.workflow.PipelineChecks)
 	workflowConfig.StateDir = workspace.StatePath
 	workflowConfig.AutoPublish = false
-	workflowConfig.ParallelImplementation = nil
 	completedChecks := 0
 	observer := factory.WorkflowObserverFunc(func(event factory.WorkflowEvent) error {
 		if event.Type == "check.completed" && completedChecks < len(evidence.Checks) {
@@ -415,6 +414,10 @@ func cloneServerConfig(config restserver.Config) restserver.Config {
 func cloneWorkflowConfig(config factory.Config) factory.Config {
 	config.Args = append([]string(nil), config.Args...)
 	config.PipelineChecks = cloneChecks(config.PipelineChecks)
+	if config.ParallelImplementation != nil {
+		parallel := *config.ParallelImplementation
+		config.ParallelImplementation = &parallel
+	}
 	return config
 }
 

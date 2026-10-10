@@ -35,6 +35,10 @@ This file configures the implemented `factory server` command. Configuration is 
     ["go", "test", "./..."],
     ["go", "vet", "./..."]
   ],
+  "parallel_subtasks": {
+    "enabled": true,
+    "max_concurrency": 4
+  },
   "limits": {
     "request_body_bytes": 524288,
     "task_bytes": 262144,
@@ -52,6 +56,8 @@ This file configures the implemented `factory server` command. Configuration is 
 `listen_address` defaults to `127.0.0.1:8080`; explicitly binding a non-loopback address exposes the API on that interface and requires suitable network controls. `repositories` maps a validated alias to an absolute checkout root; callers cannot supply paths. Before listening, the server verifies each configured path is an existing directory and the exact canonical Git working-tree root. Subdirectories, bare repositories, and symlink/path-indirected roots are rejected; linked worktree roots are accepted. Git must be installed. Validation errors identify the alias without echoing configured paths.
 
 `harness` is a fixed executable and argv, never shell text. Arguments must contain `{task}` and `{system_prompt}` exactly once; other placeholders are rejected. `verification_checks` is an optional list of trusted operator-configured argv arrays invoked after workflow stages; callers cannot provide or change checks. Empty/omitted checks mean no external checks run. The strict schema bounds this list to 16 commands, 32 nonempty argv elements per command, and 16 KiB total argv bytes per command. Only `mode: local_process` is accepted.
+
+`parallel_subtasks` is optional and disabled when omitted or when `enabled` is false. Set `enabled: true` to use Factory's existing planner-driven parallel implementation during the implementation stage of one REST job; it validates declared file scope and dependency waves, isolates workers, integrates successful changes, and rolls back integration on workflow failure. `max_concurrency` is optional (default 4) and, when specified, must be an integer from 1 through 8. It limits simultaneous subtasks within each job. This is separate from `limits.workers`, which limits simultaneous REST jobs; total subtask activity can therefore scale with both settings. Parallel execution is attempted only where the existing workflow considers the checkout eligible; otherwise the existing serial implementation path is used. Planner and agent output remain untrusted, and parallel workflow guards do not make local processes or containers a security sandbox. Only enable this for trusted repositories and harnesses.
 
 The loader rejects unknown/duplicate JSON fields and trailing JSON. Use `factory server doctor --config /absolute/path/to/server.json` for a local-only, read-only preflight of config, credential-file permissions, SQLite path metadata, configured Git checkout roots, and harness executable availability. It does not test provider reachability, open/create SQLite, start a listener, or run the harness. Its diagnostics name fields/categories only and omit configured paths and values. Start the service with `factory server --config /absolute/path/to/server.json`; no other argument ordering or config source is accepted. Resource limits are positive and bounded: request body 2 MiB, task 256 KiB, queue 1024, workers 64, retained records 1,000, events per job 200, logical registry budget 256 MiB, job timeout 24 hours, and captured output 16 MiB maximum. Defaults are 512 KiB body, 256 KiB task, queue 32, two workers, 1,000 records, 200 events, 256 MiB registry budget, 30 minutes, and 1 MiB output. Task limits count UTF-8 bytes.
 

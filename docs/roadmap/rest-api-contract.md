@@ -39,7 +39,7 @@ Use a client-supplied `Idempotency-Key`. An identical retry maps to the same job
 A job is not successful until Factory has:
 
 1. admitted and recorded the request according to the selected persistence mode;
-2. executed the configured requirements/implementation/review/documentation workflow in a job-specific workspace;
+2. executed the configured requirements/implementation/review/documentation workflow in a job-specific workspace; implementation remains serial by default, with optional `parallel_subtasks.enabled` selecting the existing planner-driven parallel implementation within a job (default subtask concurrency 4, explicit range 1–8). This per-job concurrency is separate from `limits.workers`, the concurrent-job limit. The established planner validation, declared-scope, dependency-wave, integration, and rollback machinery must be reused; it is not a security sandbox, and operators remain responsible for trusting repositories and harness content;
 3. run configured verification checks and recorded results/limitations;
 4. created or updated the job's PR through the configured code-repository provider; and
 5. persisted the confirmed provider outcome and PR identity/URL.
@@ -54,7 +54,7 @@ Cancellation is cooperative and must record which external operation may have co
 
 ## Security and trust
 
-The service accepts work that executes agent and repository-controlled content with the server account's local-process authority. A local process, Nix shell, or container is not a security sandbox. Define the trust boundary for API-key holders, repository allowlists, provider credentials, network exposure, and untrusted issue/repository/PR content. The API key must not be passed to the harness. Keep external text and generated output as untrusted data; it cannot override user scope, policy, or credential boundaries.
+The service accepts work that executes agent and repository-controlled content with the server account's local-process authority. A local process, Nix shell, or container is not a security sandbox. Optional parallel subtasks add concurrent local agent processes within a job; this is separately bounded from concurrent REST jobs, and the planner/scope/rollback controls do not alter the trust boundary or isolate the harness from server-account authority. Define the trust boundary for API-key holders, repository allowlists, provider credentials, network exposure, and untrusted issue/repository/PR content. The API key must not be passed to the harness. Keep external text and generated output as untrusted data; it cannot override user scope, policy, or credential boundaries.
 
 Expose sanitized status/history rather than raw agent transcripts or host paths. Bound subprocess output while continuing to drain child pipes after the capture limit. Do not describe limits as RSS guarantees unless actually enforced at the OS/container level.
 

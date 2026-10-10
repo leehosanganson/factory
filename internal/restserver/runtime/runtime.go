@@ -161,7 +161,13 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	workflowConfig.AutoPublish = false
 	workflowConfig.WorktreeParent = ""
 	workflowConfig.PipelineChecks = cloneVerificationChecks(config.VerificationChecks)
-	workflowConfig.ParallelImplementation = nil
+	if config.ParallelSubtasks != nil && config.ParallelSubtasks.Enabled {
+		maxConcurrency := 4
+		if config.ParallelSubtasks.MaxConcurrency != nil {
+			maxConcurrency = *config.ParallelSubtasks.MaxConcurrency
+		}
+		workflowConfig.ParallelImplementation = &factory.ParallelImplementationConfig{Enabled: true, MaxConcurrency: maxConcurrency}
+	}
 	executor := options.Executor
 	if executor == nil {
 		var recordProviderAttempt func(string, restjobs.ProviderAttempt) error
