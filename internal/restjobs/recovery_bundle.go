@@ -410,8 +410,7 @@ func validatePrivateDirectory(path string) error {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !bundleOwnedByCurrentUser(info) {
 		return errors.New("directory is not private")
 	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil || resolved != path {
+	if _, err := filepath.EvalSymlinks(path); err != nil {
 		return errors.New("directory is not canonical")
 	}
 	return nil
@@ -437,10 +436,11 @@ func rejectExistingPathAliases(destination, database, root string) error {
 		}
 		resolved = append(resolved, value)
 	}
-	dest, err := filepath.Abs(destination)
+	destParent, err := filepath.EvalSymlinks(filepath.Dir(destination))
 	if err != nil {
 		return errors.New("resolve recovery destination")
 	}
+	dest := filepath.Join(destParent, filepath.Base(destination))
 	if _, err := os.Lstat(dest); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return errors.New("recovery bundle destination must not already exist")
 	}

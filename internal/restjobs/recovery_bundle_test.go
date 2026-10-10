@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -78,6 +79,71 @@ func TestRecoveryBundleCreateVerifyRestore(t *testing.T) {
 	artifact := filepath.Join(root, "restored", "factory", "rest-server", aliasDir, "results", job.ID, "output", "artifact.txt")
 	if data, err := os.ReadFile(artifact); err != nil || string(data) != "retained synthetic artifact" {
 		t.Fatalf("restored artifact = %q, %v", data, err)
+	}
+}
+
+func TestRecoveryBundleAcceptsCanonicalPrivateDirectoriesThroughAliasedAncestors(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(filepath.Dir(root), filepath.Base(root)+"-alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "jobs.db")
+	store, err := OpenSQLiteStore(database, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	results := filepath.Join(root, "results")
+	if err := os.Mkdir(results, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bundleDir := filepath.Join(root, "bundles")
+	if err := os.Mkdir(bundleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateRecoveryBundle(context.Background(), filepath.Join(alias, "jobs.db"), filepath.Join(alias, "results"), map[string]string{"a": recoveryAliasDirectory("a")}, filepath.Join(alias, "results", "bundle.tar.gz")); err == nil {
+		t.Fatal("bundle creation accepted a destination under an aliased results root")
+	}
+	if err := CreateRecoveryBundle(context.Background(), filepath.Join(alias, "jobs.db"), filepath.Join(root, "results"), map[string]string{"a": recoveryAliasDirectory("a")}, filepath.Join(alias, "results", "bundle.tar.gz")); err == nil {
+		t.Fatal("bundle creation accepted a destination overlapping results through an aliased ancestor")
+	}
+	if err := CreateRecoveryBundle(context.Background(), filepath.Join(alias, "jobs.db"), filepath.Join(alias, "results"), map[string]string{"a": recoveryAliasDirectory("a")}, filepath.Join(alias, "bundles", "bundle.tar.gz")); err != nil {
+		t.Fatalf("create bundle through aliased ancestors: %v", err)
+	}
+	if err := VerifyRecoveryBundle(filepath.Join(root, "bundles", "bundle.tar.gz")); err != nil {
+		t.Fatalf("verify bundle created through aliased ancestor: %v", err)
+	}
+}
+
+func TestRecoveryBundleRejectsSymlinkedResultsRoot(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(root, "jobs.db")
+	store, err := OpenSQLiteStore(database, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "results")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	results := filepath.Join(root, "results-link")
+	if err := os.Symlink(target, results); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateRecoveryBundle(context.Background(), database, results, map[string]string{"a": recoveryAliasDirectory("a")}, filepath.Join(root, "bundle.tar.gz")); err == nil {
+		t.Fatal("bundle creation accepted a symlinked results root")
 	}
 }
 
@@ -216,6 +282,10 @@ func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
 	defer cancel()
 	ready := make(chan error, 1)
 	go func() {
+		deadline := time.NewTimer(5 * time.Second)
+		defer deadline.Stop()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
 		for {
 			matches, _ := filepath.Glob(filepath.Join(root, ".factory-recovery-*.partial"))
 			if len(matches) != 0 {
@@ -231,8 +301,10 @@ func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
 			case <-ctx.Done():
 				ready <- ctx.Err()
 				return
-			default:
-				time.Sleep(time.Millisecond)
+			case <-deadline.C:
+				ready <- errors.New("timed out waiting for temporary recovery archive")
+				return
+			case <-ticker.C:
 			}
 		}
 	}()
