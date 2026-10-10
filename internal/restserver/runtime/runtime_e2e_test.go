@@ -344,6 +344,37 @@ func waitForBackupJob(t *testing.T, client *http.Client, baseURL, id, apiKey str
 	t.Fatalf("job %s did not reach %s", id, want)
 }
 
+func TestCanonicalTestStateHomeResolvesSymlinks(t *testing.T) {
+	root := t.TempDir()
+	alias := filepath.Join(t.TempDir(), "state-alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatal(err)
+	}
+	got := canonicalTestStateHome(t, filepath.Join(alias, "state"))
+	want, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = filepath.Join(want, "state")
+	if got != want {
+		t.Fatalf("canonical test state home = %q, want %q", got, want)
+	}
+}
+
+func canonicalTestStateHome(t *testing.T, home string) string {
+	t.Helper()
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(home))
+	if err != nil {
+		t.Fatalf("resolve test state home parent: %v", err)
+	}
+	return filepath.Join(resolvedParent, filepath.Base(home))
+}
+
+func testProcessStateHome(t *testing.T) string {
+	t.Helper()
+	return canonicalTestStateHome(t, filepath.Join(t.TempDir(), "state"))
+}
+
 func TestRESTServerProcessHelper(t *testing.T) {
 	if os.Getenv("FACTORY_E2E_HELPER") != "1" {
 		return
@@ -1173,7 +1204,7 @@ case "$1" in *"Review the requested work"*) test -f first.txt && test -f second.
 	}
 	defer logFile.Close()
 	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
-	child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Join(t.TempDir(), "state"), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerPath, "FACTORY_E2E_PROVIDER_REQUIRES_MARKER="+filepath.Join(barrier, "integrated"))
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+testProcessStateHome(t), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_REPORT_RUNTIME_ERRORS=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerPath, "FACTORY_E2E_PROVIDER_REQUIRES_MARKER="+filepath.Join(barrier, "integrated"))
 	child.Stdout, child.Stderr = logFile, logFile
 	if err := child.Start(); err != nil {
 		t.Fatal(err)
@@ -1271,7 +1302,7 @@ func TestRESTServerProcessKeepsParallelSubtasksSerialByDefaultAndWhenDisabled(t 
 			}
 			defer logFile.Close()
 			child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
-			child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Join(t.TempDir(), "state"), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerPath)
+			child.Env = append(os.Environ(), "XDG_STATE_HOME="+testProcessStateHome(t), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_REPORT_RUNTIME_ERRORS=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerPath)
 			child.Stdout, child.Stderr = logFile, logFile
 			if err := child.Start(); err != nil {
 				t.Fatal(err)
@@ -2507,7 +2538,8 @@ func waitForProcessURL(t *testing.T, childDone <-chan error, readyPath, logPath 
 		}
 		select {
 		case err := <-childDone:
-			t.Fatalf("REST server helper exited early: %v", err)
+			logData, _ := os.ReadFile(logPath)
+			t.Fatalf("REST server helper exited early: %v; log=%s", err, logData)
 		default:
 		}
 		time.Sleep(10 * time.Millisecond)
