@@ -1,6 +1,6 @@
 # REST server operations
 
-This guide applies to the single-server REST job service. See [REST server setup and configuration](rest-server-config.md) for the current schema, [REST job server](rest-server.md) for shipped limits and trust boundaries, and the [REST API contract](../roadmap/rest-api-contract.md) for the target lifecycle.
+This guide applies to the single-server REST job service. See [REST server setup and configuration](rest-server-config.md) for the current schema, [REST job server](rest-server.md) for shipped limits and trust boundaries, and the [REST API contract](../roadmap/rest-api-contract.md) for the target lifecycle. For a single-host systemd deployment, see the [supervised deployment recipe](rest-server-systemd.md).
 
 ## Health and readiness
 
@@ -143,6 +143,10 @@ factory server bundle restore --source /secure/backup/factory-recovery.tar.gz --
 `inspect` prints only job IDs, statuses, opaque repository-directory digests, and workspace-presence flags; it does not print request text, secrets, or host paths. Restored files are arranged beneath the new destination at `factory/rest-server/jobs.db` and `factory/rest-server/<repository-digest>/results/<job-id>/...`. To use the database, point a disposable server config at that restored SQLite path and configure its workspace/results state base to the extracted tree as appropriate; do not point a live server at or overwrite the configured production state/results directory. This portability mechanism does not rewrite Git worktree administrative metadata to register retained worktrees against another checkout. The restored artifacts remain available for inspection; provider reconciliation may reject them if the configured checkout/worktree identity checks do not pass. Never treat copying those directories as a guarantee of cross-host executable reconciliation.
 
 The bundle CLI process test builds synthetic failed and interrupted jobs, moves the single bundle, verifies and inspects it, restores it under a distinct private path, and checks durable history and retained artifacts. Unit tests cover active ownership, unsafe destinations and paths, permissions, corruption, traversal, and failed creation leaving no published partial bundle. The command tests use a stopped synthetic SQLite store plus synthetic workspace directories; the result trees are not live Git worktrees or provider credentials. These are deterministic synthetic checks, not a production restore drill. A production restore drill must separately use an approved disposable target and verify its configured repository/worktree assumptions, service startup, representative inspection, and operational procedures; do not use production credentials or repositories for automated tests.
+
+## Supervised single-host deployment
+
+For a dedicated service-user unit with the installed binary, shutdown/start-rate behavior, readiness checks, and operational commands, follow the [systemd deployment recipe](rest-server-systemd.md). Keep this service as the only process owning its SQLite database; backup commands do not require starting a second server.
 
 ## Clean setup and first client request
 
