@@ -6,8 +6,8 @@
 factory job start implementation <description>
 factory job start tidy <description>
 factory job start monitor <description>
-factory job list [--scan-limit <n>] [--status <status>] [--type <type>] [--limit <n>]
-factory job get <id> [--details]
+factory job list [--json] [--details] [--scan-limit <n>] [--status <status>] [--type <type>] [--limit <n>]
+factory job get <id> [--json] [--details]
 factory job logs <id> [--session workflow] [--follow]
 factory job attach <id>
 factory job stop <id>
@@ -22,7 +22,23 @@ factory job list --scan-limit 100 --status failed
 factory job list --type monitor
 ```
 
-Filters are applied to the reconciled newest-first list before the positive-integer display limit, so `--limit` selects the newest matching jobs within the scanned set. Omitting `--scan-limit` preserves legacy behavior: all persisted records are read and reconciled before filtering. A positive `--scan-limit N` processes at most N valid job directories in filesystem iteration order, independent of record status; the selected rows are then sorted newest first, filtered, and display-limited. If another valid job directory exists beyond the scan bound, output explicitly warns that additional records were not examined and may be omitted. This is an operator-selected partial view, not a guarantee the newest N jobs or any particular status are covered. Directory enumeration itself is necessary to select records, so the option bounds job-record reads/reconciliation, not all filesystem work. No records are deleted, archived, or pruned: active, interrupted, failed, corrupt, and terminal job directories remain addressable by ID with `factory job get <id>` (corrupt records still produce read errors). The bound changes only the list scan; it does not alter lifecycle, cancellation, replay, or provider behavior. To inspect the complete history—including older failed/interrupted work—rerun `factory job list` without `--scan-limit`; inspect a known record directly with `factory job get <id> --details` and its workflow logs before deciding any recovery action.
+Filters are applied to the reconciled newest-first list before the positive-integer display limit, so `--limit` selects the newest matching jobs within the scanned set. Omitting `--scan-limit` preserves legacy behavior: all persisted records are read and reconciled before filtering. A positive `--scan-limit N` processes at most N valid job directories in filesystem iteration order, independent of record status; the selected rows are then sorted newest first, filtered, and display-limited. If another valid job directory exists beyond the scan bound, text output warns that additional records were not examined and may be omitted. This is an operator-selected partial view, not a guarantee the newest N jobs or any particular status are covered. Directory enumeration itself is necessary to select records, so the option bounds job-record reads/reconciliation, not all filesystem work. No records are deleted, archived, or pruned: active, interrupted, failed, corrupt, and terminal job directories remain addressable by ID with `factory job get <id>` (corrupt records still produce read errors). The bound changes only the list scan; it does not alter lifecycle, cancellation, replay, or provider behavior. To inspect the complete history—including older failed/interrupted work—rerun `factory job list` without `--scan-limit`; inspect a known record directly with `factory job get <id> --details` and its workflow logs before deciding any recovery action.
+
+## JSON inspection output
+
+`factory job list --json` and `factory job get <id> --json` emit exactly one JSON object followed by a newline. Errors remain diagnostics on stderr with the existing nonzero exit behavior. Without `--json`, text output is unchanged. JSON is a read-only inspection interface; it does not change job lifecycle, persist mutations, or provide lifecycle-control authority. It intentionally omits task descriptions, target/repository/worktree paths, publication summaries, monitor internals, event content, and all log contents.
+
+The stable v1 envelope is `{ "schema_version": 1, "jobs": [...] }` for list and `{ "schema_version": 1, "job": {...} }` for get. Each job has `id`, `type`, `status`, `created_at`, and `updated_at`; `started_at` and `ended_at` are present when known. Implementation jobs may include `publication_status`. Timestamps are RFC 3339 UTC strings. Existing v1 field meanings and types are stable; incompatible changes require a new schema version. Consumers should ignore unknown fields.
+
+For `factory job list`, `--details` requires `--json`; for `factory job get`, `--details` without `--json` retains its existing text behavior. In JSON mode, details adds a `details` object to each selected job with a `sessions` array (safe session IDs, status, and timestamps), `status_calls`, and `active_pi_subprocesses` (direct process observations only; descendants are not counted). This is a bounded metadata projection, not full record export. Filters and `--limit` retain their text-mode behavior and compose with JSON. Empty matches return `"jobs": []`. For a bounded scan, the list envelope also contains `scan: {"scanned": N, "has_more": true|false}` rather than mixing scan warnings into JSON stdout; `has_more` reports whether valid job directories existed beyond the scan bound.
+
+Examples for scripts:
+
+```sh
+factory job list --json | jq -r '.jobs[] | select(.status == "failed") | .id'
+factory job list --json --status running --type implementation --limit 5
+factory job get "$job_id" --json --details | jq '.job.details.sessions'
+```
 
 `factory job watch <id>...` refreshes only the selected jobs' status and latest recorded activity once per second. Each snapshot includes a safe next-action hint derived from persisted job type, status, and phase: active jobs need no action, pending monitor proposals show the inspect/approve/reject commands, recoverable monitors show the guarded reset command, failed or completed jobs show where to inspect results, and interrupted implementation/tidy jobs explicitly state that Factory will not replay them and point to details, workflow logs, and any retained worktree/branch for inspection. Hints do not include task descriptions, proposal text, or log contents. For monitor jobs the watch also shows the current phase, latest successful PR/check query time and concise check result, plus a bounded recent transition trail. Repeated IDs are shown once, in their first-supplied order. On a terminal it redraws the selected-job snapshot; when output is not a terminal, it prints labeled snapshots instead. It exits after all selected jobs reach a terminal status, or when interrupted/canceled. Watching is read-only with respect to worker lifecycle: it does not request cancellation, and it never displays job or session logs. A missing ID is reported as an error.
 
