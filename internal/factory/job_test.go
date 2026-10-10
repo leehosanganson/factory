@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1153,6 +1154,172 @@ func TestJobListLimitShowsNewestJobsAndOmittedLimitRemainsUnbounded(t *testing.T
 	}
 }
 
+func TestJobListScanLimitSelectsFilesystemEntriesAndReportsOmissions(t *testing.T) {
+	state := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := map[string]string{
+		"alpha-complete": "complete", "bravo-running": "running",
+		"charlie-interrupted": "interrupted", "delta-failed": "failed",
+	}
+	for id, status := range statuses {
+		job := JobRecord{ID: id, Type: tidyJobType, Status: status, TargetPath: t.TempDir()}
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		limit int
+	}{
+		{name: "below history size", limit: 2},
+		{name: "exact history size", limit: 4},
+		{name: "above history size", limit: 5},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			selected, hasMore, err := store.listJobIDs(tc.limit)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantMore := tc.limit < len(statuses)
+			if hasMore != wantMore || len(selected) != min(tc.limit, len(statuses)) {
+				t.Fatalf("scan selection = %d IDs, hasMore=%t; want %d IDs, hasMore=%t", len(selected), hasMore, min(tc.limit, len(statuses)), wantMore)
+			}
+			selectedSet := make(map[string]bool, len(selected))
+			for _, id := range selected {
+				selectedSet[id] = true
+			}
+			var output bytes.Buffer
+			if err := JobCommand([]string{"list", "--scan-limit", strconv.Itoa(tc.limit)}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output); err != nil {
+				t.Fatalf("bounded job list: %v", err)
+			}
+			got := output.String()
+			if !strings.Contains(got, fmt.Sprintf("History scan: selected %d valid job directories in filesystem iteration order.", len(selected))) {
+				t.Fatalf("bounded job list did not report scan coverage: %q", got)
+			}
+			if strings.Contains(got, "Additional records were not examined and may be omitted") != hasMore {
+				t.Fatalf("bounded job list omission disclosure = %q, hasMore=%t", got, hasMore)
+			}
+			for id := range statuses {
+				if strings.Contains(got, id) != selectedSet[id] {
+					t.Errorf("bounded job list inclusion for %q = %t, selected=%t: %q", id, strings.Contains(got, id), selectedSet[id], got)
+				}
+			}
+		})
+	}
+
+	for id, wantStatus := range statuses {
+		job, err := store.GetJob(id)
+		if err != nil || job.Status != wantStatus {
+			t.Errorf("scan changed or removed protected record %q: status=%q err=%v, want %q", id, job.Status, err, wantStatus)
+		}
+	}
+
+	selected, _, err := store.listJobIDs(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedSet := make(map[string]bool, len(selected))
+	for _, id := range selected {
+		selectedSet[id] = true
+	}
+	var filtered bytes.Buffer
+	if err := JobCommand([]string{"list", "--scan-limit", "2", "--status", "failed"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &filtered); err != nil {
+		t.Fatalf("bounded filtered list: %v", err)
+	}
+	gotFiltered := filtered.String()
+	if !strings.Contains(gotFiltered, "Additional records were not examined and may be omitted") || strings.Contains(gotFiltered, "delta-failed") != selectedSet["delta-failed"] {
+		t.Fatalf("bounded filter did not disclose partial history or honor the selected subset: %q", gotFiltered)
+	}
+	if !selectedSet["delta-failed"] && !strings.Contains(gotFiltered, "No jobs.") {
+		t.Fatalf("bounded filter without a selected match should say No jobs: %q", gotFiltered)
+	}
+	omittedID := ""
+	for id := range statuses {
+		if !selectedSet[id] {
+			omittedID = id
+			break
+		}
+	}
+	var retained bytes.Buffer
+	if err := JobCommand([]string{"get", omittedID}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &retained); err != nil {
+		t.Fatalf("get omitted job by ID: %v", err)
+	}
+	if !strings.Contains(retained.String(), omittedID) {
+		t.Fatalf("get omitted job output = %q, want ID %q", retained.String(), omittedID)
+	}
+}
+
+func TestJobListScanLimitDoesNotAllocateFromUserSuppliedLimit(t *testing.T) {
+	var output bytes.Buffer
+	maxInt := strconv.Itoa(int(^uint(0) >> 1))
+	if err := JobCommand([]string{"list", "--scan-limit", maxInt}, Config{StateDir: t.TempDir()}, t.TempDir(), strings.NewReader(""), &output); err != nil {
+		t.Fatalf("empty bounded job list with maximum integer limit: %v", err)
+	}
+	if !strings.Contains(output.String(), "History scan: selected 0 valid job directories") || !strings.Contains(output.String(), "No additional job records were found.") {
+		t.Fatalf("large scan limit output = %q", output.String())
+	}
+}
+
+func TestJobListScanLimitReportsSelectedCorruptRecordsAndSkipsUnselectedOnes(t *testing.T) {
+	state := t.TempDir()
+	store, err := NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"alpha-corrupt", "bravo-valid", "charlie-corrupt"} {
+		if err := store.CreateJob(JobRecord{ID: id, Type: tidyJobType, Status: "complete", TargetPath: t.TempDir()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected, hasMore, err := store.listJobIDs(2)
+	if err != nil || len(selected) != 2 || !hasMore {
+		t.Fatalf("initial bounded directory scan = %v, hasMore=%t, err=%v", selected, hasMore, err)
+	}
+	selectedCorrupt, unselectedCorrupt := selected[0], ""
+	for _, id := range []string{"alpha-corrupt", "bravo-valid", "charlie-corrupt"} {
+		if id != selected[0] && id != selected[1] {
+			unselectedCorrupt = id
+		}
+	}
+	if unselectedCorrupt == "" {
+		t.Fatal("bounded directory scan did not leave a job unselected")
+	}
+	for _, id := range []string{selectedCorrupt, unselectedCorrupt} {
+		if err := os.WriteFile(filepath.Join(store.Root(), id, "job.json"), []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var output bytes.Buffer
+	err = JobCommand([]string{"list", "--scan-limit", "2"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &output)
+	if err == nil || !strings.Contains(err.Error(), "read job "+selectedCorrupt) {
+		t.Fatalf("bounded list error = %v, want selected corrupt record %q", err, selectedCorrupt)
+	}
+	if strings.Contains(err.Error(), unselectedCorrupt) {
+		t.Fatalf("bounded list inspected unselected corrupt record %q: %v", unselectedCorrupt, err)
+	}
+	if !strings.Contains(output.String(), "Additional records were not examined and may be omitted") {
+		t.Fatalf("bounded list output lacks omission notice: %q", output.String())
+	}
+	if _, err := store.GetJob(unselectedCorrupt); err == nil {
+		t.Fatal("corrupt unselected record was unexpectedly made readable")
+	}
+	var largerBound bytes.Buffer
+	largerErr := JobCommand([]string{"list", "--scan-limit", "3"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &largerBound)
+	if largerErr == nil || !strings.Contains(largerErr.Error(), unselectedCorrupt) {
+		t.Fatalf("larger bounded scan did not inspect unselected corrupt record %q: %v", unselectedCorrupt, largerErr)
+	}
+	var fullOutput bytes.Buffer
+	fullErr := JobCommand([]string{"list"}, Config{StateDir: state}, t.TempDir(), strings.NewReader(""), &fullOutput)
+	if fullErr == nil || !strings.Contains(fullErr.Error(), "read job ") {
+		t.Fatalf("unbounded list error = %v, want the first corrupt record", fullErr)
+	}
+}
+
 func TestJobListFiltersBeforeApplyingLimit(t *testing.T) {
 	state := t.TempDir()
 	target := t.TempDir()
@@ -1217,6 +1384,9 @@ func TestJobListRejectsInvalidOptions(t *testing.T) {
 	}{
 		{name: "missing limit", args: []string{"list", "--limit"}, want: "--limit requires a positive integer"},
 		{name: "duplicate limit", args: []string{"list", "--limit", "1", "--limit", "2"}, want: "--limit may only be specified once"},
+		{name: "missing scan limit", args: []string{"list", "--scan-limit"}, want: "--scan-limit requires a positive integer"},
+		{name: "zero scan limit", args: []string{"list", "--scan-limit", "0"}, want: "--scan-limit must be a positive integer"},
+		{name: "duplicate scan limit", args: []string{"list", "--scan-limit", "1", "--scan-limit", "2"}, want: "--scan-limit may only be specified once"},
 		{name: "zero limit", args: []string{"list", "--limit", "0"}, want: "--limit must be a positive integer"},
 		{name: "negative limit", args: []string{"list", "--limit", "-1"}, want: "--limit must be a positive integer"},
 		{name: "noninteger limit", args: []string{"list", "--limit", "1.5"}, want: "--limit must be a positive integer"},

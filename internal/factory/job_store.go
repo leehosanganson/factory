@@ -875,10 +875,73 @@ func (s *JobStore) ActiveDetachedJobCount() (int, error) {
 
 // reconcileJobs scans every persisted job and applies orphan recovery before returning them.
 func (s *JobStore) reconcileJobs() ([]JobRecord, error) {
-	jobs, err := s.ListJobs()
-	if err != nil {
-		return nil, err
+	jobs, _, _, err := s.reconcileJobsWithLimit(0)
+	return jobs, err
+}
+
+// reconcileJobsWithLimit reconciles all records when limit is zero. A positive
+// limit processes at most that many valid job directories in filesystem
+// iteration order, independent of lifecycle status.
+func (s *JobStore) reconcileJobsWithLimit(limit int) ([]JobRecord, int, bool, error) {
+	if limit <= 0 {
+		jobs, err := s.ListJobs()
+		if err != nil {
+			return nil, 0, false, err
+		}
+		reconciled, err := s.reconcileJobRecords(jobs)
+		return reconciled, len(jobs), false, err
 	}
+	ids, hasMore, err := s.listJobIDs(limit)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	jobs := make([]JobRecord, 0, len(ids))
+	var errs []error
+	for _, id := range ids {
+		job, err := s.GetJob(id)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("read job %s: %w", id, err))
+			continue
+		}
+		jobs = append(jobs, job)
+	}
+	reconciled, reconcileErr := s.reconcileJobRecords(jobs)
+	if reconcileErr != nil {
+		errs = append(errs, reconcileErr)
+	}
+	return reconciled, len(ids), hasMore, errors.Join(errs...)
+}
+
+func (s *JobStore) listJobIDs(limit int) ([]string, bool, error) {
+	dir, err := os.Open(s.root)
+	if err != nil {
+		return nil, false, err
+	}
+	defer dir.Close()
+	ids := make([]string, 0)
+	for len(ids) <= limit {
+		entries, readErr := dir.ReadDir(1)
+		if errors.Is(readErr, io.EOF) {
+			return ids, false, nil
+		}
+		if readErr != nil {
+			return nil, false, readErr
+		}
+		entry := entries[0]
+		if entry.IsDir() && validateStoredID(entry.Name()) == nil {
+			ids = append(ids, entry.Name())
+			if len(ids) > limit {
+				return ids[:limit], true, nil
+			}
+		}
+	}
+	return ids, false, nil
+}
+
+func (s *JobStore) reconcileJobRecords(jobs []JobRecord) ([]JobRecord, error) {
 	var reconcileErrs []error
 	for i := range jobs {
 		job, reconcileErr := s.reconcileJob(jobs[i].ID)
