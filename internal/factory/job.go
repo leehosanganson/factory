@@ -2,6 +2,7 @@ package factory
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -76,8 +77,14 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		if err != nil {
 			return err
 		}
+		if options.details && !options.jsonOutput {
+			return fmt.Errorf("--details requires --json")
+		}
 		jobs, scanned, hasMore, err := store.reconcileJobsWithLimit(options.scanLimit)
-		if options.scanLimit > 0 {
+		if options.jsonOutput && err != nil {
+			return err
+		}
+		if options.scanLimit > 0 && !options.jsonOutput {
 			fmt.Fprintf(out, "History scan: selected %d valid job directories in filesystem iteration order.", scanned)
 			if hasMore {
 				fmt.Fprintln(out, " Additional records were not examined and may be omitted; use `factory job list` for the full history.")
@@ -95,23 +102,29 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 			}
 			jobs = filtered
 		}
+		if options.limit > 0 && len(jobs) > options.limit {
+			jobs = jobs[:options.limit]
+		}
+		if options.jsonOutput {
+			return writeJobListJSON(out, store, jobs, options.details, options.scanLimit, scanned, hasMore)
+		}
 		if len(jobs) == 0 && (err == nil || options.status != "" || options.jobType != "") {
 			fmt.Fprintln(out, "No jobs.")
 			return err
 		}
-		if options.limit > 0 && len(jobs) > options.limit {
-			jobs = jobs[:options.limit]
-		}
 		writeJobTable(out, store, jobs)
 		return err
 	case "get":
-		id, details, err := parseDetailsID("factory job get <id> [--details]", args[1:])
+		id, details, jsonOutput, err := parseJobGetOptions(args[1:])
 		if err != nil {
 			return err
 		}
 		job, err := store.reconcileJob(id)
 		if err != nil {
 			return err
+		}
+		if jsonOutput {
+			return writeJobJSON(out, store, job, details)
 		}
 		if !details {
 			writeJobTable(out, store, []JobRecord{job})
@@ -206,21 +219,35 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 }
 
 type jobListOptions struct {
-	limit     int
-	scanLimit int
-	status    string
-	jobType   string
+	limit      int
+	scanLimit  int
+	status     string
+	jobType    string
+	jsonOutput bool
+	details    bool
 }
 
-const jobListUsage = "factory job list [--limit <n>] [--scan-limit <n>] [--status <status>] [--type <type>]"
+const jobListUsage = "factory job list [--json] [--details] [--limit <n>] [--scan-limit <n>] [--status <status>] [--type <type>]"
 const jobListStatuses = "queued, running, complete, closed, failed, stopped, cancelled, interrupted, recoverable_failure"
 const jobListTypes = "implementation, tidy, monitor"
 
 func parseJobListOptions(args []string) (jobListOptions, error) {
 	var options jobListOptions
-	seen := make(map[string]bool, 3)
+	seen := make(map[string]bool, 6)
 	for i := 0; i < len(args); i++ {
 		flag := args[i]
+		if flag == "--json" || flag == "--details" {
+			if seen[flag] {
+				return jobListOptions{}, fmt.Errorf("%s may only be specified once", flag)
+			}
+			seen[flag] = true
+			if flag == "--json" {
+				options.jsonOutput = true
+			} else {
+				options.details = true
+			}
+			continue
+		}
 		if flag != "--limit" && flag != "--scan-limit" && flag != "--status" && flag != "--type" {
 			return jobListOptions{}, fmt.Errorf("unknown job list argument %q (usage: %s)", flag, jobListUsage)
 		}
@@ -275,6 +302,34 @@ func containsJobListValue(values, value string) bool {
 	return false
 }
 
+func parseJobGetOptions(args []string) (string, bool, bool, error) {
+	id := ""
+	details, jsonOutput := false, false
+	for _, arg := range args {
+		switch arg {
+		case "--details":
+			if details {
+				return "", false, false, fmt.Errorf("--details may only be specified once")
+			}
+			details = true
+		case "--json":
+			if jsonOutput {
+				return "", false, false, fmt.Errorf("--json may only be specified once")
+			}
+			jsonOutput = true
+		default:
+			if strings.HasPrefix(arg, "-") || id != "" {
+				return "", false, false, fmt.Errorf("usage: factory job get <id> [--json] [--details]")
+			}
+			id = arg
+		}
+	}
+	if id == "" {
+		return "", false, false, fmt.Errorf("usage: factory job get <id> [--json] [--details]")
+	}
+	return id, details, jsonOutput, nil
+}
+
 func parseDetailsID(usage string, args []string) (string, bool, error) {
 	if len(args) < 1 || len(args) > 2 {
 		return "", false, fmt.Errorf("usage: %s", usage)
@@ -283,6 +338,111 @@ func parseDetailsID(usage string, args []string) (string, bool, error) {
 		return "", false, fmt.Errorf("usage: %s", usage)
 	}
 	return args[0], len(args) == 2, nil
+}
+
+type jobJSON struct {
+	ID                string          `json:"id"`
+	Type              string          `json:"type"`
+	Status            string          `json:"status"`
+	CreatedAt         time.Time       `json:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at"`
+	StartedAt         *time.Time      `json:"started_at,omitempty"`
+	EndedAt           *time.Time      `json:"ended_at,omitempty"`
+	PublicationStatus string          `json:"publication_status,omitempty"`
+	Details           *jobJSONDetails `json:"details,omitempty"`
+}
+
+type jobJSONDetails struct {
+	Sessions             []jobJSONSession `json:"sessions"`
+	StatusCalls          int              `json:"status_calls"`
+	ActivePiSubprocesses int              `json:"active_pi_subprocesses"`
+}
+
+type jobJSONSession struct {
+	ID        string     `json:"id"`
+	Status    string     `json:"status"`
+	CreatedAt time.Time  `json:"created_at"`
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+}
+
+func jobJSONProjection(store *JobStore, job JobRecord, details bool) jobJSON {
+	projected := jobJSON{
+		ID: job.ID, Type: job.Type, Status: job.Status,
+		CreatedAt: job.CreatedAt.UTC(), UpdatedAt: job.UpdatedAt.UTC(),
+	}
+	if !containsJobListValue(jobListTypes, job.Type) {
+		projected.Type = "unknown"
+	}
+	if !containsJobListValue(jobListStatuses, job.Status) {
+		projected.Status = "unknown"
+	}
+	if !job.StartedAt.IsZero() {
+		startedAt := job.StartedAt.UTC()
+		projected.StartedAt = &startedAt
+	}
+	if !job.EndedAt.IsZero() {
+		endedAt := job.EndedAt.UTC()
+		projected.EndedAt = &endedAt
+	}
+	if job.Type == implementationJobType && containsJobListValue("published, unpublished, no-op", job.PublicationStatus) {
+		projected.PublicationStatus = job.PublicationStatus
+	}
+	if details {
+		trace := summarizeJobTrace(store, job)
+		projected.Details = &jobJSONDetails{
+			Sessions:    make([]jobJSONSession, 0, len(job.Sessions)),
+			StatusCalls: trace.StatusCalls, ActivePiSubprocesses: trace.ActivePi,
+		}
+		for _, session := range job.Sessions {
+			sessionID, sessionStatus := session.ID, session.Status
+			if validateStoredID(sessionID) != nil {
+				sessionID = "unknown"
+			}
+			if !containsJobListValue(jobListStatuses, sessionStatus) {
+				sessionStatus = "unknown"
+			}
+			projectedSession := jobJSONSession{ID: sessionID, Status: sessionStatus, CreatedAt: session.CreatedAt.UTC()}
+			if !session.StartedAt.IsZero() {
+				startedAt := session.StartedAt.UTC()
+				projectedSession.StartedAt = &startedAt
+			}
+			if !session.EndedAt.IsZero() {
+				endedAt := session.EndedAt.UTC()
+				projectedSession.EndedAt = &endedAt
+			}
+			projected.Details.Sessions = append(projected.Details.Sessions, projectedSession)
+		}
+	}
+	return projected
+}
+
+func writeJobJSON(out io.Writer, store *JobStore, job JobRecord, details bool) error {
+	return json.NewEncoder(out).Encode(struct {
+		SchemaVersion int     `json:"schema_version"`
+		Job           jobJSON `json:"job"`
+	}{SchemaVersion: 1, Job: jobJSONProjection(store, job, details)})
+}
+
+type jobJSONScan struct {
+	Scanned int  `json:"scanned"`
+	HasMore bool `json:"has_more"`
+}
+
+func writeJobListJSON(out io.Writer, store *JobStore, jobs []JobRecord, details bool, scanLimit, scanned int, hasMore bool) error {
+	projected := make([]jobJSON, 0, len(jobs))
+	for _, job := range jobs {
+		projected = append(projected, jobJSONProjection(store, job, details))
+	}
+	var scan *jobJSONScan
+	if scanLimit > 0 {
+		scan = &jobJSONScan{Scanned: scanned, HasMore: hasMore}
+	}
+	return json.NewEncoder(out).Encode(struct {
+		SchemaVersion int          `json:"schema_version"`
+		Jobs          []jobJSON    `json:"jobs"`
+		Scan          *jobJSONScan `json:"scan,omitempty"`
+	}{SchemaVersion: 1, Jobs: projected, Scan: scan})
 }
 
 func writeJobTable(out io.Writer, store *JobStore, jobs []JobRecord) {

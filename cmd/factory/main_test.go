@@ -21,6 +21,205 @@ import (
 	"github.com/leehosanganson/factory/internal/restserver"
 )
 
+func TestJobJSONProcessOutput(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "factory")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory CLI: %v\n%s", err, output)
+	}
+
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	target := filepath.Join(root, "private-host-path", "sample-repo")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", state)
+	store, err := factory.NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := []factory.JobRecord{
+		{ID: "json-implementation", Type: "implementation", Status: "complete", TaskDescription: "task contains PRIVATE_SECRET", TargetPath: target, Worktree: filepath.Join(root, "secret-worktree"), PublicationStatus: "published", PublicationSummary: "PRIVATE_SECRET"},
+		{ID: "json-tidy", Type: "tidy", Status: "failed", TaskDescription: "other task", TargetPath: target},
+	}
+	for i, job := range jobs {
+		job.CreatedAt = time.Date(2026, time.January, i+1, 12, 0, 0, 0, time.FixedZone("test-offset", 2*60*60))
+		job.UpdatedAt = job.CreatedAt.Add(time.Hour)
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.CreateSession(job.ID, "workflow", job.Status); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.AppendSessionLog(job.ID, "workflow", []byte("PRIVATE_SECRET raw worker log /private/host/path\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	run := func(args ...string) (string, string, error) {
+		t.Helper()
+		command := exec.Command(binary, args...)
+		command.Dir = target
+		var stdout, stderr bytes.Buffer
+		command.Stdout, command.Stderr = &stdout, &stderr
+		err := command.Run()
+		return stdout.String(), stderr.String(), err
+	}
+	decode := func(output string, destination any) {
+		t.Helper()
+		decoder := json.NewDecoder(strings.NewReader(output))
+		if err := decoder.Decode(destination); err != nil {
+			t.Fatalf("decode JSON stdout %q: %v", output, err)
+		}
+		var extra any
+		if err := decoder.Decode(&extra); err != io.EOF {
+			t.Fatalf("stdout contains data after one JSON value: %q (extra=%v err=%v)", output, extra, err)
+		}
+	}
+
+	stdout, stderr, err := run("job", "list", "--json", "--scan-limit", "2", "--status", "complete", "--type", "implementation", "--limit", "1")
+	if err != nil || stderr != "" {
+		t.Fatalf("JSON filtered list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var listing struct {
+		SchemaVersion int `json:"schema_version"`
+		Jobs          []struct {
+			ID     string `json:"id"`
+			Type   string `json:"type"`
+			Status string `json:"status"`
+		} `json:"jobs"`
+		Scan struct {
+			Scanned int  `json:"scanned"`
+			HasMore bool `json:"has_more"`
+		} `json:"scan"`
+	}
+	decode(stdout, &listing)
+	if listing.SchemaVersion != 1 || len(listing.Jobs) != 1 || listing.Jobs[0].ID != "json-implementation" || listing.Jobs[0].Type != "implementation" || listing.Jobs[0].Status != "complete" || listing.Scan.Scanned != 2 || listing.Scan.HasMore {
+		t.Fatalf("filtered list payload = %+v", listing)
+	}
+	for _, forbidden := range []string{"PRIVATE_SECRET", "private-host-path", "secret-worktree", "/private/host/path"} {
+		if strings.Contains(stdout, forbidden) {
+			t.Errorf("JSON list leaked %q: %s", forbidden, stdout)
+		}
+	}
+	stdout, stderr, err = run("job", "list", "--json", "--scan-limit", "1")
+	if err != nil || stderr != "" {
+		t.Fatalf("bounded JSON list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	decode(stdout, &listing)
+	if listing.Scan.Scanned != 1 || !listing.Scan.HasMore {
+		t.Fatalf("bounded list scan = %+v, want one scanned and more available", listing.Scan)
+	}
+
+	for _, args := range [][]string{{"job", "get", "json-implementation", "--json"}, {"job", "get", "json-implementation", "--json", "--details"}} {
+		stdout, stderr, err = run(args...)
+		if err != nil || stderr != "" {
+			t.Fatalf("JSON get %v: err=%v stderr=%q stdout=%q", args, err, stderr, stdout)
+		}
+		var payload struct {
+			SchemaVersion int `json:"schema_version"`
+			Job           struct {
+				ID                string         `json:"id"`
+				Type              string         `json:"type"`
+				Status            string         `json:"status"`
+				CreatedAt         string         `json:"created_at"`
+				UpdatedAt         string         `json:"updated_at"`
+				PublicationStatus string         `json:"publication_status"`
+				Details           map[string]any `json:"details"`
+			} `json:"job"`
+		}
+		decode(stdout, &payload)
+		if payload.SchemaVersion != 1 || payload.Job.ID != "json-implementation" || payload.Job.Type != "implementation" || payload.Job.Status != "complete" || payload.Job.CreatedAt == "" || payload.Job.UpdatedAt == "" || payload.Job.PublicationStatus != "published" {
+			t.Fatalf("get payload = %+v", payload)
+		}
+		if !strings.HasSuffix(payload.Job.CreatedAt, "Z") || !strings.HasSuffix(payload.Job.UpdatedAt, "Z") {
+			t.Errorf("timestamps are not UTC RFC3339: created=%q updated=%q", payload.Job.CreatedAt, payload.Job.UpdatedAt)
+		}
+		if (len(args) == 5) != (payload.Job.Details != nil) {
+			t.Fatalf("details presence for %v = %#v", args, payload.Job.Details)
+		}
+		if len(args) == 5 {
+			sessions, ok := payload.Job.Details["sessions"].([]any)
+			if !ok || len(sessions) != 1 {
+				t.Fatalf("details sessions = %#v", payload.Job.Details["sessions"])
+			}
+		}
+		encoded, _ := json.Marshal(payload)
+		for _, forbidden := range []string{"PRIVATE_SECRET", "raw worker log", "private-host-path", "secret-worktree", "/private/host/path"} {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Errorf("JSON get leaked %q: %s", forbidden, encoded)
+			}
+		}
+	}
+
+	stdout, stderr, err = run("job", "list", "--json", "--status", "cancelled")
+	if err != nil || stderr != "" {
+		t.Fatalf("empty JSON list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	decode(stdout, &listing)
+	if listing.Jobs == nil || len(listing.Jobs) != 0 {
+		t.Fatalf("empty list jobs = %#v, want an empty array", listing.Jobs)
+	}
+	stdout, stderr, err = run("job", "list", "--json", "--details", "--status", "complete", "--type", "implementation")
+	if err != nil || stderr != "" {
+		t.Fatalf("detailed JSON list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var detailedListing struct {
+		Jobs []struct {
+			Details map[string]any `json:"details"`
+		} `json:"jobs"`
+	}
+	decode(stdout, &detailedListing)
+	if len(detailedListing.Jobs) != 1 || detailedListing.Jobs[0].Details == nil {
+		t.Fatalf("detailed list payload = %+v", detailedListing)
+	}
+	if sessions, ok := detailedListing.Jobs[0].Details["sessions"].([]any); !ok || len(sessions) != 1 {
+		t.Fatalf("detailed list sessions = %#v", detailedListing.Jobs[0].Details["sessions"])
+	}
+
+	for _, args := range [][]string{{"job", "get", "missing-json-id", "--json"}, {"job", "get", "../unsafe", "--json"}} {
+		stdout, stderr, err = run(args...)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout != "" || stderr == "" {
+			t.Errorf("failed JSON get %v: err=%v stdout=%q stderr=%q; want exit 1, empty stdout, stderr diagnostic", args, err, stdout, stderr)
+		}
+	}
+
+	stdout, stderr, err = run("job", "list")
+	if err != nil || stderr != "" || strings.Contains(stdout, "schema_version") || !strings.Contains(stdout, "json-implementation") {
+		t.Fatalf("default text list changed: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	stdout, stderr, err = run("job", "get", "json-implementation")
+	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
+	if err != nil || stderr != "" || len(lines) != 2 || !strings.Contains(lines[0], "PUBLICATION") || !strings.Contains(lines[1], "published") || strings.Contains(stdout, "schema_version") {
+		t.Fatalf("default text get changed: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	stdout, stderr, err = run("job", "get", "json-implementation", "--details")
+	if err != nil || stderr != "" || !strings.Contains(stdout, "Description: task contains PRIVATE_SECRET") || strings.Contains(stdout, "schema_version") {
+		t.Fatalf("default detailed text get changed: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	for _, args := range [][]string{{"job", "list", "--details"}, {"job", "list", "--json", "--limit", "0"}} {
+		stdout, stderr, err = run(args...)
+		if err == nil || stdout != "" || stderr == "" {
+			t.Errorf("invalid JSON command %v: err=%v stdout=%q stderr=%q; want nonzero, empty stdout, stderr diagnostic", args, err, stdout, stderr)
+		}
+	}
+
+	corruptDir := filepath.Join(store.Root(), "corrupt-json")
+	if err := os.Mkdir(corruptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "job.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = run("job", "list", "--json")
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout != "" || stderr == "" {
+		t.Errorf("failed JSON list: err=%v stdout=%q stderr=%q; want exit 1, empty stdout, stderr diagnostic", err, stdout, stderr)
+	}
+}
+
 func TestPrivateJobWorkerInvocationRequiresStoreRoot(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if err := run([]string{"__job-worker", "job-id"}, strings.NewReader(""), &out, &errOut); err == nil || !strings.Contains(err.Error(), "invalid private worker invocation") {
@@ -280,9 +479,9 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server doctor --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "factory server bundle create --config <absolute-path> --destination <absolute-path>", "factory server bundle verify --source <absolute-path>", "factory server bundle inspect --source <absolute-path>", "factory server bundle restore --source <absolute-path> --destination <absolute-path>", "server-only JSON config", "provider reachability is not tested"}, omit: []string{"api-key-value"}},
 		{name: "server doctor help", args: []string{"server", "doctor", "--help"}, want: []string{"REST server preflight", "factory server doctor --config <absolute-path>", "Local-only, read-only", "Provider reachability is not tested", "no database is opened or created"}, omit: []string{"api-key-value"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
-		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "factory job list [--limit <n>] [--scan-limit <n>] [--status <status>] [--type <type>]", "queued, running, complete", "Filters affect listing only", "factory job list --scan-limit 100 --status failed", "Omitted jobs remain addressable by ID", "factory job list without --scan-limit reconciles all records", "{repo}"}, omit: []string{"factory run", "Monitor management"}},
+		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "factory job list [--json] [--details]", "queued, running, complete", "Filters affect listing only", "factory job list --scan-limit 100 --status failed", "Omitted jobs remain addressable by ID", "factory job list without --scan-limit reconciles all records", "schema version 1", "read-only inspection", "{repo}"}, omit: []string{"factory run", "Monitor management"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
-		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--details", "metadata"}, omit: []string{"factory job start", "factory run", "factory job show"}},
+		{name: "job get canonical", args: []string{"job", "get", "--help"}, want: []string{"factory job get", "--json", "--details", "safe session metadata"}, omit: []string{"factory job start", "factory run", "factory job show"}},
 		{name: "job watch help", args: []string{"job", "watch", "--help"}, want: []string{"factory job watch <id>...", "Refresh selected job status and latest activity", "monitor phase", "check freshness", "recent events"}, omit: []string{"factory job logs", "factory job stop"}},
 		{name: "run subcommand", args: []string{"run", "events", "--help"}, want: []string{"Gated runs", "factory run events"}, omit: []string{"factory job", "Monitor management", "Example:"}},
 		{name: "run list limit", args: []string{"run", "list", "--help"}, want: []string{"factory run list [--limit <n>]", "newest positive number"}, omit: []string{"factory run get"}},
