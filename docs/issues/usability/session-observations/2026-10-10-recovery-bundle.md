@@ -1,5 +1,9 @@
 # REST recovery bundle implementation session
 
+- On the first macOS CI run, recovery bundle tests rejected valid temporary paths under the runner's aliased temp ancestor, and a race-test watcher could block indefinitely if setup never completed. Canonical private paths still passed; the fix accepts canonical directories reached through an aliased ancestor, resolves destination-parent aliases for overlap/existence checks, and gives the watcher a bounded timeout.
+- The follow-up exact-head CI run passed on both macOS and Ubuntu. Linux `make test`, `make vet`, `make build`, and `git diff --check` also passed.
+- Factory worktree discovery surfaced many existing worktrees and unsaved observation files in a separate checkout; preserving them and continuing in the exact PR worktree kept the change scoped. No provider/live validation was performed.
+
 - Continued the pre-existing issue #215 worktree at the exact requested `origin/main` SHA; preserved all existing implementation and documentation changes.
 - The first audit found existing focused and CLI process tests covering stopped-server ownership rejection, SQLite plus retained artifact restore, failed/interrupted synthetic records and history, distinct bundle/restore paths, secret-free inspection, corruption, traversal, permissions, and no partial destination on failure.
 - Added a deterministic destination race regression. It failed against the existing code because a failed atomic hard-link publication removed a destination created concurrently by another process. Removing destination cleanup fixed the issue; 20 repeated focused runs passed. The temporary archive is still cleaned up, and atomic link publication does not expose a partial destination.
