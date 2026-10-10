@@ -111,6 +111,53 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		}
 	})
 
+	t.Run("stream state is atomic, context-aware, and preserves bounded history", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("stream-state", Request{Repository: "widget", Task: "private"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot, history, err := store.EventStreamState(context.Background(), job.ID)
+		if err != nil || snapshot.Status != StatusQueued || history.JobID != job.ID || len(history.Events) != 1 || history.LatestSequence != 1 {
+			t.Fatalf("initial stream state=(%+v,%+v,%v)", snapshot, history, err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, _, err := store.EventStreamState(ctx, job.ID); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled stream state error=%v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("history cursor is monotonic across bounded retention", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("event-cursor", Request{Repository: "widget", Task: "private task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Finish(job.ID, StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+		history, err := store.History(job.ID)
+		if err != nil || len(history.Events) == 0 {
+			t.Fatalf("retained history = (%+v, %v)", history, err)
+		}
+		encoded, err := json.Marshal(history)
+		if err != nil || strings.Contains(string(encoded), "latest_sequence") || strings.Contains(string(encoded), `"sequence"`) {
+			t.Fatalf("internal cursors changed the public history JSON: %s err=%v", encoded, err)
+		}
+		for index, event := range history.Events {
+			if event.Sequence == 0 || (index > 0 && event.Sequence <= history.Events[index-1].Sequence) {
+				t.Fatalf("event sequence at index %d = %d, history=%+v", index, event.Sequence, history.Events)
+			}
+		}
+		if history.LatestSequence < history.Events[len(history.Events)-1].Sequence {
+			t.Fatalf("latest event cursor %d precedes retained events %+v", history.LatestSequence, history.Events)
+		}
+	})
+
 	t.Run("empty listing and terminal retention", func(t *testing.T) {
 		store := newStore(t)
 		empty, err := store.ListJobs(context.Background(), 0, 0, 2)

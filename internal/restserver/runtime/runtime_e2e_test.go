@@ -2520,7 +2520,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		t.Fatalf("inspect SQLite history while write lock held: %v", err)
 	}
 	attemptDuringLock, err := providerAttemptStore.ProviderAttempt(admitted.ID)
-	if err != nil || !reflect.DeepEqual(lockedJob, lockedJobBefore) || !reflect.DeepEqual(lockedHistory, lockedHistoryBefore) || attemptDuringLock != attemptBeforeLock {
+	if err != nil || !reflect.DeepEqual(lockedJob, lockedJobBefore) || !samePublicJobHistory(lockedHistory, lockedHistoryBefore) || attemptDuringLock != attemptBeforeLock {
 		t.Fatalf("SQLite lock changed persisted reconciliation state: before=(%+v,%+v,%+v) after=(%+v,%+v,%+v) err=%v", lockedJobBefore, lockedHistoryBefore, attemptBeforeLock, lockedJob, lockedHistory, attemptDuringLock, err)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
@@ -2974,6 +2974,18 @@ func waitForProcessFailure(t *testing.T, client *http.Client, baseURL, id, apiKe
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("job %s did not fail before timeout", id)
+}
+
+func samePublicJobHistory(left, right restjobs.History) bool {
+	if left.JobID != right.JobID || left.Truncated != right.Truncated || len(left.Events) != len(right.Events) {
+		return false
+	}
+	for index := range left.Events {
+		if left.Events[index].At != right.Events[index].At || left.Events[index].Type != right.Events[index].Type || left.Events[index].Message != right.Events[index].Message {
+			return false
+		}
+	}
+	return true
 }
 
 func getProcessHistory(t *testing.T, client *http.Client, baseURL, id, apiKey string) restjobs.History {

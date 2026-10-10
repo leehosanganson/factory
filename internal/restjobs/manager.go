@@ -170,16 +170,18 @@ type Snapshot struct {
 
 // Event is one bounded history entry.
 type Event struct {
-	At      time.Time `json:"at"`
-	Type    string    `json:"type"`
-	Message string    `json:"message,omitempty"`
+	At       time.Time `json:"at"`
+	Type     string    `json:"type"`
+	Message  string    `json:"message,omitempty"`
+	Sequence uint64    `json:"-"`
 }
 
 // History is a bounded copy of one job's retained event stream.
 type History struct {
-	JobID     string  `json:"job_id"`
-	Events    []Event `json:"events"`
-	Truncated bool    `json:"truncated"`
+	JobID          string  `json:"job_id"`
+	Events         []Event `json:"events"`
+	Truncated      bool    `json:"truncated"`
+	LatestSequence uint64  `json:"-"`
 }
 
 // JobSummary is the safe, compact representation returned by collection listing.
@@ -246,6 +248,7 @@ type Store interface {
 	Get(id string) (Snapshot, error)
 	ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error)
 	History(id string) (History, error)
+	EventStreamState(ctx context.Context, id string) (Snapshot, History, error)
 	AddEvent(id, eventType, message string) error
 	RecordProviderOutcome(id string, outcome ProviderOutcome) error
 	RecordVerificationEvidence(id string, evidence VerificationEvidence) error
@@ -298,6 +301,7 @@ func RecoveryDispositionFor(status Status) RecoveryDisposition {
 type job struct {
 	snapshot       Snapshot
 	sequence       uint64
+	nextEvent      uint64
 	events         []Event
 	truncated      bool
 	accountedBytes uint64
@@ -580,7 +584,28 @@ func (m *LocalManager) History(id string) (History, error) {
 		return History{}, ErrNotFound
 	}
 	events := append([]Event(nil), entry.events...)
-	return History{JobID: id, Events: events, Truncated: entry.truncated}, nil
+	return History{JobID: id, Events: events, Truncated: entry.truncated, LatestSequence: entry.nextEvent}, nil
+}
+
+func (m *LocalManager) EventStreamState(ctx context.Context, id string) (Snapshot, History, error) {
+	if ctx == nil {
+		return Snapshot{}, History{}, ErrInvalidInput
+	}
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, History{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, History{}, err
+	}
+	entry := m.jobs[id]
+	if entry == nil {
+		return Snapshot{}, History{}, ErrNotFound
+	}
+	events := append([]Event(nil), entry.events...)
+	history := History{JobID: id, Events: events, Truncated: entry.truncated, LatestSequence: entry.nextEvent}
+	return cloneSnapshot(entry.snapshot), history, nil
 }
 
 // Recover classifies retained records without mutating them. The local backend
@@ -800,7 +825,7 @@ func (m *LocalManager) signalLocked() {
 // the logical bytes needed for an event. Callers keep lifecycle state transitions
 // independent of event availability and mark omitted history as truncated.
 func (m *LocalManager) appendEventLocked(entry *job, eventType, message string) bool {
-	event := Event{At: time.Now().UTC(), Type: eventType, Message: message}
+	event := Event{At: time.Now().UTC(), Type: eventType, Message: message, Sequence: entry.nextEvent + 1}
 	charge := eventBytes(event)
 	limit := uint64(m.config.RegistryBytes)
 	if m.registryBytes > limit {
@@ -853,6 +878,7 @@ func (m *LocalManager) appendEventLocked(entry *job, eventType, message string) 
 	if replacedCharge > 0 {
 		m.removeOldestEventLocked(entry)
 	}
+	entry.nextEvent = event.Sequence
 	entry.events = append(entry.events, event)
 	m.registryBytes += charge
 	entry.accountedBytes += charge

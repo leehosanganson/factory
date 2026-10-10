@@ -368,6 +368,43 @@ func TestSQLiteStoreBackupRestoresProviderOutcomeHistoryAndIdempotency(t *testin
 	}
 }
 
+func TestSQLiteStoreEventCursorSurvivesFullHistoryTruncation(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 2}
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("event-cursor-truncated", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(job.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddEvent(job.ID, "audit", "safe event"); err != nil {
+		t.Fatal(err)
+	}
+	history, err := store.History(job.ID)
+	if err != nil || !history.Truncated || history.LatestSequence != 4 || len(history.Events) != 2 || history.Events[0].Sequence != 3 {
+		t.Fatalf("truncated SQLite cursor/history=%+v err=%v", history, err)
+	}
+	store.Close()
+
+	reopened, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered, err := reopened.History(job.ID)
+	if err != nil || recovered.LatestSequence != 4 || recovered.Events[0].Sequence != 3 {
+		t.Fatalf("reopened SQLite cursor/history=%+v err=%v", recovered, err)
+	}
+}
+
 func TestSQLiteStorePersistsJobHistoryAndIdempotencyAcrossRestart(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())
