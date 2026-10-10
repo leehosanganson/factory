@@ -34,6 +34,11 @@ func TestDetachedJobCapacityIsAtomicAcrossCLIProcessesAndReleasedAtTerminal(t *t
 
 	firstTarget := capacityTestTarget(t)
 	secondTarget := capacityTestTarget(t)
+	secondTargetAlias := filepath.Join(root, "second-target-alias")
+	if err := os.Symlink(secondTarget, secondTargetAlias); err != nil {
+		t.Fatal(err)
+	}
+	secondTarget = secondTargetAlias
 	binary := buildCapacityTestCLI(t)
 
 	start := func(target, description string) ([]byte, error) {
@@ -90,6 +95,7 @@ func TestDetachedJobCapacityIsAtomicAcrossCLIProcessesAndReleasedAtTerminal(t *t
 		job, err := store.GetJob(jobs[0].ID)
 		return err == nil && job.Status == "complete"
 	})
+	secondTargetResolved := resolvedTestPath(t, secondTarget)
 	if output, err := start(secondTarget, "capacity after terminal release"); err != nil {
 		t.Fatalf("start after previous job became terminal: %v: %s", err, output)
 	}
@@ -99,7 +105,7 @@ func TestDetachedJobCapacityIsAtomicAcrossCLIProcessesAndReleasedAtTerminal(t *t
 			return false
 		}
 		for _, job := range jobs {
-			if job.TargetPath == secondTarget {
+			if job.TargetPath == secondTargetResolved {
 				return job.Status == "complete"
 			}
 		}
