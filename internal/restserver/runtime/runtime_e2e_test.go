@@ -45,7 +45,8 @@ func TestRESTServerJobListingProcessE2E(t *testing.T) {
 	config.Limits.MaxRecords = 8
 	config.Limits.TaskBytes = 128
 	harness := filepath.Join(t.TempDir(), "harness.sh")
-	script := "#!/bin/sh\nif [ \"$1\" = hold-listing ]; then trap 'exit 0' TERM; while :; do sleep 1; done; fi\nexit 1\n"
+	holdStarted := filepath.Join(t.TempDir(), "hold-started")
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$*\" in *hold-listing*) : > '%s'; trap 'exit 0' TERM; while :; do sleep 1; done ;; esac\nexit 1\n", holdStarted)
 	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +106,15 @@ func TestRESTServerJobListingProcessE2E(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) && getProcessJob(t, client, baseURL, second.ID, apiKey).Status != restjobs.StatusRunning {
 		time.Sleep(10 * time.Millisecond)
+	}
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(holdStarted); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(holdStarted); err != nil {
+		t.Fatalf("running job did not reach its harness hold point: %v", err)
 	}
 	queued, err := submitProcessJob(client, baseURL, apiKey, "trusted", "queued list task private", "listing-third")
 	if err != nil || queued.ID == "" {
