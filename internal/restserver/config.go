@@ -15,6 +15,7 @@ import (
 )
 
 const configFileLimit = 1 << 20
+const maxParallelSubtasks = 8
 
 const (
 	PersistenceBackendMemory = "memory"
@@ -51,15 +52,23 @@ var aliasPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
 // Config contains server-only settings. It is independent of the CLI config.
 type Config struct {
-	Mode               string            `json:"mode"`
-	ListenAddress      string            `json:"listen_address"`
-	Repositories       map[string]string `json:"repositories"`
-	Harness            HarnessConfig     `json:"harness"`
-	VerificationChecks [][]string        `json:"verification_checks,omitempty"`
-	APIKeyFile         string            `json:"api_key_file"`
-	Persistence        PersistenceConfig `json:"persistence"`
-	Provider           ProviderConfig    `json:"provider"`
-	Limits             Limits            `json:"limits"`
+	Mode               string                  `json:"mode"`
+	ListenAddress      string                  `json:"listen_address"`
+	Repositories       map[string]string       `json:"repositories"`
+	Harness            HarnessConfig           `json:"harness"`
+	VerificationChecks [][]string              `json:"verification_checks,omitempty"`
+	ParallelSubtasks   *ParallelSubtasksConfig `json:"parallel_subtasks,omitempty"`
+	APIKeyFile         string                  `json:"api_key_file"`
+	Persistence        PersistenceConfig       `json:"persistence"`
+	Provider           ProviderConfig          `json:"provider"`
+	Limits             Limits                  `json:"limits"`
+}
+
+// ParallelSubtasksConfig opts REST jobs into Factory's planner-driven parallel
+// implementation and its existing declared-scope and integration safeguards.
+type ParallelSubtasksConfig struct {
+	Enabled        bool `json:"enabled"`
+	MaxConcurrency *int `json:"max_concurrency,omitempty"`
 }
 
 // HarnessConfig is a fixed executable and argument vector selected by the operator.
@@ -137,6 +146,9 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parse REST server config: invalid JSON schema")
 	}
 	if err := validateRequiredConfigFields(data); err != nil {
+		return Config{}, fmt.Errorf("parse REST server config: %w", err)
+	}
+	if err := validateParallelSubtasksConfig(data); err != nil {
 		return Config{}, fmt.Errorf("parse REST server config: %w", err)
 	}
 
@@ -219,6 +231,9 @@ func (c Config) Validate() error {
 	}
 	if err := validateVerificationChecks(c.VerificationChecks); err != nil {
 		return err
+	}
+	if c.ParallelSubtasks != nil && c.ParallelSubtasks.MaxConcurrency != nil && (*c.ParallelSubtasks.MaxConcurrency < 1 || *c.ParallelSubtasks.MaxConcurrency > maxParallelSubtasks) {
+		return fmt.Errorf("parallel_subtasks.max_concurrency must be between 1 and %d when set", maxParallelSubtasks)
 	}
 	if !filepath.IsAbs(c.APIKeyFile) || strings.TrimSpace(c.APIKeyFile) == "" || strings.ContainsRune(c.APIKeyFile, 0) {
 		return errors.New("api_key_file must be an absolute path")
@@ -394,9 +409,11 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "api_key_file": {}, "persistence": {}, "provider": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "persistence": {}, "provider": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
+	case "parallel_subtasks":
+		fields = map[string]struct{}{"enabled": {}, "max_concurrency": {}}
 	case "persistence":
 		fields = map[string]struct{}{"backend": {}, "path": {}}
 	case "provider":
@@ -415,6 +432,25 @@ func configFieldAllowed(parent, key string) bool {
 	}
 	_, ok := fields[key]
 	return ok
+}
+
+func validateParallelSubtasksConfig(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return errors.New("invalid root object")
+	}
+	value, exists := fields["parallel_subtasks"]
+	if !exists {
+		return nil
+	}
+	var parallel map[string]json.RawMessage
+	if err := json.Unmarshal(value, &parallel); err != nil {
+		return errors.New("parallel_subtasks must be an object")
+	}
+	if concurrency, exists := parallel["max_concurrency"]; exists && bytes.Equal(bytes.TrimSpace(concurrency), []byte("null")) {
+		return errors.New("parallel_subtasks.max_concurrency must be an integer when set")
+	}
+	return nil
 }
 
 func validateRequiredConfigFields(data []byte) error {
@@ -441,7 +477,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "persistence", "provider", "repositories", "verification_checks":
+	case "harness", "limits", "parallel_subtasks", "persistence", "provider", "repositories", "verification_checks":
 		return key
 	default:
 		return ""
