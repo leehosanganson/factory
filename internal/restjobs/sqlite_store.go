@@ -912,35 +912,81 @@ func (s *SQLiteStore) ListJobs(ctx context.Context, afterSequence, snapshotSeque
 }
 
 func (s *SQLiteStore) History(id string) (History, error) {
-	if _, err := s.Get(id); err != nil {
-		return History{}, err
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	_, history, err := s.eventStreamState(ctx, id)
+	return history, err
+}
+
+func (s *SQLiteStore) EventStreamState(ctx context.Context, id string) (Snapshot, History, error) {
+	if ctx == nil {
+		return Snapshot{}, History{}, ErrInvalidInput
 	}
-	rows, err := s.db.Query(`SELECT at,type,message FROM factory_job_events WHERE job_id=? ORDER BY sequence`, id)
+	return s.eventStreamState(ctx, id)
+}
+
+func (s *SQLiteStore) eventStreamState(ctx context.Context, id string) (Snapshot, History, error) {
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, History{}, err
+	}
+	if err := s.checkOpen(); err != nil {
+		return Snapshot{}, History{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return History{}, errors.New("read SQLite job history")
+		return Snapshot{}, History{}, errors.New("read SQLite job history")
 	}
-	defer rows.Close()
+	defer tx.Rollback()
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Snapshot{}, History{}, ErrNotFound
+	}
+	if err != nil {
+		return Snapshot{}, History{}, errors.New("read SQLite job record")
+	}
 	history := History{JobID: id}
+	rows, err := tx.QueryContext(ctx, `SELECT j.event_sequence,e.sequence,e.at,e.type,e.message FROM factory_jobs j LEFT JOIN factory_job_events e ON e.job_id=j.id WHERE j.id=? ORDER BY e.sequence`, id)
+	if err != nil {
+		return Snapshot{}, History{}, errors.New("read SQLite job history")
+	}
 	for rows.Next() {
-		var at, typ, message string
-		if err := rows.Scan(&at, &typ, &message); err != nil {
-			return History{}, errors.New("decode SQLite job history")
+		var latestSequence uint64
+		var sequence sql.NullInt64
+		var at, typ, message sql.NullString
+		if err := rows.Scan(&latestSequence, &sequence, &at, &typ, &message); err != nil {
+			_ = rows.Close()
+			return Snapshot{}, History{}, errors.New("decode SQLite job history")
 		}
-		stamp, err := time.Parse(time.RFC3339Nano, at)
+		history.LatestSequence = latestSequence
+		if !sequence.Valid {
+			continue
+		}
+		stamp, err := time.Parse(time.RFC3339Nano, at.String)
 		if err != nil {
-			return History{}, errors.New("decode SQLite history timestamp")
+			_ = rows.Close()
+			return Snapshot{}, History{}, errors.New("decode SQLite history timestamp")
 		}
-		history.Events = append(history.Events, Event{At: stamp, Type: typ, Message: message})
+		history.Events = append(history.Events, Event{At: stamp, Type: typ.String, Message: message.String, Sequence: uint64(sequence.Int64)})
 	}
 	if err := rows.Err(); err != nil {
-		return History{}, errors.New("read SQLite job history")
+		_ = rows.Close()
+		return Snapshot{}, History{}, errors.New("read SQLite job history")
+	}
+	if err := rows.Close(); err != nil {
+		return Snapshot{}, History{}, errors.New("read SQLite job history")
 	}
 	var truncated int
-	if err := s.db.QueryRow(`SELECT history_truncated FROM factory_jobs WHERE id=?`, id).Scan(&truncated); err != nil {
-		return History{}, errors.New("read SQLite history marker")
+	if err := tx.QueryRowContext(ctx, `SELECT history_truncated FROM factory_jobs WHERE id=?`, id).Scan(&truncated); err != nil {
+		return Snapshot{}, History{}, errors.New("read SQLite history marker")
 	}
 	history.Truncated = truncated != 0
-	return history, nil
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, History{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return Snapshot{}, History{}, errors.New("finish SQLite job history read")
+	}
+	return snapshot, history, nil
 }
 
 func (s *SQLiteStore) AddEvent(id, eventType, message string) error {
@@ -1392,10 +1438,13 @@ func (s *SQLiteStore) checkAccepting() error {
 
 func insertEvent(ctx context.Context, tx *sql.Tx, id, eventType, message string, at time.Time, limit int) error {
 	var sequence int
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM factory_job_events WHERE job_id=?`, id).Scan(&sequence); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT event_sequence+1 FROM factory_jobs WHERE id=?`, id).Scan(&sequence); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_events(job_id,sequence,at,type,message) VALUES(?,?,?,?,?)`, id, sequence, at.UTC().Format(time.RFC3339Nano), eventType, message); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET event_sequence=? WHERE id=?`, sequence, id); err != nil {
 		return err
 	}
 	var count int

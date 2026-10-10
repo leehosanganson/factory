@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -170,6 +170,32 @@
           "404": { "$ref": "#/components/responses/NotFound" },
           "500": { "$ref": "#/components/responses/InternalError" },
           "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/events": {
+      "get": {
+        "operationId": "streamJobEvents",
+        "summary": "Stream bounded lifecycle events for a job",
+        "description": "Read-only bearer-authenticated Server-Sent Events stream for one retained job. Events are read from bounded retained history, in monotonically increasing per-job sequence order. Event IDs are decimal sequence cursors; reconnect with Last-Event-ID to replay only newer retained events without duplicates. If the cursor has expired, the HTTP response is 409 cursor_expired before streaming, or an in-stream reset event is sent and the connection closes; fetch GET /v1/jobs/{id} and /history, then reconnect without a cursor to start from retained history. If history is already truncated at initial connect for an active job, the route returns 409 so status/history can establish the baseline; terminal jobs replay the retained tail and close. If the terminal lifecycle event was evicted, a synthetic terminal_snapshot control frame reports only the current terminal status and has no event ID. Events expose only timestamp and allowlisted lifecycle type, never messages, requests, provider details, logs, credentials, or paths. A 250 ms history poll closes the initial-read/subscription race without subscriber queues. The process admits at most 16 streams; excess requests fail with 503 stream_capacity. Each stream sends a 15 second heartbeat, has a 25 second maximum lifetime and a 2 second write deadline, and releases capacity on disconnect/closure. Clients should reconnect as needed or fall back to polling GET status/history.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "$ref": "#/components/parameters/JobId" },
+          { "name": "Last-Event-ID", "in": "header", "required": false, "description": "Last decimal event sequence delivered by the prior stream.", "schema": { "type": "string", "pattern": "^[0-9]+$" } }
+        ],
+        "responses": {
+          "200": { "description": "Server-Sent Events stream with bounded JobEvent frames.", "content": { "text/event-stream": { "schema": { "type": "string", "description": "SSE frames conform to JobEvent; heartbeats are SSE comments, reset controls have event reset, and an evicted terminal lifecycle event is represented by terminal_snapshot with the current status only." } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "Cursor is expired or active-job history was truncated; read status and history before reconnecting.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "description": "The service is not ready or all 16 event stream slots are occupied.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
           "405": {
             "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
             "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
@@ -502,6 +528,25 @@
           "name": { "type": "string", "pattern": "^check-[0-9]{2}$", "description": "Generated safe check label; check output and command are never returned." },
           "outcome": { "type": "string", "enum": [ "not_completed", "passed", "failed", "canceled" ] }
         }
+      },
+      "JobEventStreamData": {
+        "type": "object",
+        "required": [ "at", "type" ],
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "type": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition" ] }
+        },
+        "additionalProperties": false
+      },
+      "JobEvent": {
+        "type": "object",
+        "required": [ "id", "event", "data" ],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[0-9]+$", "description": "Monotonic per-job event sequence used as Last-Event-ID." },
+          "event": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition" ] },
+          "data": { "$ref": "#/components/schemas/JobEventStreamData" }
+        },
+        "additionalProperties": false
       },
       "JobHistory": {
         "type": "object",

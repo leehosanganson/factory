@@ -97,6 +97,7 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"POST /v1/jobs":                           "createJob",
 		"GET /v1/jobs/{id}":                       "getJob",
 		"GET /v1/jobs/{id}/history":               "getJobHistory",
+		"GET /v1/jobs/{id}/events":                "streamJobEvents",
 		"POST /v1/jobs/{id}/cancel":               "cancelJob",
 		"POST /v1/jobs/{id}/reconcile":            "reconcileJob",
 		"POST /v1/jobs/{id}/disposition/failed":   "dispositionJobFailed",
