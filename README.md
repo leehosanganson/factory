@@ -9,6 +9,7 @@ The REST server supports volatile memory mode and optional SQLite persistence, w
 - [Implemented features](docs/features/README.md) — current CLI and REST server capabilities.
 - [Primary Factory-to-Pi workflow](docs/features/primary-workflow.md) — setup, implementation, detached-job handoff, and recovery.
 - [REST server operations](docs/features/rest-server-operations.md) — health/readiness, backup/restore, restart recovery, limits, and trusted-network operations.
+- [Supervised systemd deployment](docs/features/rest-server-systemd.md) — a single-host service-user unit and lifecycle walkthrough.
 - [Manual GitHub App live-provider test](docs/features/github-app-live-test.md) — protected opt-in sandbox validation; manual Actions invocation, required secrets/variables including the explicitly approved organization identity check, cleanup limits, and unverified status pending issue #134 provisioning.
 - [REST job contract](docs/roadmap/rest-api-contract.md) — target request-to-PR lifecycle, persistence modes, and delivery gates.
 - [Agent guidance](AGENTS.md) — repository workflow and verification conventions.
