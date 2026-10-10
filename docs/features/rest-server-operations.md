@@ -1,6 +1,6 @@
 # REST server operations
 
-This guide applies to the single-server REST job service. See [REST server setup and configuration](rest-server-config.md) for the current schema, [REST job server](rest-server.md) for shipped limits and trust boundaries, and the [REST API contract](../roadmap/rest-api-contract.md) for the target lifecycle. For a single-host systemd deployment, see the [supervised deployment recipe](rest-server-systemd.md).
+This guide applies to the single-server REST job service. See [REST server setup and configuration](rest-server-config.md) for the current schema, [REST job server](rest-server.md) for shipped limits and trust boundaries, and the [REST API contract](../roadmap/rest-api-contract.md) for the target lifecycle. The published definition is the [OpenAPI specification](../openapi/rest-api-v1.json). Compatible API changes update the spec and info.version; incompatible API changes publish a new versioned document. For a single-host systemd deployment, see the [supervised deployment recipe](rest-server-systemd.md).
 
 ## Health and readiness
 
