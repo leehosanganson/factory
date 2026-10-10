@@ -76,7 +76,15 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 		if err != nil {
 			return err
 		}
-		jobs, err := store.reconcileJobs()
+		jobs, scanned, hasMore, err := store.reconcileJobsWithLimit(options.scanLimit)
+		if options.scanLimit > 0 {
+			fmt.Fprintf(out, "History scan: selected %d valid job directories in filesystem iteration order.", scanned)
+			if hasMore {
+				fmt.Fprintln(out, " Additional records were not examined and may be omitted; use `factory job list` for the full history.")
+			} else {
+				fmt.Fprintln(out, " No additional job records were found.")
+			}
+		}
 		if options.status != "" || options.jobType != "" {
 			filtered := make([]JobRecord, 0, len(jobs))
 			for _, job := range jobs {
@@ -198,12 +206,13 @@ func jobCommandContext(ctx context.Context, args []string, cfg Config, target st
 }
 
 type jobListOptions struct {
-	limit   int
-	status  string
-	jobType string
+	limit     int
+	scanLimit int
+	status    string
+	jobType   string
 }
 
-const jobListUsage = "factory job list [--limit <n>] [--status <status>] [--type <type>]"
+const jobListUsage = "factory job list [--limit <n>] [--scan-limit <n>] [--status <status>] [--type <type>]"
 const jobListStatuses = "queued, running, complete, closed, failed, stopped, cancelled, interrupted, recoverable_failure"
 const jobListTypes = "implementation, tidy, monitor"
 
@@ -212,7 +221,7 @@ func parseJobListOptions(args []string) (jobListOptions, error) {
 	seen := make(map[string]bool, 3)
 	for i := 0; i < len(args); i++ {
 		flag := args[i]
-		if flag != "--limit" && flag != "--status" && flag != "--type" {
+		if flag != "--limit" && flag != "--scan-limit" && flag != "--status" && flag != "--type" {
 			return jobListOptions{}, fmt.Errorf("unknown job list argument %q (usage: %s)", flag, jobListUsage)
 		}
 		if seen[flag] {
@@ -221,8 +230,8 @@ func parseJobListOptions(args []string) (jobListOptions, error) {
 		seen[flag] = true
 		if i+1 >= len(args) || strings.HasPrefix(args[i+1], "--") {
 			switch flag {
-			case "--limit":
-				return jobListOptions{}, fmt.Errorf("--limit requires a positive integer")
+			case "--limit", "--scan-limit":
+				return jobListOptions{}, fmt.Errorf("%s requires a positive integer", flag)
 			case "--status":
 				return jobListOptions{}, fmt.Errorf("--status requires one of: %s", jobListStatuses)
 			default:
@@ -232,12 +241,16 @@ func parseJobListOptions(args []string) (jobListOptions, error) {
 		value := args[i+1]
 		i++
 		switch flag {
-		case "--limit":
+		case "--limit", "--scan-limit":
 			limit, err := strconv.Atoi(value)
 			if err != nil || limit <= 0 {
-				return jobListOptions{}, fmt.Errorf("--limit must be a positive integer")
+				return jobListOptions{}, fmt.Errorf("%s must be a positive integer", flag)
 			}
-			options.limit = limit
+			if flag == "--limit" {
+				options.limit = limit
+			} else {
+				options.scanLimit = limit
+			}
 		case "--status":
 			if !containsJobListValue(jobListStatuses, value) {
 				return jobListOptions{}, fmt.Errorf("invalid --status %q (valid statuses: %s)", value, jobListStatuses)
