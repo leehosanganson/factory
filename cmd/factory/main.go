@@ -77,6 +77,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 				}
 				return runServerDoctor(out, config)
 			}
+			if len(args) > 1 && args[1] == "bundle" {
+				return runServerBundle(args[2:], out)
+			}
 			if len(args) > 1 && args[1] == "backup" {
 				configPath, destination, err := parseServerBackupOptions(args[2:])
 				if err != nil {
@@ -289,6 +292,10 @@ func printCommandHelp(out io.Writer, args []string) {
 			{"factory server --config <absolute-path>", "Start the local REST job service using a server-only JSON config."},
 			{"factory server doctor --config <absolute-path>", "Check local config and prerequisites without starting the server."},
 			{"factory server backup --config <absolute-path> --destination <absolute-path>", "Create a consistent SQLite online backup."},
+			{"factory server bundle create --config <absolute-path> --destination <absolute-path>", "Create a stopped-server SQLite and retained-workspace recovery bundle."},
+			{"factory server bundle verify --source <absolute-path>", "Validate a recovery bundle without extracting it."},
+			{"factory server bundle inspect --source <absolute-path>", "Display bounded recovery bundle job metadata."},
+			{"factory server bundle restore --source <absolute-path> --destination <absolute-path>", "Restore a verified bundle into a new private directory."},
 		}
 		paragraphs = []string{"The REST API uses a shared API key and executes the configured Factory workflow locally. Server doctor is local-only; provider reachability is not tested. See docs/features/rest-server-operations.md for backup and recovery guidance."}
 	}
