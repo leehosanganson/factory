@@ -34,6 +34,39 @@ func TestSQLiteStoreSatisfiesSharedContract(t *testing.T) {
 	})
 }
 
+func TestSQLiteCancellationRequestInterruptedByRestartIsNotAcceptedAsLive(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("cancel-before-restart", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot, err := store.Cancel(job.ID); err != nil || !snapshot.CancellationRequested {
+		t.Fatalf("pre-restart cancellation=(%+v,%v)", snapshot, err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	if _, err := reopened.Cancel(job.ID); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("cancellation of interrupted job=%v, want ErrInvalidTransition", err)
+	}
+	retained, err := reopened.Get(job.ID)
+	if err != nil || retained.Status != StatusRunning || !retained.CancellationRequested {
+		t.Fatalf("restart changed interrupted cancellation=%+v err=%v", retained, err)
+	}
+}
+
 func TestSQLiteStoreCapacityRejectedKeyCanBeReused(t *testing.T) {
 	config := Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 4}
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), config)

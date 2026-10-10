@@ -320,7 +320,7 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 		if !sameRequest(existing, normalized) {
 			return Snapshot{}, false, ErrIdempotencyConflict
 		}
-		snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+		snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 		if err != nil {
 			return Snapshot{}, false, errors.New("read SQLite job record")
 		}
@@ -431,7 +431,7 @@ func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
 	if err := insertEvent(ctx, tx, id, "running", "Job started", now, s.config.MaxEventsPerJob); err != nil {
 		return Snapshot{}, errors.New("record SQLite job start")
 	}
-	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if err != nil {
 		return Snapshot{}, errors.New("read claimed SQLite job")
 	}
@@ -850,7 +850,7 @@ func (s *SQLiteStore) Get(id string) (Snapshot, error) {
 	if err := s.checkOpen(); err != nil {
 		return Snapshot{}, err
 	}
-	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Snapshot{}, ErrNotFound
 	}
@@ -1003,6 +1003,62 @@ func (s *SQLiteStore) ResolveInterrupted(id string, disposition InterruptedDispo
 	return nil
 }
 
+func (s *SQLiteStore) Cancel(id string) (Snapshot, error) {
+	if err := s.checkAccepting(); err != nil {
+		return Snapshot{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Snapshot{}, errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	var status string
+	var requested int
+	if err := tx.QueryRowContext(ctx, `SELECT status,cancellation_requested FROM factory_jobs WHERE id=?`, id).Scan(&status, &requested); errors.Is(err, sql.ErrNoRows) {
+		return Snapshot{}, ErrNotFound
+	} else if err != nil {
+		return Snapshot{}, errors.New("read SQLite job state")
+	}
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	switch Status(status) {
+	case StatusQueued:
+		if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='canceled',updated_at=? WHERE id=? AND status='queued'`, stamp, id); err != nil {
+			return Snapshot{}, errors.New("cancel queued SQLite job")
+		}
+		if err := insertEvent(ctx, tx, id, string(StatusCanceled), "Job canceled before start", now, s.config.MaxEventsPerJob); err != nil {
+			return Snapshot{}, errors.New("record SQLite queued cancellation")
+		}
+	case StatusRunning:
+		s.recoveryMu.RLock()
+		_, interrupted := s.recoveryNeeded[id]
+		s.recoveryMu.RUnlock()
+		if interrupted {
+			return Snapshot{}, ErrInvalidTransition
+		}
+		if requested == 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET cancellation_requested=1,updated_at=? WHERE id=? AND status='running'`, stamp, id); err != nil {
+				return Snapshot{}, errors.New("request SQLite job cancellation")
+			}
+			if err := insertEvent(ctx, tx, id, "cancel_requested", "Cancellation requested", now, s.config.MaxEventsPerJob); err != nil {
+				return Snapshot{}, errors.New("record SQLite cancellation request")
+			}
+		}
+	default:
+		return Snapshot{}, ErrInvalidTransition
+	}
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	if err != nil {
+		return Snapshot{}, errors.New("read canceled SQLite job")
+	}
+	if err := tx.Commit(); err != nil {
+		return Snapshot{}, errors.New("commit SQLite job cancellation")
+	}
+	return snapshot, nil
+}
+
 func (s *SQLiteStore) Finish(id string, status Status) error {
 	if !status.Terminal() {
 		return ErrInvalidTransition
@@ -1018,7 +1074,7 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC()
-	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,updated_at=? WHERE id=? AND status='running'`, status, now.Format(time.RFC3339Nano), id)
+	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,cancellation_requested=0,updated_at=? WHERE id=? AND status='running'`, status, now.Format(time.RFC3339Nano), id)
 	if err != nil {
 		return errors.New("finish SQLite job")
 	}
@@ -1056,7 +1112,7 @@ func (s *SQLiteStore) Recover(ctx context.Context) (RecoveryReport, error) {
 	if err := s.checkOpen(); err != nil {
 		return RecoveryReport{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j ORDER BY j.queue_sequence`)
+	rows, err := s.db.QueryContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j ORDER BY j.queue_sequence`)
 	if err != nil {
 		return RecoveryReport{}, errors.New("recover SQLite jobs")
 	}
@@ -1309,15 +1365,16 @@ func insertEvent(ctx context.Context, tx *sql.Tx, id, eventType, message string,
 func scanSnapshot(row interface{ Scan(...any) error }) (Snapshot, error) {
 	var snapshot Snapshot
 	var raw, status, created, updated string
-	var truncated int
+	var truncated, cancellationRequested int
 	var providerJSON, evidenceJSON sql.NullString
-	if err := row.Scan(&snapshot.ID, &raw, &status, &created, &updated, &truncated, &providerJSON, &evidenceJSON); err != nil {
+	if err := row.Scan(&snapshot.ID, &raw, &status, &created, &updated, &truncated, &cancellationRequested, &providerJSON, &evidenceJSON); err != nil {
 		return Snapshot{}, err
 	}
 	if err := json.Unmarshal([]byte(raw), &snapshot.Request); err != nil {
 		return Snapshot{}, err
 	}
 	snapshot.Status = Status(status)
+	snapshot.CancellationRequested = cancellationRequested != 0
 	var err error
 	if snapshot.CreatedAt, err = time.Parse(time.RFC3339Nano, created); err != nil {
 		return Snapshot{}, err

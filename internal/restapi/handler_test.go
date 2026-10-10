@@ -284,6 +284,94 @@ func TestInterruptedDispositionRouteIsAuthenticatedBodylessAndBounded(t *testing
 	}
 }
 
+func TestQueuedJobCancellationIsAuthenticatedAndTerminalizesBeforeExecution(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("cancel-queued", restjobs.Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	path := "/v1/jobs/" + job.ID + "/cancel"
+	if response := request(handler, http.MethodPost, path, "", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated cancellation status=%d", response.Code)
+	}
+	if response := request(handler, http.MethodPost, path, ` `, true); response.Code != http.StatusBadRequest {
+		t.Fatalf("whitespace-body cancellation status=%d", response.Code)
+	}
+	response := request(handler, http.MethodPost, path, "", true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("queued cancellation status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	var canceled restjobs.Snapshot
+	if err := json.Unmarshal(response.Body.Bytes(), &canceled); err != nil {
+		t.Fatal(err)
+	}
+	if canceled.ID != job.ID || canceled.Status != restjobs.StatusCanceled {
+		t.Fatalf("queued cancellation response=%+v, want same job canceled", canceled)
+	}
+	if _, err := manager.ClaimNext(); !errors.Is(err, restjobs.ErrNoQueuedJobs) {
+		t.Fatalf("claim after queued cancellation=%v, want no queued jobs", err)
+	}
+	history, err := manager.History(job.ID)
+	if err != nil || len(history.Events) != 2 || history.Events[1].Type != string(restjobs.StatusCanceled) {
+		t.Fatalf("queued cancellation history=%+v err=%v", history, err)
+	}
+	if response := request(handler, http.MethodPost, path, "", true); response.Code != http.StatusConflict {
+		t.Fatalf("repeat terminal cancellation status=%d body=%s, want 409", response.Code, response.Body.String())
+	}
+	if response := request(handler, http.MethodGet, path, "", true); response.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("cancellation GET status=%d", response.Code)
+	}
+}
+
+func TestCancellationRouteRepeatsPendingRequestWithoutDuplicateEvent(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("cancel-repeat", restjobs.Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	path := "/v1/jobs/" + job.ID + "/cancel"
+	for range 2 {
+		response := request(handler, http.MethodPost, path, "", true)
+		if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"cancellation_requested":true`) {
+			t.Fatalf("pending cancellation response=%d body=%s, want 202 with pending flag", response.Code, response.Body.String())
+		}
+	}
+	history, err := manager.History(job.ID)
+	if err != nil || len(history.Events) != 3 || history.Events[2].Type != "cancel_requested" {
+		t.Fatalf("repeated pending cancellation history=%+v err=%v", history, err)
+	}
+}
+
+func TestCancellationRouteIsBodylessAndRejectsIneligibleJobsWithoutMutation(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("cancel-ineligible", restjobs.Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(job.ID, restjobs.StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	path := "/v1/jobs/" + job.ID + "/cancel"
+	if response := request(handler, http.MethodPost, path, `{"status":"canceled"}`, true); response.Code != http.StatusBadRequest {
+		t.Fatalf("body-bearing cancellation status=%d body=%s", response.Code, response.Body.String())
+	}
+	response := request(handler, http.MethodPost, path, "", true)
+	assertError(t, response, http.StatusConflict, "job_not_cancelable")
+	got, err := manager.Get(job.ID)
+	if err != nil || got.Status != restjobs.StatusSucceeded {
+		t.Fatalf("terminal job mutated after rejected cancellation: %+v err=%v", got, err)
+	}
+}
+
 func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 8))
 	job, _, err := manager.Admit("reconcile-route", restjobs.Request{Repository: "widget", Task: "task"})
