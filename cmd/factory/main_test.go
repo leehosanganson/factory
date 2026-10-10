@@ -277,7 +277,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 		omit []string
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
-		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server doctor --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "server-only JSON config", "provider reachability is not tested"}, omit: []string{"api-key-value"}},
+		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server doctor --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "factory server bundle create --config <absolute-path> --destination <absolute-path>", "factory server bundle verify --source <absolute-path>", "factory server bundle inspect --source <absolute-path>", "factory server bundle restore --source <absolute-path> --destination <absolute-path>", "server-only JSON config", "provider reachability is not tested"}, omit: []string{"api-key-value"}},
 		{name: "server doctor help", args: []string{"server", "doctor", "--help"}, want: []string{"REST server preflight", "factory server doctor --config <absolute-path>", "Local-only, read-only", "Provider reachability is not tested", "no database is opened or created"}, omit: []string{"api-key-value"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "factory job list [--limit <n>] [--scan-limit <n>] [--status <status>] [--type <type>]", "queued, running, complete", "Filters affect listing only", "factory job list --scan-limit 100 --status failed", "Omitted jobs remain addressable by ID", "factory job list without --scan-limit reconciles all records", "{repo}"}, omit: []string{"factory run", "Monitor management"}},
@@ -326,6 +326,26 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("inspect state after help: %v", err)
+	}
+}
+
+func TestServerBundleCommandsRequireExactSyntax(t *testing.T) {
+	for _, args := range [][]string{
+		{"server", "bundle"},
+		{"server", "bundle", "create"},
+		{"server", "bundle", "create", "--config", "relative.json", "--destination", "/tmp/bundle.tar.gz"},
+		{"server", "bundle", "create", "--config", "/tmp/server.json", "--destination", "/tmp/bundle.tar.gz", "extra"},
+		{"server", "bundle", "verify", "--source", "relative.tar.gz"},
+		{"server", "bundle", "verify", "--source", "/tmp/bundle.tar.gz", "extra"},
+		{"server", "bundle", "restore", "--source", "/tmp/bundle.tar.gz", "--destination", "relative"},
+		{"server", "bundle", "restore", "--source", "/tmp/bundle.tar.gz", "--destination", "/tmp/destination", "extra"},
+		{"server", "bundle", "create", "--config", "/tmp/server.json", "--destination", "/tmp/bundle.tar.gz", "extra"},
+	} {
+		var out, errOut bytes.Buffer
+		err := run(args, strings.NewReader(""), &out, &errOut)
+		if err == nil || !strings.Contains(err.Error(), "usage: factory server bundle") {
+			t.Errorf("run(%v) error=%v, want strict bundle syntax error", args, err)
+		}
 	}
 }
 

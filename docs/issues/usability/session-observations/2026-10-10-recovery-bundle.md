@@ -1,0 +1,8 @@
+# REST recovery bundle implementation session
+
+- Continued the pre-existing issue #215 worktree at the exact requested `origin/main` SHA; preserved all existing implementation and documentation changes.
+- The first audit found existing focused and CLI process tests covering stopped-server ownership rejection, SQLite plus retained artifact restore, failed/interrupted synthetic records and history, distinct bundle/restore paths, secret-free inspection, corruption, traversal, permissions, and no partial destination on failure.
+- Added a deterministic destination race regression. It failed against the existing code because a failed atomic hard-link publication removed a destination created concurrently by another process. Removing destination cleanup fixed the issue; 20 repeated focused runs passed. The temporary archive is still cleaned up, and atomic link publication does not expose a partial destination.
+- Added a separate size-limit failure test proving archive writing had begun and temporary archive/SQLite files were removed after a mid-creation failure. It passed. The process-level CLI test additionally checks the manifest directly for synthetic task text, API key, repository path, and host path leakage.
+- Focused bundle unit and process tests passed. `make test`, `make vet`, and `make build` all passed on the Linux worktree. No live provider, deployment, or production restore drill was run; all bundle data and jobs are synthetic.
+- Concrete usability note: the existing CLI process-test fixtures and `OpenSQLiteStore` made it practical to exercise bundle CLI behavior without launching a provider-backed server. The race test exposed a filesystem publication cleanup hazard that simpler “destination already exists” checks did not cover.

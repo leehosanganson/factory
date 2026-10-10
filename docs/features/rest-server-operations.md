@@ -107,7 +107,9 @@ The service runs its configured local workflow with the server account's authori
 
 ## Backup and restore
 
-Create a consistent online backup while the server is running. The destination directory must already exist and be private (owner-only permissions). Do not use the configured database path as the destination.
+### SQLite-only online backup
+
+Create a consistent online backup while the server is running. This operation contains SQLite only; it does not snapshot the separate retained workspace tree. The destination directory must already exist and be private (owner-only permissions). Do not use the configured database path as the destination.
 
 ```sh
 factory server backup --config /absolute/path/to/server.json --destination /secure/backup/path/jobs.db
@@ -122,6 +124,25 @@ go test ./internal/restserver/runtime -run '^TestRESTServerBackupRestoreProcessE
 ```
 
 This is automated disposable test evidence, not a claim that a production or deployed-service restore drill has been performed.
+
+### Portable recovery bundle
+
+A bundle pairs SQLite with the retained per-job result directories found for jobs in the database snapshot. It is a stopped-server snapshot: stop the REST server cleanly first, then run `factory server bundle create`. The command independently acquires the same database ownership locks as the server and fails closed if an owner is active or lock state cannot be verified. Stop all other processes that can modify the configured results tree as well; Factory does not coordinate a live workspace snapshot. SQLite consistency is checked with `PRAGMA integrity_check`.
+
+The configured results base is selected from the same `XDG_STATE_HOME` (or `~/.local/state`) used by the service and includes only hashed configured repository directories and result directories corresponding to persisted job records. Retained workspace trees are copied as filesystem artifacts; `.git` worktree administrative links and repository-specific registration metadata are not made portable by this format. Unrelated paths, config, credentials, request bodies, provider identity, logs outside retained job result trees, and Git/provider server state are excluded. Per-job contents (worktree, state, output, workflow logs, and protected completion metadata when present) are included as opaque retained artifacts; the manifest contains only format version, job ID, configured repository-directory digest, status, and whether its workspace is present. Interrupted/failed/canceled jobs and their artifacts are not replayed, rewritten, or filtered out. Jobs whose artifacts were already cleaned or are absent remain represented with `workspace=false`; eligible provider reconciliation still requires a usable retained workspace and configured provider after restore.
+
+The destination must be a new path in an existing private directory, outside both the SQLite source and results tree. The single gzip/tar bundle is written to a private temporary file, synced, and atomically published without replacing an existing destination. Restore first validates archive structure and bounded manifest references, safe relative paths, private-file permission bits, workspace containment, and SQLite integrity. It then extracts into staging and atomically publishes to a new destination under an existing private parent. For example:
+
+```sh
+factory server bundle create --config /absolute/path/to/server.json --destination /secure/backup/factory-recovery.tar.gz
+factory server bundle verify --source /secure/backup/factory-recovery.tar.gz
+factory server bundle inspect --source /secure/backup/factory-recovery.tar.gz
+factory server bundle restore --source /secure/backup/factory-recovery.tar.gz --destination /secure/restore/new-server
+```
+
+`inspect` prints only job IDs, statuses, opaque repository-directory digests, and workspace-presence flags; it does not print request text, secrets, or host paths. Restored files are arranged beneath the new destination at `factory/rest-server/jobs.db` and `factory/rest-server/<repository-digest>/results/<job-id>/...`. To use the database, point a disposable server config at that restored SQLite path and configure its workspace/results state base to the extracted tree as appropriate; do not point a live server at or overwrite the configured production state/results directory. This portability mechanism does not rewrite Git worktree administrative metadata to register retained worktrees against another checkout. The restored artifacts remain available for inspection; provider reconciliation may reject them if the configured checkout/worktree identity checks do not pass. Never treat copying those directories as a guarantee of cross-host executable reconciliation.
+
+The bundle CLI process test builds synthetic failed and interrupted jobs, moves the single bundle, verifies and inspects it, restores it under a distinct private path, and checks durable history and retained artifacts. Unit tests cover active ownership, unsafe destinations and paths, permissions, corruption, traversal, and failed creation leaving no published partial bundle. The command tests use a stopped synthetic SQLite store plus synthetic workspace directories; the result trees are not live Git worktrees or provider credentials. These are deterministic synthetic checks, not a production restore drill. A production restore drill must separately use an approved disposable target and verify its configured repository/worktree assumptions, service startup, representative inspection, and operational procedures; do not use production credentials or repositories for automated tests.
 
 ## Clean setup and first client request
 
