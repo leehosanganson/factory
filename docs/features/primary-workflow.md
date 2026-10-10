@@ -10,7 +10,7 @@ Install the configured agent (Pi by default), copy [`config.json.example`](../..
 factory doctor
 ```
 
-Doctor validates Factory's configuration and checks whether the configured agent executable and `git` are available on `PATH`; it checks `gh` when `auto_publish` is enabled. It reports only how many `pipeline_checks` are configured; it does not display those commands, check whether they are supported, or run them. With publication enabled, zero checks is an advisory about verification confidence, not a blocker. Doctor does not access the target checkout, run tools, contact GitHub, or create state. Correct any invalid configuration or missing prerequisite before starting work.
+Doctor validates Factory's configuration and checks whether the configured agent executable and `git` are available on `PATH`; it checks `gh` when `auto_publish` is enabled. It reports only how many `pipeline_checks` are configured; it does not display those commands, check whether they are supported, or run them. With publication enabled, zero checks is an advisory about verification confidence, not a blocker. Doctor also reports the optional `detached_job_max_concurrency` cap (1–64) or that it is unlimited when omitted; it does not display configured arguments or secrets. The cap applies across active detached implementation, tidy, and monitor jobs sharing Factory state, and is separate from `parallel_implementation.max_concurrency` (subtasks within one implementation). Doctor does not access the target checkout, run tools, contact GitHub, or create state. Correct any invalid configuration or missing prerequisite before starting work.
 
 ## Run an implementation
 

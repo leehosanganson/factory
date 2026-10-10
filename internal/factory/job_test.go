@@ -658,6 +658,40 @@ func TestDetachedJobStopAndSameTargetAdmission(t *testing.T) {
 	}
 }
 
+func TestActiveDetachedJobCountExcludesTerminalAndReconcilesStale(t *testing.T) {
+	store := newTestJobStore(t)
+	target := t.TempDir()
+	for _, job := range []JobRecord{
+		{ID: "active-counted", Type: tidyJobType, TargetPath: target, Status: "running"},
+		{ID: "active-monitor", Type: monitorJobType, TargetPath: target, Status: "queued"},
+		{ID: "terminal-ignored", Type: implementationJobType, TargetPath: target, Status: "complete"},
+		{ID: "stale-reconciled", Type: implementationJobType, TargetPath: target, Status: "running"},
+	} {
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	makeJobStale(t, store, "stale-reconciled")
+	active, err := store.ActiveDetachedJobCount()
+	if err != nil || active != 2 {
+		t.Fatalf("active detached job count = %d, %v; want the fresh running tidy and queued monitor", active, err)
+	}
+	stale, err := store.GetJob("stale-reconciled")
+	if err != nil || stale.Status != "interrupted" {
+		t.Fatalf("stale job status = %q, %v; want safely reconciled interrupted", stale.Status, err)
+	}
+	if _, err := store.UpdateJob("active-counted", func(job *JobRecord) error { job.Status = "complete"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateJob("active-monitor", func(job *JobRecord) error { job.Status = "stopped"; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	active, err = store.ActiveDetachedJobCount()
+	if err != nil || active != 0 {
+		t.Fatalf("active detached job count after terminal transitions = %d, %v; want 0", active, err)
+	}
+}
+
 func TestDifferentTargetsCanAcquireIndependentJobLocks(t *testing.T) {
 	store := newTestJobStore(t)
 	first, second := t.TempDir(), t.TempDir()

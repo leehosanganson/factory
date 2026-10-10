@@ -196,6 +196,18 @@ func JobStateRoot(override string) (string, error) {
 // Root returns the resolved filesystem path backing this store.
 func (s *JobStore) Root() string { return s.root }
 
+// LockDetachedJobAdmission serializes capped detached-job admission across targets.
+func (s *JobStore) LockDetachedJobAdmission() (func(), error) {
+	locks := filepath.Join(s.root, ".admissions")
+	if err := os.MkdirAll(locks, 0o700); err != nil {
+		return nil, err
+	}
+	if err := ensureRealDirectory(s.root, locks); err != nil {
+		return nil, err
+	}
+	return s.lockNamed(filepath.Join(locks, "detached-jobs.lock"), false)
+}
+
 // LockTarget serializes jobs targeting the same resolved path across processes.
 func (s *JobStore) LockTarget(target string) (func(), error) {
 	return s.lockTargetIn(".targets", target)
@@ -844,6 +856,21 @@ func (s *JobStore) reconcileTerminalSession(id string) error {
 		return err
 	}
 	return writeJSONAtomic(jobDir, "job.json", job)
+}
+
+// ActiveDetachedJobCount reconciles safely stale records before counting active detached jobs.
+func (s *JobStore) ActiveDetachedJobCount() (int, error) {
+	jobs, err := s.reconcileJobs()
+	if err != nil {
+		return 0, err
+	}
+	active := 0
+	for _, job := range jobs {
+		if (job.Type == implementationJobType || job.Type == tidyJobType || job.Type == monitorJobType) && (job.Status == "queued" || job.Status == "running") {
+			active++
+		}
+	}
+	return active, nil
 }
 
 // reconcileJobs scans every persisted job and applies orphan recovery before returning them.

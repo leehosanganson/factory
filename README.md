@@ -34,7 +34,7 @@ make test
 make vet
 ```
 
-The binary is written to `./bin/factory`. Configuration and state are stored outside the target repository by default; see [`config.json.example`](config.json.example) and the [feature documentation](docs/features/README.md). CI builds, tests, and vets on Linux and macOS. Releases are created separately from explicit stable version tags; merging to `main` does not itself publish a release.
+The binary is written to `./bin/factory`. Configuration and state are stored outside the target repository by default; see [`config.json.example`](config.json.example) and the [feature documentation](docs/features/README.md). The optional CLI setting `detached_job_max_concurrency` caps active detached implementation, tidy, and monitor jobs sharing state (1–64); omission preserves unlimited admission. It is separate from `parallel_implementation.max_concurrency`, which controls subtasks within one implementation workflow. CI builds, tests, and vets on Linux and macOS. Releases are created separately from explicit stable version tags; merging to `main` does not itself publish a release.
 
 ## Local REST server
 

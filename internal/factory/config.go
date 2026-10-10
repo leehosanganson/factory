@@ -11,18 +11,21 @@ import (
 	"time"
 )
 
+const maxDetachedJobConcurrency = 64
+
 // Config describes the agent process and prompt overrides used for each run.
 type Config struct {
-	Command                string                        `json:"command"`
-	Args                   []string                      `json:"args"`
-	PipelineChecks         [][]string                    `json:"pipeline_checks,omitempty"`
-	ParallelImplementation *ParallelImplementationConfig `json:"parallel_implementation,omitempty"`
-	PromptDir              string                        `json:"prompt_dir,omitempty"`
-	StateDir               string                        `json:"state_dir,omitempty"`
-	WorktreeParent         string                        `json:"worktree_parent,omitempty"`
-	AutoPublish            bool                          `json:"auto_publish"`
-	AgentTimeout           string                        `json:"agent_timeout,omitempty"`
-	MonitorTimeout         string                        `json:"monitor_timeout,omitempty"`
+	Command                   string                        `json:"command"`
+	Args                      []string                      `json:"args"`
+	PipelineChecks            [][]string                    `json:"pipeline_checks,omitempty"`
+	ParallelImplementation    *ParallelImplementationConfig `json:"parallel_implementation,omitempty"`
+	DetachedJobMaxConcurrency *int                          `json:"detached_job_max_concurrency,omitempty"`
+	PromptDir                 string                        `json:"prompt_dir,omitempty"`
+	StateDir                  string                        `json:"state_dir,omitempty"`
+	WorktreeParent            string                        `json:"worktree_parent,omitempty"`
+	AutoPublish               bool                          `json:"auto_publish"`
+	AgentTimeout              string                        `json:"agent_timeout,omitempty"`
+	MonitorTimeout            string                        `json:"monitor_timeout,omitempty"`
 }
 
 // DefaultConfig returns a copy of the built-in pi command adapter.
@@ -85,6 +88,9 @@ func LoadConfig(path string) (Config, error) {
 	if _, configured := fields["auto_publish"]; !configured {
 		cfg.AutoPublish = true
 	}
+	if value, configured := fields["detached_job_max_concurrency"]; configured && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return Config{}, fmt.Errorf("invalid config %s: detached_job_max_concurrency must be an integer when set", path)
+	}
 	if err := cfg.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
 	}
@@ -123,6 +129,9 @@ func (c Config) Validate() error {
 	}
 	if err := validatePipelineChecks(c.PipelineChecks); err != nil {
 		return err
+	}
+	if c.DetachedJobMaxConcurrency != nil && (*c.DetachedJobMaxConcurrency < 1 || *c.DetachedJobMaxConcurrency > maxDetachedJobConcurrency) {
+		return fmt.Errorf("detached_job_max_concurrency must be between 1 and %d when set", maxDetachedJobConcurrency)
 	}
 	if c.ParallelImplementation != nil {
 		if c.ParallelImplementation.MaxConcurrency < 0 || c.ParallelImplementation.MaxConcurrency > maxParallelSubtasks {

@@ -67,6 +67,49 @@ func TestLoadConfigPreservesPipelineCheckArgumentVectors(t *testing.T) {
 	}
 }
 
+func TestLoadConfigDetachedJobMaxConcurrency(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "config.json")
+	for _, tc := range []struct {
+		name    string
+		field   string
+		want    int
+		wantNil bool
+		wantErr bool
+	}{
+		{name: "omitted remains unlimited", wantNil: true},
+		{name: "minimum", field: `,"detached_job_max_concurrency":1`, want: 1},
+		{name: "maximum", field: `,"detached_job_max_concurrency":64`, want: 64},
+		{name: "zero rejected", field: `,"detached_job_max_concurrency":0`, wantErr: true},
+		{name: "negative rejected", field: `,"detached_job_max_concurrency":-1`, wantErr: true},
+		{name: "above maximum rejected", field: `,"detached_job_max_concurrency":65`, wantErr: true},
+		{name: "wrong type rejected", field: `,"detached_job_max_concurrency":"2"`, wantErr: true},
+		{name: "null rejected", field: `,"detached_job_max_concurrency":null`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			content := `{"command":"pi","args":["{system_prompt}","{task}"]` + tc.field + `}`
+			if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(file)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("invalid detached_job_max_concurrency was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantNil && cfg.DetachedJobMaxConcurrency != nil {
+				t.Fatalf("omitted cap = %v, want unlimited (nil)", *cfg.DetachedJobMaxConcurrency)
+			}
+			if !tc.wantNil && (cfg.DetachedJobMaxConcurrency == nil || *cfg.DetachedJobMaxConcurrency != tc.want) {
+				t.Fatalf("detached_job_max_concurrency = %v, want %d", cfg.DetachedJobMaxConcurrency, tc.want)
+			}
+		})
+	}
+}
+
 func TestLoadConfigParallelImplementationIsExplicitlyOptIn(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(file, []byte(`{"command":"pi","args":["{task}","{system_prompt}"]}`), 0o600); err != nil {
