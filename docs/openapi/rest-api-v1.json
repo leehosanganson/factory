@@ -1,0 +1,533 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Factory REST Job API",
+    "version": "1.0.0",
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
+  },
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "healthCheck",
+        "summary": "Check process health",
+        "description": "Unauthenticated process-liveness probe. It does not establish that the service can accept work.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The process is responding.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" }
+              }
+            }
+          },
+          "405": {
+            "description": "The request used a method other than GET; the response has no body.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readinessCheck",
+        "summary": "Check service readiness",
+        "description": "Unauthenticated readiness probe. Readiness checks can be capacity-limited; a failed, unavailable, or saturated check returns not_ready.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The service is accepting requests.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadyResponse" }
+              }
+            }
+          },
+          "503": {
+            "description": "The service is not ready.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadyResponse" }
+              }
+            }
+          },
+          "405": {
+            "description": "The request used a method other than GET; the response has no body.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs": {
+      "post": {
+        "operationId": "createJob",
+        "summary": "Submit a job",
+        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries with the same normalized payload return the retained job; reuse with a different payload conflicts. Memory persistence is volatile and jobs are lost on process restart. With SQLite, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "$ref": "#/components/parameters/IdempotencyKey" }
+        ],
+        "requestBody": {
+          "required": true,
+          "description": "JSON body limit is operator-configurable up to 2 MiB; task limit is operator-configurable up to 256 KiB. The schema documents the maximum supported task length; deployments may enforce smaller limits. Repository must be an alias configured by the operator, not a filesystem path.",
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateJobRequest" }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "The job was admitted or an identical idempotent retry was replayed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateJobResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "409": {
+            "description": "The idempotency key conflicts with a different request.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "413": {
+            "description": "The request body exceeds the configured byte limit.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "415": {
+            "description": "The request Content-Type is not application/json.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "503": {
+            "description": "The service is not ready, is shutting down, or has reached queue or registry capacity.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "POST" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}": {
+      "get": {
+        "operationId": "getJob",
+        "summary": "Get a job snapshot",
+        "description": "Returns a safe snapshot including the submitted request and bounded verification evidence. It excludes credentials, host paths, raw logs, and agent transcripts. A verification check reports only its generated label and outcome; recorded limitations can state that no checks were configured and that agent completion is not an independent correctness verdict.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The retained job snapshot.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/history": {
+      "get": {
+        "operationId": "getJobHistory",
+        "summary": "Get bounded job history",
+        "description": "Returns retained lifecycle events and a truncation indicator. Event types and messages are filtered to a safe allowlist; credentials, host paths, raw logs, and agent transcripts are not returned.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The bounded event history.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobHistory" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/cancel": {
+      "post": {
+        "operationId": "cancelJob",
+        "summary": "Request cooperative cancellation",
+        "description": "Bodyless, job-scoped cancellation request. A queued job is canceled before execution and returns 200; a running job remains running with cancellation_requested=true and returns 202 while its worker exits. Cancellation does not erase workspaces or reverse provider side effects. If provider effects may have occurred, the outcome remains failed/inspectable for operator recovery rather than being reported as canceled or successful. This action is not a correctness verdict.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The queued job was canceled before execution.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "202": {
+            "description": "Cancellation was requested for a running job; execution has not necessarily stopped.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "The job is terminal or otherwise cannot be canceled.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "POST" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/reconcile": {
+      "post": {
+        "operationId": "reconcileJob",
+        "summary": "Confirm an uncertain provider outcome",
+        "description": "Bodyless, authenticated operator action. Eligibility is limited to SQLite jobs with a persisted provider attempt/outcome and retained workspace: startup-interrupted running jobs or failed jobs. It validates retained repository/branch/commit identity and performs read-only provider confirmation; it does not run the harness or write to the provider. Only a matching confirmed open PR and successful atomic recording can mark the job succeeded. Memory storage has no durable startup-recovery classification and does not support this recovery. Failed or ambiguous reconciliation remains unresolved for operator investigation. PR publication and agent completion are not independent correctness verdicts.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The provider outcome was read-only confirmed and recorded, or the already-reconciled snapshot was returned.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "Reconciliation is unavailable or the job is ineligible, mismatched, ambiguous, or could not be durably updated. The job remains unresolved.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "POST" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/disposition/failed": {
+      "post": {
+        "operationId": "dispositionJobFailed",
+        "summary": "Record an interrupted job as failed",
+        "description": "Bodyless, authenticated operator action available only for SQLite jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected failed disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The failed disposition was recorded.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "The job is not eligible for this operator disposition.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "POST" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/disposition/canceled": {
+      "post": {
+        "operationId": "dispositionJobCanceled",
+        "summary": "Record an interrupted job as canceled",
+        "description": "Bodyless, authenticated operator action available only for SQLite jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected canceled disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The canceled disposition was recorded.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "The job is not eligible for this operator disposition.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "POST" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/operations": {
+      "get": {
+        "operationId": "getOperations",
+        "summary": "Get aggregate service counters",
+        "description": "Returns bounded aggregate counts and capacity indicators only, without job IDs, requests, events, provider details, host paths, or credentials. Memory-mode records are volatile and lost at restart. SQLite queued jobs resume after restart; interrupted running jobs require operator investigation and are not replayed.",
+        "security": [ { "bearerAuth": [] } ],
+        "responses": {
+          "200": {
+            "description": "The aggregate operational summary.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/OperationalSummary" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "API key",
+        "description": "Operator-provisioned API key. Send as Authorization: Bearer <key>; never place the key in a URL or job payload."
+      }
+    },
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Non-empty retry key, at most 256 UTF-8 bytes. Identical normalized requests map to the same retained job; a different payload with the same key conflicts. Retention is bounded by the configured store and persistence mode.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 256 }
+      },
+      "JobId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Opaque job identifier returned at admission.",
+        "schema": { "type": "string", "minLength": 1 }
+      }
+    },
+    "responses": {
+      "InvalidRequest": {
+        "description": "The request is malformed, invalid, or contains unsupported fields.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+      },
+      "Unauthenticated": {
+        "description": "A single valid bearer credential is required.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+      },
+      "NotFound": {
+        "description": "The requested job does not exist or is not exposed.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+      },
+      "NotReady": {
+        "description": "The service is not accepting requests.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+      },
+      "InternalError": {
+        "description": "An internal error occurred; implementation details are redacted.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+      }
+    },
+    "schemas": {
+      "CreateJobRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "repository", "task" ],
+        "properties": {
+          "repository": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Operator-configured repository alias; it is not a URL or filesystem path."
+          },
+          "task": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 262144,
+            "description": "UTF-8 task text, at most 256 KiB by byte length; operator configuration may impose a smaller limit. Requests reject control characters other than tab, carriage return, and line feed."
+          },
+          "issue": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Optional positive issue number as context only; this does not start issue polling or a separate issue workflow."
+          }
+        }
+      },
+      "CreateJobResponse": {
+        "type": "object",
+        "required": [ "job", "replayed", "links" ],
+        "properties": {
+          "job": { "$ref": "#/components/schemas/JobSnapshot" },
+          "replayed": { "type": "boolean", "description": "True when an identical retained admission was returned for this idempotency key." },
+          "links": {
+            "type": "object",
+            "required": [ "self", "history" ],
+            "properties": {
+              "self": { "type": "string" },
+              "history": { "type": "string" }
+            }
+          }
+        }
+      },
+      "JobSnapshot": {
+        "type": "object",
+        "description": "Safe public job snapshot. The request is caller-provided text; credentials, host paths, raw logs, and agent transcripts are not exposed.",
+        "required": [ "id", "request", "status", "created_at", "updated_at" ],
+        "properties": {
+          "id": { "type": "string" },
+          "request": { "$ref": "#/components/schemas/JobRequest" },
+          "status": {
+            "type": "string",
+            "enum": [ "queued", "running", "succeeded", "failed", "canceled" ]
+          },
+          "cancellation_requested": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "provider": { "$ref": "#/components/schemas/ProviderOutcome" },
+          "verification": { "$ref": "#/components/schemas/VerificationEvidence" }
+        }
+      },
+      "JobRequest": {
+        "type": "object",
+        "required": [ "repository", "task" ],
+        "properties": {
+          "repository": { "type": "string" },
+          "task": { "type": "string" },
+          "issue": { "type": "integer", "format": "int64", "minimum": 1 }
+        }
+      },
+      "ProviderOutcome": {
+        "type": "object",
+        "description": "Confirmed provider PR identity. Presence records a provider outcome, not merge approval or a correctness verdict.",
+        "required": [ "provider", "repository", "number", "url", "branch", "commit", "state" ],
+        "properties": {
+          "provider": { "type": "string", "enum": [ "github" ] },
+          "repository": { "type": "string", "description": "Provider repository name, not a host filesystem path." },
+          "number": { "type": "integer", "format": "int64", "minimum": 1 },
+          "url": { "type": "string", "format": "uri" },
+          "branch": { "type": "string" },
+          "commit": { "type": "string" },
+          "state": { "type": "string", "enum": [ "open" ] }
+        }
+      },
+      "VerificationEvidence": {
+        "type": "object",
+        "required": [ "checks", "limitations" ],
+        "properties": {
+          "checks": {
+            "type": "array",
+            "maxItems": 16,
+            "items": { "$ref": "#/components/schemas/VerificationCheck" }
+          },
+          "limitations": {
+            "type": "array",
+            "maxItems": 4,
+            "items": {
+              "type": "string",
+              "maxLength": 128,
+              "enum": [
+                "No operator-configured verification checks were run.",
+                "Agent-reported completion is not an independent correctness verdict."
+              ]
+            }
+          }
+        }
+      },
+      "VerificationCheck": {
+        "type": "object",
+        "required": [ "name", "outcome" ],
+        "properties": {
+          "name": { "type": "string", "pattern": "^check-[0-9]{2}$", "description": "Generated safe check label; check output and command are never returned." },
+          "outcome": { "type": "string", "enum": [ "not_completed", "passed", "failed", "canceled" ] }
+        }
+      },
+      "JobHistory": {
+        "type": "object",
+        "required": [ "job_id", "events", "truncated" ],
+        "properties": {
+          "job_id": { "type": "string" },
+          "events": {
+            "type": "array",
+            "maxItems": 200,
+            "items": { "$ref": "#/components/schemas/JobEvent" }
+          },
+          "truncated": { "type": "boolean", "description": "True when older events were omitted from bounded history." }
+        }
+      },
+      "JobEvent": {
+        "type": "object",
+        "required": [ "at", "type" ],
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "type": {
+            "type": "string",
+            "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition" ]
+          },
+          "message": { "type": "string", "description": "Only allowlisted fixed messages are returned; unrecognized messages are blanked." }
+        }
+      },
+      "OperationalSummary": {
+        "type": "object",
+        "required": [ "retained_records", "record_limit", "queue_capacity", "queued", "running", "succeeded", "failed", "canceled", "queue_saturated", "recovery_needed" ],
+        "properties": {
+          "retained_records": { "type": "integer", "format": "int64", "minimum": 0 },
+          "record_limit": { "type": "integer", "format": "int64", "minimum": 0 },
+          "queue_capacity": { "type": "integer", "format": "int64", "minimum": 0 },
+          "queued": { "type": "integer", "format": "int64", "minimum": 0 },
+          "running": { "type": "integer", "format": "int64", "minimum": 0 },
+          "succeeded": { "type": "integer", "format": "int64", "minimum": 0 },
+          "failed": { "type": "integer", "format": "int64", "minimum": 0 },
+          "canceled": { "type": "integer", "format": "int64", "minimum": 0 },
+          "queue_saturated": { "type": "boolean" },
+          "recovery_needed": { "type": "integer", "format": "int64", "minimum": 0 }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": [ "status" ],
+        "properties": { "status": { "type": "string", "enum": [ "ok" ] } }
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "required": [ "status" ],
+        "properties": { "status": { "type": "string", "enum": [ "ready", "not_ready" ] } }
+      },
+      "ErrorEnvelope": {
+        "type": "object",
+        "required": [ "error" ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [ "code", "message" ],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string", "description": "Sanitized error message; internal paths, credentials, and implementation details are not returned." }
+            }
+          }
+        }
+      }
+    }
+  }
+}
