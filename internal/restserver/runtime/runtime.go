@@ -188,6 +188,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	var ready atomic.Bool
 	var readyCheck func(context.Context) error
+	var coordinator *restworker.Coordinator
 	if probe, ok := store.(interface{ Ping(context.Context) error }); ok {
 		readyCheck = probe.Ping
 	}
@@ -195,6 +196,12 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
+		CancelJob: func(requestCtx context.Context, id string) (restjobs.Snapshot, error) {
+			if err := requestCtx.Err(); err != nil {
+				return restjobs.Snapshot{}, restjobs.ErrInvalidTransition
+			}
+			return coordinator.RequestCancel(id)
+		},
 		ResolveInterrupted: func(requestCtx context.Context, id string, disposition restjobs.InterruptedDisposition) error {
 			if err := requestCtx.Err(); err != nil {
 				return restjobs.ErrInvalidTransition
@@ -291,7 +298,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	sweepDone := make(chan struct{})
 	go sweepWorkspaces(sweepCtx, sweepDone, workspaceManagers, logger, options.SweepInterval)
 
-	coordinator, err := restworker.New(manager, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers})
+	coordinator, err = restworker.New(manager, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers})
 	if err != nil {
 		closeStore()
 		return err

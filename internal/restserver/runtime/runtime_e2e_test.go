@@ -375,6 +375,215 @@ func testProcessStateHome(t *testing.T) string {
 	return canonicalTestStateHome(t, filepath.Join(t.TempDir(), "state"))
 }
 
+func TestRESTServerPerJobCancellationProcessE2E(t *testing.T) {
+	if testing.Short() || (runtime.GOOS != "linux" && runtime.GOOS != "darwin") {
+		t.Skip("process-level REST E2E requires supported local process signal semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	stateDir := testResultsBase(t)
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+	config.Limits.Workers = 1
+	config.Limits.QueueCapacity = 4
+	config.Limits.JobTimeout = "30s"
+	providerToken := filepath.Join(t.TempDir(), "provider-token")
+	if err := os.WriteFile(providerToken, []byte("synthetic-provider-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	providerWrites := filepath.Join(t.TempDir(), "provider-writes.jsonl")
+	barrier := filepath.Join(t.TempDir(), "running-barrier")
+	harnessRuns := filepath.Join(t.TempDir(), "harness-runs")
+	harness := filepath.Join(t.TempDir(), "harness.sh")
+	script := fmt.Sprintf("#!/bin/sh\ntask=\nfor arg in \"$@\"; do case \"$arg\" in cancel-running|cancel-queued|unrelated-job) task=$arg ;; esac; done\nprintf '%%s\\n' \"$task\" >> %q\nif [ \"$task\" = cancel-running ]; then printf 'ready\\n' > %q; sleep 300; fi\nprintf 'verified\\n' > result.txt\n", harnessRuns, barrier)
+	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	factoryBinary := filepath.Join(t.TempDir(), "factory")
+	root, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", factoryBinary, "./cmd/factory")
+	build.Dir = root
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory CLI: %v: %s", err, output)
+	}
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	logPath := filepath.Join(t.TempDir(), "server.log")
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+	child.Env = append(os.Environ(), "XDG_STATE_HOME="+filepath.Dir(filepath.Dir(stateDir)), "FACTORY_E2E_HELPER=1", "FACTORY_E2E_CONFIG="+configPath, "FACTORY_E2E_READY="+readyPath, "FACTORY_E2E_OUTCOMES="+providerWrites, "FACTORY_E2E_PROVIDER_MODE=cancel-e2e")
+	child.Stdout, child.Stderr = logFile, logFile
+	if err := child.Start(); err != nil {
+		_ = logFile.Close()
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- child.Wait(); _ = logFile.Close() }()
+	stopped := false
+	stop := func() {
+		if stopped || child.ProcessState != nil {
+			return
+		}
+		stopped = true
+		_ = child.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			_ = child.Process.Kill()
+			<-done
+		}
+	}
+	defer stop()
+	baseURL := waitForProcessURL(t, done, readyPath, logPath)
+	client := &http.Client{Timeout: 5 * time.Second}
+	postCancel := func(id string, auth bool) (int, string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs/"+id+"/cancel", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if auth {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response.StatusCode, string(body)
+	}
+	running, err := submitProcessJob(client, baseURL, apiKey, "trusted", "cancel-running", "cancel-running-key")
+	if err != nil || running.StatusCode != http.StatusAccepted || running.ID == "" {
+		t.Fatalf("running job admission=%+v err=%v", running, err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(barrier); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(barrier); err != nil {
+		t.Fatalf("running harness did not reach barrier: %v", err)
+	}
+	queued, err := submitProcessJob(client, baseURL, apiKey, "trusted", "cancel-queued", "cancel-queued-key")
+	if err != nil || queued.StatusCode != http.StatusAccepted || queued.ID == "" {
+		t.Fatalf("queued job admission=%+v err=%v", queued, err)
+	}
+	if status, _ := postCancel(queued.ID, false); status != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated cancel status=%d, want 401", status)
+	}
+	if status, body := postCancel(queued.ID, true); status != http.StatusOK || !strings.Contains(body, `"status":"canceled"`) {
+		t.Fatalf("queued cancel status=%d body=%s, want 200 canceled", status, body)
+	}
+	if status, body := postCancel(running.ID, true); status != http.StatusAccepted || !strings.Contains(body, `"cancellation_requested":true`) {
+		t.Fatalf("running cancel status=%d body=%s, want accepted cancellation request", status, body)
+	}
+	if status, body := postCancel(running.ID, true); status != http.StatusAccepted || !strings.Contains(body, `"cancellation_requested":true`) {
+		t.Fatalf("repeated running cancel status=%d body=%s, want idempotent pending request", status, body)
+	}
+	waitForProcessStatus(t, client, baseURL, running.ID, apiKey, restjobs.StatusCanceled)
+	canceledRunning := getProcessJob(t, client, baseURL, running.ID, apiKey)
+	if canceledRunning.Verification == nil || canceledRunning.Provider != nil {
+		t.Fatalf("canceled running outcome lost evidence or fabricated provider result: %+v", canceledRunning)
+	}
+	if status, body := postCancel(running.ID, true); status != http.StatusConflict || !strings.Contains(body, `"code":"job_not_cancelable"`) {
+		t.Fatalf("terminal cancel status=%d body=%s, want 409 conflict", status, body)
+	}
+	uncertain, err := submitProcessJob(client, baseURL, apiKey, "trusted", "provider-uncertain", "provider-uncertain-key")
+	if err != nil || uncertain.StatusCode != http.StatusAccepted || uncertain.ID == "" {
+		t.Fatalf("uncertain-provider job admission=%+v err=%v", uncertain, err)
+	}
+	uncertainAttempt := providerWrites + ".uncertain-attempt"
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(uncertainAttempt); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(uncertainAttempt); err != nil {
+		t.Fatalf("fake provider did not reach uncertain-write barrier: %v", err)
+	}
+	if status, body := postCancel(uncertain.ID, true); status != http.StatusAccepted || !strings.Contains(body, `"cancellation_requested":true`) {
+		t.Fatalf("uncertain provider cancel status=%d body=%s", status, body)
+	}
+	waitForProcessStatus(t, client, baseURL, uncertain.ID, apiKey, restjobs.StatusFailed)
+	uncertainJob := getProcessJob(t, client, baseURL, uncertain.ID, apiKey)
+	if uncertainJob.CancellationRequested || uncertainJob.Provider != nil || uncertainJob.Verification == nil {
+		t.Fatalf("uncertain provider side effect was mislabeled or evidence lost: %+v", uncertainJob)
+	}
+	uncertainHistory := getProcessHistory(t, client, baseURL, uncertain.ID, apiKey)
+	if len(uncertainHistory.Events) < 4 || uncertainHistory.Events[len(uncertainHistory.Events)-2].Type != "cancel_requested" || uncertainHistory.Events[len(uncertainHistory.Events)-1].Type != string(restjobs.StatusFailed) {
+		t.Fatalf("uncertain provider cancellation history=%+v", uncertainHistory)
+	}
+	queuedHistory := getProcessHistory(t, client, baseURL, queued.ID, apiKey)
+	runningHistory := getProcessHistory(t, client, baseURL, running.ID, apiKey)
+	if len(queuedHistory.Events) != 2 || queuedHistory.Events[1].Type != string(restjobs.StatusCanceled) || len(runningHistory.Events) != 4 || runningHistory.Events[2].Type != "cancel_requested" || runningHistory.Events[3].Type != string(restjobs.StatusCanceled) {
+		t.Fatalf("cancellation histories queued=%+v running=%+v", queuedHistory, runningHistory)
+	}
+	resultsPath := filepath.Join(stateDir, aliasDirectory("trusted"), "results")
+	if _, err := os.Stat(filepath.Join(resultsPath, running.ID, "worktree")); err != nil {
+		t.Fatalf("canceled running workspace not retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(resultsPath, running.ID, ".completion.json")); !os.IsNotExist(err) {
+		t.Fatalf("canceled running job has completion marker: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(resultsPath, uncertain.ID, "worktree")); err != nil {
+		t.Fatalf("uncertain provider workspace not retained: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(resultsPath, uncertain.ID, ".completion.json")); !os.IsNotExist(err) {
+		t.Fatalf("uncertain provider job has completion marker: %v", err)
+	}
+	if runs, err := os.ReadFile(harnessRuns); err != nil || strings.Count(string(runs), "cancel-running") != 1 || strings.Contains(string(runs), "cancel-queued") {
+		t.Fatalf("harness executions=%q err=%v; queued job ran or running count differs", runs, err)
+	}
+	if writes, err := os.ReadFile(providerWrites); (err != nil && !os.IsNotExist(err)) || len(writes) != 0 {
+		t.Fatalf("canceled jobs caused confirmed provider writes: data=%q err=%v", writes, err)
+	}
+	attempts, err := os.ReadFile(uncertainAttempt)
+	if err != nil || strings.TrimSpace(string(attempts)) != uncertain.ID {
+		t.Fatalf("uncertain provider attempts=%q err=%v, want one attempt for selected job", attempts, err)
+	}
+	stop()
+	stopped = true
+	persisted, err := restworker.NewLocalJobManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer persisted.Close()
+	for _, id := range []string{queued.ID, running.ID} {
+		job, err := persisted.Get(id)
+		if err != nil || job.Status != restjobs.StatusCanceled {
+			t.Fatalf("persisted canceled job=%+v err=%v", job, err)
+		}
+	}
+	persistedUncertain, err := persisted.Get(uncertain.ID)
+	if err != nil || persistedUncertain.Status != restjobs.StatusFailed || persistedUncertain.Provider != nil || persistedUncertain.Verification == nil {
+		t.Fatalf("persisted uncertain provider cancellation=%+v err=%v", persistedUncertain, err)
+	}
+}
+
 func TestRESTServerProcessHelper(t *testing.T) {
 	if os.Getenv("FACTORY_E2E_HELPER") != "1" {
 		return
@@ -391,6 +600,8 @@ func TestRESTServerProcessHelper(t *testing.T) {
 			publisher = &uncertainE2EPublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
 		case "confirmed-wait":
 			publisher = &confirmedWaitingE2EPublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
+		case "cancel-e2e":
+			publisher = &cancelE2EPublisher{path: os.Getenv("FACTORY_E2E_OUTCOMES")}
 		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -416,6 +627,7 @@ func TestRESTServerProcessHelper(t *testing.T) {
 }
 
 type e2ePublisher struct{ path string }
+type cancelE2EPublisher struct{ path string }
 
 type uncertainE2EPublisher struct{ path string }
 
@@ -568,6 +780,23 @@ func (p *uncertainE2EPublisher) Publish(ctx context.Context, request restprovide
 		return restprovider.Outcome{}, err
 	}
 	return record.Outcome, nil
+}
+
+func (p *cancelE2EPublisher) Ping(context.Context) error { return nil }
+
+func (p *cancelE2EPublisher) Publish(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	if err := ctx.Err(); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	if err := os.WriteFile(p.path+".uncertain-attempt", []byte(request.JobID), 0o600); err != nil {
+		return restprovider.Outcome{}, err
+	}
+	<-ctx.Done()
+	return restprovider.Outcome{}, fmt.Errorf("%w: fake accepted provider write response lost", restprovider.ErrUncertain)
+}
+
+func (p *cancelE2EPublisher) Reconcile(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
+	return restprovider.Outcome{}, fmt.Errorf("unexpected reconciliation in cancellation E2E")
 }
 
 func (p *e2ePublisher) Ping(context.Context) error { return nil }
@@ -2653,6 +2882,22 @@ func getProcessJobResponse(t *testing.T, client *http.Client, baseURL, id, apiKe
 		t.Fatal(err)
 	}
 	return job, string(body)
+}
+
+func waitForProcessStatus(t *testing.T, client *http.Client, baseURL, id, apiKey string, want restjobs.Status) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		job := getProcessJob(t, client, baseURL, id, apiKey)
+		if job.Status.Terminal() {
+			if job.Status != want {
+				t.Fatalf("job %s terminal status=%s, want %s", id, job.Status, want)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not reach terminal state %s", id, want)
 }
 
 func waitForProcessJob(t *testing.T, client *http.Client, baseURL, id, apiKey string) {

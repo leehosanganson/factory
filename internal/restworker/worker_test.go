@@ -283,6 +283,97 @@ func TestExecutorPanicFinishesFailedAndWorkerContinues(t *testing.T) {
 	checkNoSensitiveEvent(t, manager, panicked.ID)
 }
 
+func TestRequestCancelDoesNotFabricateCanceledAfterProviderAttempt(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "provider-side-effect")
+	started := make(chan struct{})
+	executor := requiredResultExecutorFunc(func(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+		if err := manager.AddEvent(job.ID, "provider_attempt", "Persisted provider write identity"); err != nil {
+			return nil, err
+		}
+		close(started)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+	coordinator, err := New(manager, executor, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if _, err := coordinator.RequestCancel(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		finished <- coordinator.Shutdown(ctx)
+	}()
+	if err := <-finished; err != nil {
+		t.Fatal(err)
+	}
+	got, err := manager.Get(job.ID)
+	if err != nil || got.Status != restjobs.StatusFailed || got.Provider != nil {
+		t.Fatalf("canceled provider side effect outcome=%+v err=%v, want failed without fabricated provider outcome", got, err)
+	}
+}
+
+type requiredResultExecutorFunc func(context.Context, restjobs.Snapshot) (*restjobs.ProviderOutcome, error)
+
+func (f requiredResultExecutorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error {
+	_, err := f(ctx, job)
+	return err
+}
+func (f requiredResultExecutorFunc) ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+	return f(ctx, job)
+}
+func (requiredResultExecutorFunc) RequiresProviderOutcome() bool { return true }
+
+func TestRequestCancelCancelsOnlySelectedRunningExecutor(t *testing.T) {
+	manager := newTestManager(t, 2, 2)
+	first := admit(t, manager, "first")
+	second := admit(t, manager, "second")
+	started := make(chan string, 2)
+	canceled := make(chan string, 2)
+	release := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, job restjobs.Snapshot) error {
+		started <- job.ID
+		<-ctx.Done()
+		canceled <- job.ID
+		<-release
+		return ctx.Err()
+	}), CoordinatorConfig{Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedIDs := map[string]bool{<-started: true, <-started: true}
+	if !startedIDs[first.ID] || !startedIDs[second.ID] {
+		t.Fatalf("started jobs=%v, want both jobs", startedIDs)
+	}
+	requested, err := coordinator.RequestCancel(first.ID)
+	if err != nil || requested.Status != restjobs.StatusRunning || !requested.CancellationRequested {
+		t.Fatalf("RequestCancel()=(%+v,%v), want running pending cancellation", requested, err)
+	}
+	select {
+	case id := <-canceled:
+		if id != first.ID {
+			t.Fatalf("canceled executor job=%q, want selected job %q", id, first.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("selected executor did not receive cancellation")
+	}
+	if got, _ := manager.Get(second.ID); got.Status != restjobs.StatusRunning || got.CancellationRequested {
+		t.Fatalf("unselected job changed after cancellation: %+v", got)
+	}
+	close(release)
+	waitForStatus(t, manager, first.ID, restjobs.StatusCanceled)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestShutdownCancelsQueuedAndActiveJobs(t *testing.T) {
 	manager := newTestManager(t, 3, 1)
 	active := admit(t, manager, "active")

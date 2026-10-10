@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/leehosanganson/factory/internal/factory"
@@ -62,6 +63,8 @@ type FactoryExecutor struct {
 	provider                     restprovider.Publisher
 	recordProviderAttempt        func(string, restjobs.ProviderAttempt) error
 	markProviderAttemptUncertain func(string) error
+	providerAttemptsMu           sync.Mutex
+	providerAttempts             map[string]bool
 }
 
 // NewFactoryExecutor validates the trusted configuration and builds the
@@ -117,7 +120,7 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, recordVerificationEvidence: config.RecordVerificationEvidence, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain,
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, recordVerificationEvidence: config.RecordVerificationEvidence, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain, providerAttempts: make(map[string]bool),
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -160,6 +163,15 @@ func newLocalJobManager(config restserver.Config, server bool) (restjobs.Store, 
 // checks with one job-wide deadline. All returned errors are intentionally
 // generic because lower layers can include paths, command output, or secrets.
 func (e *FactoryExecutor) RequiresProviderOutcome() bool { return e.provider != nil }
+
+func (e *FactoryExecutor) CancellationOutcome(jobID string) restjobs.Status {
+	e.providerAttemptsMu.Lock()
+	defer e.providerAttemptsMu.Unlock()
+	if e.providerAttempts[jobID] {
+		return restjobs.StatusFailed
+	}
+	return restjobs.StatusCanceled
+}
 
 func (e *FactoryExecutor) CompleteResult(ctx context.Context, job restjobs.Snapshot) error {
 	if ctx == nil || ctx.Err() != nil || e.provider == nil || job.Provider == nil {
@@ -307,6 +319,9 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 		branch := restprovider.JobBranch(job.ID)
 		repository := e.server.Provider.Repositories[job.Request.Repository]
 
+		e.providerAttemptsMu.Lock()
+		e.providerAttempts[job.ID] = true
+		e.providerAttemptsMu.Unlock()
 		if e.recordProviderAttempt != nil && e.recordProviderAttempt(job.ID, restjobs.ProviderAttempt{Provider: "github", Repository: repository, Branch: branch, Commit: commit}) != nil {
 			return nil, errExecutionFailed
 		}

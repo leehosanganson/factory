@@ -59,6 +59,17 @@ func (m *testWorkspaceManager) MarkSucceeded(id string) error {
 	return m.markErr
 }
 
+func TestFactoryExecutorCancellationOutcomePreservesUncertainProviderAttempt(t *testing.T) {
+	executor := &FactoryExecutor{providerAttempts: make(map[string]bool)}
+	if got := executor.CancellationOutcome("before-attempt"); got != restjobs.StatusCanceled {
+		t.Fatalf("cancellation before provider attempt = %q, want canceled", got)
+	}
+	executor.providerAttempts["uncertain-attempt"] = true
+	if got := executor.CancellationOutcome("uncertain-attempt"); got != restjobs.StatusFailed {
+		t.Fatalf("cancellation after provider attempt = %q, want failed for operator investigation", got)
+	}
+}
+
 func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t *testing.T) {
 	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, &executorTestAgent{})
 	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {

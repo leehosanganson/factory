@@ -124,6 +124,62 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		}
 	})
 
+	t.Run("cancel queued work without claiming it", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("cancel-queued", Request{Repository: "widget", Task: "task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		canceled, err := store.Cancel(job.ID)
+		if err != nil || canceled.Status != StatusCanceled {
+			t.Fatalf("Cancel() = (%+v, %v), want canceled queued job", canceled, err)
+		}
+		if _, err := store.ClaimNext(); !errors.Is(err, ErrNoQueuedJobs) {
+			t.Fatalf("ClaimNext() after queued cancellation = %v, want ErrNoQueuedJobs", err)
+		}
+		history, err := store.History(job.ID)
+		if err != nil || len(history.Events) != 2 || history.Events[1].Type != string(StatusCanceled) {
+			t.Fatalf("canceled queued history = (%+v, %v), want queued/canceled", history, err)
+		}
+		if _, err := store.Cancel(job.ID); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("repeated terminal Cancel() = %v, want ErrInvalidTransition", err)
+		}
+	})
+
+	t.Run("request running cancellation without terminalizing early", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("cancel-running", Request{Repository: "widget", Task: "task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+		requested, err := store.Cancel(job.ID)
+		if err != nil || requested.Status != StatusRunning || !requested.CancellationRequested {
+			t.Fatalf("Cancel() = (%+v, %v), want running with cancellation requested", requested, err)
+		}
+		repeated, err := store.Cancel(job.ID)
+		if err != nil || repeated.Status != StatusRunning || !repeated.CancellationRequested {
+			t.Fatalf("repeated Cancel() = (%+v, %v), want same pending request", repeated, err)
+		}
+		history, err := store.History(job.ID)
+		if err != nil || len(history.Events) != 3 || history.Events[2].Type != "cancel_requested" {
+			t.Fatalf("pending cancellation history = (%+v, %v), want one cancel_requested event", history, err)
+		}
+		if err := store.Finish(job.ID, StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+		finished, err := store.Get(job.ID)
+		if err != nil || finished.Status != StatusSucceeded || finished.CancellationRequested {
+			t.Fatalf("finished cancellation = (%+v, %v), want executor-selected terminal state", finished, err)
+		}
+		history, err = store.History(job.ID)
+		if err != nil || len(history.Events) != 4 || history.Events[3].Type != string(StatusSucceeded) {
+			t.Fatalf("finished cancellation history = (%+v, %v), want terminal event after request", history, err)
+		}
+	})
+
 	t.Run("close cancels queued work", func(t *testing.T) {
 		store := newStore(t)
 		job, _, err := store.Admit("queued-key", Request{Repository: "widget", Task: "task"})

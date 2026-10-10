@@ -157,13 +157,14 @@ func validateVerificationEvidence(evidence VerificationEvidence) error {
 // Snapshot is a copy of public job state. Verification contains only safe
 // check labels/outcomes and fixed limitation messages, never command output.
 type Snapshot struct {
-	ID           string                `json:"id"`
-	Request      Request               `json:"request"`
-	Status       Status                `json:"status"`
-	CreatedAt    time.Time             `json:"created_at"`
-	UpdatedAt    time.Time             `json:"updated_at"`
-	Provider     *ProviderOutcome      `json:"provider,omitempty"`
-	Verification *VerificationEvidence `json:"verification,omitempty"`
+	ID                    string                `json:"id"`
+	Request               Request               `json:"request"`
+	Status                Status                `json:"status"`
+	CancellationRequested bool                  `json:"cancellation_requested,omitempty"`
+	CreatedAt             time.Time             `json:"created_at"`
+	UpdatedAt             time.Time             `json:"updated_at"`
+	Provider              *ProviderOutcome      `json:"provider,omitempty"`
+	Verification          *VerificationEvidence `json:"verification,omitempty"`
 }
 
 // Event is one bounded history entry.
@@ -225,6 +226,7 @@ type Store interface {
 	RecordProviderOutcome(id string, outcome ProviderOutcome) error
 	RecordVerificationEvidence(id string, evidence VerificationEvidence) error
 	Finish(id string, terminalStatus Status) error
+	Cancel(id string) (Snapshot, error)
 	Recover(ctx context.Context) (RecoveryReport, error)
 	OperationalSummary(ctx context.Context) (OperationalSummary, error)
 }
@@ -644,6 +646,44 @@ func (m *LocalManager) ResolveInterrupted(id string, disposition InterruptedDisp
 	return ErrInvalidTransition
 }
 
+func (m *LocalManager) Cancel(id string) (Snapshot, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.jobs[id]
+	if entry == nil {
+		return Snapshot{}, ErrNotFound
+	}
+	switch entry.snapshot.Status {
+	case StatusQueued:
+		if !m.appendEventLocked(entry, string(StatusCanceled), "Job canceled before start") {
+			entry.truncated = true
+		}
+		entry.snapshot.Status = StatusCanceled
+		entry.snapshot.UpdatedAt = time.Now().UTC()
+		for index, queuedID := range m.queue {
+			if queuedID == id {
+				m.queue = append(m.queue[:index], m.queue[index+1:]...)
+				break
+			}
+		}
+		m.signalLocked()
+		return cloneSnapshot(entry.snapshot), nil
+	case StatusRunning:
+		if entry.snapshot.CancellationRequested {
+			return cloneSnapshot(entry.snapshot), nil
+		}
+		entry.snapshot.CancellationRequested = true
+		entry.snapshot.UpdatedAt = time.Now().UTC()
+		if !m.appendEventLocked(entry, "cancel_requested", "Cancellation requested") {
+			entry.truncated = true
+		}
+		m.signalLocked()
+		return cloneSnapshot(entry.snapshot), nil
+	default:
+		return Snapshot{}, ErrInvalidTransition
+	}
+}
+
 func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	if !terminalStatus.Terminal() {
 		return ErrInvalidTransition
@@ -661,6 +701,7 @@ func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 		entry.truncated = true
 	}
 	entry.snapshot.Status = terminalStatus
+	entry.snapshot.CancellationRequested = false
 	entry.snapshot.UpdatedAt = time.Now().UTC()
 	m.running--
 	m.signalLocked()
@@ -908,6 +949,9 @@ func sameRequest(a, b Request) bool {
 }
 
 func cloneSnapshot(snapshot Snapshot) Snapshot {
+	if snapshot.Status.Terminal() {
+		snapshot.CancellationRequested = false
+	}
 	if snapshot.Request.Issue != nil {
 		issue := *snapshot.Request.Issue
 		snapshot.Request.Issue = &issue

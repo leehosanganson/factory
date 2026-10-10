@@ -36,6 +36,7 @@ type Config struct {
 	ReadyError          func(context.Context) error
 	ReconcileProvider   func(context.Context, string) error
 	ResolveInterrupted  func(context.Context, string, restjobs.InterruptedDisposition) error
+	CancelJob           func(context.Context, string) (restjobs.Snapshot, error)
 }
 
 // Handler serves the REST API using the supplied manager and immutable API key.
@@ -159,6 +160,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.getHistory(w, parts[0])
+			return
+		}
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "cancel" {
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w, http.MethodPost)
+				return
+			}
+			h.cancelJob(w, r, parts[0])
 			return
 		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "reconcile" {
@@ -333,6 +342,33 @@ func (h *Handler) resolveInterrupted(w http.ResponseWriter, r *http.Request, id,
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
+func (h *Handler) cancelJob(w http.ResponseWriter, r *http.Request, id string) {
+	if !bodyless(r) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	var snapshot restjobs.Snapshot
+	var err error
+	if h.config.CancelJob != nil {
+		snapshot, err = h.config.CancelJob(r.Context(), id)
+	} else {
+		snapshot, err = h.manager.Cancel(id)
+	}
+	if err != nil {
+		if errors.Is(err, restjobs.ErrInvalidTransition) {
+			writeError(w, http.StatusConflict, "job_not_cancelable", "Job is not eligible for cancellation.")
+		} else {
+			h.writeManagerError(w, err)
+		}
+		return
+	}
+	status := http.StatusAccepted
+	if snapshot.Status == restjobs.StatusCanceled {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, snapshot)
+}
+
 func (h *Handler) reconcileProvider(w http.ResponseWriter, r *http.Request, id string) {
 	if !bodyless(r) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
@@ -398,7 +434,7 @@ func (h *Handler) getHistory(w http.ResponseWriter, id string) {
 
 func safeEventType(value string) bool {
 	switch value {
-	case "queued", "running", "succeeded", "failed", "canceled", "provider_reconciled", "operator_disposition":
+	case "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition":
 		return true
 	default:
 		return false
@@ -406,7 +442,7 @@ func safeEventType(value string) bool {
 }
 
 func safeEventMessage(eventType, message string) bool {
-	return message == "" || (eventType == "queued" && message == "Job admitted") || (eventType == "running" && message == "Job started") || (eventType == "provider_reconciled" && message == "Operator confirmed provider outcome") || (eventType == "operator_disposition" && (message == "failed" || message == "canceled")) || ((eventType == "succeeded" || eventType == "failed" || eventType == "canceled") && message == "Job finished")
+	return message == "" || (eventType == "queued" && message == "Job admitted") || (eventType == "running" && message == "Job started") || (eventType == "cancel_requested" && message == "Cancellation requested") || (eventType == "canceled" && message == "Job canceled before start") || (eventType == "provider_reconciled" && message == "Operator confirmed provider outcome") || (eventType == "operator_disposition" && (message == "failed" || message == "canceled")) || ((eventType == "succeeded" || eventType == "failed" || eventType == "canceled") && message == "Job finished")
 }
 
 func (h *Handler) writeManagerError(w http.ResponseWriter, err error) {
