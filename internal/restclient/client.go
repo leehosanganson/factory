@@ -85,6 +85,12 @@ func (c *Client) History(ctx context.Context, id string) (restjobs.History, erro
 	return result, err
 }
 
+func (c *Client) Operations(ctx context.Context) (restjobs.OperationalSummary, error) {
+	var result restjobs.OperationalSummary
+	err := c.request(ctx, http.MethodGet, "/v1/operations", nil, http.StatusOK, decodeJSON(&result), nil)
+	return result, err
+}
+
 func (c *Client) Cancel(ctx context.Context, id string) (restjobs.Snapshot, error) {
 	var result restjobs.Snapshot
 	err := c.request(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(id)+"/cancel", nil, []int{http.StatusOK, http.StatusAccepted}, decodeJSON(&result), nil)

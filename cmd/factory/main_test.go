@@ -26,7 +26,7 @@ func TestRESTClientCommandHelp(t *testing.T) {
 	if err := run([]string{"rest", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
 		t.Fatalf("rest help: %v", err)
 	}
-	for _, want := range []string{"factory rest", "submit", "get", "list", "watch", "cancel"} {
+	for _, want := range []string{"factory rest", "submit", "get", "list", "watch", "cancel", "operations"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("REST client help missing %q: %s", want, out.String())
 		}
