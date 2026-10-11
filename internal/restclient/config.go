@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -59,7 +60,7 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, errors.New("REST client config is invalid")
 	}
 	parsed, err := url.Parse(file.BaseURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || strings.TrimSpace(file.TokenFile) != file.TokenFile || file.TokenFile == "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Scheme == "http" && !isLoopbackHost(parsed.Hostname())) || strings.TrimSpace(file.TokenFile) != file.TokenFile || file.TokenFile == "" {
 		return Config{}, errors.New("REST client config is invalid")
 	}
 	tokenPath := file.TokenFile
@@ -75,6 +76,14 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, errors.New("REST client token file is invalid")
 	}
 	return Config{BaseURL: strings.TrimRight(file.BaseURL, "/"), Token: token}, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.IsLoopback()
 }
 
 func readPrivateFile(path string) ([]byte, error) {
