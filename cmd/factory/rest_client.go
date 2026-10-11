@@ -23,6 +23,8 @@ func restClientHelp() []helpCommand {
 		{"factory rest watch [--poll-interval <duration>] [--json] <job-id>", "Follow one job; poll status/history safely."},
 		{"factory rest cancel [--json] <job-id>", "Request cooperative cancellation of one remote job."},
 		{"factory rest operations [--json]", "Show an authenticated aggregate operations snapshot."},
+		{"factory rest disposition --confirm [--json] <failed|canceled> <job-id>", "Explicitly disposition an eligible interrupted SQLite job."},
+		{"factory rest reconcile [--json] <job-id>", "Confirm an eligible SQLite provider outcome using read-only reconciliation."},
 	}
 }
 
@@ -38,6 +40,7 @@ func runRESTClient(args []string, out io.Writer) error {
 	jsonOutput := flags.Bool("json", false, "emit stable JSON")
 	repository := flags.String("repository", "", "configured repository alias")
 	key := flags.String("idempotency-key", "", "stable idempotency key")
+	confirmDisposition := flags.Bool("confirm", false, "confirm the explicit failed or canceled disposition")
 	limit := flags.Int("limit", 0, "page size")
 	after := flags.Uint64("after", 0, "job-list continuation cursor")
 	snapshot := flags.Uint64("snapshot", 0, "job-list snapshot ceiling")
@@ -121,6 +124,24 @@ func runRESTClient(args []string, out io.Writer) error {
 			return err
 		}
 		return writeRESTResult(out, *jsonOutput, "operations", result, fmt.Sprintf("Operations snapshot: %d retained job(s), %d/%d records, queue %d/%d (saturated: %t), queued %d, running %d, succeeded %d, failed %d, canceled %d, recovery needed %d.", result.RetainedRecords, result.RetainedRecords, result.RecordLimit, result.Queued, result.QueueCapacity, result.QueueSaturated, result.Queued, result.Running, result.Succeeded, result.Failed, result.Canceled, result.RecoveryNeeded))
+	case "disposition":
+		if !*confirmDisposition || flags.NArg() != 2 || (flags.Arg(0) != string(restjobs.InterruptedDispositionFailed) && flags.Arg(0) != string(restjobs.InterruptedDispositionCanceled)) {
+			return errors.New("usage: factory rest disposition --confirm [--json] <failed|canceled> <job-id>")
+		}
+		result, err := client.Disposition(ctx, flags.Arg(1), restjobs.InterruptedDisposition(flags.Arg(0)))
+		if err != nil {
+			return err
+		}
+		return writeRESTResult(out, *jsonOutput, "job", result, fmt.Sprintf("Remote job %s explicitly dispositioned as %s.", result.ID, result.Status))
+	case "reconcile":
+		if flags.NArg() != 1 || *confirmDisposition {
+			return errors.New("usage: factory rest reconcile [--json] <job-id>")
+		}
+		result, err := client.Reconcile(ctx, flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		return writeRESTResult(out, *jsonOutput, "job", result, fmt.Sprintf("Remote job %s reconciled from read-only provider confirmation (%s).", result.ID, result.Status))
 	case "watch":
 		if flags.NArg() != 1 {
 			return errors.New("usage: factory rest watch [--poll-interval <duration>] [--json] <job-id>")
