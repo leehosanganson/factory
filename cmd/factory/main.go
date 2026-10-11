@@ -51,13 +51,15 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "doctor" && args[0] != "--gate" {
+		if len(args) > 1 && args[0] != "rest" && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "doctor" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
 		case "version":
 			fmt.Fprintln(out, version)
 			return nil
+		case "rest":
+			return runRESTClient(args[1:], out)
 		case "doctor":
 			if len(args) != 1 {
 				return fmt.Errorf("usage: factory doctor")
@@ -234,7 +236,7 @@ func commandHelpRequested(args []string) bool {
 		return len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") || len(args) == 3 && args[1] == "doctor" && (args[2] == "-h" || args[2] == "--help" || args[2] == "help")
 	}
 	switch args[0] {
-	case "implement", "tidy", "job", "run", "monitor", "work", "doctor":
+	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -255,6 +257,9 @@ func printCommandHelp(out io.Writer, args []string) {
 	var commands []helpCommand
 	var paragraphs []string
 	switch canonical {
+	case "rest":
+		title = "REST job client"
+		commands = restClientHelp()
 	case "doctor":
 		title = "Setup diagnostics"
 		commands = []helpCommand{{"factory doctor", "Check config and required executables without starting work."}}
@@ -800,6 +805,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory job <command>", "Manage detached jobs."},
 		{"factory run <command>", "Manage gated runs."},
 		{"factory server --config <absolute-path>", "Start the REST API server."},
+		{"factory rest <command>", "Submit and inspect jobs on a configured REST server."},
 		{"factory doctor", "Check local setup without starting work."},
 		{"factory version", "Print the build version."},
 		{"factory help, -h, --help", "Show this concise help."},
