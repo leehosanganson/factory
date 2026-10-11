@@ -22,6 +22,7 @@ func restClientHelp() []helpCommand {
 		{"factory rest history [--json] <job-id>", "Inspect bounded remote job history."},
 		{"factory rest watch [--poll-interval <duration>] [--json] <job-id>", "Follow one job; poll status/history safely."},
 		{"factory rest cancel [--json] <job-id>", "Request cooperative cancellation of one remote job."},
+		{"factory rest operations [--json]", "Show an authenticated aggregate operations snapshot."},
 	}
 }
 
@@ -111,6 +112,15 @@ func runRESTClient(args []string, out io.Writer) error {
 			return err
 		}
 		return writeRESTResult(out, *jsonOutput, "job", result, fmt.Sprintf("Cancellation requested for %s; cancellation is cooperative (%s).", result.ID, result.Status))
+	case "operations":
+		if flags.NArg() != 0 {
+			return errors.New("usage: factory rest operations [--json]")
+		}
+		result, err := client.Operations(ctx)
+		if err != nil {
+			return err
+		}
+		return writeRESTResult(out, *jsonOutput, "operations", result, fmt.Sprintf("Operations snapshot: %d retained job(s), %d/%d records, queue %d/%d (saturated: %t), queued %d, running %d, succeeded %d, failed %d, canceled %d, recovery needed %d.", result.RetainedRecords, result.RetainedRecords, result.RecordLimit, result.Queued, result.QueueCapacity, result.QueueSaturated, result.Queued, result.Running, result.Succeeded, result.Failed, result.Canceled, result.RecoveryNeeded))
 	case "watch":
 		if flags.NArg() != 1 {
 			return errors.New("usage: factory rest watch [--poll-interval <duration>] [--json] <job-id>")
