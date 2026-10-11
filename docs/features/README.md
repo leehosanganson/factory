@@ -10,7 +10,7 @@ This section describes implemented behavior, distinct from the remaining target 
 - [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, opt-in foreground GitHub issue polling, and version-pinned human-direction records; requests remain queued because no autonomous worker is implemented.
 - [REST job server](rest-server.md) — current authenticated job execution, persistence modes, provider PR writes, readiness, graceful runtime lifecycle, and local-only read-only configuration preflight.
 - [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, SQLite backup and portable recovery bundles, restart recovery classification, limits, and trusted-network operations.
-- [REST job client](rest-client.md) — separate protected client configuration and CLI commands for remote submit, inspect, watch, cooperative cancellation, and read-only aggregate operations snapshots.
+- [REST job client](rest-client.md) — separate protected client configuration and CLI commands for remote submit, inspect, watch, cooperative cancellation, read-only aggregate operations, and explicit SQLite interrupted-job recovery actions.
 - [Supervised systemd deployment](rest-server-systemd.md) — dedicated service account, private paths, installed binary unit, lifecycle, and single-host operations.
 - [Manual GitHub App live-provider test](github-app-live-test.md) — guarded opt-in live verification in a dedicated sandbox; not run by default CI.
 

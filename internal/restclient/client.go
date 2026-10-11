@@ -97,6 +97,21 @@ func (c *Client) Cancel(ctx context.Context, id string) (restjobs.Snapshot, erro
 	return result, err
 }
 
+// Disposition selects a non-success outcome for an eligible interrupted SQLite job.
+func (c *Client) Disposition(ctx context.Context, id string, disposition restjobs.InterruptedDisposition) (restjobs.Snapshot, error) {
+	var result restjobs.Snapshot
+	path := "/v1/jobs/" + url.PathEscape(id) + "/disposition/" + url.PathEscape(string(disposition))
+	err := c.request(ctx, http.MethodPost, path, nil, http.StatusOK, decodeJSON(&result), nil)
+	return result, err
+}
+
+// Reconcile requests read-only provider confirmation for an eligible SQLite job.
+func (c *Client) Reconcile(ctx context.Context, id string) (restjobs.Snapshot, error) {
+	var result restjobs.Snapshot
+	err := c.request(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(id)+"/reconcile", nil, http.StatusOK, decodeJSON(&result), nil)
+	return result, err
+}
+
 // Event is the deliberately small allowlisted payload carried by the versioned SSE route.
 type Event struct {
 	ID   uint64 `json:"id"`
