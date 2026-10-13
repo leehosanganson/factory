@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 func restClientHelp() []helpCommand {
 	return []helpCommand{
 		{"factory rest submit --repository <alias> [--idempotency-key <key>] [--json] <task>", "Submit work to the configured REST server."},
+		{"factory rest issue --repository <alias> [--idempotency-key <key>] [--json] <issue-number>", "Dispatch a GitHub issue to the configured REST server's job queue."},
 		{"factory rest get [--json] <job-id>", "Inspect a remote job."},
 		{"factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json]", "List retained remote jobs."},
 		{"factory rest history [--json] <job-id>", "Inspect bounded remote job history."},
@@ -78,6 +80,30 @@ func runRESTClient(args []string, out io.Writer) error {
 			}{1, safeSubmission(result)})
 		}
 		fmt.Fprintf(out, "Submitted remote job %s (%s).\n", result.Job.ID, result.Job.Status)
+		return nil
+	case "issue":
+		if *repository == "" || len(flags.Args()) != 1 {
+			return errors.New("usage: factory rest issue --repository <alias> [--idempotency-key <key>] [--json] <issue-number>")
+		}
+		issueNumber, err := strconv.Atoi(flags.Arg(0))
+		if err != nil || issueNumber <= 0 {
+			return errors.New("issue number must be a positive integer")
+		}
+		result, err := client.SubmitIssue(ctx, *repository, issueNumber, *key)
+		if err != nil {
+			return err
+		}
+		if *jsonOutput {
+			return json.NewEncoder(out).Encode(struct {
+				SchemaVersion int `json:"schema_version"`
+				Submission    struct {
+					Job      safeRESTJob `json:"job"`
+					Replayed bool        `json:"replayed"`
+					Links    any         `json:"links"`
+				} `json:"submission"`
+			}{1, safeSubmission(result)})
+		}
+		fmt.Fprintf(out, "Submitted remote job %s (%s) for issue %d.\n", result.Job.ID, result.Job.Status, issueNumber)
 		return nil
 	case "get":
 		if flags.NArg() != 1 {
