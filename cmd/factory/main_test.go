@@ -33,6 +33,24 @@ func TestRESTClientCommandHelp(t *testing.T) {
 	}
 }
 
+func TestIssue238PrepopulatedCallerStateDoesNotLeak(t *testing.T) {
+	caller := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(caller, "factory", "detached-jobs"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(caller, "factory", "detached-jobs", "unrelated-legacy.json"), []byte(`{"id":"unrelated-legacy","type":"implementation","status":"complete"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", caller)
+	var out, errOut bytes.Buffer
+	if err := run([]string{"job", "list"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatalf("job list with pre-populated caller state: %v\n%s", err, errOut.String())
+	}
+	if strings.Contains(out.String(), "unrelated-legacy") {
+		t.Fatalf("caller state leaked into in-process job list: %s", out.String())
+	}
+}
+
 func TestJobJSONProcessOutput(t *testing.T) {
 	binary := filepath.Join(t.TempDir(), "factory")
 	build := exec.Command("go", "build", "-o", binary, ".")
@@ -46,7 +64,6 @@ func TestJobJSONProcessOutput(t *testing.T) {
 	if err := os.MkdirAll(target, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("XDG_STATE_HOME", state)
 	store, err := factory.NewJobStore(filepath.Join(state, "factory", "detached-jobs"))
 	if err != nil {
 		t.Fatal(err)
@@ -69,10 +86,11 @@ func TestJobJSONProcessOutput(t *testing.T) {
 		}
 	}
 
-	run := func(args ...string) (string, string, error) {
+	r := func(args ...string) (string, string, error) {
 		t.Helper()
 		command := exec.Command(binary, args...)
 		command.Dir = target
+		command.Env = append(os.Environ(), "XDG_STATE_HOME="+state)
 		var stdout, stderr bytes.Buffer
 		command.Stdout, command.Stderr = &stdout, &stderr
 		err := command.Run()
@@ -90,7 +108,7 @@ func TestJobJSONProcessOutput(t *testing.T) {
 		}
 	}
 
-	stdout, stderr, err := run("job", "list", "--json", "--scan-limit", "2", "--status", "complete", "--type", "implementation", "--limit", "1")
+	stdout, stderr, err := r("job", "list", "--json", "--scan-limit", "2", "--status", "complete", "--type", "implementation", "--limit", "1")
 	if err != nil || stderr != "" {
 		t.Fatalf("JSON filtered list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
@@ -115,7 +133,7 @@ func TestJobJSONProcessOutput(t *testing.T) {
 			t.Errorf("JSON list leaked %q: %s", forbidden, stdout)
 		}
 	}
-	stdout, stderr, err = run("job", "list", "--json", "--scan-limit", "1")
+	stdout, stderr, err = r("job", "list", "--json", "--scan-limit", "1")
 	if err != nil || stderr != "" {
 		t.Fatalf("bounded JSON list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
@@ -125,7 +143,7 @@ func TestJobJSONProcessOutput(t *testing.T) {
 	}
 
 	for _, args := range [][]string{{"job", "get", "json-implementation", "--json"}, {"job", "get", "json-implementation", "--json", "--details"}} {
-		stdout, stderr, err = run(args...)
+		stdout, stderr, err = r(args...)
 		if err != nil || stderr != "" {
 			t.Fatalf("JSON get %v: err=%v stderr=%q stdout=%q", args, err, stderr, stdout)
 		}
@@ -165,7 +183,7 @@ func TestJobJSONProcessOutput(t *testing.T) {
 		}
 	}
 
-	stdout, stderr, err = run("job", "list", "--json", "--status", "cancelled")
+	stdout, stderr, err = r("job", "list", "--json", "--status", "cancelled")
 	if err != nil || stderr != "" {
 		t.Fatalf("empty JSON list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
@@ -173,7 +191,7 @@ func TestJobJSONProcessOutput(t *testing.T) {
 	if listing.Jobs == nil || len(listing.Jobs) != 0 {
 		t.Fatalf("empty list jobs = %#v, want an empty array", listing.Jobs)
 	}
-	stdout, stderr, err = run("job", "list", "--json", "--details", "--status", "complete", "--type", "implementation")
+	stdout, stderr, err = r("job", "list", "--json", "--details", "--status", "complete", "--type", "implementation")
 	if err != nil || stderr != "" {
 		t.Fatalf("detailed JSON list: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
@@ -191,28 +209,28 @@ func TestJobJSONProcessOutput(t *testing.T) {
 	}
 
 	for _, args := range [][]string{{"job", "get", "missing-json-id", "--json"}, {"job", "get", "../unsafe", "--json"}} {
-		stdout, stderr, err = run(args...)
+		stdout, stderr, err = r(args...)
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout != "" || stderr == "" {
 			t.Errorf("failed JSON get %v: err=%v stdout=%q stderr=%q; want exit 1, empty stdout, stderr diagnostic", args, err, stdout, stderr)
 		}
 	}
 
-	stdout, stderr, err = run("job", "list")
+	stdout, stderr, err = r("job", "list")
 	if err != nil || stderr != "" || strings.Contains(stdout, "schema_version") || !strings.Contains(stdout, "json-implementation") {
 		t.Fatalf("default text list changed: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
-	stdout, stderr, err = run("job", "get", "json-implementation")
+	stdout, stderr, err = r("job", "get", "json-implementation")
 	lines := strings.Split(strings.TrimSuffix(stdout, "\n"), "\n")
 	if err != nil || stderr != "" || len(lines) != 2 || !strings.Contains(lines[0], "PUBLICATION") || !strings.Contains(lines[1], "published") || strings.Contains(stdout, "schema_version") {
 		t.Fatalf("default text get changed: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
-	stdout, stderr, err = run("job", "get", "json-implementation", "--details")
+	stdout, stderr, err = r("job", "get", "json-implementation", "--details")
 	if err != nil || stderr != "" || !strings.Contains(stdout, "Description: task contains PRIVATE_SECRET") || strings.Contains(stdout, "schema_version") {
 		t.Fatalf("default detailed text get changed: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
 	for _, args := range [][]string{{"job", "list", "--details"}, {"job", "list", "--json", "--limit", "0"}} {
-		stdout, stderr, err = run(args...)
+		stdout, stderr, err = r(args...)
 		if err == nil || stdout != "" || stderr == "" {
 			t.Errorf("invalid JSON command %v: err=%v stdout=%q stderr=%q; want nonzero, empty stdout, stderr diagnostic", args, err, stdout, stderr)
 		}
@@ -225,7 +243,7 @@ func TestJobJSONProcessOutput(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(corruptDir, "job.json"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stdout, stderr, err = run("job", "list", "--json")
+	stdout, stderr, err = r("job", "list", "--json")
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 || stdout != "" || stderr == "" {
 		t.Errorf("failed JSON list: err=%v stdout=%q stderr=%q; want exit 1, empty stdout, stderr diagnostic", err, stdout, stderr)
