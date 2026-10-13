@@ -55,6 +55,28 @@ func (c *Client) Submit(ctx context.Context, repository, task, idempotencyKey st
 	return result, err
 }
 
+// SubmitIssue dispatches a GitHub issue to the server's durable job queue. The
+// issue number is forwarded as the request's issue field; no task text is sent.
+func (c *Client) SubmitIssue(ctx context.Context, repository string, issue int, idempotencyKey string) (Submission, error) {
+	if issue <= 0 {
+		return Submission{}, errors.New("issue number must be positive")
+	}
+	if idempotencyKey == "" {
+		var random [16]byte
+		if _, err := rand.Read(random[:]); err != nil {
+			return Submission{}, errors.New("could not create an idempotency key")
+		}
+		idempotencyKey = hex.EncodeToString(random[:])
+	}
+	number := issue
+	body, _ := json.Marshal(restjobs.Request{Repository: repository, Issue: &number})
+	var result Submission
+	err := c.request(ctx, http.MethodPost, "/v1/jobs", body, http.StatusAccepted, func(response *http.Response) error {
+		return json.NewDecoder(response.Body).Decode(&result)
+	}, map[string]string{"Content-Type": "application/json", "Idempotency-Key": idempotencyKey})
+	return result, err
+}
+
 func (c *Client) Get(ctx context.Context, id string) (restjobs.Snapshot, error) {
 	var result restjobs.Snapshot
 	err := c.request(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(id), nil, http.StatusOK, decodeJSON(&result), nil)
