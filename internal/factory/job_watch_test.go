@@ -110,6 +110,38 @@ func TestJobWatchRefreshesStatusAndActivityWithoutPrintingLogs(t *testing.T) {
 	}
 }
 
+func TestJobWatchShowsUpdateFreshnessWithoutEstimates(t *testing.T) {
+	store := newWatchTestStore(t)
+	createWatchJob(t, store, "freshness", "running")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out safeWatchBuffer
+	done := make(chan error, 1)
+	go func() { done <- watchJobs(ctx, store, []string{"freshness"}, &out, false, time.Hour) }()
+	waitFor(t, time.Second, func() bool { return strings.Contains(out.String(), "Job freshness") })
+	text := out.String()
+	if !strings.Contains(text, "Updated: ") {
+		t.Fatalf("watch snapshot did not show record update age: %q", text)
+	}
+	if !strings.Contains(text, "Completion estimate: none available; Factory does not predict completion time.") {
+		t.Fatalf("watch snapshot did not state that no completion estimate is available: %q", text)
+	}
+	for _, forbidden := range []string{"ETA", "eta:", "% complete", "percent"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("watch invented a progress estimate or percentage: %q", text)
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watch did not exit after context cancellation")
+	}
+}
+
 func TestJobWatchCancellationDoesNotStopWorker(t *testing.T) {
 	store := newWatchTestStore(t)
 	createWatchJob(t, store, "still-running", "running")

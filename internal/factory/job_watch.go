@@ -15,6 +15,7 @@ type watchedJob struct {
 	ID                string
 	Status            string
 	Activity          string
+	UpdatedAt         time.Time
 	NextAction        string
 	Phase             string
 	LatestCheckAt     time.Time
@@ -38,7 +39,7 @@ func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer
 			if err != nil {
 				return fmt.Errorf("watch job %s: %w", id, err)
 			}
-			watched := watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity, NextAction: jobWatchNextAction(job)}
+			watched := watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity, UpdatedAt: job.UpdatedAt, NextAction: jobWatchNextAction(job)}
 			if job.Monitor != nil {
 				watched.Phase = monitorDisplayPhase(job.Monitor)
 				watched.LatestCheckAt = job.Monitor.LatestCheckAt
@@ -123,6 +124,23 @@ func writeMonitorRecentEvents(out io.Writer, events []monitorTraceEvent, indent 
 	return nil
 }
 
+func describeUpdateAge(now, updated time.Time) string {
+	if updated.IsZero() {
+		return "unknown (no recorded update)"
+	}
+	age := now.Sub(updated)
+	switch {
+	case age < 0:
+		return "just now"
+	case age < time.Minute:
+		return fmt.Sprintf("%d seconds ago", int(age.Seconds()))
+	case age < time.Hour:
+		return fmt.Sprintf("%.1f minutes ago", age.Minutes())
+	default:
+		return fmt.Sprintf("%.1f hours ago", age.Hours())
+	}
+}
+
 func uniqueJobIDs(ids []string) []string {
 	seen := make(map[string]struct{}, len(ids))
 	unique := make([]string, 0, len(ids))
@@ -137,6 +155,12 @@ func uniqueJobIDs(ids []string) []string {
 }
 
 func writeJobWatchSnapshot(out io.Writer, jobs []watchedJob, terminal bool) error {
+	return writeJobWatchSnapshotAt(out, jobs, time.Now(), terminal)
+}
+
+// writeJobWatchSnapshotAt renders the snapshot against a fixed clock so update
+// ages stay deterministic in tests.
+func writeJobWatchSnapshotAt(out io.Writer, jobs []watchedJob, now time.Time, terminal bool) error {
 	if terminal {
 		if _, err := io.WriteString(out, "\033[H\033[2J"); err != nil {
 			return err
@@ -146,7 +170,10 @@ func writeJobWatchSnapshot(out io.Writer, jobs []watchedJob, terminal bool) erro
 		return err
 	}
 	for _, job := range jobs {
-		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n  Latest activity: %s\n  Next action: %s\n", job.ID, job.Status, strings.TrimSpace(job.Activity), job.NextAction); err != nil {
+		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n  Latest activity: %s\n  Updated: %s\n  Next action: %s\n", job.ID, job.Status, strings.TrimSpace(job.Activity), describeUpdateAge(now, job.UpdatedAt), job.NextAction); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(out, "  Completion estimate: none available; Factory does not predict completion time.\n"); err != nil {
 			return err
 		}
 		if job.Phase != "" {
