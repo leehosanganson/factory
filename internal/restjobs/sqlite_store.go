@@ -332,6 +332,37 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Snapshot{}, false, errors.New("read SQLite idempotency record")
 	}
+	if normalized.IssueProvenance != nil {
+		provenance := normalized.IssueProvenance
+		err = tx.QueryRowContext(ctx, `SELECT j.id,j.request_json FROM factory_job_issue_provenance p JOIN factory_jobs j ON j.id=p.job_id WHERE p.tracker=? AND p.source_repository=? AND p.issue_number=? AND p.version=?`, provenance.Tracker, provenance.SourceRepository, provenance.IssueNumber, provenance.Version).Scan(&id, &raw)
+		if err == nil {
+			var existing Request
+			if json.Unmarshal([]byte(raw), &existing) != nil {
+				return Snapshot{}, false, errors.New("SQLite job record is invalid")
+			}
+			if !sameRequest(existing, normalized) {
+				return Snapshot{}, false, ErrProvenanceConflict
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(key,job_id,request_json) VALUES(?,?,?)`, key, id, raw); err != nil {
+				var sqliteErr *sqlite.Error
+				if errors.As(err, &sqliteErr) && sqliteErr.Code() == 19 {
+					return Snapshot{}, false, ErrIdempotencyConflict
+				}
+				return Snapshot{}, false, errors.New("persist SQLite idempotency key")
+			}
+			snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+			if err != nil {
+				return Snapshot{}, false, errors.New("read SQLite job record")
+			}
+			if err := tx.Commit(); err != nil {
+				return Snapshot{}, false, errors.New("finish SQLite provenance lookup")
+			}
+			return snapshot, true, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return Snapshot{}, false, errors.New("read SQLite issue provenance")
+		}
+	}
 	var retained int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs`).Scan(&retained); err != nil {
 		return Snapshot{}, false, errors.New("check SQLite retained-record capacity")
@@ -364,6 +395,16 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(key,job_id,request_json) VALUES(?,?,?)`, key, id, string(requestJSON)); err != nil {
 		return Snapshot{}, false, errors.New("persist SQLite idempotency key")
+	}
+	if normalized.IssueProvenance != nil {
+		provenance := normalized.IssueProvenance
+		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_issue_provenance(tracker,source_repository,issue_number,version,job_id) VALUES(?,?,?,?,?)`, provenance.Tracker, provenance.SourceRepository, provenance.IssueNumber, provenance.Version, id); err != nil {
+			var sqliteErr *sqlite.Error
+			if errors.As(err, &sqliteErr) && sqliteErr.Code() == 19 {
+				return Snapshot{}, false, ErrProvenanceConflict
+			}
+			return Snapshot{}, false, errors.New("persist SQLite issue provenance")
+		}
 	}
 	if err := insertEvent(ctx, tx, id, "queued", "Job admitted", now, s.config.MaxEventsPerJob); err != nil {
 		return Snapshot{}, false, errors.New("persist SQLite admission history")

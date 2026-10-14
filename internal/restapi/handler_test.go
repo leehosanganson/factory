@@ -1048,6 +1048,68 @@ func TestAdmissionReplayConflictAndQueueFull(t *testing.T) {
 	assertError(t, full, http.StatusServiceUnavailable, "queue_full")
 }
 
+func TestIssueProvenanceAdmissionReplayAndSanitizedConflict(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 4, 8))
+	handler := newTestHandler(t, manager, nil)
+	handler.config.MaxRequestBodyBytes = 2048
+	body := `{"repository":"widget","task":"visible issue task","issue":42,"issue_provenance":{"tracker":"github","source_repository":"acme/widget","issue_number":42,"version":"` + strings.Repeat("a", 64) + `","url":"https://github.com/acme/widget/issues/42","title":"Sanitized title"}}`
+	first := postJob(handler, body, "issue-key-one")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("first = %d %s", first.Code, first.Body.String())
+	}
+	var accepted struct {
+		Job      restjobs.Snapshot `json:"job"`
+		Replayed bool              `json:"replayed"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &accepted); err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Job.Request.Task != "visible issue task" || accepted.Job.Request.IssueProvenance == nil {
+		t.Fatalf("accepted request=%+v", accepted.Job.Request)
+	}
+	detail := request(handler, http.MethodGet, "/v1/jobs/"+accepted.Job.ID, "", true)
+	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"task":"visible issue task"`) || !strings.Contains(detail.Body.String(), `"issue_provenance"`) {
+		t.Fatalf("authenticated job detail did not preserve visible task/provenance: %d %s", detail.Code, detail.Body.String())
+	}
+	second := postJob(handler, body, "issue-key-two")
+	var replay struct {
+		Job      restjobs.Snapshot `json:"job"`
+		Replayed bool              `json:"replayed"`
+	}
+	if second.Code != http.StatusAccepted || json.Unmarshal(second.Body.Bytes(), &replay) != nil || !replay.Replayed || replay.Job.ID != accepted.Job.ID {
+		t.Fatalf("different-key provenance replay=%d %s", second.Code, second.Body.String())
+	}
+	changed := strings.Replace(body, "visible issue task", "DIFFERENT_PRIVATE_TASK", 1)
+	conflict := postJob(handler, changed, "issue-key-three")
+	assertError(t, conflict, http.StatusConflict, "issue_provenance_conflict")
+	if strings.Contains(conflict.Body.String(), "DIFFERENT_PRIVATE_TASK") || strings.Contains(conflict.Body.String(), "Sanitized title") {
+		t.Fatalf("provenance conflict leaked request metadata: %s", conflict.Body.String())
+	}
+	omitted := postJob(handler, `{"repository":"widget","task":"visible issue task","issue":42}`, "issue-key-one")
+	assertError(t, omitted, http.StatusConflict, "idempotency_conflict")
+}
+
+func TestMalformedIssueProvenanceIsRejected(t *testing.T) {
+	handler := newTestHandler(t, newTestManager(t, managerConfig(4, 4, 8)), nil)
+	handler.config.MaxRequestBodyBytes = 2048
+	valid := `"issue_provenance":{"tracker":"github","source_repository":"acme/widget","issue_number":42,"version":"` + strings.Repeat("a", 64) + `","url":"https://github.com/acme/widget/issues/42","title":"Safe"}`
+	for _, tc := range []struct{ name, provenance string }{
+		{"unknown nested field", strings.TrimSuffix(valid, `}`) + `,"body":"duplicate body"}`},
+
+		{"wrong tracker", strings.Replace(valid, `"github"`, `"gitlab"`, 1)},
+		{"uppercase version", strings.Replace(valid, strings.Repeat("a", 64), strings.Repeat("A", 64), 1)},
+		{"mismatched issue", strings.Replace(valid, `"issue_number":42`, `"issue_number":43`, 1)},
+		{"invalid url", strings.Replace(valid, `https://github.com/acme/widget/issues/42`, `https://evil.example/issues/42`, 1)},
+		{"non-object", `"issue_provenance":null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"repository":"widget","task":"task",` + tc.provenance + `}`
+			response := postJob(handler, body, "bad-"+strings.ReplaceAll(tc.name, " ", "-"))
+			assertError(t, response, http.StatusBadRequest, "invalid_request")
+		})
+	}
+}
+
 func TestAdmissionRegistryFull(t *testing.T) {
 	manager := newTestManager(t, managerConfig(1, 1, 4))
 	first, _, err := manager.Admit("key-1", restjobs.Request{Repository: "widget", Task: "active"})

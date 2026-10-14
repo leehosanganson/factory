@@ -588,6 +588,176 @@ func TestSQLiteStoreConcurrentConnectionsShareIdempotency(t *testing.T) {
 	}
 }
 
+func TestSQLiteStoreRejectsMalformedIssueProvenanceBeforeAdmission(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	request := provenanceRequest("visible task")
+	request.IssueProvenance.URL = "https://github.com/acme/widget/issues/43"
+	if _, replay, err := store.Admit("malformed-provenance", request); !errors.Is(err, ErrInvalidInput) || replay {
+		t.Fatalf("malformed provenance admission=(replayed %t, %v), want ErrInvalidInput", replay, err)
+	}
+
+	var jobs, idempotencyKeys, provenanceMappings int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM factory_jobs`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM factory_job_idempotency`).Scan(&idempotencyKeys); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM factory_job_issue_provenance`).Scan(&provenanceMappings); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 0 || idempotencyKeys != 0 || provenanceMappings != 0 {
+		t.Fatalf("malformed admission persisted jobs=%d idempotency keys=%d provenance mappings=%d; want none", jobs, idempotencyKeys, provenanceMappings)
+	}
+}
+
+func TestSQLiteIssueProvenanceSurvivesReopenAndAttachesKeys(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := provenanceRequest("visible task")
+	first, _, err := store.Admit("durable-provenance-one", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	second, replay, err := reopened.Admit("durable-provenance-two", request)
+	if err != nil || !replay || second.ID != first.ID {
+		t.Fatalf("reopened different-key provenance=(%+v,%t,%v), want original job", second, replay, err)
+	}
+	attachedKeyReplay, replay, err := reopened.Admit("durable-provenance-two", request)
+	if err != nil || !replay || attachedKeyReplay.ID != first.ID {
+		t.Fatalf("replay of newly attached key=(%+v,%t,%v), want original job", attachedKeyReplay, replay, err)
+	}
+	sameKeyReplay, replay, err := reopened.Admit("durable-provenance-one", request)
+	if err != nil || !replay || sameKeyReplay.ID != first.ID {
+		t.Fatalf("reopened same-key provenance=(%+v,%t,%v), want original job", sameKeyReplay, replay, err)
+	}
+	if got, err := reopened.Get(first.ID); err != nil || got.Request.Task != "visible task" || got.Request.IssueProvenance == nil || got.Request.IssueProvenance.Title != "bounded title" {
+		t.Fatalf("reopened provenance/task=(%+v,%v)", got, err)
+	}
+	changed := request
+	changed.Task = "different visible task"
+	if _, _, err := reopened.Admit("durable-provenance-conflict", changed); !errors.Is(err, ErrProvenanceConflict) {
+		t.Fatalf("reopened changed payload error=%v, want provenance conflict", err)
+	}
+}
+
+func TestSQLiteStoreConcurrentConnectionsShareIssueProvenance(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	stores := make([]*SQLiteStore, 2)
+	for i := range stores {
+		store, err := OpenSQLiteStore(path, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = store
+		defer store.CloseStore()
+	}
+	const callers = 16
+	start := make(chan struct{})
+	type outcome struct {
+		job    Snapshot
+		replay bool
+		err    error
+	}
+	results := make(chan outcome, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			job, replay, err := stores[index%len(stores)].Admit(fmt.Sprintf("provenance-concurrent-%d", index), provenanceRequest("same task"))
+			results <- outcome{job: job, replay: replay, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var firstID string
+	newAdmissions := 0
+	for result := range results {
+		if result.err != nil {
+			t.Errorf("concurrent provenance admission: %v", result.err)
+			continue
+		}
+		if firstID == "" {
+			firstID = result.job.ID
+		}
+		if result.job.ID != firstID {
+			t.Errorf("provenance admissions returned IDs %q and %q", firstID, result.job.ID)
+		}
+		if !result.replay {
+			newAdmissions++
+		}
+	}
+	if firstID == "" || newAdmissions != 1 {
+		t.Fatalf("first ID=%q new admissions=%d, want one durable job", firstID, newAdmissions)
+	}
+	changed := provenanceRequest("different task")
+	if _, _, err := stores[0].Admit("provenance-conflict-independent-key", changed); !errors.Is(err, ErrProvenanceConflict) {
+		t.Fatalf("cross-connection changed-payload error=%v, want provenance conflict", err)
+	}
+}
+
+func TestSQLiteStoreConcurrentConflictingProvenanceAdmitsOnlyOnePayload(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	stores := make([]*SQLiteStore, 2)
+	for i := range stores {
+		store, err := OpenSQLiteStore(path, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = store
+		defer store.CloseStore()
+	}
+	start := make(chan struct{})
+	type result struct {
+		job Snapshot
+		err error
+	}
+	results := make(chan result, 2)
+	for i, task := range []string{"first task", "different task"} {
+		go func(index int, task string) {
+			<-start
+			job, _, err := stores[index].Admit(fmt.Sprintf("conflicting-provenance-%d", index), provenanceRequest(task))
+			results <- result{job: job, err: err}
+		}(i, task)
+	}
+	close(start)
+	first := <-results
+	second := <-results
+	admitted := 0
+	conflicts := 0
+	for _, result := range []result{first, second} {
+		if result.err == nil {
+			admitted++
+		} else if errors.Is(result.err, ErrProvenanceConflict) {
+			conflicts++
+		} else {
+			t.Errorf("unexpected concurrent error: %v", result.err)
+		}
+	}
+	if admitted != 1 || conflicts != 1 {
+		t.Fatalf("concurrent conflicting requests: admitted=%d conflicts=%d results=(%+v,%+v)", admitted, conflicts, first, second)
+	}
+}
+
 func TestSQLiteStoreRejectsInvalidPathAndUnavailableDatabase(t *testing.T) {
 	if _, err := OpenSQLiteStore("", testConfig()); err == nil {
 		t.Fatal("empty path accepted")

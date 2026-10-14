@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ import (
 var (
 	ErrInvalidInput        = errors.New("invalid job input")
 	ErrIdempotencyConflict = errors.New("idempotency key conflicts with an existing request")
+	ErrProvenanceConflict  = errors.New("issue provenance conflicts with an existing request")
 	ErrQueueFull           = errors.New("job queue is full")
 	ErrRegistryFull        = errors.New("job registry is full")
 	ErrNotFound            = errors.New("job not found")
@@ -51,6 +53,7 @@ const (
 	maxKeyBytes                = 256
 	maxAliasBytes              = 256
 	maxTaskBytes               = 256 << 10
+	maxIssueTitleBytes         = 4 << 10
 	maxEventBytes              = 4_096
 	maxVerificationChecks      = 16
 	maxVerificationLimitations = 4
@@ -80,10 +83,27 @@ func (s Status) Terminal() bool {
 // Request is the only job payload accepted by the manager. It deliberately
 // contains no command, executable, or execution-mode field.
 type Request struct {
-	Repository string `json:"repository"`
-	Task       string `json:"task"`
-	Issue      *int   `json:"issue,omitempty"`
+	Repository      string           `json:"repository"`
+	Task            string           `json:"task"`
+	Issue           *int             `json:"issue,omitempty"`
+	IssueProvenance *IssueProvenance `json:"issue_provenance,omitempty"`
 }
+
+// IssueProvenance identifies one explicitly dispatched GitHub issue snapshot.
+// It contains bounded identity metadata only; the task remains the request body.
+type IssueProvenance struct {
+	Tracker          string `json:"tracker"`
+	SourceRepository string `json:"source_repository"`
+	IssueNumber      int    `json:"issue_number"`
+	Version          string `json:"version"`
+	URL              string `json:"url"`
+	Title            string `json:"title"`
+}
+
+var (
+	githubIssueOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+	githubIssueRepoPattern  = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+)
 
 // Config contains operator-selected process-local capacity and payload bounds.
 // Zero MaxRecords, MaxEventsPerJob, MaxTaskBytes, and RegistryBytes use bounded defaults.
@@ -298,6 +318,13 @@ func RecoveryDispositionFor(status Status) RecoveryDisposition {
 	}
 }
 
+type issueProvenanceKey struct {
+	tracker          string
+	sourceRepository string
+	issueNumber      int
+	version          string
+}
+
 type job struct {
 	snapshot       Snapshot
 	sequence       uint64
@@ -313,6 +340,7 @@ type LocalManager struct {
 	config        Config
 	jobs          map[string]*job
 	idempotency   map[string]string
+	provenance    map[issueProvenanceKey]string
 	queue         []string
 	running       int
 	nextSequence  uint64
@@ -351,6 +379,7 @@ func NewManager(config Config) (*LocalManager, error) {
 		config:      config,
 		jobs:        make(map[string]*job),
 		idempotency: make(map[string]string),
+		provenance:  make(map[issueProvenanceKey]string),
 		notify:      make(chan struct{}),
 	}, nil
 }
@@ -379,6 +408,26 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 			return cloneSnapshot(existing.snapshot), true, nil
 		}
 	}
+	if normalized.IssueProvenance != nil {
+		provenanceKey := keyForIssueProvenance(*normalized.IssueProvenance)
+		if id, ok := m.provenance[provenanceKey]; ok {
+			existing := m.jobs[id]
+			if existing == nil {
+				delete(m.provenance, provenanceKey)
+			} else if !sameRequest(existing.snapshot.Request, normalized) {
+				return Snapshot{}, false, ErrProvenanceConflict
+			} else {
+				keyBytes := uint64(recordOverheadBytes + len(key))
+				if !m.makeByteRoomLocked(keyBytes, existing) {
+					return Snapshot{}, false, ErrRegistryFull
+				}
+				existing.accountedBytes += keyBytes
+				m.registryBytes += keyBytes
+				m.idempotency[key] = id
+				return cloneSnapshot(existing.snapshot), true, nil
+			}
+		}
+	}
 	if len(m.queue) >= m.config.QueueCapacity {
 		return Snapshot{}, false, ErrQueueFull
 	}
@@ -405,6 +454,9 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 		return Snapshot{}, false, ErrRegistryFull
 	}
 	m.idempotency[key] = id
+	if normalized.IssueProvenance != nil {
+		m.provenance[keyForIssueProvenance(*normalized.IssueProvenance)] = id
+	}
 	m.queue = append(m.queue, id)
 	m.signalLocked()
 	return cloneSnapshot(created), false, nil
@@ -921,6 +973,9 @@ func (m *LocalManager) oldestTerminalLocked(excluded *job) *job {
 func (m *LocalManager) removeJobLocked(entry *job) {
 	m.registryBytes -= entry.accountedBytes
 	delete(m.jobs, entry.snapshot.ID)
+	if entry.snapshot.Request.IssueProvenance != nil {
+		delete(m.provenance, keyForIssueProvenance(*entry.snapshot.Request.IssueProvenance))
+	}
 	for key, id := range m.idempotency {
 		if id == entry.snapshot.ID {
 			delete(m.idempotency, key)
@@ -985,7 +1040,12 @@ func (m *LocalManager) removeOldestEventLocked(entry *job) {
 }
 
 func recordBytes(request Request, key string) uint64 {
-	return uint64(recordOverheadBytes) + uint64(len(request.Task)) + uint64(len(request.Repository)) + uint64(len(key))
+	size := uint64(recordOverheadBytes) + uint64(len(request.Task)) + uint64(len(request.Repository)) + uint64(len(key))
+	if request.IssueProvenance != nil {
+		provenance := request.IssueProvenance
+		size += uint64(len(provenance.Tracker) + len(provenance.SourceRepository) + len(provenance.Version) + len(provenance.URL) + len(provenance.Title) + 32)
+	}
+	return size
 }
 
 func eventBytes(event Event) uint64 {
@@ -1008,6 +1068,9 @@ func (m *LocalManager) evictOldestTerminalExceptLocked(protected *job) bool {
 	}
 	m.registryBytes -= oldest.accountedBytes
 	delete(m.jobs, oldestID)
+	if oldest.snapshot.Request.IssueProvenance != nil {
+		delete(m.provenance, keyForIssueProvenance(*oldest.snapshot.Request.IssueProvenance))
+	}
 	for key, id := range m.idempotency {
 		if id == oldestID {
 			delete(m.idempotency, key)
@@ -1019,10 +1082,12 @@ func (m *LocalManager) evictOldestTerminalExceptLocked(protected *job) bool {
 func normalizeAdmission(key string, request Request, maxTaskBytes int) (string, Request, error) {
 	key = strings.TrimSpace(key)
 	request.Repository = strings.TrimSpace(request.Repository)
-	request.Task = strings.TrimSpace(request.Task)
+	if request.IssueProvenance == nil {
+		request.Task = strings.TrimSpace(request.Task)
+	}
 	if !validText(key, 1, maxKeyBytes, false) ||
 		!validText(request.Repository, 1, maxAliasBytes, false) ||
-		!validText(request.Task, 1, maxTaskBytes, true) {
+		strings.TrimSpace(request.Task) == "" || !validText(request.Task, 1, maxTaskBytes, true) {
 		return "", Request{}, ErrInvalidInput
 	}
 	if request.Issue != nil {
@@ -1032,7 +1097,47 @@ func normalizeAdmission(key string, request Request, maxTaskBytes int) (string, 
 		issue := *request.Issue
 		request.Issue = &issue
 	}
+	if request.IssueProvenance != nil {
+		provenance := *request.IssueProvenance
+		if !validIssueProvenance(provenance) || (request.Issue != nil && *request.Issue != provenance.IssueNumber) {
+			return "", Request{}, ErrInvalidInput
+		}
+		request.IssueProvenance = &provenance
+	}
 	return key, request, nil
+}
+
+func validIssueProvenanceFields(provenance IssueProvenance) bool {
+	parts := strings.Split(provenance.SourceRepository, "/")
+	if provenance.Tracker != "github" || len(parts) != 2 || !githubIssueOwnerPattern.MatchString(parts[0]) || !githubIssueRepoPattern.MatchString(parts[1]) || parts[1] == "." || parts[1] == ".." || provenance.IssueNumber <= 0 || len(provenance.Version) != 64 || !validText(provenance.Title, 0, maxIssueTitleBytes, false) {
+		return false
+	}
+	for _, digit := range provenance.Version {
+		if !(digit >= '0' && digit <= '9') && !(digit >= 'a' && digit <= 'f') {
+			return false
+		}
+	}
+	for _, r := range provenance.Title {
+		if isBidiFormattingControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func validIssueProvenanceURL(provenance IssueProvenance) bool {
+	wantURL := fmt.Sprintf("https://github.com/%s/issues/%d", provenance.SourceRepository, provenance.IssueNumber)
+	parsed, err := url.Parse(provenance.URL)
+	return err == nil && provenance.URL == wantURL && parsed.Scheme == "https" && parsed.Host == "github.com" && parsed.User == nil && parsed.RawPath == "" && parsed.Path == fmt.Sprintf("/%s/issues/%d", provenance.SourceRepository, provenance.IssueNumber) && parsed.RawQuery == "" && parsed.Fragment == ""
+}
+
+func validIssueProvenance(provenance IssueProvenance) bool {
+	return validIssueProvenanceFields(provenance) && validIssueProvenanceURL(provenance)
+}
+
+func isBidiFormattingControl(r rune) bool {
+	return r == 0x061c || r == 0x200e || r == 0x200f ||
+		(r >= 0x202a && r <= 0x202e) || (r >= 0x2066 && r <= 0x206f)
 }
 
 func validText(value string, min, max int, allowWhitespaceControls bool) bool {
@@ -1048,13 +1153,24 @@ func validText(value string, min, max int, allowWhitespaceControls bool) bool {
 }
 
 func sameRequest(a, b Request) bool {
-	if a.Repository != b.Repository || a.Task != b.Task {
+	if a.Repository != b.Repository || a.Task != b.Task || !sameIssueProvenance(a.IssueProvenance, b.IssueProvenance) {
 		return false
 	}
 	if a.Issue == nil || b.Issue == nil {
 		return a.Issue == nil && b.Issue == nil
 	}
 	return *a.Issue == *b.Issue
+}
+
+func keyForIssueProvenance(provenance IssueProvenance) issueProvenanceKey {
+	return issueProvenanceKey{tracker: provenance.Tracker, sourceRepository: provenance.SourceRepository, issueNumber: provenance.IssueNumber, version: provenance.Version}
+}
+
+func sameIssueProvenance(a, b *IssueProvenance) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 func cloneSnapshot(snapshot Snapshot) Snapshot {
@@ -1064,6 +1180,10 @@ func cloneSnapshot(snapshot Snapshot) Snapshot {
 	if snapshot.Request.Issue != nil {
 		issue := *snapshot.Request.Issue
 		snapshot.Request.Issue = &issue
+	}
+	if snapshot.Request.IssueProvenance != nil {
+		provenance := *snapshot.Request.IssueProvenance
+		snapshot.Request.IssueProvenance = &provenance
 	}
 	if snapshot.Verification != nil {
 		copy := cloneVerificationEvidence(*snapshot.Verification)

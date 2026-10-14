@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,6 +90,172 @@ func TestAdmissionNormalizesAndReplaysPayload(t *testing.T) {
 	}
 	if second.Request.Issue == nil || *second.Request.Issue != 17 {
 		t.Fatalf("stored issue = %v, want copied issue 17", second.Request.Issue)
+	}
+	provenanceRequest := provenanceRequest("task")
+	stored, _, err := manager.Admit("provenance-copy", provenanceRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenanceRequest.IssueProvenance.Title = "caller mutation"
+	stored.Request.IssueProvenance.Title = "snapshot mutation"
+	got, err := manager.Get(stored.ID)
+	if err != nil || got.Request.IssueProvenance.Title != "bounded title" {
+		t.Fatalf("provenance was not isolated from caller/snapshot mutation: (%+v,%v)", got.Request.IssueProvenance, err)
+	}
+}
+
+func TestIssueProvenanceDeduplicatesCompleteRequestAndEvictsWithRecord(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 3, MaxConcurrentJobs: 1, MaxRecords: 3, MaxEventsPerJob: 4})
+	request := provenanceRequest("original task")
+	first, replay, err := manager.Admit("first-key", request)
+	if err != nil || replay {
+		t.Fatalf("initial provenance admission = (%+v,%t,%v)", first, replay, err)
+	}
+	second, replay, err := manager.Admit("second-key", request)
+	if err != nil || !replay || second.ID != first.ID {
+		t.Fatalf("same provenance under another key = (%+v,%t,%v), want original job", second, replay, err)
+	}
+	if _, replay, err := manager.Admit("first-key", request); err != nil || !replay {
+		t.Fatalf("same-key replay = %t,%v", replay, err)
+	}
+	if _, replay, err := manager.Admit("second-key", request); err != nil || !replay {
+		t.Fatalf("replay of attached idempotency key = %t,%v", replay, err)
+	}
+	for name, changed := range map[string]Request{
+		"task":        func() Request { r := request; r.Task = "changed task"; return r }(),
+		"destination": func() Request { r := request; r.Repository = "other"; return r }(),
+		"title": func() Request {
+			r := request
+			p := *r.IssueProvenance
+			p.Title = "changed"
+			r.IssueProvenance = &p
+			return r
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, _, err := manager.Admit("new-"+name, changed); !errors.Is(err, ErrProvenanceConflict) {
+				t.Fatalf("changed complete request error = %v, want provenance conflict", err)
+			}
+		})
+	}
+	changedVersion := request
+	provenance := *request.IssueProvenance
+	provenance.Version = strings.Repeat("b", 64)
+	changedVersion.IssueProvenance = &provenance
+	newVersion, replay, err := manager.Admit("changed-version-key", changedVersion)
+	if err != nil || replay || newVersion.ID == first.ID {
+		t.Fatalf("changed version should be a distinct admission: (%+v,%t,%v)", newVersion, replay, err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(first.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	third, _, err := manager.Admit("after-eviction", Request{Repository: "widget", Task: "ordinary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(newVersion.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.Admit("replacement-provenance", request); err != nil {
+		t.Fatalf("evicted provenance mapping still reserved identity: %v (third=%s)", err, third.ID)
+	}
+}
+
+func provenanceRequest(task string) Request {
+	issue := 42
+	return Request{Repository: "widget", Task: task, Issue: &issue, IssueProvenance: &IssueProvenance{
+		Tracker: "github", SourceRepository: "acme/widget", IssueNumber: issue,
+		Version: strings.Repeat("a", 64), URL: "https://github.com/acme/widget/issues/42", Title: "bounded title",
+	}}
+}
+
+func TestConcurrentIssueProvenanceAdmissionSharesJob(t *testing.T) {
+	manager := testManager(t, Config{QueueCapacity: 16, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 4})
+	const callers = 16
+	start := make(chan struct{})
+	type result struct {
+		job    Snapshot
+		replay bool
+		err    error
+	}
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for index := 0; index < callers; index++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			job, replay, err := manager.Admit(fmt.Sprintf("concurrent-issue-key-%d", index), provenanceRequest("same complete task"))
+			results <- result{job: job, replay: replay, err: err}
+		}(index)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var firstID string
+	newAdmissions := 0
+	for result := range results {
+		if result.err != nil {
+			t.Errorf("concurrent provenance admission: %v", result.err)
+			continue
+		}
+		if firstID == "" {
+			firstID = result.job.ID
+		}
+		if result.job.ID != firstID {
+			t.Errorf("provenance admissions returned IDs %q and %q", firstID, result.job.ID)
+		}
+		if !result.replay {
+			newAdmissions++
+		}
+	}
+	if firstID == "" || newAdmissions != 1 {
+		t.Fatalf("first ID=%q new admissions=%d, want exactly one", firstID, newAdmissions)
+	}
+	if len(manager.idempotency) != callers {
+		t.Fatalf("attached idempotency keys=%d, want %d", len(manager.idempotency), callers)
+	}
+	attachedBytes := uint64(0)
+	for index := 0; index < callers; index++ {
+		attachedBytes += uint64(recordOverheadBytes + len(fmt.Sprintf("concurrent-issue-key-%d", index)))
+	}
+	if manager.jobs[firstID].accountedBytes < attachedBytes {
+		t.Fatalf("registry accounting=%d, does not include all attached keys (%d bytes)", manager.jobs[firstID].accountedBytes, attachedBytes)
+	}
+}
+
+func TestAdmissionRejectsInvalidIssueProvenance(t *testing.T) {
+	base := provenanceRequest("task")
+	cases := map[string]func(*Request){
+		"tracker":               func(r *Request) { r.IssueProvenance.Tracker = "gitlab" },
+		"repository":            func(r *Request) { r.IssueProvenance.SourceRepository = "../repo" },
+		"repository components": func(r *Request) { r.IssueProvenance.SourceRepository = "a/b/c" },
+		"number":                func(r *Request) { r.IssueProvenance.IssueNumber = 0 },
+		"version length":        func(r *Request) { r.IssueProvenance.Version = "abcd" },
+		"version uppercase":     func(r *Request) { r.IssueProvenance.Version = strings.Repeat("A", 64) },
+		"url":                   func(r *Request) { r.IssueProvenance.URL = "http://github.com/acme/widget/issues/42" },
+		"mismatched url":        func(r *Request) { r.IssueProvenance.URL = "https://github.com/acme/widget/issues/43" },
+		"title control":         func(r *Request) { r.IssueProvenance.Title = "bad\nline" },
+		"title bidi":            func(r *Request) { r.IssueProvenance.Title = "bad\u200e title" },
+		"title bound":           func(r *Request) { r.IssueProvenance.Title = stringsOf('x', maxIssueTitleBytes+1) },
+		"number mismatch":       func(r *Request) { r.IssueProvenance.IssueNumber++ },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			request := base
+			provenance := *base.IssueProvenance
+			request.IssueProvenance = &provenance
+			mutate(&request)
+			if _, _, err := testManager(t, testConfig()).Admit("invalid-provenance", request); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("invalid provenance error = %v, want ErrInvalidInput", err)
+			}
+		})
 	}
 }
 
