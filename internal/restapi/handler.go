@@ -335,7 +335,7 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for name := range fields {
-		if name != "repository" && name != "task" && name != "issue" {
+		if name != "repository" && name != "task" && name != "issue" && name != "issue_provenance" {
 			writeError(w, http.StatusBadRequest, "unknown_field", "Request contains an unsupported field.")
 			return
 		}
@@ -359,6 +359,12 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 	if rawIssue, ok := fields["issue"]; ok {
 		var issue int
 		if err := json.Unmarshal(rawIssue, &issue); err != nil || issue <= 0 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+	}
+	if rawProvenance, ok := fields["issue_provenance"]; ok {
+		if !validProvenanceShape(rawProvenance) {
 			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 			return
 		}
@@ -731,12 +737,38 @@ func safeEventMessage(eventType, message string) bool {
 	return message == "" || (eventType == "queued" && message == "Job admitted") || (eventType == "running" && message == "Job started") || (eventType == "cancel_requested" && message == "Cancellation requested") || (eventType == "canceled" && message == "Job canceled before start") || (eventType == "provider_reconciled" && message == "Operator confirmed provider outcome") || (eventType == "operator_disposition" && (message == "failed" || message == "canceled")) || ((eventType == "succeeded" || eventType == "failed" || eventType == "canceled") && message == "Job finished")
 }
 
+func validProvenanceShape(raw json.RawMessage) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil || len(fields) != 6 {
+		return false
+	}
+	for _, name := range []string{"tracker", "source_repository", "issue_number", "version", "url", "title"} {
+		if _, ok := fields[name]; !ok {
+			return false
+		}
+	}
+	var typed struct {
+		Tracker          *string `json:"tracker"`
+		SourceRepository *string `json:"source_repository"`
+		IssueNumber      *int    `json:"issue_number"`
+		Version          *string `json:"version"`
+		URL              *string `json:"url"`
+		Title            *string `json:"title"`
+	}
+	if json.Unmarshal(raw, &typed) != nil {
+		return false
+	}
+	return typed.Tracker != nil && typed.SourceRepository != nil && typed.IssueNumber != nil && typed.Version != nil && typed.URL != nil && typed.Title != nil
+}
+
 func (h *Handler) writeManagerError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, restjobs.ErrInvalidInput):
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 	case errors.Is(err, restjobs.ErrIdempotencyConflict):
 		writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with an existing request.")
+	case errors.Is(err, restjobs.ErrProvenanceConflict):
+		writeError(w, http.StatusConflict, "issue_provenance_conflict", "Issue provenance conflicts with an existing request.")
 	case errors.Is(err, restjobs.ErrQueueFull):
 		writeError(w, http.StatusServiceUnavailable, "queue_full", "Job queue is full.")
 	case errors.Is(err, restjobs.ErrRegistryFull):

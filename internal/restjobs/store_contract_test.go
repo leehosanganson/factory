@@ -214,6 +214,39 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		}
 	})
 
+	t.Run("provenance deduplicates independently of idempotency keys", func(t *testing.T) {
+		store := newStore(t)
+		request := provenanceRequest("same complete task")
+		first, replay, err := store.Admit("provenance-key-one", request)
+		if err != nil || replay {
+			t.Fatalf("first provenance admission=(%+v,%t,%v)", first, replay, err)
+		}
+		second, replay, err := store.Admit("provenance-key-two", request)
+		if err != nil || !replay || second.ID != first.ID {
+			t.Fatalf("second key for same provenance=(%+v,%t,%v), want same job", second, replay, err)
+		}
+		changed := request
+		changed.Task = "changed task"
+		if _, _, err := store.Admit("provenance-key-three", changed); !errors.Is(err, ErrProvenanceConflict) {
+			t.Fatalf("different task on same provenance error=%v, want provenance conflict", err)
+		}
+		without := Request{Repository: request.Repository, Task: request.Task, Issue: request.Issue}
+		if _, _, err := store.Admit("provenance-key-one", without); !errors.Is(err, ErrIdempotencyConflict) {
+			t.Fatalf("omitted provenance reusing provenance idempotency key error=%v", err)
+		}
+		if _, _, err := store.Admit("ordinary-key", without); err != nil {
+			t.Fatalf("legacy request without provenance was rejected: %v", err)
+		}
+		changedVersion := request
+		provenance := *request.IssueProvenance
+		provenance.Version = strings.Repeat("b", 64)
+		changedVersion.IssueProvenance = &provenance
+		third, replay, err := store.Admit("provenance-version-two", changedVersion)
+		if err != nil || replay || third.ID == first.ID {
+			t.Fatalf("new provenance version=(%+v,%t,%v), want new job", third, replay, err)
+		}
+	})
+
 	t.Run("concurrent identical admissions share one job", func(t *testing.T) {
 		store := newStore(t)
 		const callers = 16

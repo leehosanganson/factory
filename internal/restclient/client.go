@@ -55,9 +55,9 @@ func (c *Client) Submit(ctx context.Context, repository, task, idempotencyKey st
 	return result, err
 }
 
-// SubmitIssue dispatches a GitHub issue to the server's durable job queue. The
-// issue number is forwarded as the request's issue field; no task text is sent.
-func (c *Client) SubmitIssue(ctx context.Context, repository string, issue int, idempotencyKey string) (Submission, error) {
+// SubmitIssue dispatches an explicitly confirmed GitHub issue snapshot with its
+// ordinary task and bounded identity metadata through the canonical job route.
+func (c *Client) SubmitIssue(ctx context.Context, repository, task string, issue int, provenance restjobs.IssueProvenance, idempotencyKey string) (Submission, error) {
 	if issue <= 0 {
 		return Submission{}, errors.New("issue number must be positive")
 	}
@@ -69,7 +69,7 @@ func (c *Client) SubmitIssue(ctx context.Context, repository string, issue int, 
 		idempotencyKey = hex.EncodeToString(random[:])
 	}
 	number := issue
-	body, _ := json.Marshal(restjobs.Request{Repository: repository, Issue: &number})
+	body, _ := json.Marshal(restjobs.Request{Repository: repository, Task: task, Issue: &number, IssueProvenance: &provenance})
 	var result Submission
 	err := c.request(ctx, http.MethodPost, "/v1/jobs", body, http.StatusAccepted, func(response *http.Response) error {
 		return json.NewDecoder(response.Body).Decode(&result)

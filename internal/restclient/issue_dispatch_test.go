@@ -11,7 +11,7 @@ import (
 	"github.com/leehosanganson/factory/internal/restjobs"
 )
 
-func TestSubmitIssueSendsIssueNumberAndRepository(t *testing.T) {
+func TestSubmitIssueSendsTaskAndBoundedProvenance(t *testing.T) {
 	const token = "issue-dispatch-token"
 	var captured map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -33,28 +33,41 @@ func TestSubmitIssueSendsIssueNumberAndRepository(t *testing.T) {
 	defer server.Close()
 
 	client := New(Config{BaseURL: server.URL, Token: token})
-	submission, err := client.SubmitIssue(context.Background(), "acme/widget", 42, "stable-issue-key")
+	task := "Implement the request from the issue body."
+	provenance := restjobs.IssueProvenance{Tracker: "github", SourceRepository: "acme/widget", IssueNumber: 42, Version: strings.Repeat("a", 64), URL: "https://github.com/acme/widget/issues/42", Title: "Safe title"}
+	submission, err := client.SubmitIssue(context.Background(), "destination", task, 42, provenance, "stable-issue-key")
 	if err != nil {
 		t.Fatalf("SubmitIssue: %v", err)
 	}
 	if submission.Job.ID != "job-1" || submission.Job.Status != restjobs.StatusQueued {
 		t.Errorf("submission = %+v, want job-1/queued", submission.Job)
 	}
-	if captured["repository"] != "acme/widget" {
+	if captured["repository"] != "destination" {
 		t.Errorf("request repository = %v", captured["repository"])
+	}
+	if captured["task"] != task {
+		t.Errorf("request task = %v, want exact visible task", captured["task"])
+	}
+	gotProvenance, ok := captured["issue_provenance"].(map[string]any)
+	if !ok || gotProvenance["tracker"] != "github" || gotProvenance["source_repository"] != "acme/widget" || gotProvenance["version"] != provenance.Version || gotProvenance["url"] != provenance.URL || gotProvenance["title"] != "Safe title" {
+		t.Errorf("request provenance = %#v", captured["issue_provenance"])
+	}
+	if _, containsBody := gotProvenance["body"]; containsBody {
+		t.Errorf("provenance duplicated issue body: %#v", gotProvenance)
 	}
 	if issue, ok := captured["issue"].(float64); !ok || int(issue) != 42 {
 		t.Errorf("request issue = %v (type %T), want 42", captured["issue"], captured["issue"])
 	}
-	if task, present := captured["task"]; !present || task != "" {
-		t.Errorf("request must not carry a non-empty task field: %v", captured)
+	if issueNumber, ok := gotProvenance["issue_number"].(float64); !ok || int(issueNumber) != 42 {
+		t.Errorf("provenance issue_number = %v, want 42", gotProvenance["issue_number"])
 	}
 }
 
 func TestSubmitIssueRejectsNonPositiveIssueNumber(t *testing.T) {
 	client := New(Config{BaseURL: "http://127.0.0.1:0", Token: "unused"})
+	provenance := restjobs.IssueProvenance{Tracker: "github", SourceRepository: "acme/widget", IssueNumber: 1, Version: strings.Repeat("a", 64), URL: "https://github.com/acme/widget/issues/1"}
 	for _, n := range []int{0, -1} {
-		if _, err := client.SubmitIssue(context.Background(), "acme/widget", n, "key"); err == nil {
+		if _, err := client.SubmitIssue(context.Background(), "destination", "task", n, provenance, "key"); err == nil {
 			t.Errorf("issue %d accepted, want rejection", n)
 		}
 	}
@@ -69,7 +82,8 @@ func TestSubmitIssueErrorIsSanitized(t *testing.T) {
 	defer server.Close()
 
 	client := New(Config{BaseURL: server.URL, Token: token})
-	_, err := client.SubmitIssue(context.Background(), "acme/widget", 42, "key")
+	provenance := restjobs.IssueProvenance{Tracker: "github", SourceRepository: "acme/widget", IssueNumber: 42, Version: strings.Repeat("a", 64), URL: "https://github.com/acme/widget/issues/42"}
+	_, err := client.SubmitIssue(context.Background(), "destination", "task", 42, provenance, "key")
 	if err == nil || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "/private/issue/path") || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("sanitized error = %v", err)
 	}

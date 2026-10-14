@@ -2,6 +2,7 @@ package restjobs
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -51,6 +52,49 @@ func TestLocalStoreContractSerializesConcurrentIdempotentAdmission(t *testing.T)
 	}
 	if _, err := store.Get(first); err != nil {
 		t.Fatalf("retained concurrently admitted job: %v", err)
+	}
+}
+
+func TestLocalStoreContractConcurrentProvenanceKeysAttachToOneJob(t *testing.T) {
+	store, err := NewManager(Config{QueueCapacity: 16, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const callers = 16
+	start := make(chan struct{})
+	type result struct {
+		id  string
+		err error
+	}
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			job, _, err := store.Admit(fmt.Sprintf("concurrent-provenance-key-%d", index), provenanceRequest("same task"))
+			results <- result{id: job.ID, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var id string
+	for result := range results {
+		if result.err != nil {
+			t.Errorf("concurrent provenance admission: %v", result.err)
+			continue
+		}
+		if id == "" {
+			id = result.id
+		}
+		if result.id != id {
+			t.Errorf("concurrent provenance IDs %q and %q", id, result.id)
+		}
+	}
+	if id == "" || len(store.idempotency) != callers {
+		t.Fatalf("job ID=%q attached keys=%d, want %d keys on one job", id, len(store.idempotency), callers)
 	}
 }
 

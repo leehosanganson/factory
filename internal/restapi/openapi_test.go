@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -52,6 +53,88 @@ func TestOpenAPIDocumentationNavigationAndVersionPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIssueProvenanceOpenAPIValidationParity(t *testing.T) {
+	specPath := filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json")
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatalf("read OpenAPI spec %s: %v", specPath, err)
+	}
+	var document struct {
+		Components struct {
+			Schemas map[string]map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatalf("decode OpenAPI spec: %v", err)
+	}
+	provenance := document.Components.Schemas["IssueProvenance"]
+	if provenance == nil {
+		t.Fatal("OpenAPI spec is missing IssueProvenance schema")
+	}
+	var properties map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(provenance["properties"], &properties); err != nil {
+		t.Fatalf("decode IssueProvenance properties: %v", err)
+	}
+
+	t.Run("title UTF-8 byte bound", func(t *testing.T) {
+		title := properties["title"]
+		var maxLength, maxBytes int
+		var description string
+		if err := json.Unmarshal(title["maxLength"], &maxLength); err != nil || maxLength != 4096 {
+			t.Fatalf("title maxLength = %d, %v; want 4096 characters", maxLength, err)
+		}
+		if err := json.Unmarshal(title["x-maxBytes"], &maxBytes); err != nil || maxBytes != 4096 {
+			t.Fatalf("title x-maxBytes = %d, %v; want 4096 bytes", maxBytes, err)
+		}
+		if err := json.Unmarshal(title["description"], &description); err != nil || !strings.Contains(description, "UTF-8 byte length") || !strings.Contains(description, "maxLength counts characters") {
+			t.Fatalf("title description %q must distinguish UTF-8 byte length from character-count maxLength", description)
+		}
+
+		handler := newTestHandler(t, newTestManager(t, managerConfig(4, 4, 8)), nil)
+		handler.config.MaxRequestBodyBytes = 8192
+		requestBody := func(value string) string {
+			body, err := json.Marshal(map[string]any{
+				"repository": "widget",
+				"task":       "bounded title test",
+				"issue":      42,
+				"issue_provenance": map[string]any{
+					"tracker": "github", "source_repository": "acme/widget", "issue_number": 42,
+					"version": strings.Repeat("a", 64), "url": "https://github.com/acme/widget/issues/42", "title": value,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(body)
+		}
+		if response := postJob(handler, requestBody(strings.Repeat("é", 2048)), "title-at-byte-limit"); response.Code != 202 {
+			t.Fatalf("2048 two-byte characters (4096 UTF-8 bytes) status=%d, body=%s; want accepted", response.Code, response.Body.String())
+		}
+		assertError(t, postJob(handler, requestBody(strings.Repeat("é", 2049)), "title-over-byte-limit"), 400, "invalid_request")
+	})
+
+	t.Run("source repository excludes dot components", func(t *testing.T) {
+		var pattern string
+		if err := json.Unmarshal(properties["source_repository"]["pattern"], &pattern); err != nil {
+			t.Fatalf("decode source_repository pattern: %v", err)
+		}
+		compiled, err := regexp.Compile(pattern)
+		if err != nil {
+			t.Fatalf("compile source_repository pattern: %v", err)
+		}
+		for _, repository := range []string{"acme/widget", "owner/-repo", "owner/.hidden", "owner/..."} {
+			if !compiled.MatchString(repository) {
+				t.Errorf("source_repository pattern rejects valid server repository %q", repository)
+			}
+		}
+		for _, repository := range []string{"owner/.", "owner/..", "owner/../repo", "owner/repo/extra"} {
+			if compiled.MatchString(repository) {
+				t.Errorf("source_repository pattern accepts invalid server repository %q", repository)
+			}
+		}
+	})
 }
 
 func TestOpenAPIRouteInventory(t *testing.T) {

@@ -166,7 +166,10 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker fa
 	}
 }
 
-const restIssueTaskMaxBytes = 256 << 10
+const (
+	restIssueTaskMaxBytes            = 256 << 10
+	restIssueProvenanceTitleMaxBytes = 4 << 10
+)
 
 func runRESTIssue(ctx context.Context, flags *flag.FlagSet, out io.Writer, destination, sourceRepository, confirmedVersion string, asJSON bool, tracker factorycore.IssueTracker, submitter *restclient.Client, suppliedKey string) error {
 	if destination == "" || sourceRepository == "" || flags.NArg() != 1 {
@@ -199,6 +202,9 @@ func runRESTIssue(ctx context.Context, flags *flag.FlagSet, out io.Writer, desti
 		return errors.New("issue tracker returned an invalid identity, state, or version; no job was submitted. Request a fresh preview after checking provider access")
 	}
 	task := issueDispatchTask(snapshot)
+	if len(escapeIssueContent(snapshot.Title)) > restIssueProvenanceTitleMaxBytes {
+		return fmt.Errorf("sanitized issue title exceeds the provenance limit of %d bytes; no job was submitted", restIssueProvenanceTitleMaxBytes)
+	}
 	if len(task) > restIssueTaskMaxBytes {
 		return fmt.Errorf("generated issue task exceeds the REST task limit of %d bytes; no job was submitted", restIssueTaskMaxBytes)
 	}
@@ -212,7 +218,10 @@ func runRESTIssue(ctx context.Context, flags *flag.FlagSet, out io.Writer, desti
 		return fmt.Errorf("issue is %q, not open (current version %s); no job was submitted. Run factory rest issue without --confirm-version for a new preview", snapshot.State, snapshot.Version)
 	}
 	key := issueDispatchKey(destination, sourceRepository, issueNumber, snapshot.Version)
-	result, err := submitter.Submit(ctx, destination, task, key)
+	result, err := submitter.SubmitIssue(ctx, destination, task, issueNumber, restjobs.IssueProvenance{
+		Tracker: "github", SourceRepository: sourceRepository, IssueNumber: issueNumber,
+		Version: snapshot.Version, URL: snapshot.URL, Title: escapeIssueContent(snapshot.Title),
+	}, key)
 	if err != nil {
 		return err
 	}
@@ -270,6 +279,11 @@ func isBidiFormattingControl(r rune) bool {
 func validIssueVersion(version string) bool {
 	if len(version) != 64 {
 		return false
+	}
+	for _, digit := range version {
+		if !(digit >= '0' && digit <= '9') && !(digit >= 'a' && digit <= 'f') {
+			return false
+		}
 	}
 	_, err := hex.DecodeString(version)
 	return err == nil

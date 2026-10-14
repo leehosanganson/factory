@@ -140,8 +140,15 @@ func TestRESTIssuePreviewAndConfirmedDispatchUseProductionHandler(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.Request.Repository != "destination" || job.Request.Task != preview.Preview.Task || strings.TrimSpace(job.Request.Task) == "" || job.Request.Issue != nil {
-		t.Fatalf("admitted request = %+v; want only destination alias and exact nonempty preview task", job.Request)
+	if job.Request.Repository != "destination" || job.Request.Task != preview.Preview.Task || strings.TrimSpace(job.Request.Task) == "" || job.Request.Issue == nil || *job.Request.Issue != snapshot.Number || job.Request.IssueProvenance == nil {
+		t.Fatalf("admitted request = %+v; want destination, exact task, issue number, and provenance", job.Request)
+	}
+	provenance := job.Request.IssueProvenance
+	if provenance.Tracker != "github" || provenance.SourceRepository != snapshot.Repository || provenance.IssueNumber != snapshot.Number || provenance.Version != snapshot.Version || provenance.URL != snapshot.URL || provenance.Title != escapeIssueContent(snapshot.Title) {
+		t.Fatalf("admitted provenance = %+v; want bounded identity and sanitized title", provenance)
+	}
+	if strings.Contains(provenance.Title, "\x1b") || strings.Contains(provenance.Title, "\u200e") || strings.Contains(job.Request.Task, snapshot.Body) {
+		t.Fatalf("provenance/title/task safety mismatch: provenance=%+v", provenance)
 	}
 	firstKey := idempotencyKeys[0]
 
@@ -226,6 +233,30 @@ func TestRESTIssuePreviewSanitizesTerminalControlsAndRejectsOversizedTask(t *tes
 	}
 	if output.Len() != 0 {
 		t.Fatalf("oversized task produced preview output of %d bytes", output.Len())
+	}
+}
+
+func TestRESTIssueRejectsNonLowercaseSHA256Version(t *testing.T) {
+	snapshot := factorycore.IssueSnapshot{Repository: "source/project", Number: 8, Title: "title", Body: "body", State: "open", URL: "https://github.com/source/project/issues/8", Version: strings.Repeat("A", 64)}
+	tracker := issueTrackerFunc(func(context.Context, string, string) (factorycore.IssueSnapshot, error) { return snapshot, nil })
+	configPath := writeRESTIssueClientConfig(t, "http://127.0.0.1:1")
+	args := []string{"issue", "--config", configPath, "--repository", "destination", "--issue-repository", "source/project", "8"}
+	var output strings.Builder
+	err := runRESTClientWithIssueDependencies(args, &output, tracker, func(restclient.Config) *restclient.Client { return nil })
+	if err == nil || !strings.Contains(err.Error(), "invalid identity") || output.Len() != 0 {
+		t.Fatalf("invalid version error=%v output bytes=%d", err, output.Len())
+	}
+}
+
+func TestRESTIssueRejectsOversizedSanitizedProvenanceTitle(t *testing.T) {
+	snapshot := factorycore.IssueSnapshot{Repository: "source/project", Number: 8, Title: strings.Repeat("é", 2500), Body: "body", State: "open", URL: "https://github.com/source/project/issues/8", Version: strings.Repeat("d", 64)}
+	tracker := issueTrackerFunc(func(context.Context, string, string) (factorycore.IssueSnapshot, error) { return snapshot, nil })
+	configPath := writeRESTIssueClientConfig(t, "http://127.0.0.1:1")
+	args := []string{"issue", "--config", configPath, "--repository", "destination", "--issue-repository", "source/project", "8"}
+	var output strings.Builder
+	err := runRESTClientWithIssueDependencies(args, &output, tracker, func(restclient.Config) *restclient.Client { return nil })
+	if err == nil || !strings.Contains(err.Error(), "provenance limit") || output.Len() != 0 {
+		t.Fatalf("oversized provenance title error=%v output bytes=%d", err, output.Len())
 	}
 }
 

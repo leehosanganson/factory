@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -81,7 +81,7 @@
       "post": {
         "operationId": "createJob",
         "summary": "Submit a job",
-        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries with the same normalized payload return the retained job; reuse with a different payload conflicts. Memory persistence is volatile and jobs are lost on process restart. With SQLite, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
+        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries with the same normalized payload return the retained job; reuse with a different payload conflicts. Optional issue_provenance stores bounded GitHub source identity, exact snapshot version, canonical issue URL, and sanitized title only; the submitted task remains ordinary visible request.task content. Across idempotency keys, the tuple (tracker, source_repository, issue_number, version) maps to one retained job when the complete request matches; differing task, destination, title, URL, or other request content conflicts with sanitized HTTP 409. A changed version is a distinct identity. Provenance is caller-supplied metadata and the server does not fetch GitHub or verify snapshot authenticity. Memory persistence is volatile and jobs are lost on process restart. With SQLite, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "$ref": "#/components/parameters/IdempotencyKey" }
@@ -107,7 +107,7 @@
           "400": { "$ref": "#/components/responses/InvalidRequest" },
           "401": { "$ref": "#/components/responses/Unauthenticated" },
           "409": {
-            "description": "The idempotency key conflicts with a different request.",
+            "description": "The idempotency key or issue provenance conflicts with a different complete request.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
           },
           "413": {
@@ -416,8 +416,9 @@
             "type": "integer",
             "format": "int64",
             "minimum": 1,
-            "description": "Optional positive issue number as context only; this does not start issue polling or a separate issue workflow."
-          }
+            "description": "Optional positive issue number as context only; when issue_provenance is supplied, it must match issue_number."
+          },
+          "issue_provenance": { "$ref": "#/components/schemas/IssueProvenance" }
         }
       },
       "CreateJobResponse": {
@@ -425,7 +426,7 @@
         "required": [ "job", "replayed", "links" ],
         "properties": {
           "job": { "$ref": "#/components/schemas/JobSnapshot" },
-          "replayed": { "type": "boolean", "description": "True when an identical retained admission was returned for this idempotency key." },
+          "replayed": { "type": "boolean", "description": "True when the retained job was returned for an identical idempotency key or exact issue-provenance request." },
           "links": {
             "type": "object",
             "required": [ "self", "history" ],
@@ -481,7 +482,22 @@
         "properties": {
           "repository": { "type": "string" },
           "task": { "type": "string" },
-          "issue": { "type": "integer", "format": "int64", "minimum": 1 }
+          "issue": { "type": "integer", "format": "int64", "minimum": 1 },
+          "issue_provenance": { "$ref": "#/components/schemas/IssueProvenance" }
+        }
+      },
+      "IssueProvenance": {
+        "type": "object",
+        "description": "Bounded GitHub issue snapshot identity metadata only. It contains no issue body, which remains visible in the ordinary JobRequest.task. Caller metadata is not authenticated or verified by the server against GitHub.",
+        "additionalProperties": false,
+        "required": [ "tracker", "source_repository", "issue_number", "version", "url", "title" ],
+        "properties": {
+          "tracker": { "type": "string", "enum": [ "github" ] },
+          "source_repository": { "type": "string", "pattern": "^[A-Za-z0-9-]+/([A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9._-]*[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.{3,})$" },
+          "issue_number": { "type": "integer", "format": "int64", "minimum": 1 },
+          "version": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lowercase SHA-256 snapshot fingerprint." },
+          "url": { "type": "string", "format": "uri", "pattern": "^https://github.com/[^/]+/[^/]+/issues/[1-9][0-9]*$" },
+          "title": { "type": "string", "maxLength": 4096, "x-maxBytes": 4096, "description": "Sanitized title; control characters are rejected. The server enforces a maximum UTF-8 byte length of 4096; schema maxLength counts characters." }
         }
       },
       "ProviderOutcome": {
