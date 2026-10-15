@@ -1,4 +1,4 @@
-.PHONY: build test fmt vet clean help
+.PHONY: build test fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
@@ -13,6 +13,15 @@ fmt:
 vet:
 	go vet ./...
 
+test-postgres-up:
+	docker compose -f docker-compose.postgres-test.yml up -d --wait
+
+test-postgres: test-postgres-up
+	FACTORY_TEST_POSTGRES_URL='postgres://factory:factory@127.0.0.1:55432/factory_test?sslmode=disable' FACTORY_REQUIRE_POSTGRES_TEST=1 go test ./internal/restjobs -run '^TestPostgresOwnershipIntegration$$' -count=1 -v
+
+test-postgres-down:
+	docker compose -f docker-compose.postgres-test.yml down --volumes
+
 clean:
 	rm -rf bin
 
@@ -22,5 +31,8 @@ help:
 		test 'Run all Go tests' \
 		fmt 'Format Go source files' \
 		vet 'Run go vet' \
+		test-postgres-up 'Start the disposable PostgreSQL 18 test service' \
+		test-postgres 'Run PostgreSQL 18 ownership integration tests' \
+		test-postgres-down 'Stop the PostgreSQL 18 test service' \
 		clean 'Remove build artifacts' \
 		help 'List available Make targets'
