@@ -20,3 +20,7 @@ Structure the PR description with these sections:
 - **Verification** — checks run and their results. If you did not run checks, say so and briefly explain why when useful.
 
 Keep each PR scoped and reviewable; split unrelated work into separate PRs where practical.
+
+## Commit attribution
+
+Commit authorship and co-authorship must identify human contributors only. Do not set a tool or agent as the commit author/committer or add an agent `Co-authored-by` trailer, including `Factory Agent`. Contributors remain responsible for their commits; review or tool assistance does not constitute authorship. Pull-request CI rejects Factory Agent attribution in commit author/committer metadata or commit-message trailers.

@@ -7,6 +7,7 @@
 - For substantive engineering work, use Factory's [`implement` workflow](.agents/skills/factory/SKILL.md) by default. If already inside an active Factory workflow, continue there rather than starting a nested Factory workflow. Use a focused direct edit for small isolated fixes, questions, research, and review-only work; consult the skill for `tidy` and `monitor` limits.
 - Clarify user goals, constraints, and acceptance criteria before consequential choices. Keep the user in control; request explicit approval for proposed usability fixes before implementation. Approval gates are opt-in unless requested.
 - Treat successful agent exit as process success, not an independent correctness verdict. Inspect the resulting diff and run relevant checks.
+- Commit authorship/co-authorship must identify human contributors only. Never set an agent/tool as author or committer and never add agent `Co-authored-by` trailers; Factory assistance is not authorship.
 
 ## Positive feedback loop
 
