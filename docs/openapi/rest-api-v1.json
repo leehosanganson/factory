@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.4.0",
+    "version": "1.4.1",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -145,6 +145,31 @@
           "200": {
             "description": "The retained job snapshot.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
+          },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
+    "/v1/jobs/{id}/issue-provenance": {
+      "get": {
+        "operationId": "getJobIssueProvenance",
+        "summary": "Get bounded issue provenance",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own jobs only)" ],
+        "description": "Returns only the job ID and bounded issue provenance metadata. It never returns the ordinary request.task, which may contain the issue body. Jobs without issue provenance return 404. Submitters can inspect only their own jobs; operators can inspect any retained job.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": {
+            "description": "The bounded provenance projection.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobIssueProvenance" } } }
           },
           "401": { "$ref": "#/components/responses/Unauthenticated" },
           "404": { "$ref": "#/components/responses/NotFound" },
@@ -506,6 +531,16 @@
           "repository": { "type": "string" },
           "task": { "type": "string" },
           "issue": { "type": "integer", "format": "int64", "minimum": 1 },
+          "issue_provenance": { "$ref": "#/components/schemas/IssueProvenance" }
+        }
+      },
+      "JobIssueProvenance": {
+        "type": "object",
+        "description": "Provenance-only projection. The request task and issue body are not present.",
+        "additionalProperties": false,
+        "required": [ "job_id", "issue_provenance" ],
+        "properties": {
+          "job_id": { "type": "string" },
           "issue_provenance": { "$ref": "#/components/schemas/IssueProvenance" }
         }
       },

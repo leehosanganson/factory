@@ -9,6 +9,28 @@ import (
 	"testing"
 )
 
+func TestIssueProvenanceUsesScopedRouteAndDecodesOnlyProjection(t *testing.T) {
+	const token = "provenance-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/jobs/job-42/issue-provenance" {
+			t.Errorf("request = %s %s, want scoped provenance GET", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"job_id":"job-42","issue_provenance":{"tracker":"github","source_repository":"acme/widget","issue_number":42,"version":"` + strings.Repeat("a", 64) + `","url":"https://github.com/acme/widget/issues/42","title":"Bounded title"}}`))
+	}))
+	defer server.Close()
+
+	result, err := New(Config{BaseURL: server.URL, Token: token}).IssueProvenance(context.Background(), "job-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.JobID != "job-42" || result.Provenance.IssueNumber != 42 || result.Provenance.Title != "Bounded title" {
+		t.Fatalf("provenance result = %+v", result)
+	}
+}
+
 func TestListForPrincipalUsesOpaqueCursorAndDecodesSafePage(t *testing.T) {
 	const token = "submitter-list-token"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -581,11 +581,19 @@ func TestNotReadyRejectsJobOperationsBeforeAuthentication(t *testing.T) {
 
 func TestSubmitterAuthorizationOwnershipAndOperatorCompatibility(t *testing.T) {
 	manager := newTestManager(t, managerConfig(8, 8, 8))
-	first, _, err := manager.AdmitAs("shared-idempotency", "alice", restjobs.Request{Repository: "widget", Task: "alice private task"})
+	issueNumber := 42
+	first, _, err := manager.AdmitAs("shared-idempotency", "alice", restjobs.Request{Repository: "widget", Task: "alice private task", Issue: &issueNumber, IssueProvenance: &restjobs.IssueProvenance{
+		Tracker: "github", SourceRepository: "acme/widget", IssueNumber: issueNumber, Version: strings.Repeat("a", 64),
+		URL: "https://github.com/acme/widget/issues/42", Title: "Bounded issue title",
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := manager.AdmitAs("shared-idempotency", "bob", restjobs.Request{Repository: "widget", Task: "bob private task"}); err != nil {
+	bobIssueNumber := 43
+	if _, _, err := manager.AdmitAs("shared-idempotency", "bob", restjobs.Request{Repository: "widget", Task: "bob private task", Issue: &bobIssueNumber, IssueProvenance: &restjobs.IssueProvenance{
+		Tracker: "github", SourceRepository: "acme/widget", IssueNumber: bobIssueNumber, Version: strings.Repeat("b", 64),
+		URL: "https://github.com/acme/widget/issues/43", Title: "Bob issue title",
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.ClaimNext(); err != nil {
@@ -603,16 +611,32 @@ func TestSubmitterAuthorizationOwnershipAndOperatorCompatibility(t *testing.T) {
 	if err := manager.AddEvent(first.ID, "running", "Job started"); err != nil {
 		t.Fatal(err)
 	}
-	for _, suffix := range []string{"", "/history", "/events"} {
+	for _, suffix := range []string{"", "/history", "/events", "/issue-provenance"} {
 		own := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+suffix, "", aliceToken)
 		if own.Code != http.StatusOK {
 			t.Errorf("owner GET %s status=%d body=%s", suffix, own.Code, own.Body.String())
+		}
+		if suffix == "/issue-provenance" && (strings.Contains(own.Body.String(), "alice private task") || !strings.Contains(own.Body.String(), "Bounded issue title")) {
+			t.Errorf("owner provenance response leaked task or omitted metadata: %s", own.Body.String())
 		}
 		forbidden := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+suffix, "", bobToken)
 		unknown := principalRequest(handler, http.MethodGet, "/v1/jobs/not-a-job"+suffix, "", bobToken)
 		if forbidden.Code != http.StatusNotFound || forbidden.Code != unknown.Code || forbidden.Body.String() != unknown.Body.String() {
 			t.Errorf("%s ownership disclosed existence: forbidden=%d %s unknown=%d %s", suffix, forbidden.Code, forbidden.Body.String(), unknown.Code, unknown.Body.String())
 		}
+	}
+	plainJob, _, err := manager.AdmitAs("alice-ordinary-job", "alice", restjobs.Request{Repository: "widget", Task: "ordinary private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainOwner := principalRequest(handler, http.MethodGet, "/v1/jobs/"+plainJob.ID+"/issue-provenance", "", aliceToken)
+	plainUnknown := principalRequest(handler, http.MethodGet, "/v1/jobs/not-a-job/issue-provenance", "", aliceToken)
+	if plainOwner.Code != http.StatusNotFound || plainOwner.Body.String() != plainUnknown.Body.String() || strings.Contains(plainOwner.Body.String(), "ordinary private task") {
+		t.Fatalf("owner request without provenance did not match generic not-found: owner=%d %s unknown=%d %s", plainOwner.Code, plainOwner.Body.String(), plainUnknown.Code, plainUnknown.Body.String())
+	}
+	plainOther := principalRequest(handler, http.MethodGet, "/v1/jobs/"+plainJob.ID+"/issue-provenance", "", bobToken)
+	if plainOther.Code != http.StatusNotFound || plainOther.Body.String() != plainUnknown.Body.String() {
+		t.Fatalf("nonowner request without provenance disclosed job existence: other=%d %s unknown=%d %s", plainOther.Code, plainOther.Body.String(), plainUnknown.Code, plainUnknown.Body.String())
 	}
 	ownHistory := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+"/history", "", aliceToken)
 	if !strings.Contains(ownHistory.Body.String(), `"type":"running"`) {
@@ -1350,6 +1374,32 @@ func TestIssueProvenanceAdmissionReplayAndSanitizedConflict(t *testing.T) {
 	detail := request(handler, http.MethodGet, "/v1/jobs/"+accepted.Job.ID, "", true)
 	if detail.Code != http.StatusOK || !strings.Contains(detail.Body.String(), `"task":"visible issue task"`) || !strings.Contains(detail.Body.String(), `"issue_provenance"`) {
 		t.Fatalf("authenticated job detail did not preserve visible task/provenance: %d %s", detail.Code, detail.Body.String())
+	}
+	provenance := request(handler, http.MethodGet, "/v1/jobs/"+accepted.Job.ID+"/issue-provenance", "", true)
+	if provenance.Code != http.StatusOK {
+		t.Fatalf("provenance inspection = %d %s", provenance.Code, provenance.Body.String())
+	}
+	escapedPath := request(handler, http.MethodGet, "/v1/jobs/"+accepted.Job.ID+"%2Fissue-provenance", "", true)
+	assertError(t, escapedPath, http.StatusNotFound, "not_found")
+	if strings.Contains(escapedPath.Body.String(), "visible issue task") {
+		t.Fatalf("escaped path exposed job data: %s", escapedPath.Body.String())
+	}
+	var provenanceFields map[string]json.RawMessage
+	if err := json.Unmarshal(provenance.Body.Bytes(), &provenanceFields); err != nil {
+		t.Fatal(err)
+	}
+	if len(provenanceFields) != 2 || provenanceFields["job_id"] == nil || provenanceFields["issue_provenance"] == nil || strings.Contains(provenance.Body.String(), "visible issue task") {
+		t.Fatalf("provenance projection was not narrowly bounded: %s", provenance.Body.String())
+	}
+	ordinary, _, err := manager.Admit("no-issue-provenance", restjobs.Request{Repository: "widget", Task: "ordinary task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	absent := request(handler, http.MethodGet, "/v1/jobs/"+ordinary.ID+"/issue-provenance", "", true)
+	assertError(t, absent, http.StatusNotFound, "not_found")
+	unknownProvenance := request(handler, http.MethodGet, "/v1/jobs/unknown/issue-provenance", "", true)
+	if absent.Body.String() != unknownProvenance.Body.String() {
+		t.Fatalf("absent provenance disclosed job existence: absent=%s unknown=%s", absent.Body.String(), unknownProvenance.Body.String())
 	}
 	second := postJob(handler, body, "issue-key-two")
 	var replay struct {
