@@ -53,7 +53,7 @@ These are dependency gates, not dates. CI/CD feedback, issue polling/reconciliat
 - No second MVP for autonomous issue polling; it can later feed the same job API/lifecycle.
 - No horizontal fleet or distributed broker requirement for the initial service.
 
-See the [REST job contract](rest-api-contract.md) for API and reliability requirements, [execution modes](execution-modes.md) for the server/executor boundary, the [PostgreSQL ownership deployment contract](postgresql-ownership-deployment-contract.md) for the isolated protocol's test-only boundary and failover prohibitions, and the [OCI sandbox host contract](oci-sandbox-host-contract.md) for the candidate host prerequisites and refusal boundary.
+See the [REST job contract](rest-api-contract.md) for API and reliability requirements, [execution modes](execution-modes.md) for the server/executor boundary, the [PostgreSQL ownership deployment contract](postgresql-ownership-deployment-contract.md) for the isolated protocol's test-only boundary and failover prohibitions, the [worker identity and credential contract](worker-identity-credential-contract.md), the [worker recovery/cancellation contract](worker-recovery-cancellation-contract.md), the [attempt workspace/provider-write contract](attempt-workspace-provider-write-contract.md), and the [OCI sandbox host contract](oci-sandbox-host-contract.md) for candidate host prerequisites and refusal boundaries.
 
 ## Feedback loop
 
