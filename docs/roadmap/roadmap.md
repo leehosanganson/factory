@@ -18,6 +18,8 @@ Persistence is behind a backend interface. The implemented optional SQLite backe
 
 The first deployment is a single Factory server with bounded workers and operator-configured repositories, agent harness, credentials, and limits. Local-process execution and containers are not security sandboxes. Horizontal scaling, a fleet coordinator, remote worker placement, and a web UI are later options, not MVP prerequisites.
 
+The isolated PostgreSQL 18 ownership protocol is test-only and is not a supported production persistence/deployment mode. Its deployment contract is single writable primary, no automated failover/promotion or multi-primary setup, and operator-only restoration after the former primary and all workers/clients are enforceably stopped or fenced. Connection loss or ambiguous transaction outcomes are unknown, not proof of rollback: the worker must stop further work and side effects, and no new attempt or provider write may start until an operator establishes the authoritative durable state. Schema upgrades are prohibited unless a separately reviewed upgrade policy is adopted. No production HA, RPO/RTO, replication, or recovery guarantee is made. See [PostgreSQL topology and failover contract](postgresql-ownership-deployment-contract.md); production Store/runtime integration remains blocked pending a selected and tested HA design.
+
 ## Pull-request and human boundary
 
 Creating or updating a PR with the configured code-repository provider is a required part of a successful implementation job, not an optional publication feature. A job must not report success until the provider operation is confirmed and its PR identity/URL is recorded. Retries after timeouts or process interruption must reconcile live provider state before repeating a write; uncertain outcomes are surfaced for recovery rather than blindly creating another branch or PR.
@@ -49,7 +51,7 @@ These are dependency gates, not dates. CI/CD feedback, issue polling/reconciliat
 - No second MVP for autonomous issue polling; it can later feed the same job API/lifecycle.
 - No horizontal fleet or distributed broker requirement for the initial service.
 
-See the [REST job contract](rest-api-contract.md) for API and reliability requirements and [execution modes](execution-modes.md) for the server/executor boundary.
+See the [REST job contract](rest-api-contract.md) for API and reliability requirements, [execution modes](execution-modes.md) for the server/executor boundary, and the [PostgreSQL ownership deployment contract](postgresql-ownership-deployment-contract.md) for the isolated protocol's test-only boundary and failover prohibitions.
 
 ## Feedback loop
 
