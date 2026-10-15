@@ -49,8 +49,9 @@ func NewPostgresOwnership(db *sql.DB) *PostgresOwnership {
 	return &PostgresOwnership{db: db}
 }
 
-// Migrate creates only this protocol's schema-version and ownership metadata
-// tables. The foreign key makes migration fail closed when factory_jobs is absent.
+// Migrate creates the fresh v1 ownership schema and attempt history tables in
+// one transaction. The foreign keys make migration fail closed when
+// factory_jobs is absent.
 func (p *PostgresOwnership) Migrate(ctx context.Context) error {
 	if ctx == nil || p == nil || p.db == nil {
 		return ErrInvalidInput
@@ -89,7 +90,24 @@ func (p *PostgresOwnership) Migrate(ctx context.Context) error {
 		lease_until timestamptz NOT NULL,
 		updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 	)`); err != nil {
-		return errors.New("create PostgreSQL ownership schema")
+		return errors.New("create PostgreSQL ownership table")
+	}
+	// Worker and boot IDs are operator-chosen labels, not credentials. The
+	// bearer owner token is deliberately absent from durable attempt history.
+	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS factory_job_attempt_history (
+		job_id text NOT NULL REFERENCES factory_jobs(id),
+		generation bigint NOT NULL CHECK (generation > 0),
+		worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
+		boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
+		claimed_at timestamptz NOT NULL,
+		started_at timestamptz NOT NULL,
+		lease_until timestamptz NOT NULL,
+		finished_at timestamptz,
+		status text CHECK (status IN ('succeeded', 'failed', 'canceled')),
+		PRIMARY KEY (job_id, generation),
+		CHECK ((finished_at IS NULL AND status IS NULL) OR (finished_at IS NOT NULL AND status IS NOT NULL))
+	)`); err != nil {
+		return errors.New("create PostgreSQL attempt history table")
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit PostgreSQL ownership migration")
@@ -140,6 +158,12 @@ func (p *PostgresOwnership) ClaimNext(ctx context.Context, workerID, bootID stri
 		RETURNING generation`, jobID, token, workerID, bootID, leaseDuration.Microseconds()).Scan(&generation)
 	if err != nil {
 		return PostgresAttemptClaim{}, errors.New("record PostgreSQL job ownership")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_attempt_history
+		(job_id, generation, worker_id, boot_id, claimed_at, started_at, lease_until)
+		SELECT job_id, generation, worker_id, boot_id, clock_timestamp(), clock_timestamp(), lease_until
+		FROM factory_job_ownership WHERE job_id = $1`, jobID); err != nil {
+		return PostgresAttemptClaim{}, errors.New("record PostgreSQL attempt history")
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status = 'running'
 		WHERE id = $1 AND status = 'queued'`, jobID)
@@ -208,6 +232,19 @@ func (p *PostgresOwnership) Finish(ctx context.Context, attempt PostgresAttempt,
 	}
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return ErrStaleAttempt
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE factory_job_attempt_history AS h SET
+		finished_at = clock_timestamp(), status = $3,
+		lease_until = o.lease_until
+		FROM factory_job_ownership AS o
+		WHERE h.job_id = $1 AND h.generation = $2 AND h.finished_at IS NULL AND h.status IS NULL
+		AND o.job_id = h.job_id AND o.generation = h.generation
+		AND o.worker_id = $4 AND o.boot_id = $5`, attempt.JobID, attempt.Generation, status, attempt.WorkerID, attempt.BootID)
+	if err != nil {
+		return errors.New("finish PostgreSQL attempt history")
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.New("finish PostgreSQL attempt history")
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit PostgreSQL job finish")

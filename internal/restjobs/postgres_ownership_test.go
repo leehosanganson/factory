@@ -86,6 +86,14 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 		if exists {
 			t.Fatal("failed migration left an ownership table behind")
 		}
+		for _, table := range []string{"factory_postgres_ownership_schema", "factory_job_attempt_history"} {
+			if err := db.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
+				t.Fatal(err)
+			}
+			if exists {
+				t.Fatalf("failed migration left %s behind", table)
+			}
+		}
 	})
 
 	t.Run("concurrent migrations serialize across connections", func(t *testing.T) {
@@ -145,9 +153,9 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 			t.Fatalf("read migrated schema version: %v", err)
 		}
 		if version != postgresOwnershipSchemaVersion {
-			t.Fatalf("schema version = %d, want %d", version, postgresOwnershipSchemaVersion)
+			t.Fatalf("schema version = %d, want fresh schema v1 (%d)", version, postgresOwnershipSchemaVersion)
 		}
-		for _, table := range []string{"factory_postgres_ownership_schema", "factory_job_ownership"} {
+		for _, table := range []string{"factory_postgres_ownership_schema", "factory_job_ownership", "factory_job_attempt_history"} {
 			var exists bool
 			if err := db1.QueryRow(`SELECT to_regclass($1) IS NOT NULL`, table).Scan(&exists); err != nil {
 				t.Fatalf("check table %s: %v", table, err)
@@ -156,18 +164,13 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 				t.Fatalf("migration did not create %s", table)
 			}
 		}
-
-		mustExec(t, db1, `UPDATE factory_postgres_ownership_schema SET version = 2 WHERE singleton = 1`)
-		mustExec(t, db1, `DROP TABLE factory_job_ownership`)
-		if err := NewPostgresOwnership(db2).Migrate(context.Background()); err == nil || !strings.Contains(err.Error(), "unsupported PostgreSQL ownership schema version 2") {
-			t.Fatalf("unsupported schema version migration error = %v, want unsupported-version failure", err)
-		}
-		var ownershipTableExists bool
-		if err := db1.QueryRow(`SELECT to_regclass('factory_job_ownership') IS NOT NULL`).Scan(&ownershipTableExists); err != nil {
+		var historyColumns int
+		if err := db1.QueryRow(`SELECT count(*) FROM information_schema.columns
+			WHERE table_schema = current_schema() AND table_name = 'factory_job_attempt_history'`).Scan(&historyColumns); err != nil {
 			t.Fatal(err)
 		}
-		if ownershipTableExists {
-			t.Fatal("migration created ownership table despite unsupported schema version")
+		if historyColumns != 9 {
+			t.Fatalf("fresh v1 attempt-history columns = %d, want 9", historyColumns)
 		}
 	})
 
@@ -179,7 +182,8 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 			status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
 			queue_sequence bigint NOT NULL UNIQUE
 		)`)
-		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ('123e4567-e89b-42d3-a456-426614174000','queued',1)`)
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES
+			('123e4567-e89b-42d3-a456-426614174000','queued',1)`)
 		ownership := NewPostgresOwnership(db)
 		if err := ownership.Migrate(ctx); err != nil {
 			t.Fatalf("migrate: %v", err)
@@ -226,36 +230,29 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 		if winner.Generation != 1 || winner.JobID != "123e4567-e89b-42d3-a456-426614174000" || winner.OwnerToken == "" {
 			t.Fatalf("unexpected claim: %+v", winner)
 		}
+		var claimedHistoryRows int
+		if err := db.QueryRow(`SELECT count(*) FROM factory_job_attempt_history WHERE job_id = $1`, winner.JobID).Scan(&claimedHistoryRows); err != nil {
+			t.Fatal(err)
+		}
+		if claimedHistoryRows != 1 {
+			t.Fatalf("history rows after one successful claim and one conflict = %d, want 1", claimedHistoryRows)
+		}
 		if err := ownership.ValidateCurrent(ctx, winner.PostgresAttempt); err != nil {
 			t.Fatalf("new claim not current: %v", err)
 		}
+		assertPostgresAttemptHistory(t, db, winner.JobID, winner.Generation, winner.WorkerID, winner.BootID, winner.OwnerToken, "")
 		wrongWorker := winner.PostgresAttempt
 		wrongWorker.WorkerID = "different-worker"
 		if err := ownership.ValidateCurrent(ctx, wrongWorker); !errors.Is(err, ErrStaleAttempt) {
 			t.Fatalf("wrong worker identity validation = %v, want ErrStaleAttempt", err)
 		}
 
-		// Expiry is a mutation fence only: it does not reclaim or requeue.
-		mustExec(t, db, `UPDATE factory_job_ownership SET lease_until = clock_timestamp() - interval '1 second' WHERE job_id = '123e4567-e89b-42d3-a456-426614174000'`)
-		if err := ownership.Heartbeat(ctx, winner.PostgresAttempt, time.Minute); !errors.Is(err, ErrStaleAttempt) {
-			t.Fatalf("expired heartbeat error = %v, want ErrStaleAttempt", err)
+		// Finish the first generation, then an explicit external/operator requeue
+		// starts a second durable history row with a new fencing generation.
+		if err := ownership.Finish(ctx, winner.PostgresAttempt, StatusFailed); err != nil {
+			t.Fatalf("finish first attempt: %v", err)
 		}
-		if err := ownership.Finish(ctx, winner.PostgresAttempt, StatusSucceeded); !errors.Is(err, ErrStaleAttempt) {
-			t.Fatalf("expired finish error = %v, want ErrStaleAttempt", err)
-		}
-		var status string
-		if err := db.QueryRow(`SELECT status FROM factory_jobs WHERE id = '123e4567-e89b-42d3-a456-426614174000'`).Scan(&status); err != nil {
-			t.Fatal(err)
-		}
-		if status != "running" {
-			t.Fatalf("expired job status = %q, want running", status)
-		}
-		if _, err := ownership.ClaimNext(ctx, "worker-c", "boot-2", time.Minute); !errors.Is(err, ErrNoQueuedJobs) {
-			t.Fatalf("expired running job was unexpectedly reclaimed: %v", err)
-		}
-
-		// Only an explicit external/operator requeue can make it claimable again;
-		// the retained row must increment generation and fence the old handle.
+		assertPostgresAttemptHistory(t, db, winner.JobID, winner.Generation, winner.WorkerID, winner.BootID, winner.OwnerToken, string(StatusFailed))
 		mustExec(t, db, `UPDATE factory_jobs SET status = 'queued' WHERE id = '123e4567-e89b-42d3-a456-426614174000'`)
 		reclaim, err := ownership.ClaimNext(ctx, "worker-c", "boot-2", time.Minute)
 		if err != nil {
@@ -271,12 +268,133 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 			t.Fatalf("live heartbeat: %v", err)
 		}
 		if err := ownership.Finish(ctx, reclaim.PostgresAttempt, StatusSucceeded); err != nil {
-			t.Fatalf("finish: %v", err)
+			t.Fatalf("finish second attempt: %v", err)
 		}
 		if err := ownership.ValidateCurrent(ctx, reclaim.PostgresAttempt); !errors.Is(err, ErrStaleAttempt) {
 			t.Fatalf("terminal attempt validation = %v, want ErrStaleAttempt", err)
 		}
+		assertPostgresAttemptHistory(t, db, winner.JobID, winner.Generation, winner.WorkerID, winner.BootID, winner.OwnerToken, string(StatusFailed))
+		assertPostgresAttemptHistory(t, db, reclaim.JobID, reclaim.Generation, reclaim.WorkerID, reclaim.BootID, reclaim.OwnerToken, string(StatusSucceeded))
+		var generations int
+		if err := db.QueryRow(`SELECT count(*) FROM factory_job_attempt_history WHERE job_id = $1`, winner.JobID).Scan(&generations); err != nil {
+			t.Fatal(err)
+		}
+		if generations != 2 {
+			t.Fatalf("retained attempt generations = %d, want 2", generations)
+		}
+
+		// Lease expiry fences mutations without reclaiming or creating history.
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ('123e4567-e89b-42d3-a456-426614174001','queued',2)`)
+		expiring, err := ownership.ClaimNext(ctx, "worker-expiring", "boot-3", time.Minute)
+		if err != nil {
+			t.Fatalf("claim expiring job: %v", err)
+		}
+		mustExec(t, db, `UPDATE factory_job_ownership SET lease_until = clock_timestamp() - interval '1 second' WHERE job_id = '123e4567-e89b-42d3-a456-426614174001'`)
+		if err := ownership.Heartbeat(ctx, expiring.PostgresAttempt, time.Minute); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("expired heartbeat error = %v, want ErrStaleAttempt", err)
+		}
+		if err := ownership.Finish(ctx, expiring.PostgresAttempt, StatusSucceeded); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("expired finish error = %v, want ErrStaleAttempt", err)
+		}
+		var status string
+		if err := db.QueryRow(`SELECT status FROM factory_jobs WHERE id = $1`, expiring.JobID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" {
+			t.Fatalf("expired job status = %q, want running", status)
+		}
+		if _, err := ownership.ClaimNext(ctx, "worker-late", "boot-4", time.Minute); !errors.Is(err, ErrNoQueuedJobs) {
+			t.Fatalf("expired running job was unexpectedly reclaimed: %v", err)
+		}
+		var expiredHistoryCount int
+		if err := db.QueryRow(`SELECT count(*) FROM factory_job_attempt_history WHERE job_id = $1`, expiring.JobID).Scan(&expiredHistoryCount); err != nil {
+			t.Fatal(err)
+		}
+		if expiredHistoryCount != 1 {
+			t.Fatalf("expired job history rows = %d, want one claim row", expiredHistoryCount)
+		}
+
+		// A history-write failure must roll back the job transition as well.
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ('123e4567-e89b-42d3-a456-426614174002','queued',3)`)
+		mustExec(t, db, `INSERT INTO factory_job_attempt_history
+			(job_id,generation,worker_id,boot_id,claimed_at,started_at,lease_until)
+			VALUES ('123e4567-e89b-42d3-a456-426614174002',1,'existing-worker','existing-boot',
+			clock_timestamp(),clock_timestamp(),clock_timestamp()+interval '1 minute')`)
+		if _, err := ownership.ClaimNext(ctx, "worker-conflict", "boot-5", time.Minute); err == nil {
+			t.Fatal("claim with a conflicting history generation succeeded")
+		}
+		if err := db.QueryRow(`SELECT status FROM factory_jobs WHERE id = '123e4567-e89b-42d3-a456-426614174002'`).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "queued" {
+			t.Fatalf("job status after failed claim history write = %q, want queued", status)
+		}
+		var ownershipRows int
+		if err := db.QueryRow(`SELECT count(*) FROM factory_job_ownership WHERE job_id = '123e4567-e89b-42d3-a456-426614174002'`).Scan(&ownershipRows); err != nil {
+			t.Fatal(err)
+		}
+		if ownershipRows != 0 {
+			t.Fatalf("ownership rows after failed claim history write = %d, want 0", ownershipRows)
+		}
+		mustExec(t, db, `DELETE FROM factory_job_attempt_history WHERE job_id = '123e4567-e89b-42d3-a456-426614174002'`)
+
+		finishRollback, err := ownership.ClaimNext(ctx, "worker-finish-failure", "boot-6", time.Minute)
+		if err != nil {
+			t.Fatalf("claim before finish rollback test: %v", err)
+		}
+		if _, err := db.Exec(`DELETE FROM factory_job_attempt_history WHERE job_id = $1`, finishRollback.JobID); err != nil {
+			t.Fatal(err)
+		}
+		if err := ownership.Finish(ctx, finishRollback.PostgresAttempt, StatusFailed); err == nil {
+			t.Fatal("finish without an active history row succeeded")
+		}
+		if err := db.QueryRow(`SELECT status FROM factory_jobs WHERE id = $1`, finishRollback.JobID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status != "running" {
+			t.Fatalf("job status after failed finish history write = %q, want running", status)
+		}
 	})
+}
+
+func assertPostgresAttemptHistory(t *testing.T, db *sql.DB, jobID string, generation int64, workerID, bootID, token, wantStatus string) {
+	t.Helper()
+	var gotWorker, gotBoot string
+	var claimedAt, startedAt, leaseUntil time.Time
+	var finishedAt sql.NullTime
+	var status sql.NullString
+	err := db.QueryRow(`SELECT worker_id, boot_id, claimed_at, started_at, lease_until, finished_at, status
+		FROM factory_job_attempt_history WHERE job_id = $1 AND generation = $2`, jobID, generation).
+		Scan(&gotWorker, &gotBoot, &claimedAt, &startedAt, &leaseUntil, &finishedAt, &status)
+	if err != nil {
+		t.Fatalf("read attempt history for generation %d: %v", generation, err)
+	}
+	if gotWorker != workerID || gotBoot != bootID || claimedAt.IsZero() || startedAt.IsZero() || leaseUntil.IsZero() {
+		t.Fatalf("attempt history identity/timestamps = (%q, %q, %v, %v, %v)", gotWorker, gotBoot, claimedAt, startedAt, leaseUntil)
+	}
+	if wantStatus == "" {
+		if finishedAt.Valid || status.Valid {
+			t.Fatalf("active attempt history has terminal fields: finished=%v status=%v", finishedAt, status)
+		}
+	} else if !finishedAt.Valid || !status.Valid || status.String != wantStatus {
+		t.Fatalf("terminal attempt history = finished %v, status %v; want status %q", finishedAt, status, wantStatus)
+	}
+	var tokenColumnExists bool
+	if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'factory_job_attempt_history' AND column_name = 'owner_token')`).Scan(&tokenColumnExists); err != nil {
+		t.Fatal(err)
+	}
+	if tokenColumnExists {
+		t.Fatal("attempt history schema contains bearer owner token column")
+	}
+	var tokenMatches int
+	if err := db.QueryRow(`SELECT count(*) FROM factory_job_attempt_history
+		WHERE to_jsonb(factory_job_attempt_history)::text LIKE '%' || $1 || '%'`, token).Scan(&tokenMatches); err != nil {
+		t.Fatal(err)
+	}
+	if tokenMatches != 0 {
+		t.Fatal("attempt history data contains bearer owner token")
+	}
 }
 
 func sqlOpenPGX(dsn string) (*sql.DB, error) {
