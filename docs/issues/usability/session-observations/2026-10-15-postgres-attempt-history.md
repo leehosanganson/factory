@@ -1,0 +1,6 @@
+# Session observations: PostgreSQL attempt history
+
+- **Verified observation:** The isolated PostgreSQL ownership protocol now has one fresh schema v1 containing the migration ledger, current owner record, and durable attempt-history table. The migration creates these transactionally under the existing advisory lock; independent concurrent initial migrations remain covered by the PostgreSQL 18 integration test.
+- **Verified observation:** A successful claim writes the new ownership generation, the active history row, and the queued-to-running job transition in one transaction. Finish writes the terminal history fields and terminal job status in one transaction. History has no owner-token column or token data; tests also cover multiple explicit generations and expired leases remaining unreassigned.
+- **Scope note:** This is an isolated PostgreSQL ownership protocol. No runtime integration, reassignment, recovery, or worker authentication was added. Because the protocol has not launched, this schema is designated v1 from its outset; there is no v1-to-v2 backfill or compatibility handling for earlier unmerged writers.
+- No additional Factory CLI usability friction was observed during this coding pass. These are session observations, not user-reported findings.
