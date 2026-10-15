@@ -174,6 +174,87 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("attempt history write failures roll back claim and finish", func(t *testing.T) {
+		db := scopedPostgresDB(t, admin, dsn)
+		ctx := context.Background()
+		const claimJobID = "123e4567-e89b-42d3-a456-426614174010"
+		const finishJobID = "123e4567-e89b-42d3-a456-426614174011"
+		mustExec(t, db, `CREATE TABLE factory_jobs (
+			id text PRIMARY KEY,
+			status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
+			queue_sequence bigint NOT NULL UNIQUE
+		)`)
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES
+			('`+claimJobID+`','queued',1), ('`+finishJobID+`','queued',2)`)
+		ownership := NewPostgresOwnership(db)
+		if err := ownership.Migrate(ctx); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+
+		mustExec(t, db, `CREATE FUNCTION reject_designated_history_insert() RETURNS trigger
+			LANGUAGE plpgsql AS $$ BEGIN
+				IF NEW.job_id = '`+claimJobID+`' THEN
+					RAISE EXCEPTION 'injected attempt-history insert failure';
+				END IF;
+				RETURN NEW;
+			END $$`)
+		mustExec(t, db, `CREATE TRIGGER reject_designated_history_insert
+			BEFORE INSERT ON factory_job_attempt_history
+			FOR EACH ROW EXECUTE FUNCTION reject_designated_history_insert()`)
+		claim, err := ownership.ClaimNext(ctx, "worker-claim-fault", "boot-claim-fault", time.Minute)
+		if err == nil || errors.Is(err, ErrNoQueuedJobs) || err.Error() != "record PostgreSQL attempt history" {
+			t.Fatalf("ClaimNext() with history insert fault = (%+v, %v), want generic claim failure", claim, err)
+		}
+		assertPostgresJobStatus(t, db, claimJobID, "queued")
+		assertPostgresOwnershipCount(t, db, claimJobID, 0)
+		mustExec(t, db, `DROP TRIGGER reject_designated_history_insert ON factory_job_attempt_history`)
+		mustExec(t, db, `DROP FUNCTION reject_designated_history_insert()`)
+
+		claim, err = ownership.ClaimNext(ctx, "worker-claim-retry", "boot-claim-retry", time.Minute)
+		if err != nil {
+			t.Fatalf("ClaimNext() after removing history fault: %v", err)
+		}
+		if claim.JobID != claimJobID || claim.Generation != 1 {
+			t.Fatalf("retry claim = (%s, generation %d), want designated job generation 1", claim.JobID, claim.Generation)
+		}
+		assertPostgresJobStatus(t, db, claimJobID, "running")
+		assertPostgresOwnershipGeneration(t, db, claimJobID, 1)
+		assertPostgresAttemptHistory(t, db, claimJobID, 1, claim.WorkerID, claim.BootID, claim.OwnerToken, "")
+		assertPostgresHistoryCount(t, db, claimJobID, 1)
+
+		finishClaim, err := ownership.ClaimNext(ctx, "worker-finish-fault", "boot-finish-fault", time.Minute)
+		if err != nil {
+			t.Fatalf("claim before finish fault: %v", err)
+		}
+		if finishClaim.JobID != finishJobID || finishClaim.Generation != 1 {
+			t.Fatalf("finish test claim = (%s, generation %d), want designated job generation 1", finishClaim.JobID, finishClaim.Generation)
+		}
+		mustExec(t, db, `CREATE FUNCTION reject_designated_history_update() RETURNS trigger
+			LANGUAGE plpgsql AS $$ BEGIN
+				IF NEW.job_id = '`+finishJobID+`' THEN
+					RAISE EXCEPTION 'injected attempt-history update failure';
+				END IF;
+				RETURN NEW;
+			END $$`)
+		mustExec(t, db, `CREATE TRIGGER reject_designated_history_update
+			BEFORE UPDATE ON factory_job_attempt_history
+			FOR EACH ROW EXECUTE FUNCTION reject_designated_history_update()`)
+		if err := ownership.Finish(ctx, finishClaim.PostgresAttempt, StatusSucceeded); err == nil || err.Error() != "finish PostgreSQL attempt history" {
+			t.Fatalf("Finish() with history update fault = %v, want generic finish failure", err)
+		}
+		assertPostgresJobStatus(t, db, finishJobID, "running")
+		assertPostgresOwnershipGeneration(t, db, finishJobID, 1)
+		assertPostgresAttemptHistory(t, db, finishJobID, 1, finishClaim.WorkerID, finishClaim.BootID, finishClaim.OwnerToken, "")
+		assertPostgresHistoryCount(t, db, finishJobID, 1)
+		mustExec(t, db, `DROP TRIGGER reject_designated_history_update ON factory_job_attempt_history`)
+		mustExec(t, db, `DROP FUNCTION reject_designated_history_update()`)
+		if err := ownership.Finish(ctx, finishClaim.PostgresAttempt, StatusSucceeded); err != nil {
+			t.Fatalf("Finish() after removing history fault: %v", err)
+		}
+		assertPostgresJobStatus(t, db, finishJobID, string(StatusSucceeded))
+		assertPostgresAttemptHistory(t, db, finishJobID, 1, finishClaim.WorkerID, finishClaim.BootID, finishClaim.OwnerToken, string(StatusSucceeded))
+	})
+
 	t.Run("concurrent claim fencing, expiry, and terminal finish", func(t *testing.T) {
 		db := scopedPostgresDB(t, admin, dsn)
 		ctx := context.Background()
@@ -440,6 +521,50 @@ func mustExec(t *testing.T, db *sql.DB, statement string) {
 	t.Helper()
 	if _, err := db.Exec(statement); err != nil {
 		t.Fatalf("execute %q: %v", statement, err)
+	}
+}
+
+func assertPostgresJobStatus(t *testing.T, db *sql.DB, jobID, want string) {
+	t.Helper()
+	var status string
+	if err := db.QueryRow(`SELECT status FROM factory_jobs WHERE id = $1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read status for job %s: %v", jobID, err)
+	}
+	if status != want {
+		t.Fatalf("job %s status = %q, want %q", jobID, status, want)
+	}
+}
+
+func assertPostgresOwnershipCount(t *testing.T, db *sql.DB, jobID string, want int) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM factory_job_ownership WHERE job_id = $1`, jobID).Scan(&count); err != nil {
+		t.Fatalf("count ownership rows for job %s: %v", jobID, err)
+	}
+	if count != want {
+		t.Fatalf("job %s ownership rows = %d, want %d", jobID, count, want)
+	}
+}
+
+func assertPostgresOwnershipGeneration(t *testing.T, db *sql.DB, jobID string, want int64) {
+	t.Helper()
+	var generation int64
+	if err := db.QueryRow(`SELECT generation FROM factory_job_ownership WHERE job_id = $1`, jobID).Scan(&generation); err != nil {
+		t.Fatalf("read ownership generation for job %s: %v", jobID, err)
+	}
+	if generation != want {
+		t.Fatalf("job %s ownership generation = %d, want %d", jobID, generation, want)
+	}
+}
+
+func assertPostgresHistoryCount(t *testing.T, db *sql.DB, jobID string, want int) {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM factory_job_attempt_history WHERE job_id = $1`, jobID).Scan(&count); err != nil {
+		t.Fatalf("count attempt history rows for job %s: %v", jobID, err)
+	}
+	if count != want {
+		t.Fatalf("job %s attempt history rows = %d, want %d", jobID, count, want)
 	}
 }
 
