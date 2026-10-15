@@ -3,6 +3,8 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -56,6 +58,25 @@ func (p *readinessPublisher) Ping(context.Context) error {
 
 func (p *readinessPublisher) Publish(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
 	return restprovider.Outcome{}, errors.New("not used in readiness test")
+}
+
+func TestRunNamedPrincipalAndLegacyBearerCredentialsAuthenticate(t *testing.T) {
+	config, legacyToken := runtimeFixture(t)
+	resolver, err := restserver.LoadPrincipalResolver(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, token := range []string{legacyToken, "runtime-named-operator-token"} {
+		if !resolver.APIKey().Authenticate(token) {
+			t.Errorf("runtime resolver rejected configured credential")
+		}
+	}
+	if resolver.APIKey().Authenticate("unconfigured-runtime-token") {
+		t.Fatal("runtime resolver accepted unconfigured credential")
+	}
+	if principal, ok := resolver.Resolve("runtime-named-operator-token"); !ok || principal.ID != "runtime-operator" || principal.Role != "operator" {
+		t.Fatalf("runtime named credential resolved to %+v, %v", principal, ok)
+	}
 }
 
 func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T) {
@@ -119,15 +140,15 @@ func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T)
 		defer response.Body.Close()
 		return response.StatusCode
 	}
-	submitStatus := func() int {
+	submitStatus := func(token, idempotencyKey string) int {
 		t.Helper()
 		request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs", strings.NewReader(`{"repository":"trusted","task":"must not queue"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Header.Set("Authorization", "Bearer "+key)
+		request.Header.Set("Authorization", "Bearer "+token)
 		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("Idempotency-Key", "outage-request")
+		request.Header.Set("Idempotency-Key", idempotencyKey)
 		response, err := client.Do(request)
 		if err != nil {
 			t.Fatal(err)
@@ -145,8 +166,12 @@ func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T)
 	if got := getStatus("/readyz"); got != http.StatusServiceUnavailable {
 		t.Fatalf("readiness during store outage=%d, want %d", got, http.StatusServiceUnavailable)
 	}
-	if got := submitStatus(); got != http.StatusServiceUnavailable {
-		t.Fatalf("admission during store outage=%d, want %d", got, http.StatusServiceUnavailable)
+	if got := submitStatus("runtime-named-operator-token", "named-outage-request"); got != http.StatusServiceUnavailable {
+		t.Fatalf("named operator admission during store outage=%d, want %d", got, http.StatusServiceUnavailable)
+	}
+
+	if got := submitStatus(key, "legacy-outage-request"); got != http.StatusServiceUnavailable {
+		t.Fatalf("legacy admission during store outage=%d, want %d", got, http.StatusServiceUnavailable)
 	}
 	store.up.Store(true)
 	if got := getStatus("/readyz"); got != http.StatusOK {
@@ -156,7 +181,7 @@ func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T)
 	if got := getStatus("/readyz"); got != http.StatusServiceUnavailable {
 		t.Fatalf("readiness during provider outage=%d, want %d", got, http.StatusServiceUnavailable)
 	}
-	if got := submitStatus(); got != http.StatusServiceUnavailable {
+	if got := submitStatus(key, "provider-outage-request"); got != http.StatusServiceUnavailable {
 		t.Fatalf("admission during provider outage=%d, want %d", got, http.StatusServiceUnavailable)
 	}
 	publisher.up.Store(true)
@@ -167,15 +192,18 @@ func TestRunReadinessRecoversAfterProviderOutageAndBlocksAdmission(t *testing.T)
 	if got := getStatus("/readyz"); got != http.StatusOK {
 		t.Fatalf("readiness after provider recovery=%d, want %d; probes=%d", got, http.StatusOK, publisher.checks.Load())
 	}
-	if got := submitStatus(); got != http.StatusAccepted {
-		t.Fatalf("admission after provider recovery=%d, want %d", got, http.StatusAccepted)
+	if got := submitStatus("unconfigured-runtime-token", "unknown-request"); got != http.StatusUnauthorized {
+		t.Fatalf("unconfigured bearer status=%d, want %d", got, http.StatusUnauthorized)
+	}
+	if got := submitStatus("runtime-named-operator-token", "recovered-request"); got != http.StatusAccepted {
+		t.Fatalf("named operator admission after provider recovery=%d, want %d", got, http.StatusAccepted)
 	}
 	deadline = time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && executions.Load() == 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if executions.Load() != 1 {
-		t.Fatalf("job execution count=%d, want one admitted job after recovery", executions.Load())
+		t.Fatalf("job execution count=%d, want one legacy-key admission after recovery", executions.Load())
 	}
 	cancel()
 	select {
@@ -911,6 +939,26 @@ func runtimeFixture(t *testing.T) (restserver.Config, string) {
 	config.Repositories = map[string]string{"trusted": root}
 	config.Harness = restserver.HarnessConfig{Executable: "pi", Args: []string{"{system_prompt}", "{task}"}}
 	config.APIKeyFile = keyPath
+	const operatorToken = "runtime-named-operator-token"
+	digest := sha256.Sum256([]byte(operatorToken))
+	verifierPath := filepath.Join(t.TempDir(), "operator-verifier.json")
+	verifier, err := json.Marshal(struct {
+		Version    int `json:"version"`
+		Principals []struct {
+			ID          string `json:"id"`
+			TokenSHA256 string `json:"token_sha256"`
+		} `json:"principals"`
+	}{Version: 1, Principals: []struct {
+		ID          string `json:"id"`
+		TokenSHA256 string `json:"token_sha256"`
+	}{{ID: "runtime-operator", TokenSHA256: hex.EncodeToString(digest[:])}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(verifierPath, verifier, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Principals = []restserver.PrincipalConfig{{ID: "runtime-operator", Role: "operator", TokenFile: verifierPath, Enabled: true}}
 	return config, key
 }
 

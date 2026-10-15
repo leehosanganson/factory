@@ -137,6 +137,104 @@ func TestIssueProvenanceOpenAPIValidationParity(t *testing.T) {
 	})
 }
 
+func TestOpenAPIRoleDependentListingContract(t *testing.T) {
+	specPath := filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json")
+	data, err := os.ReadFile(specPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Info struct {
+			Version string `json:"version"`
+		} `json:"info"`
+		Paths map[string]struct {
+			Get struct {
+				Description string `json:"description"`
+				Parameters  []struct {
+					Name string `json:"name"`
+					In   string `json:"in"`
+				} `json:"parameters"`
+				Responses map[string]struct {
+					Content map[string]struct {
+						Schema struct {
+							OneOf []struct {
+								Ref string `json:"$ref"`
+							} `json:"oneOf"`
+						} `json:"schema"`
+					} `json:"content"`
+				} `json:"responses"`
+			} `json:"get"`
+		} `json:"paths"`
+		Components struct {
+			Schemas map[string]struct {
+				Required   []string                   `json:"required"`
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Info.Version != "1.4.0" {
+		t.Errorf("OpenAPI version = %q, want 1.4.0", document.Info.Version)
+	}
+	listing, ok := document.Paths["/v1/jobs"]
+	if !ok {
+		t.Fatal("OpenAPI spec is missing GET /v1/jobs")
+	}
+	queryNames := map[string]bool{}
+	for _, parameter := range listing.Get.Parameters {
+		if parameter.In == "query" {
+			queryNames[parameter.Name] = true
+		}
+	}
+	for _, parameter := range []string{"limit", "after", "snapshot", "cursor"} {
+		if !queryNames[parameter] {
+			t.Errorf("GET /v1/jobs is missing query parameter %q", parameter)
+		}
+	}
+	response := listing.Get.Responses["200"].Content["application/json"].Schema
+	refs := map[string]bool{}
+	for _, alternative := range response.OneOf {
+		refs[alternative.Ref] = true
+	}
+	if !refs["#/components/schemas/JobPage"] || !refs["#/components/schemas/SubmitterJobPage"] {
+		t.Errorf("GET /v1/jobs response oneOf refs = %v", refs)
+	}
+	for name, required := range map[string][]string{
+		"SubmitterJobPage": {"jobs", "has_more", "next_cursor"},
+		"JobSnapshot":      {"submitted_by"},
+	} {
+		schema, exists := document.Components.Schemas[name]
+		if !exists {
+			t.Errorf("missing %s schema", name)
+			continue
+		}
+		for _, field := range required {
+			if !containsString(schema.Required, field) {
+				t.Errorf("%s required fields %v omit %q", name, schema.Required, field)
+			}
+			if _, exists := schema.Properties[field]; !exists {
+				t.Errorf("%s properties omit %q", name, field)
+			}
+		}
+	}
+	for _, expected := range []string{"submitter", "operator", "15 minutes", "restart", "process memory"} {
+		if !strings.Contains(listing.Get.Description, expected) {
+			t.Errorf("listing description omits %q", expected)
+		}
+	}
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
 func TestOpenAPIRouteInventory(t *testing.T) {
 	specPath := filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json")
 	data, err := os.ReadFile(specPath)

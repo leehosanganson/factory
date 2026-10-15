@@ -76,10 +76,14 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("invalid REST server config: %w", err)
 	}
-	key, err := restserver.LoadAPIKey(config.APIKeyFile)
+	if !principalsConfigured(config) {
+		return errors.New("invalid REST server config: principals must include an enabled operator")
+	}
+	principals, err := restserver.LoadPrincipalResolver(config)
 	if err != nil {
 		return err
 	}
+	key := principals.APIKey()
 	openStore := options.OpenStore
 	if openStore == nil {
 		openStore = restworker.NewLocalServerJobManager
@@ -363,6 +367,18 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		return fmt.Errorf("stop REST workspace sweeper: %w", sweepErr)
 	}
 	return nil
+}
+
+func principalsConfigured(config restserver.Config) bool {
+	if len(config.Principals) == 0 {
+		return false
+	}
+	for _, principal := range config.Principals {
+		if principal.Enabled && principal.Role == "operator" {
+			return true
+		}
+	}
+	return false
 }
 
 func newShutdownContext(timeout time.Duration) (context.Context, context.CancelFunc) {

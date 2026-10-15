@@ -49,6 +49,7 @@ const (
 )
 
 var aliasPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+var principalIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 
 // Config contains server-only settings. It is independent of the CLI config.
 type Config struct {
@@ -59,6 +60,7 @@ type Config struct {
 	VerificationChecks [][]string              `json:"verification_checks,omitempty"`
 	ParallelSubtasks   *ParallelSubtasksConfig `json:"parallel_subtasks,omitempty"`
 	APIKeyFile         string                  `json:"api_key_file"`
+	Principals         []PrincipalConfig       `json:"principals,omitempty"`
 	Persistence        PersistenceConfig       `json:"persistence"`
 	Provider           ProviderConfig          `json:"provider"`
 	Limits             Limits                  `json:"limits"`
@@ -95,6 +97,14 @@ type Limits struct {
 type PersistenceConfig struct {
 	Backend string `json:"backend"`
 	Path    string `json:"path,omitempty"`
+}
+
+// PrincipalConfig binds a stable caller identity and role to a protected bearer-token file.
+type PrincipalConfig struct {
+	ID        string `json:"id"`
+	Role      string `json:"role"`
+	TokenFile string `json:"token_file"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type ProviderConfig struct {
@@ -168,6 +178,9 @@ func LoadConfig(path string) (Config, error) {
 	if err := config.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid REST server config: %w", err)
 	}
+	if !enabledNamedOperator(config.Principals) {
+		return Config{}, errors.New("invalid REST server config: principals must contain at least one enabled operator")
+	}
 	return config, nil
 }
 
@@ -238,10 +251,44 @@ func (c Config) Validate() error {
 	if !filepath.IsAbs(c.APIKeyFile) || strings.TrimSpace(c.APIKeyFile) == "" || strings.ContainsRune(c.APIKeyFile, 0) {
 		return errors.New("api_key_file must be an absolute path")
 	}
+	principalIDs := make(map[string]struct{}, len(c.Principals))
+	hasEnabledOperator := false
+	for index, principal := range c.Principals {
+		if !principalIDPattern.MatchString(principal.ID) || principal.ID == "legacy-shared" {
+			return fmt.Errorf("principals[%d].id is invalid", index)
+		}
+		if _, exists := principalIDs[principal.ID]; exists {
+			return errors.New("principals must not contain duplicate IDs")
+		}
+		principalIDs[principal.ID] = struct{}{}
+		switch principal.Role {
+		case "submitter", "operator":
+		default:
+			return fmt.Errorf("principals[%d].role must be submitter or operator", index)
+		}
+		if !filepath.IsAbs(principal.TokenFile) || strings.TrimSpace(principal.TokenFile) == "" || strings.ContainsRune(principal.TokenFile, 0) {
+			return fmt.Errorf("principals[%d].token_file must be an absolute path", index)
+		}
+		if principal.Enabled && principal.Role == "operator" {
+			hasEnabledOperator = true
+		}
+	}
+	if c.Principals != nil && !hasEnabledOperator {
+		return errors.New("principals must contain at least one enabled operator")
+	}
 	if err := c.Limits.validate(); err != nil {
 		return err
 	}
 	return nil
+}
+
+func enabledNamedOperator(principals []PrincipalConfig) bool {
+	for _, principal := range principals {
+		if principal.Enabled && principal.Role == "operator" {
+			return true
+		}
+	}
+	return false
 }
 
 func validateListenAddress(address string) error {
@@ -394,7 +441,7 @@ func consumeConfigJSONValue(decoder *json.Decoder, parent string) error {
 		return err
 	case '[':
 		for decoder.More() {
-			if err := consumeConfigJSONValue(decoder, ""); err != nil {
+			if err := consumeConfigJSONValue(decoder, parent); err != nil {
 				return err
 			}
 		}
@@ -409,11 +456,13 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "persistence": {}, "provider": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "parallel_subtasks":
 		fields = map[string]struct{}{"enabled": {}, "max_concurrency": {}}
+	case "principals":
+		fields = map[string]struct{}{"id": {}, "role": {}, "token_file": {}, "enabled": {}}
 	case "persistence":
 		fields = map[string]struct{}{"backend": {}, "path": {}}
 	case "provider":
@@ -458,7 +507,7 @@ func validateRequiredConfigFields(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return errors.New("invalid root object")
 	}
-	for _, field := range []string{"mode", "repositories", "harness", "api_key_file"} {
+	for _, field := range []string{"mode", "repositories", "harness", "api_key_file", "principals"} {
 		if _, ok := fields[field]; !ok {
 			return fmt.Errorf("required field %q is missing", field)
 		}
@@ -472,12 +521,23 @@ func validateRequiredConfigFields(data []byte) error {
 			return fmt.Errorf("required harness field %q is missing", field)
 		}
 	}
+	var principals []map[string]json.RawMessage
+	if err := json.Unmarshal(fields["principals"], &principals); err != nil {
+		return errors.New("principals must be an array")
+	}
+	for index, principal := range principals {
+		for _, field := range []string{"id", "role", "token_file", "enabled"} {
+			if _, ok := principal[field]; !ok {
+				return fmt.Errorf("required principal %d field %q is missing", index, field)
+			}
+		}
+	}
 	return nil
 }
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "parallel_subtasks", "persistence", "provider", "repositories", "verification_checks":
+	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "repositories", "verification_checks":
 		return key
 	default:
 		return ""

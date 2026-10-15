@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.3.0",
+    "version": "1.4.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -62,15 +62,17 @@
       "get": {
         "operationId": "listJobs",
         "summary": "List retained job summaries",
-        "description": "Read-only bearer-authenticated listing ordered by immutable admission sequence, oldest first. The first request captures a snapshot_sequence ceiling; while has_more is true, continue with the returned next_sequence as after and the same snapshot_sequence. Jobs admitted later are excluded from that traversal and appear when starting again without cursors. Cursors are opaque to clients. Each page is bounded to 1–100 items (default 50); only id, status, created_at, and updated_at are returned, never request/task text, provider details, events, logs, or paths. Status and updated_at are a current per-page view; the snapshot boundary freezes membership, not lifecycle state. Retained terminal and interrupted jobs are included until store retention removes them.",
+        "description": "Read-only bearer-authenticated listing with role-dependent response and pagination. The legacy shared API key and named operator credentials receive the operator JobPage: jobs ordered by immutable admission sequence, oldest first, with snapshot_sequence and next_sequence; continue with the returned next_sequence as after and the same snapshot_sequence. Named submitter credentials receive only their own jobs in SubmitterJobPage and use the opaque next_cursor as cursor. Submitter cursors are held in process memory, bound to that principal, expire after 15 minutes, and become invalid on restart. Both page types are bounded to 1–100 items (default 50) and expose only id, status, created_at, and updated_at. The response omits request/task text, provider details, events, logs, paths, and admission sequence metadata for submitters. Status and updated_at are current per-page values; the snapshot boundary freezes membership, not lifecycle state.",
+        "x-role-dependent-response": true,
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
-          { "name": "after", "in": "query", "required": false, "description": "The next_sequence returned by the preceding page.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
-          { "name": "snapshot", "in": "query", "required": false, "description": "The snapshot_sequence returned by the first page; required with after.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } }
+          { "name": "after", "in": "query", "required": false, "description": "Operator listing only: next_sequence returned by the preceding page; required with snapshot.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
+          { "name": "snapshot", "in": "query", "required": false, "description": "Operator listing only: snapshot_sequence returned by the first page; required with after and forbidden with cursor.", "schema": { "type": "integer", "format": "int64", "minimum": 1 }, "x-mutuallyExclusiveWith": [ "cursor" ] },
+          { "name": "cursor", "in": "query", "required": false, "description": "Named submitter listing only: opaque next_cursor from the previous page; mutually exclusive with after and snapshot.", "schema": { "type": "string", "minLength": 1 }, "x-mutuallyExclusiveWith": [ "after", "snapshot" ] }
         ],
         "responses": {
-          "200": { "description": "A bounded page of safe job summaries.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobPage" } } } },
+          "200": { "description": "A bounded page of safe job summaries.", "content": { "application/json": { "schema": { "oneOf": [ { "$ref": "#/components/schemas/JobPage" }, { "$ref": "#/components/schemas/SubmitterJobPage" } ], "description": "JobPage for the legacy shared key or named operator; SubmitterJobPage for a named submitter." } } } },
           "400": { "$ref": "#/components/responses/InvalidRequest" },
           "401": { "$ref": "#/components/responses/Unauthenticated" },
           "500": { "$ref": "#/components/responses/InternalError" },
@@ -81,7 +83,8 @@
       "post": {
         "operationId": "createJob",
         "summary": "Submit a job",
-        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries with the same normalized payload return the retained job; reuse with a different payload conflicts. Optional issue_provenance stores bounded GitHub source identity, exact snapshot version, canonical issue URL, and sanitized title only; the submitted task remains ordinary visible request.task content. Across idempotency keys, the tuple (tracker, source_repository, issue_number, version) maps to one retained job when the complete request matches; differing task, destination, title, URL, or other request content conflicts with sanitized HTTP 409. A changed version is a distinct identity. Provenance is caller-supplied metadata and the server does not fetch GitHub or verify snapshot authenticity. Memory persistence is volatile and jobs are lost on process restart. With SQLite, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter" ],
+        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries are scoped to the authenticated principal: same-principal retries with the same normalized payload return the retained job, while reuse for different payload conflicts; different principals may use the same key independently. Optional issue_provenance stores bounded GitHub source identity, exact snapshot version, canonical issue URL, and sanitized title only; the submitted task remains ordinary visible request.task content. Across principals and idempotency keys, the tuple (tracker, source_repository, issue_number, version) maps to one retained job. A tuple already reserved by another principal/job returns a generic sanitized conflict that does not reveal the owner or job; changed complete content also conflicts. A changed version is a distinct identity. Provenance is caller-supplied metadata and the server does not fetch GitHub or verify snapshot authenticity. Named submitters may submit but can inspect only their own jobs; operators can inspect all jobs. Memory persistence is volatile and jobs are lost on process restart. With SQLite, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "$ref": "#/components/parameters/IdempotencyKey" }
@@ -107,7 +110,7 @@
           "400": { "$ref": "#/components/responses/InvalidRequest" },
           "401": { "$ref": "#/components/responses/Unauthenticated" },
           "409": {
-            "description": "The idempotency key or issue provenance conflicts with a different complete request.",
+            "description": "The principal-scoped idempotency key conflicts with a different request, or the globally unique issue-provenance tuple is already reserved by another principal/job. Provenance conflicts are generic and do not disclose the existing owner or job.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
           },
           "413": {
@@ -134,6 +137,7 @@
       "get": {
         "operationId": "getJob",
         "summary": "Get a job snapshot",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own jobs only)" ],
         "description": "Returns a safe snapshot including the submitted request and bounded verification evidence. It excludes credentials, host paths, raw logs, and agent transcripts. A verification check reports only its generated label and outcome; recorded limitations can state that no checks were configured and that agent completion is not an independent correctness verdict.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
@@ -158,6 +162,7 @@
       "get": {
         "operationId": "getJobHistory",
         "summary": "Get bounded job history",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own jobs only)" ],
         "description": "Returns retained lifecycle events and a truncation indicator. Event types and messages are filtered to a safe allowlist; credentials, host paths, raw logs, and agent transcripts are not returned.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
@@ -182,6 +187,7 @@
       "get": {
         "operationId": "streamJobEvents",
         "summary": "Stream bounded lifecycle events for a job",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own jobs only)" ],
         "description": "Read-only bearer-authenticated Server-Sent Events stream for one retained job. Events are read from bounded retained history, in monotonically increasing per-job sequence order. Event IDs are decimal sequence cursors; reconnect with Last-Event-ID to replay only newer retained events without duplicates. If the cursor has expired, the HTTP response is 409 cursor_expired before streaming, or an in-stream reset event is sent and the connection closes; fetch GET /v1/jobs/{id} and /history, then reconnect without a cursor to start from retained history. If history is already truncated at initial connect for an active job, the route returns 409 so status/history can establish the baseline; terminal jobs replay the retained tail and close. If the terminal lifecycle event was evicted, a synthetic terminal_snapshot control frame reports only the current terminal status and has no event ID. Events expose only timestamp and allowlisted lifecycle type, never messages, requests, provider details, logs, credentials, or paths. A 250 ms history poll closes the initial-read/subscription race without subscriber queues. The process admits at most 16 streams; excess requests fail with 503 stream_capacity. Each stream sends a 15 second heartbeat, has a 25 second maximum lifetime and a 2 second write deadline, and releases capacity on disconnect/closure. Clients should reconnect as needed or fall back to polling GET status/history.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
@@ -208,6 +214,7 @@
       "post": {
         "operationId": "cancelJob",
         "summary": "Request cooperative cancellation",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
         "description": "Bodyless, job-scoped cancellation request. A queued job is canceled before execution and returns 200; a running job remains running with cancellation_requested=true and returns 202 while its worker exits. Cancellation does not erase workspaces or reverse provider side effects. If provider effects may have occurred, the outcome remains failed/inspectable for operator recovery rather than being reported as canceled or successful. This action is not a correctness verdict.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
@@ -241,6 +248,7 @@
       "post": {
         "operationId": "reconcileJob",
         "summary": "Confirm an uncertain provider outcome",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
         "description": "Bodyless, authenticated operator action. Eligibility is limited to SQLite jobs with a persisted provider attempt/outcome and retained workspace: startup-interrupted running jobs or failed jobs. It validates retained repository/branch/commit identity and performs read-only provider confirmation; it does not run the harness or write to the provider. Only a matching confirmed open PR and successful atomic recording can mark the job succeeded. Memory storage has no durable startup-recovery classification and does not support this recovery. Failed or ambiguous reconciliation remains unresolved for operator investigation. PR publication and agent completion are not independent correctness verdicts.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
@@ -270,6 +278,7 @@
       "post": {
         "operationId": "dispositionJobFailed",
         "summary": "Record an interrupted job as failed",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
         "description": "Bodyless, authenticated operator action available only for SQLite jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected failed disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
@@ -299,6 +308,7 @@
       "post": {
         "operationId": "dispositionJobCanceled",
         "summary": "Record an interrupted job as canceled",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
         "description": "Bodyless, authenticated operator action available only for SQLite jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected canceled disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
@@ -328,6 +338,7 @@
       "get": {
         "operationId": "getOperations",
         "summary": "Get aggregate service counters",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
         "description": "Returns bounded aggregate counts and capacity indicators only, without job IDs, requests, events, provider details, host paths, or credentials. Memory-mode records are volatile and lost at restart. SQLite queued jobs resume after restart; interrupted running jobs require operator investigation and are not replayed.",
         "security": [ { "bearerAuth": [] } ],
         "responses": {
@@ -352,8 +363,8 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "bearerFormat": "API key",
-        "description": "Operator-provisioned API key. Send as Authorization: Bearer <key>; never place the key in a URL or job payload."
+        "bearerFormat": "Bearer token",
+        "description": "Send the operator-provisioned shared API key or a configured named-principal bearer token as Authorization: Bearer <token>; never place credentials in a URL or job payload. The shared legacy key is operator-wide. Named submitter credentials are restricted to submission and owner-filtered inspection/listing; named operator credentials have operator-wide job and operator-action access."
       }
     },
     "parameters": {
@@ -439,12 +450,23 @@
       },
       "JobPage": {
         "type": "object",
+        "additionalProperties": false,
         "required": [ "jobs", "snapshot_sequence", "has_more" ],
         "properties": {
           "jobs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/JobSummary" } },
           "snapshot_sequence": { "type": "integer", "format": "int64", "minimum": 0, "description": "Admission-sequence ceiling captured on the first page; zero denotes an empty store." },
           "next_sequence": { "type": "integer", "format": "int64", "minimum": 1, "description": "Continuation cursor, present only when has_more is true." },
           "has_more": { "type": "boolean" }
+        }
+      },
+      "SubmitterJobPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "jobs", "has_more", "next_cursor" ],
+        "properties": {
+          "jobs": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/JobSummary" } },
+          "has_more": { "type": "boolean" },
+          "next_cursor": { "type": "string", "description": "Opaque, principal-bound server cursor. Empty when has_more is false. Process-memory state expires after 15 minutes and is lost on restart." }
         }
       },
       "JobSummary": {
@@ -461,9 +483,10 @@
       "JobSnapshot": {
         "type": "object",
         "description": "Safe public job snapshot. The request is caller-provided text; credentials, host paths, raw logs, and agent transcripts are not exposed.",
-        "required": [ "id", "request", "status", "created_at", "updated_at" ],
+        "required": [ "id", "submitted_by", "request", "status", "created_at", "updated_at" ],
         "properties": {
           "id": { "type": "string" },
+          "submitted_by": { "type": "string", "description": "Stable Factory principal ID that admitted the job. Existing jobs migrated from the shared API key are attributed to legacy-shared; the original human submitter is unknown." },
           "request": { "$ref": "#/components/schemas/JobRequest" },
           "status": {
             "type": "string",

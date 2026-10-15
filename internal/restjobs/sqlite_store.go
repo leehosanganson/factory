@@ -296,7 +296,15 @@ func (s *SQLiteStore) migrate(ctx context.Context) error {
 }
 
 func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error) {
+	return s.AdmitAs(key, legacySharedPrincipalID, request)
+}
+
+func (s *SQLiteStore) AdmitAs(key, principalID string, request Request) (Snapshot, bool, error) {
 	key, normalized, err := normalizeAdmission(key, request, s.config.MaxTaskBytes)
+	if err != nil {
+		return Snapshot{}, false, err
+	}
+	principalID, err = normalizePrincipalID(principalID)
 	if err != nil {
 		return Snapshot{}, false, err
 	}
@@ -311,7 +319,18 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 	}
 	defer tx.Rollback()
 	var id, raw string
-	err = tx.QueryRowContext(ctx, `SELECT j.id,j.request_json FROM factory_job_idempotency i JOIN factory_jobs j ON j.id=i.job_id WHERE i.key=?`, key).Scan(&id, &raw)
+	if normalized.IssueProvenance != nil {
+		provenance := normalized.IssueProvenance
+		var existingPrincipal string
+		err = tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.submitter FROM factory_job_issue_provenance p JOIN factory_jobs j ON j.id=p.job_id WHERE p.tracker=? AND p.source_repository=? AND p.issue_number=? AND p.version=?`, provenance.Tracker, provenance.SourceRepository, provenance.IssueNumber, provenance.Version).Scan(&id, &raw, &existingPrincipal)
+		if err == nil && existingPrincipal != principalID {
+			return Snapshot{}, false, ErrProvenanceConflict
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return Snapshot{}, false, errors.New("read SQLite issue provenance")
+		}
+	}
+	err = tx.QueryRowContext(ctx, `SELECT j.id,j.request_json FROM factory_job_idempotency i JOIN factory_jobs j ON j.id=i.job_id WHERE i.principal_id=? AND i.key=?`, principalID, key).Scan(&id, &raw)
 	if err == nil {
 		var existing Request
 		if json.Unmarshal([]byte(raw), &existing) != nil {
@@ -320,7 +339,7 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 		if !sameRequest(existing, normalized) {
 			return Snapshot{}, false, ErrIdempotencyConflict
 		}
-		snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+		snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 		if err != nil {
 			return Snapshot{}, false, errors.New("read SQLite job record")
 		}
@@ -343,14 +362,14 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 			if !sameRequest(existing, normalized) {
 				return Snapshot{}, false, ErrProvenanceConflict
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(key,job_id,request_json) VALUES(?,?,?)`, key, id, raw); err != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(principal_id,key,job_id,request_json) VALUES(?,?,?,?)`, principalID, key, id, raw); err != nil {
 				var sqliteErr *sqlite.Error
 				if errors.As(err, &sqliteErr) && sqliteErr.Code() == 19 {
 					return Snapshot{}, false, ErrIdempotencyConflict
 				}
 				return Snapshot{}, false, errors.New("persist SQLite idempotency key")
 			}
-			snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+			snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 			if err != nil {
 				return Snapshot{}, false, errors.New("read SQLite job record")
 			}
@@ -390,10 +409,10 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 	if err != nil {
 		return Snapshot{}, false, ErrInvalidInput
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,history_truncated) VALUES(?,?,?,?,?,?,0)`, id, string(requestJSON), StatusQueued, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sequence); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,history_truncated,submitter) VALUES(?,?,?,?,?,?,0,?)`, id, string(requestJSON), StatusQueued, now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano), sequence, principalID); err != nil {
 		return Snapshot{}, false, errors.New("persist SQLite job")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(key,job_id,request_json) VALUES(?,?,?)`, key, id, string(requestJSON)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(principal_id,key,job_id,request_json) VALUES(?,?,?,?)`, principalID, key, id, string(requestJSON)); err != nil {
 		return Snapshot{}, false, errors.New("persist SQLite idempotency key")
 	}
 	if normalized.IssueProvenance != nil {
@@ -412,7 +431,7 @@ func (s *SQLiteStore) Admit(key string, request Request) (Snapshot, bool, error)
 	if err := tx.Commit(); err != nil {
 		return Snapshot{}, false, errors.New("commit SQLite job admission")
 	}
-	return Snapshot{ID: id, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}, false, nil
+	return Snapshot{ID: id, Submitter: principalID, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}, false, nil
 }
 
 func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
@@ -472,7 +491,7 @@ func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
 	if err := insertEvent(ctx, tx, id, "running", "Job started", now, s.config.MaxEventsPerJob); err != nil {
 		return Snapshot{}, errors.New("record SQLite job start")
 	}
-	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if err != nil {
 		return Snapshot{}, errors.New("read claimed SQLite job")
 	}
@@ -891,7 +910,25 @@ func (s *SQLiteStore) Get(id string) (Snapshot, error) {
 	if err := s.checkOpen(); err != nil {
 		return Snapshot{}, err
 	}
-	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Snapshot{}, ErrNotFound
+	}
+	if err != nil {
+		return Snapshot{}, errors.New("read SQLite job")
+	}
+	return snapshot, nil
+}
+
+func (s *SQLiteStore) GetForPrincipal(id, principalID string) (Snapshot, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if err := s.checkOpen(); err != nil {
+		return Snapshot{}, err
+	}
+	snapshot, err := scanSnapshot(s.db.QueryRow(`SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=? AND j.submitter=?`, id, principalID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Snapshot{}, ErrNotFound
 	}
@@ -904,6 +941,18 @@ func (s *SQLiteStore) Get(id string) (Snapshot, error) {
 // ListJobs returns a bounded page in immutable admission order. The snapshot
 // ceiling prevents admissions after page one from entering a continuation.
 func (s *SQLiteStore) ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
+	return s.listJobs(ctx, "", afterSequence, snapshotSequence, limit)
+}
+
+func (s *SQLiteStore) ListForPrincipal(ctx context.Context, principalID string, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return JobPage{}, err
+	}
+	return s.listJobs(ctx, principalID, afterSequence, snapshotSequence, limit)
+}
+
+func (s *SQLiteStore) listJobs(ctx context.Context, principalID string, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
 	if err := validateJobPageRequest(ctx, afterSequence, snapshotSequence, limit); err != nil {
 		return JobPage{}, err
 	}
@@ -915,7 +964,15 @@ func (s *SQLiteStore) ListJobs(ctx context.Context, afterSequence, snapshotSeque
 			return JobPage{}, errors.New("read SQLite job listing snapshot")
 		}
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id,status,created_at,updated_at,queue_sequence FROM factory_jobs WHERE queue_sequence>? AND queue_sequence<=? ORDER BY queue_sequence LIMIT ?`, afterSequence, snapshotSequence, limit+1)
+	query := `SELECT id,status,created_at,updated_at,queue_sequence FROM factory_jobs WHERE queue_sequence>? AND queue_sequence<=?`
+	args := []any{afterSequence, snapshotSequence}
+	if principalID != "" {
+		query += ` AND submitter=?`
+		args = append(args, principalID)
+	}
+	query += ` ORDER BY queue_sequence LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return JobPage{}, errors.New("read SQLite job listing")
 	}
@@ -978,7 +1035,7 @@ func (s *SQLiteStore) eventStreamState(ctx context.Context, id string) (Snapshot
 		return Snapshot{}, History{}, errors.New("read SQLite job history")
 	}
 	defer tx.Rollback()
-	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Snapshot{}, History{}, ErrNotFound
 	}
@@ -1187,7 +1244,7 @@ func (s *SQLiteStore) Cancel(id string) (Snapshot, error) {
 	default:
 		return Snapshot{}, ErrInvalidTransition
 	}
-	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if err != nil {
 		return Snapshot{}, errors.New("read canceled SQLite job")
 	}
@@ -1250,7 +1307,7 @@ func (s *SQLiteStore) Recover(ctx context.Context) (RecoveryReport, error) {
 	if err := s.checkOpen(); err != nil {
 		return RecoveryReport{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j ORDER BY j.queue_sequence`)
+	rows, err := s.db.QueryContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j ORDER BY j.queue_sequence`)
 	if err != nil {
 		return RecoveryReport{}, errors.New("recover SQLite jobs")
 	}
@@ -1508,7 +1565,7 @@ func scanSnapshot(row interface{ Scan(...any) error }) (Snapshot, error) {
 	var raw, status, created, updated string
 	var truncated, cancellationRequested int
 	var providerJSON, evidenceJSON sql.NullString
-	if err := row.Scan(&snapshot.ID, &raw, &status, &created, &updated, &truncated, &cancellationRequested, &providerJSON, &evidenceJSON); err != nil {
+	if err := row.Scan(&snapshot.ID, &raw, &status, &created, &updated, &truncated, &cancellationRequested, &snapshot.Submitter, &providerJSON, &evidenceJSON); err != nil {
 		return Snapshot{}, err
 	}
 	if err := json.Unmarshal([]byte(raw), &snapshot.Request); err != nil {

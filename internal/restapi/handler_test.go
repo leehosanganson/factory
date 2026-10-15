@@ -3,12 +3,15 @@ package restapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +42,69 @@ func newTestHandler(t *testing.T, manager restjobs.Manager, ready func() bool) *
 	}
 	return handler
 }
+
+func newPrincipalTestHandler(t *testing.T, manager restjobs.Manager, principals ...restserver.PrincipalConfig) *Handler {
+	t.Helper()
+	config := restserver.Config{APIKeyFile: writeAPIKey(t, testAPIKey), Principals: principals}
+	for _, item := range principals {
+		token := item.ID + "-named-token"
+		verifier := filepath.Join(t.TempDir(), "verifier.json")
+		digest := sha256.Sum256([]byte(token))
+		data, err := json.Marshal(struct {
+			Version    int `json:"version"`
+			Principals []struct {
+				ID          string `json:"id"`
+				TokenSHA256 string `json:"token_sha256"`
+			} `json:"principals"`
+		}{Version: 1, Principals: []struct {
+			ID          string `json:"id"`
+			TokenSHA256 string `json:"token_sha256"`
+		}{{ID: item.ID, TokenSHA256: hex.EncodeToString(digest[:])}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(verifier, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		item.TokenFile = verifier
+		for index := range config.Principals {
+			if config.Principals[index].ID == item.ID {
+				config.Principals[index].TokenFile = verifier
+			}
+		}
+	}
+	resolver, err := restserver.LoadPrincipalResolver(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := New(manager, resolver.APIKey(), Config{
+		MaxRequestBodyBytes: 256,
+		MaxTaskBytes:        128,
+		RepositoryAliases:   map[string]struct{}{"widget": {}},
+		Ready:               func() bool { return true },
+		ReadyError:          func(context.Context) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return handler
+}
+
+func principalRequest(handler http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+token)
+	if method == http.MethodPost && path == "/v1/jobs" {
+		r.Header.Set("Idempotency-Key", "handler-principal-test-key")
+	}
+	if body != "" {
+		r.Header.Set("Content-Type", "application/json")
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, r)
+	return response
+}
+
+func namedPrincipalToken(id string) string { return id + "-named-token" }
 
 func newTestManager(t *testing.T, config restjobs.Config) *restjobs.LocalManager {
 	t.Helper()
@@ -510,6 +576,220 @@ func TestNotReadyRejectsJobOperationsBeforeAuthentication(t *testing.T) {
 		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"not_ready"`) {
 			t.Errorf("%s %s while not ready = %d %s", tc.method, tc.path, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestSubmitterAuthorizationOwnershipAndOperatorCompatibility(t *testing.T) {
+	manager := newTestManager(t, managerConfig(8, 8, 8))
+	first, _, err := manager.AdmitAs("shared-idempotency", "alice", restjobs.Request{Repository: "widget", Task: "alice private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.AdmitAs("shared-idempotency", "bob", restjobs.Request{Repository: "widget", Task: "bob private task"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(first.ID, restjobs.StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+	)
+	aliceToken, bobToken := namedPrincipalToken("alice"), namedPrincipalToken("bob")
+	if err := manager.AddEvent(first.ID, "running", "Job started"); err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"", "/history", "/events"} {
+		own := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+suffix, "", aliceToken)
+		if own.Code != http.StatusOK {
+			t.Errorf("owner GET %s status=%d body=%s", suffix, own.Code, own.Body.String())
+		}
+		forbidden := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+suffix, "", bobToken)
+		unknown := principalRequest(handler, http.MethodGet, "/v1/jobs/not-a-job"+suffix, "", bobToken)
+		if forbidden.Code != http.StatusNotFound || forbidden.Code != unknown.Code || forbidden.Body.String() != unknown.Body.String() {
+			t.Errorf("%s ownership disclosed existence: forbidden=%d %s unknown=%d %s", suffix, forbidden.Code, forbidden.Body.String(), unknown.Code, unknown.Body.String())
+		}
+	}
+	ownHistory := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+"/history", "", aliceToken)
+	if !strings.Contains(ownHistory.Body.String(), `"type":"running"`) {
+		t.Fatalf("owner history omitted expected retained event: %s", ownHistory.Body.String())
+	}
+	ownEvents := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID+"/events", "", aliceToken)
+	if !strings.Contains(ownEvents.Body.String(), "event: queued") {
+		t.Fatalf("owner event stream omitted job events: %s", ownEvents.Body.String())
+	}
+	for _, path := range []string{"/v1/operations", "/v1/jobs/known/cancel", "/v1/jobs/known/reconcile", "/v1/jobs/known/disposition/failed", "/v1/jobs/unknown/operator-path"} {
+		response := principalRequest(handler, http.MethodGet, path, "", aliceToken)
+		if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), `"code":"not_found"`) || !strings.Contains(response.Body.String(), `"message":"Resource not found."`) {
+			t.Errorf("submitter route %s = %d %s, want generic 404", path, response.Code, response.Body.String())
+		}
+	}
+	for _, method := range []string{http.MethodPost, http.MethodDelete} {
+		response := principalRequest(handler, method, "/v1/jobs/"+first.ID+"/cancel", "", aliceToken)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("submitter %s cancel status=%d body=%s, want generic 404", method, response.Code, response.Body.String())
+		}
+	}
+	// Identity comes only from the resolved credential. The same idempotency key
+	// may be used by separate principals without colliding or transferring ownership.
+	spoofedIdentity := principalRequest(handler, http.MethodPost, "/v1/jobs", `{"repository":"widget","task":"spoof","principal":"bob"}`, aliceToken)
+	assertError(t, spoofedIdentity, http.StatusBadRequest, "unknown_field")
+	for _, tc := range []struct{ id, token, task string }{{"alice", aliceToken, "new alice task"}, {"bob", bobToken, "new bob task"}} {
+		response := principalRequest(handler, http.MethodPost, "/v1/jobs", `{"repository":"widget","task":"`+tc.task+`"}`, tc.token)
+		var accepted struct {
+			Job restjobs.Snapshot `json:"job"`
+		}
+		if response.Code != http.StatusAccepted || json.Unmarshal(response.Body.Bytes(), &accepted) != nil || accepted.Job.Submitter != tc.id {
+			t.Fatalf("%s submit status=%d body=%s, submitter=%q", tc.id, response.Code, response.Body.String(), accepted.Job.Submitter)
+		}
+	}
+	aliceJob, _, err := manager.AdmitAs("identity-check", "alice", restjobs.Request{Repository: "widget", Task: "identity"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.GetForPrincipal(aliceJob.ID, "bob"); !errors.Is(err, restjobs.ErrNotFound) {
+		t.Fatalf("principal ownership not enforced by store: %v", err)
+	}
+	operator := principalRequest(handler, http.MethodGet, "/v1/jobs", "", namedPrincipalToken("admin"))
+	legacy := request(handler, http.MethodGet, "/v1/jobs", "", true)
+	operatorDetail := principalRequest(handler, http.MethodGet, "/v1/jobs/"+first.ID, "", namedPrincipalToken("admin"))
+	if operatorDetail.Code != http.StatusOK || !strings.Contains(operatorDetail.Body.String(), first.ID) {
+		t.Fatalf("operator cannot inspect another principal's job: %d %s", operatorDetail.Code, operatorDetail.Body.String())
+	}
+	for label, response := range map[string]*httptest.ResponseRecorder{"named operator": operator, "legacy key": legacy} {
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"snapshot_sequence"`) || strings.Contains(response.Body.String(), `"next_cursor"`) {
+			t.Errorf("%s list changed legacy operator response: %d %s", label, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestSubmitterPaginationCursorIsOpaqueBoundAndExpires(t *testing.T) {
+	manager := newTestManager(t, managerConfig(8, 8, 8))
+	var bobFirstID string
+	var aliceIDs []string
+	for _, job := range []struct{ key, owner string }{{"a-1", "alice"}, {"b-1", "bob"}, {"a-2", "alice"}, {"a-3", "alice"}} {
+		snapshot, _, err := manager.AdmitAs(job.key, job.owner, restjobs.Request{Repository: "widget", Task: "private"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.owner == "bob" {
+			bobFirstID = snapshot.ID
+		} else {
+			aliceIDs = append(aliceIDs, snapshot.ID)
+		}
+	}
+	handler := newPrincipalTestHandler(t, manager, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true})
+	bobJob, _, err := manager.AdmitAs("b-last", "bob", restjobs.Request{Repository: "widget", Task: "bob private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := principalRequest(handler, http.MethodGet, "/v1/jobs?limit=1", "", namedPrincipalToken("alice"))
+	var page struct {
+		Jobs       []restjobs.JobSummary `json:"jobs"`
+		HasMore    bool                  `json:"has_more"`
+		NextCursor string                `json:"next_cursor"`
+	}
+	if first.Code != http.StatusOK || json.Unmarshal(first.Body.Bytes(), &page) != nil || len(page.Jobs) != 1 || page.Jobs[0].ID != aliceIDs[0] || !page.HasMore || page.NextCursor == "" {
+		t.Fatalf("submitter first page=%d %s", first.Code, first.Body.String())
+	}
+	for _, forbidden := range []string{"next_sequence", "snapshot_sequence", "after", "snapshot", "private"} {
+		if strings.Contains(first.Body.String(), forbidden) {
+			t.Fatalf("submitter list exposed %q: %s", forbidden, first.Body.String())
+		}
+	}
+	if len(page.NextCursor) < 40 || strings.Contains(page.NextCursor, "=") {
+		t.Fatalf("cursor is not an opaque high-entropy handle: %q", page.NextCursor)
+	}
+	if _, exists := handler.cursors[page.NextCursor]; !exists {
+		t.Fatal("next_cursor not recorded server-side")
+	}
+	for _, query := range []string{"after=1&snapshot=4", "snapshot=4", "cursor=unknown"} {
+		bad := principalRequest(handler, http.MethodGet, "/v1/jobs?"+query, "", namedPrincipalToken("alice"))
+		assertError(t, bad, http.StatusBadRequest, "invalid_request")
+	}
+	wrongOwner := principalRequest(handler, http.MethodGet, "/v1/jobs?cursor="+page.NextCursor, "", namedPrincipalToken("bob"))
+	assertError(t, wrongOwner, http.StatusBadRequest, "invalid_request")
+	continued := principalRequest(handler, http.MethodGet, "/v1/jobs?limit=1&cursor="+page.NextCursor, "", namedPrincipalToken("alice"))
+	var nextPage struct {
+		Jobs []restjobs.JobSummary `json:"jobs"`
+	}
+	if continued.Code != http.StatusOK || json.Unmarshal(continued.Body.Bytes(), &nextPage) != nil || len(nextPage.Jobs) != 1 || nextPage.Jobs[0].ID != aliceIDs[1] || strings.Contains(continued.Body.String(), bobFirstID) || nextPage.Jobs[0].ID == bobJob.ID || strings.Contains(continued.Body.String(), "next_sequence") {
+		t.Fatalf("cursor continuation status=%d body=%s", continued.Code, continued.Body.String())
+	}
+	newHandler := newPrincipalTestHandler(t, manager, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true})
+	invalidAfterRestart := principalRequest(newHandler, http.MethodGet, "/v1/jobs?cursor="+page.NextCursor, "", namedPrincipalToken("alice"))
+	assertError(t, invalidAfterRestart, http.StatusBadRequest, "invalid_request")
+
+	handler.now = func() time.Time { return time.Now().Add(submitterCursorTTL + time.Second) }
+	expired := principalRequest(handler, http.MethodGet, "/v1/jobs?cursor="+page.NextCursor, "", namedPrincipalToken("alice"))
+	assertError(t, expired, http.StatusBadRequest, "invalid_request")
+	if _, exists := handler.cursors[page.NextCursor]; exists {
+		t.Fatal("expired cursor was not purged")
+	}
+	if len(handler.cursorKeys) != 0 {
+		t.Fatalf("expired cursor key was not purged: %+v", handler.cursorKeys)
+	}
+}
+
+func TestSubmitterPaginationReplayReusesCursorAcrossPrincipals(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 4, 4))
+	for _, job := range []struct{ key, principal string }{{"alice-1", "alice"}, {"bob-1", "bob"}, {"alice-2", "alice"}, {"bob-2", "bob"}} {
+		if _, _, err := manager.AdmitAs(job.key, job.principal, restjobs.Request{Repository: "widget", Task: "task"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+	)
+	getFirstPage := func(principal string) string {
+		t.Helper()
+		response := principalRequest(handler, http.MethodGet, "/v1/jobs?limit=1", "", namedPrincipalToken(principal))
+		var page struct {
+			HasMore    bool   `json:"has_more"`
+			NextCursor string `json:"next_cursor"`
+		}
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &page) != nil || !page.HasMore || page.NextCursor == "" {
+			t.Fatalf("%s first page status=%d body=%s", principal, response.Code, response.Body.String())
+		}
+		return page.NextCursor
+	}
+
+	aliceCursor := getFirstPage("alice")
+	if replayCursor := getFirstPage("alice"); replayCursor != aliceCursor {
+		t.Fatalf("identical page replay issued a different cursor: first=%q replay=%q", aliceCursor, replayCursor)
+	}
+	if len(handler.cursors) != 1 || len(handler.cursorKeys) != 1 {
+		t.Fatalf("replayed continuation consumed extra slots: cursors=%d keys=%d", len(handler.cursors), len(handler.cursorKeys))
+	}
+	if bobCursor := getFirstPage("bob"); bobCursor == aliceCursor {
+		t.Fatal("different principal unexpectedly shared the same cursor handle")
+	}
+	if len(handler.cursors) != 2 || len(handler.cursorKeys) != 2 {
+		t.Fatalf("second principal cursor state inconsistent: cursors=%d keys=%d", len(handler.cursors), len(handler.cursorKeys))
+	}
+}
+
+func TestSubmitterCursorCapacityReturnsSanitizedUnavailable(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 4, 2))
+	for range 2 {
+		if _, _, err := manager.AdmitAs(fmt.Sprintf("key-%d", time.Now().UnixNano()), "alice", restjobs.Request{Repository: "widget", Task: "task"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := newPrincipalTestHandler(t, manager, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true})
+	now := time.Now()
+	for index := range submitterCursorCapacity {
+		handler.cursors[fmt.Sprintf("occupied-%d", index)] = submitterCursor{principalID: "alice", expiresAt: now.Add(time.Hour)}
+	}
+	response := principalRequest(handler, http.MethodGet, "/v1/jobs?limit=1", "", namedPrincipalToken("alice"))
+	assertError(t, response, http.StatusServiceUnavailable, "cursor_capacity")
+	if strings.Contains(response.Body.String(), "alice") || strings.Contains(response.Body.String(), "occupied") {
+		t.Fatalf("cursor capacity response leaked internal state: %s", response.Body.String())
 	}
 }
 

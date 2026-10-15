@@ -83,6 +83,25 @@ func TestRecoveryBundleProcessCreateMoveVerifyRestoreInspect(t *testing.T) {
 	config.Repositories = map[string]string{"private-alias": repo}
 	config.Harness = restserver.HarnessConfig{Executable: "unused-harness", Args: []string{"{task}", "{system_prompt}"}}
 	config.APIKeyFile = filepath.Join(root, "api-key")
+	config.Principals = []restserver.PrincipalConfig{{ID: "bundle-operator", Role: "operator", TokenFile: filepath.Join(root, "operator-verifier.json"), Enabled: true}}
+	verifierToken := []byte("bundle-operator-token")
+	verifierDigest := sha256.Sum256(verifierToken)
+	verifierData, err := json.Marshal(struct {
+		Version    int `json:"version"`
+		Principals []struct {
+			ID          string `json:"id"`
+			TokenSHA256 string `json:"token_sha256"`
+		} `json:"principals"`
+	}{Version: 1, Principals: []struct {
+		ID          string `json:"id"`
+		TokenSHA256 string `json:"token_sha256"`
+	}{{ID: "bundle-operator", TokenSHA256: hex.EncodeToString(verifierDigest[:])}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(config.Principals[0].TokenFile, verifierData, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: dbPath}
 	if err := os.WriteFile(config.APIKeyFile, []byte("never-included-api-key"), 0o600); err != nil {
 		t.Fatal(err)

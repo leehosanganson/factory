@@ -16,6 +16,14 @@ func CheckLocalPrerequisites(config Config) []string {
 	if _, err := LoadAPIKey(config.APIKeyFile); err != nil {
 		issues = append(issues, "api_key_file: unavailable or invalid")
 	}
+	for _, principal := range config.Principals {
+		if principal.Enabled {
+			if _, err := loadPrincipalTokenDigest(principal.TokenFile, principal.ID); err != nil {
+				issues = append(issues, "principals: unavailable or invalid token verifier")
+				break
+			}
+		}
+	}
 	if config.Provider.Backend == "github" {
 		if _, err := LoadProviderToken(config.Provider.TokenFile); err != nil {
 			issues = append(issues, "provider.token_file: unavailable or invalid")
