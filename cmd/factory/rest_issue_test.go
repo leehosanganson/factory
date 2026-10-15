@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -25,6 +27,266 @@ type issueTrackerFunc func(context.Context, string, string) (factorycore.IssueSn
 
 func (f issueTrackerFunc) GetIssue(ctx context.Context, repository, issue string) (factorycore.IssueSnapshot, error) {
 	return f(ctx, repository, issue)
+}
+
+func TestRESTIssueDispatchProcessUsesProductionHandler(t *testing.T) {
+	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 8, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+
+	const serverKey = "issue-dispatch-process-test-token"
+	keyPath := filepath.Join(t.TempDir(), "server-token")
+	if err := os.WriteFile(keyPath, []byte(serverKey), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	apiKey, err := restserver.LoadAPIKey(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := restapi.New(manager, apiKey, restapi.Config{
+		MaxRequestBodyBytes: 1 << 20,
+		MaxTaskBytes:        256 << 10,
+		RepositoryAliases:   map[string]struct{}{"destination": {}},
+		Ready:               func() bool { return true },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var posts int
+	var idempotencyKeys []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/jobs" {
+			posts++
+			idempotencyKeys = append(idempotencyKeys, r.Header.Get("Idempotency-Key"))
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+serverKey {
+			t.Errorf("authorization = %q", got)
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+
+	root := t.TempDir()
+	binary := filepath.Join(root, "factory")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build CLI: %v\n%s", err, output)
+	}
+
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.Mkdir(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ghLog := filepath.Join(root, "gh-args.log")
+	ghResponse := filepath.Join(root, "gh-issue.json")
+	const response = `{"id":123456789,"number":37,"title":"Fix the widget timeout","body":"Requests should stop waiting after the configured deadline.\n\nExpected: timeout is reported clearly.","state":"open","html_url":"https://github.com/source/project/issues/37","updated_at":"2026-10-14T12:34:56Z"}`
+	if err := os.WriteFile(ghResponse, []byte(response), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ghScript := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$GH_LOG\"\nexec cat \"$GH_RESPONSE\"\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte(ghScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	clientTokenPath := filepath.Join(root, "client-token")
+	if err := os.WriteFile(clientTokenPath, []byte(serverKey+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "rest-client.json")
+	config := fmt.Sprintf(`{"base_url":%q,"token_file":"client-token"}`, server.URL)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(args ...string) (string, string, error) {
+		t.Helper()
+		command := exec.Command(binary, args...)
+		command.Env = environmentWithOverrides(os.Environ(), map[string]string{
+			"PATH":        fakeBin + string(os.PathListSeparator) + os.Getenv("PATH"),
+			"GH_LOG":      ghLog,
+			"GH_RESPONSE": ghResponse,
+		})
+		var stdout, stderr bytes.Buffer
+		command.Stdout, command.Stderr = &stdout, &stderr
+		err := command.Run()
+		return stdout.String(), stderr.String(), err
+	}
+
+	args := []string{"rest", "issue", "--config", configPath, "--repository", "destination", "--issue-repository", "source/project", "--json", "37"}
+	stdout, stderr, err := run(args...)
+	if err != nil || stderr != "" {
+		t.Fatalf("preview: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var preview struct {
+		SchemaVersion int `json:"schema_version"`
+		Preview       struct {
+			Version string `json:"version"`
+			Task    string `json:"task"`
+		} `json:"preview"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &preview); err != nil {
+		t.Fatalf("decode preview JSON %q: %v", stdout, err)
+	}
+	if preview.SchemaVersion != 1 || len(preview.Preview.Version) != sha256.Size*2 {
+		t.Fatalf("invalid preview schema/version: %+v", preview)
+	}
+	if _, err := hex.DecodeString(preview.Preview.Version); err != nil || preview.Preview.Version != strings.ToLower(preview.Preview.Version) {
+		t.Fatalf("preview version is not lowercase SHA-256 hex: %q (%v)", preview.Preview.Version, err)
+	}
+	if preview.Preview.Task == "" || len(preview.Preview.Task) > restIssueTaskMaxBytes || !strings.Contains(preview.Preview.Task, "Source repository: source/project") || !strings.Contains(preview.Preview.Task, "Issue number: 37") {
+		t.Fatalf("preview task is empty, unbounded, or missing issue identity: %q", preview.Preview.Task)
+	}
+	if posts != 0 {
+		t.Fatalf("preview issued %d POST admissions", posts)
+	}
+	page, err := manager.ListJobs(context.Background(), 0, 0, 10)
+	if err != nil || len(page.Jobs) != 0 {
+		t.Fatalf("preview admitted jobs: page=%+v err=%v", page, err)
+	}
+	wantGHArgs := "api --method GET repos/source/project/issues/37"
+	if got, err := os.ReadFile(ghLog); err != nil || string(got) != wantGHArgs+"\n" {
+		t.Fatalf("preview gh calls = %q, err=%v; want exactly %q", got, err, wantGHArgs)
+	}
+
+	confirmedArgs := append([]string(nil), args...)
+	confirmedArgs = append(confirmedArgs[:len(confirmedArgs)-1], "--confirm-version", preview.Preview.Version, "37")
+	stdout, stderr, err = run(confirmedArgs...)
+	if err != nil || stderr != "" {
+		t.Fatalf("confirmed dispatch: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var submission struct {
+		SchemaVersion int `json:"schema_version"`
+		Submission    struct {
+			Job struct {
+				ID string `json:"id"`
+			} `json:"job"`
+		} `json:"submission"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &submission); err != nil {
+		t.Fatalf("decode submission JSON %q: %v", stdout, err)
+	}
+	if submission.SchemaVersion != 1 || submission.Submission.Job.ID == "" {
+		t.Fatalf("invalid submission response: %+v", submission)
+	}
+	if posts != 1 {
+		t.Fatalf("confirmed dispatch issued %d POST admissions, want 1", posts)
+	}
+	page, err = manager.ListJobs(context.Background(), 0, 0, 10)
+	if err != nil || len(page.Jobs) != 1 || page.Jobs[0].ID != submission.Submission.Job.ID {
+		t.Fatalf("confirmed dispatch admitted jobs: page=%+v err=%v", page, err)
+	}
+	job, err := manager.Get(submission.Submission.Job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Request.Repository != "destination" || job.Request.Task != preview.Preview.Task || job.Request.Issue == nil || *job.Request.Issue != 37 || job.Request.IssueProvenance == nil {
+		t.Fatalf("admitted request = %+v; want preview task and issue context", job.Request)
+	}
+	provenance := job.Request.IssueProvenance
+	if provenance.Tracker != "github" || provenance.SourceRepository != "source/project" || provenance.IssueNumber != 37 || provenance.Version != preview.Preview.Version || provenance.URL != "https://github.com/source/project/issues/37" || provenance.Title != "Fix the widget timeout" {
+		t.Fatalf("admitted provenance = %+v", provenance)
+	}
+	if len(idempotencyKeys) != 1 || idempotencyKeys[0] == "" {
+		t.Fatalf("confirmed idempotency keys = %v, want one nonempty key", idempotencyKeys)
+	}
+	firstJobID := job.ID
+	firstKey := idempotencyKeys[0]
+
+	stdout, stderr, err = run(confirmedArgs...)
+	if err != nil || stderr != "" {
+		t.Fatalf("same-version retry: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var replay struct {
+		Submission struct {
+			Replayed bool `json:"replayed"`
+			Job      struct {
+				ID string `json:"id"`
+			} `json:"job"`
+		} `json:"submission"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &replay); err != nil || !replay.Submission.Replayed || replay.Submission.Job.ID != firstJobID {
+		t.Fatalf("same-version process replay = %+v, err=%v stdout=%q", replay, err, stdout)
+	}
+	page, err = manager.ListJobs(context.Background(), 0, 0, 10)
+	if err != nil || len(page.Jobs) != 1 || posts != 2 || len(idempotencyKeys) != 2 || idempotencyKeys[1] != firstKey {
+		t.Fatalf("same-version retry changed admission: jobs=%+v posts=%d keys=%v err=%v", page.Jobs, posts, idempotencyKeys, err)
+	}
+
+	const changedResponse = `{"id":123456789,"number":37,"title":"Clarify the widget timeout","body":"Requests should stop waiting after the configured deadline.\n\nThe timeout must be visible in job history.","state":"open","html_url":"https://github.com/source/project/issues/37","updated_at":"2026-10-15T12:34:56Z"}`
+	if err := os.WriteFile(ghResponse, []byte(changedResponse), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = run(args...)
+	if err != nil || stderr != "" {
+		t.Fatalf("changed-version preview: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var changedPreview struct {
+		Preview struct {
+			Version string `json:"version"`
+		} `json:"preview"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &changedPreview); err != nil || changedPreview.Preview.Version == "" || changedPreview.Preview.Version == preview.Preview.Version {
+		t.Fatalf("changed-version preview = %+v, err=%v stdout=%q", changedPreview, err, stdout)
+	}
+	staleArgs := append([]string(nil), confirmedArgs...)
+	staleArgs[len(staleArgs)-2] = preview.Preview.Version
+	stdout, stderr, err = run(staleArgs...)
+	if err == nil || !strings.Contains(stderr, "version changed") || stdout != "" {
+		t.Fatalf("stale version confirmation: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	page, listErr := manager.ListJobs(context.Background(), 0, 0, 10)
+	if listErr != nil || len(page.Jobs) != 1 || posts != 2 {
+		t.Fatalf("stale confirmation admitted work: jobs=%+v posts=%d err=%v", page.Jobs, posts, listErr)
+	}
+	changedArgs := append([]string(nil), args...)
+	changedArgs = append(changedArgs[:len(changedArgs)-1], "--confirm-version", changedPreview.Preview.Version, "37")
+	stdout, stderr, err = run(changedArgs...)
+	if err != nil || stderr != "" {
+		t.Fatalf("renewed changed-version confirmation: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	var changedSubmission struct {
+		Submission struct {
+			Job struct {
+				ID string `json:"id"`
+			} `json:"job"`
+		} `json:"submission"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &changedSubmission); err != nil || changedSubmission.Submission.Job.ID == "" || changedSubmission.Submission.Job.ID == firstJobID {
+		t.Fatalf("changed-version submission = %+v, err=%v stdout=%q", changedSubmission, err, stdout)
+	}
+	page, err = manager.ListJobs(context.Background(), 0, 0, 10)
+	if err != nil || len(page.Jobs) != 2 || posts != 3 || len(idempotencyKeys) != 3 || idempotencyKeys[2] == firstKey {
+		t.Fatalf("renewed version did not create a distinct job/key: jobs=%+v posts=%d keys=%v err=%v", page.Jobs, posts, idempotencyKeys, err)
+	}
+	changedJob, err := manager.Get(changedSubmission.Submission.Job.ID)
+	if err != nil || changedJob.Request.IssueProvenance == nil || changedJob.Request.IssueProvenance.Version != changedPreview.Preview.Version {
+		t.Fatalf("changed issue version provenance = %+v err=%v", changedJob.Request.IssueProvenance, err)
+	}
+
+	wantCalls := strings.Repeat(wantGHArgs+"\n", 6)
+	if got, err := os.ReadFile(ghLog); err != nil || string(got) != wantCalls {
+		t.Fatalf("process issue tracker calls = %q, err=%v; want six exact GETs", got, err)
+	}
+}
+
+func environmentWithOverrides(environment []string, overrides map[string]string) []string {
+	result := make([]string, 0, len(environment)+len(overrides))
+	for _, entry := range environment {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			result = append(result, entry)
+			continue
+		}
+		if _, replace := overrides[name]; !replace {
+			result = append(result, entry)
+		}
+	}
+	for name, value := range overrides {
+		result = append(result, name+"="+value)
+	}
+	return result
 }
 
 func TestRESTIssuePreviewAndConfirmedDispatchUseProductionHandler(t *testing.T) {
