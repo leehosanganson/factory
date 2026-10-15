@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/leehosanganson/factory/internal/restjobs"
 )
 
 var ErrInvalidConfig = errors.New("invalid restworker configuration")
+
+const attemptHeartbeatInterval = 5 * time.Second
 
 // Executor runs one claimed job. Implementations should honor ctx cancellation.
 type Executor interface {
@@ -19,6 +22,9 @@ type Executor interface {
 }
 type ResultExecutor interface {
 	ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error)
+}
+type AttemptResultExecutor interface {
+	ExecuteWithAttemptResult(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error)
 }
 
 type ProviderOutcomeExecutor interface{ RequiresProviderOutcome() bool }
@@ -116,7 +122,7 @@ func (c *Coordinator) worker() {
 		if stopped {
 			return
 		}
-		job, err := c.manager.WaitClaim(c.ctx)
+		claim, err := c.manager.WaitClaimAttempt(c.ctx)
 		if err != nil {
 			if errors.Is(err, restjobs.ErrManagerClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -129,15 +135,33 @@ func (c *Coordinator) worker() {
 		stopped = c.stopped
 		c.mu.Unlock()
 		if stopped {
-			_ = c.manager.Finish(job.ID, restjobs.StatusCanceled)
+			// No executor has received this claim, so ending it here is safe.
+			_ = c.manager.FinishAttempt(claim.Attempt, restjobs.StatusCanceled)
 			return
 		}
-		c.execute(job)
+		c.execute(claim.Job, claim.Attempt)
 	}
 }
 
-func (c *Coordinator) execute(job restjobs.Snapshot) {
+func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHandle) {
 	jobCtx, cancel := context.WithCancel(c.ctx)
+	heartbeatDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(attemptHeartbeatInterval)
+		defer ticker.Stop()
+		defer close(heartbeatDone)
+		for {
+			select {
+			case <-jobCtx.Done():
+				return
+			case <-ticker.C:
+				if err := c.manager.HeartbeatAttempt(attempt); err != nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 	c.jobsMu.Lock()
 	c.jobs[job.ID] = cancel
 	current, err := c.manager.Get(job.ID)
@@ -150,6 +174,7 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 		delete(c.jobs, job.ID)
 		c.jobsMu.Unlock()
 		cancel()
+		<-heartbeatDone
 	}()
 	status := restjobs.StatusFailed
 	requiresProviderOutcome := false
@@ -161,18 +186,20 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 		}()
 		if required, ok := c.executor.(ProviderOutcomeExecutor); ok && required.RequiresProviderOutcome() {
 			requiresProviderOutcome = true
-			executor, resultCapable := c.executor.(ResultExecutor)
-			if !resultCapable {
+			var outcome *restjobs.ProviderOutcome
+			var err error
+			executor, ok := c.executor.(AttemptResultExecutor)
+			if !ok {
 				return
 			}
-			outcome, err := executor.ExecuteWithResult(jobCtx, job)
+			outcome, err = executor.ExecuteWithAttemptResult(jobCtx, job, attempt)
 			if err != nil {
 				return
 			}
 			if outcome == nil {
 				return
 			}
-			if c.manager.RecordProviderOutcome(job.ID, *outcome) != nil {
+			if c.manager.RecordProviderOutcomeForAttempt(attempt, *outcome) != nil {
 				return
 			}
 			job.Provider = outcome
@@ -182,18 +209,27 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 			status = restjobs.StatusSucceeded
 			return
 		}
-		if executor, ok := c.executor.(ResultExecutor); ok {
-			outcome, err := executor.ExecuteWithResult(jobCtx, job)
-			if err == nil && outcome != nil {
-				if c.manager.RecordProviderOutcome(job.ID, *outcome) == nil {
-					status = restjobs.StatusSucceeded
-				}
-			} else if err == nil {
+		if executor, ok := c.executor.(AttemptResultExecutor); ok {
+			outcome, err := executor.ExecuteWithAttemptResult(jobCtx, job, attempt)
+			if err == nil && outcome == nil {
 				status = restjobs.StatusSucceeded
 			}
 			return
 		}
-		if err := c.executor.Execute(jobCtx, job); err == nil {
+		if executor, ok := c.executor.(ResultExecutor); ok {
+			outcome, err := executor.ExecuteWithResult(jobCtx, job)
+			if err == nil && outcome == nil {
+				status = restjobs.StatusSucceeded
+			}
+			return
+		}
+		if executor, ok := c.executor.(interface {
+			ExecuteWithAttempt(context.Context, restjobs.Snapshot, restjobs.AttemptHandle) error
+		}); ok {
+			if err := executor.ExecuteWithAttempt(jobCtx, job, attempt); err == nil {
+				status = restjobs.StatusSucceeded
+			}
+		} else if err := c.executor.Execute(jobCtx, job); err == nil {
 			status = restjobs.StatusSucceeded
 		}
 	}()
@@ -212,5 +248,5 @@ func (c *Coordinator) execute(job restjobs.Snapshot) {
 	}
 	// Finish is the sole terminal transition. Executor errors and panic values
 	// are intentionally excluded from history to avoid leaking raw output.
-	_ = c.manager.Finish(job.ID, status)
+	_ = c.manager.FinishAttempt(attempt, status)
 }

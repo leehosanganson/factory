@@ -3,9 +3,63 @@ package restjobs
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestSQLiteStoresRaceForOneQueuedAttempt(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "race.db")
+	first, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.CloseStore()
+	second, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.CloseStore()
+	job, _, err := first.Admit("race-claim", Request{Repository: "widget", Task: "one claim only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan struct {
+		claim AttemptClaim
+		err   error
+	}, 2)
+	var wg sync.WaitGroup
+	for _, store := range []*SQLiteStore{first, second} {
+		wg.Add(1)
+		go func(store *SQLiteStore) {
+			defer wg.Done()
+			<-start
+			claim, err := store.ClaimNextAttempt()
+			results <- struct {
+				claim AttemptClaim
+				err   error
+			}{claim, err}
+		}(store)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	claims := 0
+	for result := range results {
+		if result.err == nil {
+			claims++
+			if result.claim.Job.ID != job.ID || result.claim.Attempt.Generation != 1 || !validAttemptHandle(result.claim.Attempt) {
+				t.Errorf("claim identity = %+v", result.claim)
+			}
+		} else if !errors.Is(result.err, ErrNoQueuedJobs) && !errors.Is(result.err, ErrNoWorkerSlots) {
+			t.Errorf("competing claim error = %v", result.err)
+		}
+	}
+	if claims != 1 {
+		t.Fatalf("successful claims = %d, want exactly one", claims)
+	}
+}
 
 func TestLocalStoreContractSerializesConcurrentIdempotentAdmission(t *testing.T) {
 	store, err := NewManager(Config{QueueCapacity: 16, MaxConcurrentJobs: 4, MaxRecords: 16, MaxEventsPerJob: 4})

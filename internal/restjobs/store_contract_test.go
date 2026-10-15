@@ -21,6 +21,23 @@ func TestLocalManagerSatisfiesStoreContract(t *testing.T) {
 	})
 }
 
+func forceAttemptLeaseExpired(t *testing.T, store Store, id string) {
+	t.Helper()
+	past := time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano)
+	switch typed := store.(type) {
+	case *LocalManager:
+		typed.mu.Lock()
+		typed.jobs[id].leaseUntil = time.Now().UTC().Add(-time.Minute)
+		typed.mu.Unlock()
+	case *SQLiteStore:
+		if _, err := typed.db.Exec(`UPDATE factory_worker_ownership SET lease_until=? WHERE job_id=?`, past, id); err != nil {
+			t.Fatal(err)
+		}
+	default:
+		t.Fatalf("unsupported test store %T", store)
+	}
+}
+
 func setListTestCreatedAt(t *testing.T, store Store, ids ...string) {
 	t.Helper()
 	const tied = "2026-10-10T12:00:00Z"
@@ -45,6 +62,140 @@ func setListTestCreatedAt(t *testing.T, store Store, ids ...string) {
 
 func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 	t.Helper()
+	t.Run("expired attempt leases block renewal and finishing without reclaiming work", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("expired-attempt", Request{Repository: "widget", Task: "expired worker cannot revive lease"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimNextAttempt()
+		if err != nil {
+			t.Fatal(err)
+		}
+		forceAttemptLeaseExpired(t, store, job.ID)
+		if err := store.HeartbeatAttempt(claim.Attempt); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("expired heartbeat = %v, want ErrStaleAttempt", err)
+		}
+		if err := store.FinishAttempt(claim.Attempt, StatusFailed); !errors.Is(err, ErrStaleAttempt) {
+			t.Fatalf("expired finish = %v, want ErrStaleAttempt", err)
+		}
+		got, err := store.Get(job.ID)
+		if err != nil || got.Status != StatusRunning {
+			t.Fatalf("job after expired attempt = (%+v, %v), want running", got, err)
+		}
+		if _, err := store.ClaimNextAttempt(); !errors.Is(err, ErrNoQueuedJobs) {
+			t.Fatalf("claim after expiry = %v, want ErrNoQueuedJobs", err)
+		}
+	})
+	t.Run("unfenced compatibility claims preserve legacy mutation APIs", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("legacy-claim", Request{Repository: "widget", Task: "single-process admin compatibility"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed, err := store.ClaimNext()
+		if err != nil || claimed.ID != job.ID {
+			t.Fatalf("legacy ClaimNext() = (%+v, %v)", claimed, err)
+		}
+		if err := store.RecordVerificationEvidence(job.ID, VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}); err != nil {
+			t.Fatalf("legacy evidence mutation: %v", err)
+		}
+		if err := store.Finish(job.ID, StatusSucceeded); err != nil {
+			t.Fatalf("legacy finish mutation: %v", err)
+		}
+	})
+	t.Run("legacy mutations cannot bypass expired attempt ownership", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("legacy-after-attempt", Request{Repository: "widget", Task: "admin compatibility cannot mutate worker claim"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimNextAttempt()
+		if err != nil {
+			t.Fatal(err)
+		}
+		forceAttemptLeaseExpired(t, store, job.ID)
+		outcome := ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 1, URL: "https://github.com/acme/widget/pull/1", Branch: "factory/job/" + job.ID, Commit: "abcdef0", State: "open"}
+		evidence := VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}
+		for name, mutate := range map[string]func() error{
+			"finish":                func() error { return store.Finish(job.ID, StatusFailed) },
+			"provider outcome":      func() error { return store.RecordProviderOutcome(job.ID, outcome) },
+			"verification evidence": func() error { return store.RecordVerificationEvidence(job.ID, evidence) },
+			"event":                 func() error { return store.AddEvent(job.ID, "late", "unscoped compatibility mutation") },
+		} {
+			if err := mutate(); !errors.Is(err, ErrStaleAttempt) && !errors.Is(err, ErrInvalidTransition) {
+				t.Errorf("unscoped %s mutation error = %v, want fenced rejection", name, err)
+			}
+		}
+		got, err := store.Get(job.ID)
+		if err != nil || got.Status != StatusRunning || got.Provider != nil || got.Verification != nil {
+			t.Fatalf("job after rejected unscoped mutations = (%+v, %v)", got, err)
+		}
+		for name, mutate := range map[string]func() error{
+			"provider outcome":      func() error { return store.RecordProviderOutcomeForAttempt(claim.Attempt, outcome) },
+			"verification evidence": func() error { return store.RecordVerificationEvidenceForAttempt(claim.Attempt, evidence) },
+			"event":                 func() error { return store.AddEventForAttempt(claim.Attempt, "late_attempt", "expired attempt") },
+			"finish":                func() error { return store.FinishAttempt(claim.Attempt, StatusFailed) },
+		} {
+			if err := mutate(); !errors.Is(err, ErrStaleAttempt) {
+				t.Errorf("expired attempt %s mutation = %v, want ErrStaleAttempt", name, err)
+			}
+		}
+	})
+	t.Run("attempt handles fence worker mutations after terminalization", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("fenced-attempt", Request{Repository: "widget", Task: "fence stale worker"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimNextAttempt()
+		if err != nil || claim.Job.ID != job.ID || !validAttemptHandle(claim.Attempt) {
+			t.Fatalf("ClaimNextAttempt() = (%+v, %v)", claim, err)
+		}
+		if claim.Attempt.Generation != 1 {
+			t.Fatalf("first generation = %d, want 1", claim.Attempt.Generation)
+		}
+		if err := store.HeartbeatAttempt(claim.Attempt); err != nil {
+			t.Fatalf("heartbeat: %v", err)
+		}
+		if err := store.AddEventForAttempt(claim.Attempt, "worker", "owned mutation"); err != nil {
+			t.Fatalf("fenced event: %v", err)
+		}
+		if err := store.RecordVerificationEvidenceForAttempt(claim.Attempt, VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}); err != nil {
+			t.Fatalf("fenced evidence: %v", err)
+		}
+		providerAttempt := ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0"}
+		if err := store.RecordProviderAttemptForAttempt(claim.Attempt, providerAttempt); err != nil {
+			t.Fatalf("fenced provider attempt: %v", err)
+		}
+		if err := store.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+			t.Fatalf("fenced uncertain attempt: %v", err)
+		}
+		outcome := ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 1, URL: "https://github.com/acme/widget/pull/1", Branch: providerAttempt.Branch, Commit: providerAttempt.Commit, State: "open"}
+		if err := store.RecordProviderOutcomeForAttempt(claim.Attempt, outcome); err != nil {
+			t.Fatalf("fenced provider outcome: %v", err)
+		}
+		if err := store.FinishAttempt(claim.Attempt, StatusFailed); err != nil {
+			t.Fatalf("fenced finish: %v", err)
+		}
+		for name, mutate := range map[string]func() error{
+			"heartbeat": func() error { return store.HeartbeatAttempt(claim.Attempt) },
+			"event":     func() error { return store.AddEventForAttempt(claim.Attempt, "late", "stale") },
+			"provider attempt": func() error {
+				return store.RecordProviderAttemptForAttempt(claim.Attempt, ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0"})
+			},
+			"uncertain provider attempt": func() error { return store.MarkProviderAttemptUncertainForAttempt(claim.Attempt) },
+			"provider outcome": func() error {
+				return store.RecordProviderOutcomeForAttempt(claim.Attempt, ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 1, URL: "https://github.com/acme/widget/pull/1", Branch: "factory/job/" + job.ID, Commit: "abcdef0", State: "open"})
+			},
+			"verification": func() error { return store.RecordVerificationEvidenceForAttempt(claim.Attempt, VerificationEvidence{}) },
+			"finish":       func() error { return store.FinishAttempt(claim.Attempt, StatusCanceled) },
+		} {
+			if err := mutate(); !errors.Is(err, ErrStaleAttempt) {
+				t.Errorf("stale %s mutation error = %v, want ErrStaleAttempt", name, err)
+			}
+		}
+	})
 	t.Run("bounded listing has stable admission order and snapshot boundary", func(t *testing.T) {
 		store := newStore(t)
 		first, _, err := store.Admit("list-first", Request{Repository: "widget", Task: "private first task"})

@@ -207,6 +207,58 @@ func executorJob(task string) restjobs.Snapshot {
 	return restjobs.Snapshot{ID: executorJobID, Request: restjobs.Request{Repository: "trusted", Task: task}}
 }
 
+func executorAttempt() restjobs.AttemptHandle {
+	return restjobs.AttemptHandle{JobID: executorJobID, Generation: 1, OwnerToken: strings.Repeat("a", 64)}
+}
+
+func TestFactoryExecutorRejectsProviderExecutionWithoutAttemptBeforeSideEffects(t *testing.T) {
+	agent := &executorTestAgent{}
+	executor, workspace, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+	var providerCalls int
+	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
+		providerCalls++
+		return restprovider.Outcome{}, nil
+	})
+
+	if _, err := executor.ExecuteWithResult(context.Background(), executorJob("must not start")); !errors.Is(err, errExecutionFailed) {
+		t.Fatalf("ExecuteWithResult() error = %v, want execution failure", err)
+	}
+	if len(agent.calls) != 0 || workspace.createdID != "" || providerCalls != 0 {
+		t.Fatalf("provider execution without attempt caused side effects: stages=%v workspace=%q provider calls=%d", agent.calls, workspace.createdID, providerCalls)
+	}
+}
+
+func TestFactoryExecutorLegacyEntriesRejectPersistenceWithoutAttemptBeforeSideEffects(t *testing.T) {
+	for _, entry := range []struct {
+		name string
+		run  func(*FactoryExecutor) error
+	}{
+		{name: "Execute", run: func(executor *FactoryExecutor) error {
+			return executor.Execute(context.Background(), executorJob("must not start"))
+		}},
+		{name: "ExecuteWithResult", run: func(executor *FactoryExecutor) error {
+			_, err := executor.ExecuteWithResult(context.Background(), executorJob("must not start"))
+			return err
+		}},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			agent := &executorTestAgent{}
+			executor, workspace, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+			var callbacks int
+			executor.recordVerificationEvidence = func(restjobs.AttemptHandle, restjobs.VerificationEvidence) error {
+				callbacks++
+				return nil
+			}
+			if err := entry.run(executor); !errors.Is(err, errExecutionFailed) {
+				t.Fatalf("legacy direct entry error = %v, want execution failure", err)
+			}
+			if len(agent.calls) != 0 || workspace.createdID != "" || callbacks != 0 {
+				t.Fatalf("legacy entry caused workflow side effects: stages=%v workspace=%q persistence callbacks=%d", agent.calls, workspace.createdID, callbacks)
+			}
+		})
+	}
+}
+
 func TestNewLocalJobManagerUsesServerRegistryLimits(t *testing.T) {
 	config := restserver.DefaultConfig()
 	config.Repositories = map[string]string{"trusted": t.TempDir()}
@@ -280,9 +332,9 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	agent.outputBytes = 5 << 20
 	executor, workspace, repo := newExecutorFixture(t, "10s", restJobOutputLimit, agent, []string{check})
 	var evidence restjobs.VerificationEvidence
-	executor.recordVerificationEvidence = func(id string, recorded restjobs.VerificationEvidence) error {
-		if id != executorJobID {
-			t.Fatalf("evidence job ID = %q", id)
+	executor.recordVerificationEvidence = func(attempt restjobs.AttemptHandle, recorded restjobs.VerificationEvidence) error {
+		if attempt != executorAttempt() {
+			t.Fatalf("evidence attempt = %+v", attempt)
 		}
 		evidence = recorded
 		return nil
@@ -291,7 +343,7 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.Execute(context.Background(), executorJob("implement feature")); err != nil {
+	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("implement feature"), executorAttempt()); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got, want := strings.Join(agent.calls, ","), "requirements,implement,review,document"; got != want {
@@ -320,12 +372,12 @@ func TestFactoryExecutorRecordsNoConfiguredCheckLimitation(t *testing.T) {
 	agent := &executorTestAgent{}
 	executor, _, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
 	var evidence restjobs.VerificationEvidence
-	executor.recordVerificationEvidence = func(_ string, recorded restjobs.VerificationEvidence) error {
+	executor.recordVerificationEvidence = func(_ restjobs.AttemptHandle, recorded restjobs.VerificationEvidence) error {
 		evidence = recorded
 		return nil
 	}
-	if err := executor.Execute(context.Background(), executorJob("do work")); err != nil {
-		t.Fatalf("Execute() error = %v", err)
+	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("do work"), executorAttempt()); err != nil {
+		t.Fatalf("ExecuteWithAttempt() error = %v", err)
 	}
 	if len(evidence.Checks) != 0 || len(evidence.Limitations) != 2 || evidence.Limitations[0] != restjobs.LimitationAgentNotVerdict || evidence.Limitations[1] != restjobs.LimitationNoChecksConfigured {
 		t.Fatalf("no-check verification evidence = %+v", evidence)
@@ -353,11 +405,11 @@ func TestFactoryExecutorRetainsWorkspaceUnmarkedOnStageOrCheckFailure(t *testing
 			}
 			executor, manager, _ := newExecutorFixture(t, "2s", 256, agent, checks...)
 			var evidence restjobs.VerificationEvidence
-			executor.recordVerificationEvidence = func(_ string, recorded restjobs.VerificationEvidence) error {
+			executor.recordVerificationEvidence = func(_ restjobs.AttemptHandle, recorded restjobs.VerificationEvidence) error {
 				evidence = recorded
 				return nil
 			}
-			err := executor.Execute(context.Background(), executorJob("do work"))
+			err := executor.ExecuteWithAttempt(context.Background(), executorJob("do work"), executorAttempt())
 			if !errors.Is(err, errExecutionFailed) || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "private") {
 				t.Fatalf("Execute() error = %v, want sanitized failure", err)
 			}
@@ -384,7 +436,7 @@ func TestFactoryExecutorBoundsCombinedStageAndCheckFilesAndRecordsTruncation(t *
 	agent := &executorTestAgent{outputBytes: 5 << 20}
 	executor, manager, _ := newExecutorFixture(t, "20s", restJobOutputLimit, agent, []string{check})
 	var evidence restjobs.VerificationEvidence
-	executor.recordVerificationEvidence = func(_ string, recorded restjobs.VerificationEvidence) error {
+	executor.recordVerificationEvidence = func(_ restjobs.AttemptHandle, recorded restjobs.VerificationEvidence) error {
 		evidence = recorded
 		return nil
 	}
@@ -393,7 +445,7 @@ func TestFactoryExecutorBoundsCombinedStageAndCheckFilesAndRecordsTruncation(t *
 		observed = append(observed, event)
 		return nil
 	})
-	if err := executor.Execute(context.Background(), executorJob("sensitive user task")); err != nil {
+	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("sensitive user task"), executorAttempt()); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got := strings.Join(agent.calls, ","); got != "requirements,implement,review,document" {

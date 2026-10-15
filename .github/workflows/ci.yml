@@ -34,3 +34,35 @@ jobs:
 
       - name: Vet
         run: make vet
+
+  postgres-ownership:
+    name: PostgreSQL 18 ownership integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: factory
+          POSTGRES_PASSWORD: factory
+          POSTGRES_DB: factory_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U factory -d factory_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      FACTORY_TEST_POSTGRES_URL: postgres://factory:factory@localhost:5432/factory_test?sslmode=disable
+      FACTORY_REQUIRE_POSTGRES_TEST: "1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+
+      - name: Run PostgreSQL ownership integration test
+        run: go test ./internal/restjobs -run '^TestPostgresOwnershipIntegration$' -count=1 -v
