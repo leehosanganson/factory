@@ -1,6 +1,7 @@
 package restjobs
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -177,6 +179,10 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 		postgresOwnershipProcessClaimTest(t, admin, dsn)
 	})
 
+	t.Run("independent processes fence a stale generation after explicit requeue", func(t *testing.T) {
+		postgresOwnershipProcessFencingTest(t, admin, dsn)
+	})
+
 	t.Run("concurrent claim fencing, expiry, and terminal finish", func(t *testing.T) {
 		db := scopedPostgresDB(t, admin, dsn)
 		ctx := context.Background()
@@ -304,6 +310,13 @@ func TestPostgresOwnershipProcessHelper(t *testing.T) {
 	bootID := os.Getenv("FACTORY_POSTGRES_CLAIM_BOOT_ID")
 	readyPath := os.Getenv("FACTORY_POSTGRES_CLAIM_READY_FILE")
 	releasePath := os.Getenv("FACTORY_POSTGRES_CLAIM_RELEASE_FILE")
+	mode := os.Getenv("FACTORY_POSTGRES_CLAIM_MODE")
+	if mode == "" {
+		mode = "compete"
+	}
+	if mode != "compete" && mode != "fence" {
+		t.Fatalf("unknown PostgreSQL claim helper mode %q", mode)
+	}
 	if dsn == "" || schema == "" || jobID == "" || workerID == "" || bootID == "" || readyPath == "" || releasePath == "" {
 		t.Fatal("PostgreSQL claim helper configuration is incomplete")
 	}
@@ -314,14 +327,26 @@ func TestPostgresOwnershipProcessHelper(t *testing.T) {
 	if err := db.PingContext(connectCtx); err != nil {
 		t.Fatalf("connect to PostgreSQL test schema: %v", err)
 	}
-	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+	if mode == "fence" {
+		var backendPID int
+		if err := db.QueryRowContext(connectCtx, `SELECT pg_backend_pid()`).Scan(&backendPID); err != nil {
+			t.Fatalf("read PostgreSQL backend identity: %v", err)
+		}
+		if err := os.WriteFile(readyPath, []byte(strconv.Itoa(backendPID)), 0o600); err != nil {
+			t.Fatalf("signal ready: %v", err)
+		}
+	} else if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
 		t.Fatalf("signal ready: %v", err)
 	}
-	if err := waitForPostgresBarrier(releasePath, 20*time.Second); err != nil {
-		t.Fatalf("wait for claim release: %v", err)
+	if mode == "compete" {
+		if err := waitForPostgresBarrier(releasePath, 20*time.Second); err != nil {
+			t.Fatalf("wait for claim release: %v", err)
+		}
 	}
 
-	claim, err := NewPostgresOwnership(db).ClaimNext(context.Background(), workerID, bootID, time.Minute)
+	opCtx, opCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer opCancel()
+	claim, err := NewPostgresOwnership(db).ClaimNext(opCtx, workerID, bootID, time.Minute)
 	result := postgresProcessClaimResult{}
 	switch {
 	case err == nil:
@@ -342,6 +367,23 @@ func TestPostgresOwnershipProcessHelper(t *testing.T) {
 	}
 	if result.Outcome == "ErrNoQueuedJobs" {
 		t.FailNow()
+	}
+	if mode == "fence" {
+		if err := waitForPostgresBarrier(releasePath, 20*time.Second); err != nil {
+			t.Fatalf("wait for finish release: %v", err)
+		}
+		finishErr := NewPostgresOwnership(db).Finish(opCtx, claim.PostgresAttempt, StatusSucceeded)
+		switch {
+		case errors.Is(finishErr, ErrStaleAttempt):
+			result.Outcome = "stale_attempt"
+		case finishErr == nil:
+			result.Outcome = "finished"
+		default:
+			t.Fatalf("finish claimed job: %v", finishErr)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			t.Fatalf("write finish result: %v", err)
+		}
 	}
 }
 
@@ -509,6 +551,271 @@ func postgresOwnershipProcessClaimTest(t *testing.T, admin *sql.DB, dsn string) 
 	}
 	if ownershipCount != 1 || generation != 1 || workerID != winner.workerID || bootID != winner.bootID {
 		t.Fatalf("persisted ownership=(count %d, generation %d, worker %q, boot %q), want one generation-1 row for winner %s", ownershipCount, generation, workerID, bootID, winner.workerID)
+	}
+}
+
+func postgresOwnershipProcessFencingTest(t *testing.T, admin *sql.DB, dsn string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	schema, err := newPostgresSchemaName()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admin.ExecContext(ctx, `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create process-fencing schema: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`); err != nil {
+			t.Errorf("drop process-fencing schema: %v", err)
+		}
+	})
+
+	db := postgresDBForSchema(t, dsn, schema)
+	jobID, err := newJobID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `CREATE TABLE factory_jobs (
+		id text PRIMARY KEY,
+		status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
+		queue_sequence bigint NOT NULL UNIQUE
+	)`)
+	if _, err := db.ExecContext(ctx, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ($1,'queued',1)`, jobID); err != nil {
+		t.Fatalf("insert process-fencing job: %v", err)
+	}
+	if err := NewPostgresOwnership(db).Migrate(ctx); err != nil {
+		t.Fatalf("migrate process-fencing schema: %v", err)
+	}
+	var parentBackendPID int
+	if err := db.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&parentBackendPID); err != nil {
+		t.Fatalf("read parent PostgreSQL backend identity: %v", err)
+	}
+
+	type childProcess struct {
+		workerID   string
+		bootID     string
+		ready      string
+		release    string
+		cmd        *exec.Cmd
+		lines      chan string
+		stderrPath string
+		stderrFile *os.File
+		waitErr    error
+	}
+	barrierDir := t.TempDir()
+	children := make([]*childProcess, 0, 2)
+	startChild := func(workerID, bootID string) *childProcess {
+		t.Helper()
+		child := &childProcess{
+			workerID:   workerID,
+			bootID:     bootID,
+			ready:      filepath.Join(barrierDir, workerID+".ready"),
+			release:    filepath.Join(barrierDir, workerID+".release"),
+			lines:      make(chan string, 4),
+			stderrPath: filepath.Join(barrierDir, workerID+".stderr"),
+		}
+		stderrFile, err := os.Create(child.stderrPath)
+		if err != nil {
+			t.Fatalf("create %s stderr capture: %v", workerID, err)
+		}
+		child.stderrFile = stderrFile
+		child.cmd = exec.CommandContext(ctx, os.Args[0], "-test.run=^TestPostgresOwnershipProcessHelper$")
+		child.cmd.Env = append(os.Environ(),
+			"FACTORY_POSTGRES_CLAIM_HELPER=1",
+			"FACTORY_POSTGRES_CLAIM_MODE=fence",
+			"FACTORY_TEST_POSTGRES_URL="+dsn,
+			"FACTORY_POSTGRES_CLAIM_SCHEMA="+schema,
+			"FACTORY_POSTGRES_CLAIM_JOB_ID="+jobID,
+			"FACTORY_POSTGRES_CLAIM_WORKER_ID="+workerID,
+			"FACTORY_POSTGRES_CLAIM_BOOT_ID="+bootID,
+			"FACTORY_POSTGRES_CLAIM_READY_FILE="+child.ready,
+			"FACTORY_POSTGRES_CLAIM_RELEASE_FILE="+child.release,
+		)
+		stdout, err := child.cmd.StdoutPipe()
+		if err != nil {
+			t.Fatalf("open %s stdout: %v", workerID, err)
+		}
+		child.cmd.Stderr = child.stderrFile
+		if err := child.cmd.Start(); err != nil {
+			_ = child.stderrFile.Close()
+			t.Fatalf("start %s process: %v", workerID, err)
+		}
+		children = append(children, child)
+		go func() {
+			defer close(child.lines)
+			reader := bufio.NewReader(stdout)
+			for {
+				line, err := reader.ReadString('\n')
+				if len(line) > 0 {
+					child.lines <- strings.TrimSpace(line)
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		return child
+	}
+	defer func() {
+		for _, child := range children {
+			if child.cmd.ProcessState == nil {
+				_ = child.cmd.Process.Kill()
+				_ = child.cmd.Wait()
+			}
+			_ = child.stderrFile.Close()
+		}
+	}()
+	stderr := func(child *childProcess) string {
+		t.Helper()
+		contents, err := os.ReadFile(child.stderrPath)
+		if err != nil {
+			return "<stderr unavailable: " + err.Error() + ">"
+		}
+		return string(contents)
+	}
+	readLine := func(child *childProcess, stage string) postgresProcessClaimResult {
+		t.Helper()
+		select {
+		case line, ok := <-child.lines:
+			for ok && !strings.HasPrefix(line, `{"outcome":`) {
+				line, ok = <-child.lines
+			}
+			if !ok {
+				t.Fatalf("process %s exited before %s; stderr=%q", child.workerID, stage, stderr(child))
+			}
+			if strings.Contains(strings.ToLower(line), "owner_token") || strings.Contains(line, "0123456789abcdef") {
+				t.Fatalf("%s output leaked ownership token: %q", child.workerID, line)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(line), &fields); err != nil {
+				t.Fatalf("decode %s %s output fields: %v; line=%q", child.workerID, stage, err, line)
+			}
+			for field := range fields {
+				switch field {
+				case "outcome", "job_id", "generation", "worker_id", "boot_id":
+				default:
+					t.Fatalf("%s output includes unexpected field %q: %s", child.workerID, field, line)
+				}
+			}
+			var result postgresProcessClaimResult
+			if err := json.Unmarshal([]byte(line), &result); err != nil {
+				t.Fatalf("decode %s %s result: %v; line=%q", child.workerID, stage, err, line)
+			}
+			return result
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for %s %s output: %v", child.workerID, stage, ctx.Err())
+			return postgresProcessClaimResult{}
+		}
+	}
+	waitChild := func(child *childProcess) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- child.cmd.Wait() }()
+		select {
+		case child.waitErr = <-done:
+			if child.waitErr != nil {
+				t.Fatalf("%s process failed: %v; stderr=%q", child.workerID, child.waitErr, stderr(child))
+			}
+		case <-ctx.Done():
+			_ = child.cmd.Process.Kill()
+			child.waitErr = <-done
+			t.Fatalf("timed out waiting for %s process exit: %v", child.workerID, ctx.Err())
+		}
+	}
+	backendPID := func(child *childProcess) int {
+		t.Helper()
+		if err := waitForPostgresBarrierContext(ctx, child.ready); err != nil {
+			t.Fatalf("wait for %s readiness: %v", child.workerID, err)
+		}
+		contents, err := os.ReadFile(child.ready)
+		if err != nil {
+			t.Fatalf("read %s backend identity: %v", child.workerID, err)
+		}
+		pid, err := strconv.Atoi(string(contents))
+		if err != nil {
+			t.Fatalf("parse %s backend identity %q: %v", child.workerID, contents, err)
+		}
+		if pid == parentBackendPID {
+			t.Fatalf("%s unexpectedly shares parent PostgreSQL backend %d", child.workerID, pid)
+		}
+		return pid
+	}
+	assertClaim := func(child *childProcess, result postgresProcessClaimResult, generation int64) {
+		t.Helper()
+		if result.Outcome != "claimed" || result.JobID != jobID || result.Generation != generation || result.WorkerID != child.workerID || result.BootID != child.bootID {
+			t.Fatalf("%s claim = %+v, want job %s generation %d", child.workerID, result, jobID, generation)
+		}
+	}
+
+	processA := startChild("worker-process-a", "boot-process-a")
+	pidA := backendPID(processA)
+	assertClaim(processA, readLine(processA, "claim"), 1)
+	var status string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id = $1`, jobID).Scan(&status); err != nil {
+		t.Fatalf("read committed A claim status: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("A claim status = %q, want committed running", status)
+	}
+
+	// This is an explicit test-operator requeue after A's committed claim. It
+	// deliberately does not simulate recovery or establish that process A stopped.
+	result, err := db.ExecContext(ctx, `UPDATE factory_jobs SET status = 'queued' WHERE id = $1 AND status = 'running'`, jobID)
+	if err != nil {
+		t.Fatalf("operator-style test requeue after A claim: %v", err)
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		t.Fatalf("operator-style test requeue affected %d rows, error %v; want one", changed, err)
+	}
+
+	processB := startChild("worker-process-b", "boot-process-b")
+	pidB := backendPID(processB)
+	if pidA == pidB {
+		t.Fatalf("processes A and B share PostgreSQL backend %d", pidA)
+	}
+	assertClaim(processB, readLine(processB, "claim"), 2)
+
+	if err := os.WriteFile(processA.release, []byte("finish"), 0o600); err != nil {
+		t.Fatalf("release process A finish: %v", err)
+	}
+	staleFinish := readLine(processA, "finish")
+	if staleFinish.Outcome != "stale_attempt" || staleFinish.JobID != jobID || staleFinish.Generation != 1 || staleFinish.WorkerID != processA.workerID || staleFinish.BootID != processA.bootID {
+		t.Fatalf("process A finish result = %+v, want ErrStaleAttempt for generation 1", staleFinish)
+	}
+	waitChild(processA)
+
+	var bCurrent bool
+	if err := db.QueryRowContext(ctx, `SELECT j.status = 'running' AND o.generation = 2
+		AND o.worker_id = $2 AND o.boot_id = $3 AND o.lease_until > clock_timestamp()
+		FROM factory_jobs j JOIN factory_job_ownership o ON o.job_id = j.id WHERE j.id = $1`,
+		jobID, processB.workerID, processB.bootID).Scan(&bCurrent); err != nil {
+		t.Fatalf("verify B remains current after stale A finish: %v", err)
+	}
+	if !bCurrent {
+		t.Fatal("B is no longer current or job is not running after stale A finish")
+	}
+
+	if err := os.WriteFile(processB.release, []byte("finish"), 0o600); err != nil {
+		t.Fatalf("release process B finish: %v", err)
+	}
+	bFinish := readLine(processB, "finish")
+	if bFinish.Outcome != "finished" || bFinish.JobID != jobID || bFinish.Generation != 2 || bFinish.WorkerID != processB.workerID || bFinish.BootID != processB.bootID {
+		t.Fatalf("process B finish result = %+v, want successful generation-2 finish", bFinish)
+	}
+	waitChild(processB)
+
+	var ownershipCount int
+	var generation int64
+	var workerID, bootID string
+	if err := db.QueryRowContext(ctx, `SELECT j.status, COUNT(o.job_id), MIN(o.generation), MIN(o.worker_id), MIN(o.boot_id)
+		FROM factory_jobs j JOIN factory_job_ownership o ON o.job_id = j.id WHERE j.id = $1 GROUP BY j.status`, jobID).
+		Scan(&status, &ownershipCount, &generation, &workerID, &bootID); err != nil {
+		t.Fatalf("read terminal process-fencing state: %v", err)
+	}
+	if status != string(StatusSucceeded) || ownershipCount != 1 || generation != 2 || workerID != processB.workerID || bootID != processB.bootID {
+		t.Fatalf("terminal state=(status %q, ownership rows %d, generation %d, worker %q, boot %q), want succeeded with one generation-2 B row", status, ownershipCount, generation, workerID, bootID)
 	}
 }
 
