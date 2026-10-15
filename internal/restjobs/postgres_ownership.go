@@ -12,12 +12,13 @@ import (
 )
 
 const (
-	postgresOwnershipSchemaVersion          = 1
-	postgresOwnershipMigrationLockKey int64 = 0x464143544F5259 // "FACTORY", reserved for ownership migrations.
-	postgresMinLease                        = 5 * time.Second
-	postgresMaxLease                        = 10 * time.Minute
-	postgresMaxOwnerIDBytes                 = 128
-	postgresOwnerTokenBytes                 = 32
+	postgresOwnershipSchemaVersion               = 2
+	postgresOwnershipPreviousSchemaVersion       = 1
+	postgresOwnershipMigrationLockKey      int64 = 0x464143544F5259 // "FACTORY", reserved for ownership migrations.
+	postgresMinLease                             = 5 * time.Second
+	postgresMaxLease                             = 10 * time.Minute
+	postgresMaxOwnerIDBytes                      = 128
+	postgresOwnerTokenBytes                      = 32
 )
 
 var postgresOwnerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
@@ -49,9 +50,9 @@ func NewPostgresOwnership(db *sql.DB) *PostgresOwnership {
 	return &PostgresOwnership{db: db}
 }
 
-// Migrate creates the fresh v1 ownership schema and attempt history tables in
-// one transaction. The foreign keys make migration fail closed when
-// factory_jobs is absent.
+// Migrate creates the ownership and attempt-history schema, upgrading v1
+// ownership metadata when needed. The foreign keys make migration fail closed
+// when factory_jobs is absent.
 func (p *PostgresOwnership) Migrate(ctx context.Context) error {
 	if ctx == nil || p == nil || p.db == nil {
 		return ErrInvalidInput
@@ -78,7 +79,7 @@ func (p *PostgresOwnership) Migrate(ctx context.Context) error {
 	if err := tx.QueryRowContext(ctx, `SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1 FOR UPDATE`).Scan(&version); err != nil {
 		return errors.New("read PostgreSQL ownership schema version")
 	}
-	if version != postgresOwnershipSchemaVersion {
+	if version != postgresOwnershipSchemaVersion && version != postgresOwnershipPreviousSchemaVersion {
 		return fmt.Errorf("unsupported PostgreSQL ownership schema version %d", version)
 	}
 	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS factory_job_ownership (
@@ -108,6 +109,23 @@ func (p *PostgresOwnership) Migrate(ctx context.Context) error {
 		CHECK ((finished_at IS NULL AND status IS NULL) OR (finished_at IS NOT NULL AND status IS NOT NULL))
 	)`); err != nil {
 		return errors.New("create PostgreSQL attempt history table")
+	}
+	if version == postgresOwnershipPreviousSchemaVersion {
+		// v1 ownership predates durable attempt history. Preserve the currently
+		// running attempt so it can still finish; updated_at is the best available
+		// claim/start timestamp because v1 did not retain separate timestamps.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_attempt_history
+			(job_id, generation, worker_id, boot_id, claimed_at, started_at, lease_until)
+			SELECT o.job_id, o.generation, o.worker_id, o.boot_id, o.updated_at, o.updated_at, o.lease_until
+			FROM factory_job_ownership AS o
+			JOIN factory_jobs AS j ON j.id = o.job_id
+			WHERE j.status = 'running'
+			ON CONFLICT (job_id, generation) DO NOTHING`); err != nil {
+			return errors.New("backfill PostgreSQL active attempt history")
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE factory_postgres_ownership_schema SET version = $1 WHERE singleton = 1`, postgresOwnershipSchemaVersion); err != nil {
+			return errors.New("upgrade PostgreSQL ownership schema version")
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit PostgreSQL ownership migration")
@@ -204,6 +222,17 @@ func (p *PostgresOwnership) Heartbeat(ctx context.Context, attempt PostgresAttem
 	}
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 		return ErrStaleAttempt
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE factory_job_attempt_history AS h SET lease_until = o.lease_until
+		FROM factory_job_ownership AS o
+		WHERE h.job_id = $1 AND h.generation = $2 AND h.finished_at IS NULL AND h.status IS NULL
+		AND o.job_id = h.job_id AND o.generation = h.generation
+		AND o.worker_id = $3 AND o.boot_id = $4`, attempt.JobID, attempt.Generation, attempt.WorkerID, attempt.BootID)
+	if err != nil {
+		return errors.New("renew PostgreSQL attempt history lease")
+	}
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		return errors.New("renew PostgreSQL attempt history lease")
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit PostgreSQL worker heartbeat")
