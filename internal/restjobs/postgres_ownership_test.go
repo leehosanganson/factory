@@ -688,6 +688,7 @@ func TestPostgresOwnershipProcessHelper(t *testing.T) {
 	bootID := os.Getenv("FACTORY_POSTGRES_CLAIM_BOOT_ID")
 	readyPath := os.Getenv("FACTORY_POSTGRES_CLAIM_READY_FILE")
 	releasePath := os.Getenv("FACTORY_POSTGRES_CLAIM_RELEASE_FILE")
+	heartbeatReleasePath := os.Getenv("FACTORY_POSTGRES_CLAIM_HEARTBEAT_RELEASE_FILE")
 	mode := os.Getenv("FACTORY_POSTGRES_CLAIM_MODE")
 	if mode == "" {
 		mode = "compete"
@@ -695,7 +696,7 @@ func TestPostgresOwnershipProcessHelper(t *testing.T) {
 	if mode != "compete" && mode != "fence" {
 		t.Fatalf("unknown PostgreSQL claim helper mode %q", mode)
 	}
-	if dsn == "" || schema == "" || jobID == "" || workerID == "" || bootID == "" || readyPath == "" || releasePath == "" {
+	if dsn == "" || schema == "" || jobID == "" || workerID == "" || bootID == "" || readyPath == "" || releasePath == "" || (mode == "fence" && heartbeatReleasePath == "") {
 		t.Fatal("PostgreSQL claim helper configuration is incomplete")
 	}
 
@@ -747,6 +748,21 @@ func TestPostgresOwnershipProcessHelper(t *testing.T) {
 		t.FailNow()
 	}
 	if mode == "fence" {
+		if err := waitForPostgresBarrier(heartbeatReleasePath, 20*time.Second); err != nil {
+			t.Fatalf("wait for heartbeat release: %v", err)
+		}
+		heartbeatErr := NewPostgresOwnership(db).Heartbeat(opCtx, claim.PostgresAttempt, time.Minute)
+		switch {
+		case errors.Is(heartbeatErr, ErrStaleAttempt):
+			result.Outcome = "heartbeat_stale"
+		case heartbeatErr == nil:
+			result.Outcome = "heartbeat_ok"
+		default:
+			t.Fatalf("heartbeat claimed job: %v", heartbeatErr)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(result); err != nil {
+			t.Fatalf("write heartbeat result: %v", err)
+		}
 		if err := waitForPostgresBarrier(releasePath, 20*time.Second); err != nil {
 			t.Fatalf("wait for finish release: %v", err)
 		}
@@ -972,27 +988,29 @@ func postgresOwnershipProcessFencingTest(t *testing.T, admin *sql.DB, dsn string
 	}
 
 	type childProcess struct {
-		workerID   string
-		bootID     string
-		ready      string
-		release    string
-		cmd        *exec.Cmd
-		lines      chan string
-		stderrPath string
-		stderrFile *os.File
-		waitErr    error
+		workerID         string
+		bootID           string
+		ready            string
+		heartbeatRelease string
+		release          string
+		cmd              *exec.Cmd
+		lines            chan string
+		stderrPath       string
+		stderrFile       *os.File
+		waitErr          error
 	}
 	barrierDir := t.TempDir()
 	children := make([]*childProcess, 0, 2)
 	startChild := func(workerID, bootID string) *childProcess {
 		t.Helper()
 		child := &childProcess{
-			workerID:   workerID,
-			bootID:     bootID,
-			ready:      filepath.Join(barrierDir, workerID+".ready"),
-			release:    filepath.Join(barrierDir, workerID+".release"),
-			lines:      make(chan string, 4),
-			stderrPath: filepath.Join(barrierDir, workerID+".stderr"),
+			workerID:         workerID,
+			bootID:           bootID,
+			ready:            filepath.Join(barrierDir, workerID+".ready"),
+			heartbeatRelease: filepath.Join(barrierDir, workerID+".heartbeat.release"),
+			release:          filepath.Join(barrierDir, workerID+".release"),
+			lines:            make(chan string, 4),
+			stderrPath:       filepath.Join(barrierDir, workerID+".stderr"),
 		}
 		stderrFile, err := os.Create(child.stderrPath)
 		if err != nil {
@@ -1009,6 +1027,7 @@ func postgresOwnershipProcessFencingTest(t *testing.T, admin *sql.DB, dsn string
 			"FACTORY_POSTGRES_CLAIM_WORKER_ID="+workerID,
 			"FACTORY_POSTGRES_CLAIM_BOOT_ID="+bootID,
 			"FACTORY_POSTGRES_CLAIM_READY_FILE="+child.ready,
+			"FACTORY_POSTGRES_CLAIM_HEARTBEAT_RELEASE_FILE="+child.heartbeatRelease,
 			"FACTORY_POSTGRES_CLAIM_RELEASE_FILE="+child.release,
 		)
 		stdout, err := child.cmd.StdoutPipe()
@@ -1148,6 +1167,11 @@ func postgresOwnershipProcessFencingTest(t *testing.T, admin *sql.DB, dsn string
 		t.Fatalf("operator-style test requeue affected %d rows, error %v; want one", changed, err)
 	}
 
+	var generationOneLease time.Time
+	if err := db.QueryRowContext(ctx, `SELECT lease_until FROM factory_job_attempt_history WHERE job_id = $1 AND generation = 1`, jobID).Scan(&generationOneLease); err != nil {
+		t.Fatalf("read generation-1 lease before test-only requeue: %v", err)
+	}
+
 	processB := startChild("worker-process-b", "boot-process-b")
 	pidB := backendPID(processB)
 	if pidA == pidB {
@@ -1155,6 +1179,41 @@ func postgresOwnershipProcessFencingTest(t *testing.T, admin *sql.DB, dsn string
 	}
 	assertClaim(processB, readLine(processB, "claim"), 2)
 
+	if err := os.WriteFile(processA.heartbeatRelease, []byte("heartbeat"), 0o600); err != nil {
+		t.Fatalf("release process A heartbeat: %v", err)
+	}
+	staleHeartbeat := readLine(processA, "heartbeat")
+	if staleHeartbeat.Outcome != "heartbeat_stale" || staleHeartbeat.JobID != jobID || staleHeartbeat.Generation != 1 || staleHeartbeat.WorkerID != processA.workerID || staleHeartbeat.BootID != processA.bootID {
+		t.Fatalf("process A heartbeat result = %+v, want ErrStaleAttempt for generation 1", staleHeartbeat)
+	}
+	var aHistoryLease, bHistoryLease, bOwnershipLease time.Time
+	if err := db.QueryRowContext(ctx, `SELECT lease_until FROM factory_job_attempt_history WHERE job_id = $1 AND generation = 1`, jobID).Scan(&aHistoryLease); err != nil {
+		t.Fatalf("read generation-1 history after stale heartbeat: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT h.lease_until, o.lease_until FROM factory_job_attempt_history h
+		JOIN factory_job_ownership o ON o.job_id = h.job_id WHERE h.job_id = $1 AND h.generation = 2`, jobID).
+		Scan(&bHistoryLease, &bOwnershipLease); err != nil {
+		t.Fatalf("read generation-2 leases after stale heartbeat: %v", err)
+	}
+	if !aHistoryLease.Equal(generationOneLease) || !bHistoryLease.Equal(bOwnershipLease) {
+		t.Fatalf("leases after stale generation-1 heartbeat: A history=%v (before requeue %v), B history=%v, B ownership=%v; want A unchanged and B synchronized", aHistoryLease, generationOneLease, bHistoryLease, bOwnershipLease)
+	}
+	if err := os.WriteFile(processB.heartbeatRelease, []byte("heartbeat"), 0o600); err != nil {
+		t.Fatalf("release process B heartbeat: %v", err)
+	}
+	liveHeartbeat := readLine(processB, "heartbeat")
+	if liveHeartbeat.Outcome != "heartbeat_ok" || liveHeartbeat.Generation != 2 || liveHeartbeat.WorkerID != processB.workerID || liveHeartbeat.BootID != processB.bootID {
+		t.Fatalf("process B heartbeat result = %+v, want successful generation-2 renewal", liveHeartbeat)
+	}
+	var bLeaseSynchronized bool
+	if err := db.QueryRowContext(ctx, `SELECT h.lease_until = o.lease_until FROM factory_job_attempt_history h
+		JOIN factory_job_ownership o ON o.job_id = h.job_id WHERE h.job_id = $1 AND h.generation = 2`, jobID).
+		Scan(&bLeaseSynchronized); err != nil {
+		t.Fatalf("verify generation-2 history follows successful heartbeat: %v", err)
+	}
+	if !bLeaseSynchronized {
+		t.Fatal("successful generation-2 heartbeat did not synchronize attempt-history lease")
+	}
 	if err := os.WriteFile(processA.release, []byte("finish"), 0o600); err != nil {
 		t.Fatalf("release process A finish: %v", err)
 	}
