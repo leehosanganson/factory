@@ -32,7 +32,7 @@ func TestRESTWatchProcessFallsBackToHistoryWithoutDuplicateEvents(t *testing.T) 
 		t.Skip("process-level REST E2E requires supported local process semantics")
 	}
 
-	fixture := newRESTWatchProcessFixture(t, func(w http.ResponseWriter, r *http.Request, handler http.Handler) {
+	fixture := newRESTWatchProcessFixtureWithPrivateEvent(t, func(w http.ResponseWriter, r *http.Request, handler http.Handler) {
 		if strings.HasSuffix(r.URL.Path, "/events") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -47,9 +47,6 @@ func TestRESTWatchProcessFallsBackToHistoryWithoutDuplicateEvents(t *testing.T) 
 	process.waitForLine(t, " running")
 	if got := fixture.managerGet(t).Status; got != restjobs.StatusRunning {
 		t.Fatalf("watch baseline job state=%s, want nonterminal running", got)
-	}
-	if err := fixture.manager.AddEvent(fixture.job.ID, "cancel_requested", "PRIVATE_EVENT /PRIVATE_WORKSPACE PRIVATE_PROVIDER_TOKEN"); err != nil {
-		t.Fatal(err)
 	}
 	process.waitForLine(t, "cancel_requested")
 	fixture.executor.release()
@@ -231,14 +228,28 @@ func TestRESTWatchProcessSanitizesAuthReadinessAndStreamErrors(t *testing.T) {
 }
 
 type restWatchExecutor struct {
-	started     chan struct{}
-	releaseCh   chan struct{}
-	releaseOnce sync.Once
-	calls       atomic.Int32
+	manager          *restjobs.LocalManager
+	emitPrivateEvent bool
+	started          chan struct{}
+	releaseCh        chan struct{}
+	releaseOnce      sync.Once
+	calls            atomic.Int32
 }
 
 func (e *restWatchExecutor) Execute(ctx context.Context, _ restjobs.Snapshot) error {
+	return errors.New("Coordinator bypassed attempt-aware watch execution")
+}
+
+func (e *restWatchExecutor) ExecuteWithAttempt(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) error {
 	e.calls.Add(1)
+	if attempt.JobID != job.ID {
+		return errors.New("watch executor received mismatched attempt")
+	}
+	if e.emitPrivateEvent {
+		if err := e.manager.AddEventForAttempt(attempt, "cancel_requested", "PRIVATE_EVENT /PRIVATE_WORKSPACE PRIVATE_PROVIDER_TOKEN"); err != nil {
+			return err
+		}
+	}
 	close(e.started)
 	select {
 	case <-e.releaseCh:
@@ -270,6 +281,14 @@ type restWatchProcessFixture struct {
 }
 
 func newRESTWatchProcessFixture(t *testing.T, wrap func(http.ResponseWriter, *http.Request, http.Handler)) *restWatchProcessFixture {
+	return newRESTWatchProcessFixtureWithEvent(t, wrap, false)
+}
+
+func newRESTWatchProcessFixtureWithPrivateEvent(t *testing.T, wrap func(http.ResponseWriter, *http.Request, http.Handler)) *restWatchProcessFixture {
+	return newRESTWatchProcessFixtureWithEvent(t, wrap, true)
+}
+
+func newRESTWatchProcessFixtureWithEvent(t *testing.T, wrap func(http.ResponseWriter, *http.Request, http.Handler), emitPrivateEvent bool) *restWatchProcessFixture {
 	t.Helper()
 	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 8})
 	if err != nil {
@@ -283,7 +302,7 @@ func newRESTWatchProcessFixture(t *testing.T, wrap func(http.ResponseWriter, *ht
 	t.Logf("synthetic REST watch job ID: %s", job.ID)
 	fixture := &restWatchProcessFixture{
 		t: t, manager: manager, job: job,
-		executor: &restWatchExecutor{started: make(chan struct{}), releaseCh: make(chan struct{})},
+		executor: &restWatchExecutor{manager: manager, emitPrivateEvent: emitPrivateEvent, started: make(chan struct{}), releaseCh: make(chan struct{})},
 		root:     t.TempDir(), privatePath: filepath.Join(t.TempDir(), "PRIVATE_WORKSPACE"), secret: "PRIVATE_PROVIDER_TOKEN",
 	}
 	fixture.repoPath = filepath.Join(fixture.root, "synthetic-widget")

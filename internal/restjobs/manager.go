@@ -30,6 +30,7 @@ var (
 	ErrNoQueuedJobs        = errors.New("no queued jobs")
 	ErrNoWorkerSlots       = errors.New("no worker slots available")
 	ErrManagerClosed       = errors.New("job manager is closed")
+	ErrStaleAttempt        = errors.New("stale worker attempt")
 )
 
 func validateProviderOutcome(outcome ProviderOutcome) error {
@@ -44,6 +45,8 @@ func validRepositoryName(value string) bool {
 	parts := strings.Split(value, "/")
 	return len(parts) == 2 && parts[0] != "" && parts[1] != "" && !strings.Contains(value, "..")
 }
+
+const attemptLeaseDuration = time.Minute
 
 const (
 	maxRecordsLimit            = 1000
@@ -175,6 +178,20 @@ func validateVerificationEvidence(evidence VerificationEvidence) error {
 	return nil
 }
 
+// AttemptHandle is the immutable fencing identity issued for one worker claim.
+// Its owner token is opaque and must not be exposed to job clients.
+type AttemptHandle struct {
+	JobID      string `json:"-"`
+	Generation int64  `json:"-"`
+	OwnerToken string `json:"-"`
+}
+
+// AttemptClaim pairs a claimed job snapshot with its fencing identity.
+type AttemptClaim struct {
+	Job     Snapshot
+	Attempt AttemptHandle
+}
+
 // Snapshot is a copy of public job state. Verification contains only safe
 // check labels/outcomes and fixed limitation messages, never command output.
 type Snapshot struct {
@@ -255,17 +272,27 @@ type RecoveryReport struct {
 // to idempotency, preserve lifecycle/history consistency, and honor cancellation
 // for context-bearing operations.
 //
-// ClaimNext and Finish provide explicit synchronous lifecycle control; no
-// goroutines or workers are started by this package. WaitClaim blocks until a
-// job and worker slot are available, context cancellation, or Close. Close
-// stops admission, cancels queued jobs, and leaves running jobs for workers to
-// finish.
+// ClaimNext and WaitClaim are unfenced single-process/admin compatibility APIs;
+// they must never be used by distributed workers. Attempt-aware workers use
+// ClaimNextAttempt and WaitClaimAttempt, then only the corresponding fenced
+// mutation methods. Finish provides explicit synchronous compatibility control;
+// no goroutines or workers are started by this package. Close stops admission,
+// cancels queued jobs, and leaves running jobs for workers to finish.
 type Store interface {
 	Admit(idempotencyKey string, request Request) (Snapshot, bool, error)
 	AdmitAs(idempotencyKey, principalID string, request Request) (Snapshot, bool, error)
 	ResolveInterrupted(id string, disposition InterruptedDisposition) error
 	ClaimNext() (Snapshot, error)
 	WaitClaim(ctx context.Context) (Snapshot, error)
+	ClaimNextAttempt() (AttemptClaim, error)
+	WaitClaimAttempt(ctx context.Context) (AttemptClaim, error)
+	HeartbeatAttempt(AttemptHandle) error
+	AddEventForAttempt(AttemptHandle, string, string) error
+	RecordProviderAttemptForAttempt(AttemptHandle, ProviderAttempt) error
+	MarkProviderAttemptUncertainForAttempt(AttemptHandle) error
+	RecordProviderOutcomeForAttempt(AttemptHandle, ProviderOutcome) error
+	RecordVerificationEvidenceForAttempt(AttemptHandle, VerificationEvidence) error
+	FinishAttempt(AttemptHandle, Status) error
 	Close()
 	Get(id string) (Snapshot, error)
 	GetForPrincipal(id, principalID string) (Snapshot, error)
@@ -335,12 +362,16 @@ type idempotencyIdentity struct {
 }
 
 type job struct {
-	snapshot       Snapshot
-	sequence       uint64
-	nextEvent      uint64
-	events         []Event
-	truncated      bool
-	accountedBytes uint64
+	snapshot        Snapshot
+	providerAttempt *ProviderAttempt
+	generation      int64
+	ownerToken      string
+	leaseUntil      time.Time
+	sequence        uint64
+	nextEvent       uint64
+	events          []Event
+	truncated       bool
+	accountedBytes  uint64
 }
 
 const legacySharedPrincipalID = "legacy-shared"
@@ -489,47 +520,75 @@ func (m *LocalManager) AdmitAs(idempotencyKey, principalID string, request Reque
 	return cloneSnapshot(created), false, nil
 }
 
-// ClaimNext removes the oldest pending job from queue capacity and moves it to
-// running. It returns ErrNoQueuedJobs if the queue is empty.
+// ClaimNext is an unfenced single-process/admin compatibility claim. It does
+// not create AttemptHandle ownership state and must never be used by distributed
+// workers. Use ClaimNextAttempt for worker execution.
 func (m *LocalManager) ClaimNext() (Snapshot, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return Snapshot{}, ErrManagerClosed
 	}
+	return m.claimLegacyLocked()
+}
+
+func (m *LocalManager) ClaimNextAttempt() (AttemptClaim, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return AttemptClaim{}, ErrManagerClosed
+	}
 	return m.claimLocked()
 }
 
 // WaitClaim blocks without polling until a queued job and worker slot are
-// available. A closed manager returns ErrManagerClosed; cancellation returns
-// ctx.Err().
+// available. This is an unfenced single-process/admin compatibility API; it
+// must never be used by distributed workers. Use WaitClaimAttempt instead.
 func (m *LocalManager) WaitClaim(ctx context.Context) (Snapshot, error) {
+	claim, err := m.waitClaim(ctx, false)
+	return claim.Job, err
+}
+
+func (m *LocalManager) WaitClaimAttempt(ctx context.Context) (AttemptClaim, error) {
+	claim, err := m.waitClaim(ctx, true)
+	return claim, err
+}
+
+func (m *LocalManager) waitClaim(ctx context.Context, attemptAware bool) (AttemptClaim, error) {
 	if ctx == nil {
-		return Snapshot{}, ErrInvalidInput
+		return AttemptClaim{}, ErrInvalidInput
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return Snapshot{}, err
+			return AttemptClaim{}, err
 		}
 		m.mu.Lock()
 		if m.closed {
 			m.mu.Unlock()
-			return Snapshot{}, ErrManagerClosed
+			return AttemptClaim{}, ErrManagerClosed
 		}
 		if err := ctx.Err(); err != nil {
 			m.mu.Unlock()
-			return Snapshot{}, err
+			return AttemptClaim{}, err
 		}
 		if len(m.queue) > 0 && m.running < m.config.MaxConcurrentJobs {
-			snapshot, err := m.claimLocked()
+			var claim AttemptClaim
+			var err error
+			if attemptAware {
+				claim, err = m.claimLocked()
+			} else {
+				var snapshot Snapshot
+				snapshot, err = m.claimLegacyLocked()
+				claim.Job = snapshot
+			}
 			m.mu.Unlock()
-			return snapshot, err
+			return claim, err
 		}
 		changed := m.notify
 		m.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return Snapshot{}, ctx.Err()
+			return AttemptClaim{}, ctx.Err()
 		case <-changed:
 		}
 	}
@@ -561,7 +620,7 @@ func (m *LocalManager) Close() {
 	m.signalLocked()
 }
 
-func (m *LocalManager) claimLocked() (Snapshot, error) {
+func (m *LocalManager) claimLegacyLocked() (Snapshot, error) {
 	if len(m.queue) == 0 {
 		return Snapshot{}, ErrNoQueuedJobs
 	}
@@ -582,6 +641,73 @@ func (m *LocalManager) claimLocked() (Snapshot, error) {
 	entry.snapshot.UpdatedAt = time.Now().UTC()
 	m.running++
 	return cloneSnapshot(entry.snapshot), nil
+}
+
+func (m *LocalManager) claimLocked() (AttemptClaim, error) {
+	if len(m.queue) == 0 {
+		return AttemptClaim{}, ErrNoQueuedJobs
+	}
+	if m.running >= m.config.MaxConcurrentJobs {
+		return AttemptClaim{}, ErrNoWorkerSlots
+	}
+	id := m.queue[0]
+	entry := m.jobs[id]
+	if entry == nil || entry.snapshot.Status != StatusQueued {
+		return AttemptClaim{}, fmt.Errorf("queued job invariant violated")
+	}
+	token, err := newOwnerToken()
+	if err != nil {
+		return AttemptClaim{}, err
+	}
+	if entry.generation == int64(^uint64(0)>>1) {
+		return AttemptClaim{}, ErrInvalidTransition
+	}
+	entry.generation++
+	entry.ownerToken = token
+	entry.leaseUntil = time.Now().UTC().Add(attemptLeaseDuration)
+	if !m.appendEventLocked(entry, "running", "Job started") {
+		entry.truncated = true
+	}
+	m.queue[0] = ""
+	m.queue = m.queue[1:]
+	entry.snapshot.Status = StatusRunning
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	m.running++
+	return AttemptClaim{Job: cloneSnapshot(entry.snapshot), Attempt: AttemptHandle{JobID: id, Generation: entry.generation, OwnerToken: entry.ownerToken}}, nil
+}
+
+func newOwnerToken() (string, error) {
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", errors.New("generate worker owner token")
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+func validAttemptHandle(attempt AttemptHandle) bool {
+	if !validJobID(attempt.JobID) || attempt.Generation <= 0 || len(attempt.OwnerToken) != 64 {
+		return false
+	}
+	for _, char := range attempt.OwnerToken {
+		if !(char >= '0' && char <= '9') && !(char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *LocalManager) ownsAttemptLocked(attempt AttemptHandle) (*job, error) {
+	if !validAttemptHandle(attempt) {
+		return nil, ErrInvalidInput
+	}
+	entry := m.jobs[attempt.JobID]
+	if entry == nil {
+		return nil, ErrNotFound
+	}
+	if entry.snapshot.Status != StatusRunning || entry.generation != attempt.Generation || entry.ownerToken != attempt.OwnerToken || !time.Now().UTC().Before(entry.leaseUntil) {
+		return nil, ErrStaleAttempt
+	}
+	return entry, nil
 }
 
 // Get returns a defensive copy of a retained job snapshot.
@@ -793,9 +919,124 @@ func (m *LocalManager) AddEvent(id, eventType, message string) error {
 	if entry == nil {
 		return ErrNotFound
 	}
+	if entry.generation > 0 || entry.ownerToken != "" {
+		return ErrStaleAttempt
+	}
 	if !m.appendEventLocked(entry, eventType, message) {
 		return ErrRegistryFull
 	}
+	return nil
+}
+
+func (m *LocalManager) HeartbeatAttempt(attempt AttemptHandle) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	entry.leaseUntil = time.Now().UTC().Add(attemptLeaseDuration)
+	return nil
+}
+
+func (m *LocalManager) AddEventForAttempt(attempt AttemptHandle, eventType, message string) error {
+	eventType, message = strings.TrimSpace(eventType), strings.TrimSpace(message)
+	if !validAttemptHandle(attempt) || !validText(eventType, 1, 64, false) || !validText(message, 0, maxEventBytes, true) {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	if !m.appendEventLocked(entry, eventType, message) {
+		return ErrRegistryFull
+	}
+	entry.leaseUntil = time.Now().UTC().Add(attemptLeaseDuration)
+	return nil
+}
+
+func (m *LocalManager) RecordProviderAttemptForAttempt(attemptHandle AttemptHandle, attempt ProviderAttempt) error {
+	if !validAttemptHandle(attemptHandle) || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+attemptHandle.JobID || !validCommitID(attempt.Commit) {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attemptHandle)
+	if err != nil {
+		return err
+	}
+	if entry.providerAttempt != nil {
+		if *entry.providerAttempt != attempt {
+			return ErrInvalidTransition
+		}
+		return nil
+	}
+	copy := attempt
+	entry.providerAttempt = &copy
+	return nil
+}
+
+func (m *LocalManager) MarkProviderAttemptUncertainForAttempt(attemptHandle AttemptHandle) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attemptHandle)
+	if err != nil {
+		return err
+	}
+	if entry.providerAttempt == nil {
+		return ErrInvalidTransition
+	}
+	entry.providerAttempt.Uncertain = true
+	return nil
+}
+
+func (m *LocalManager) RecordProviderOutcomeForAttempt(attempt AttemptHandle, outcome ProviderOutcome) error {
+	if !validAttemptHandle(attempt) || validateProviderOutcome(outcome) != nil {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	copy := outcome
+	entry.snapshot.Provider = &copy
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	entry.leaseUntil = time.Now().UTC().Add(attemptLeaseDuration)
+	return nil
+}
+
+func (m *LocalManager) RecordVerificationEvidenceForAttempt(attempt AttemptHandle, evidence VerificationEvidence) error {
+	if !validAttemptHandle(attempt) || validateVerificationEvidence(evidence) != nil {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	previousCharge := verificationEvidenceBytes(entry.snapshot.Verification)
+	nextCharge := verificationEvidenceBytes(&evidence)
+	if nextCharge > previousCharge {
+		delta := nextCharge - previousCharge
+		if !m.makeByteRoomLocked(delta, entry) {
+			return ErrRegistryFull
+		}
+		entry.accountedBytes += delta
+		m.registryBytes += delta
+	} else {
+		delta := previousCharge - nextCharge
+		entry.accountedBytes -= delta
+		m.registryBytes -= delta
+	}
+	copy := cloneVerificationEvidence(evidence)
+	entry.snapshot.Verification = &copy
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	entry.leaseUntil = time.Now().UTC().Add(attemptLeaseDuration)
 	return nil
 }
 
@@ -808,6 +1049,9 @@ func (m *LocalManager) RecordProviderOutcome(id string, outcome ProviderOutcome)
 	entry := m.jobs[id]
 	if entry == nil {
 		return ErrNotFound
+	}
+	if entry.generation > 0 || entry.ownerToken != "" {
+		return ErrStaleAttempt
 	}
 	if entry.snapshot.Status != StatusRunning {
 		return ErrInvalidTransition
@@ -827,6 +1071,9 @@ func (m *LocalManager) RecordVerificationEvidence(id string, evidence Verificati
 	entry := m.jobs[id]
 	if entry == nil {
 		return ErrNotFound
+	}
+	if entry.generation > 0 || entry.ownerToken != "" {
+		return ErrStaleAttempt
 	}
 	if entry.snapshot.Status != StatusRunning {
 		return ErrInvalidTransition
@@ -900,6 +1147,27 @@ func (m *LocalManager) Cancel(id string) (Snapshot, error) {
 	}
 }
 
+func (m *LocalManager) FinishAttempt(attempt AttemptHandle, terminalStatus Status) error {
+	if !validAttemptHandle(attempt) || !terminalStatus.Terminal() {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	if !m.appendEventLocked(entry, string(terminalStatus), "Job finished") {
+		entry.truncated = true
+	}
+	entry.snapshot.Status = terminalStatus
+	entry.snapshot.CancellationRequested = false
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	m.running--
+	m.signalLocked()
+	return nil
+}
+
 func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	if !terminalStatus.Terminal() {
 		return ErrInvalidTransition
@@ -909,6 +1177,9 @@ func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	entry := m.jobs[id]
 	if entry == nil {
 		return ErrNotFound
+	}
+	if entry.generation > 0 || entry.ownerToken != "" {
+		return ErrStaleAttempt
 	}
 	if entry.snapshot.Status != StatusRunning {
 		return ErrInvalidTransition

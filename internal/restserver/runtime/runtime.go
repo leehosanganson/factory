@@ -174,16 +174,11 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	executor := options.Executor
 	if executor == nil {
-		var recordProviderAttempt func(string, restjobs.ProviderAttempt) error
-		var markProviderAttemptUncertain func(string) error
-		if sqliteStore, ok := store.(*restjobs.SQLiteStore); ok {
-			recordProviderAttempt = sqliteStore.RecordProviderAttempt
-			markProviderAttemptUncertain = sqliteStore.MarkProviderAttemptUncertain
-		}
 		executor, err = restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
 			Server: config, Workflow: workflowConfig, Workspaces: workspaces, Provider: publisher,
-			RecordProviderAttempt: recordProviderAttempt, MarkProviderAttemptUncertain: markProviderAttemptUncertain,
-			RecordVerificationEvidence: manager.RecordVerificationEvidence,
+			RecordProviderAttempt:        manager.RecordProviderAttemptForAttempt,
+			MarkProviderAttemptUncertain: manager.MarkProviderAttemptUncertainForAttempt,
+			RecordVerificationEvidence:   manager.RecordVerificationEvidenceForAttempt,
 		})
 		if err != nil {
 			closeStore()

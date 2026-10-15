@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,35 +39,131 @@ func (f executorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error 
 	return f(ctx, job)
 }
 
-type requiredResultExecutor struct{ outcome *restjobs.ProviderOutcome }
+type attemptAwareExecutor struct {
+	manager *restjobs.LocalManager
+	attempt restjobs.AttemptHandle
+}
+
+func (e *attemptAwareExecutor) Execute(context.Context, restjobs.Snapshot) error {
+	return errors.New("Coordinator bypassed attempt-aware execution")
+}
+func (e *attemptAwareExecutor) ExecuteWithAttempt(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) error {
+	e.attempt = attempt
+	if attempt.JobID != job.ID || attempt.Generation <= 0 || len(attempt.OwnerToken) != 64 {
+		return errors.New("invalid worker attempt handle")
+	}
+	return e.manager.AddEventForAttempt(attempt, "worker_test", "fenced execution")
+}
+
+func TestCoordinatorPassesClaimHandleToAttemptAwareExecutor(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "attempt-aware")
+	executor := &attemptAwareExecutor{manager: manager}
+	coordinator, err := New(manager, executor, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+	result := waitForStatus(t, manager, job.ID, restjobs.StatusSucceeded)
+	if executor.attempt.JobID != job.ID || result.Status != restjobs.StatusSucceeded {
+		t.Fatalf("execution attempt=%+v result=%+v", executor.attempt, result)
+	}
+	history, err := manager.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range history.Events {
+		found = found || event.Type == "worker_test"
+	}
+	if !found {
+		t.Fatalf("attempt-aware worker event missing: %+v", history.Events)
+	}
+}
+
+type requiredResultExecutor struct {
+	outcome *restjobs.ProviderOutcome
+	calls   *atomic.Int32
+}
 
 func (requiredResultExecutor) Execute(context.Context, restjobs.Snapshot) error { return nil }
 func (e requiredResultExecutor) ExecuteWithResult(context.Context, restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+	e.calls.Add(1)
 	return e.outcome, nil
 }
 func (requiredResultExecutor) RequiresProviderOutcome() bool { return true }
 
-func TestWorkerRequiresProviderOutcomeBeforeSuccess(t *testing.T) {
-	for _, outcome := range []*restjobs.ProviderOutcome{nil, {Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}} {
-		manager := newTestManager(t, 1, 1)
-		job := admit(t, manager, "provider-result")
-		coordinator, err := New(manager, requiredResultExecutor{outcome: outcome}, CoordinatorConfig{Workers: 1})
-		if err != nil {
-			t.Fatal(err)
-		}
-		want := restjobs.StatusSucceeded
-		if outcome == nil {
-			want = restjobs.StatusFailed
-		}
-		result := waitForStatus(t, manager, job.ID, want)
-		if outcome != nil && (result.Provider == nil || *result.Provider != *outcome) {
-			t.Fatalf("provider outcome=%+v", result.Provider)
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		if err := coordinator.Shutdown(ctx); err != nil {
-			t.Fatal(err)
-		}
-		cancel()
+func TestWorkerRequiresAttemptAwareProviderOutcome(t *testing.T) {
+	outcome := &restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "provider-result")
+	var legacyCalls atomic.Int32
+	coordinator, err := New(manager, requiredResultExecutor{outcome: outcome, calls: &legacyCalls}, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := waitForStatus(t, manager, job.ID, restjobs.StatusFailed)
+	if legacyCalls.Load() != 0 || result.Provider != nil {
+		t.Fatalf("legacy provider result path invoked or accepted: calls=%d result=%+v", legacyCalls.Load(), result)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerAcceptsAttemptAwareProviderOutcome(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "attempt-provider-result")
+	outcome := &restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}
+	var gotAttempt restjobs.AttemptHandle
+	executor := attemptRequiredResultExecutorFunc(func(_ context.Context, _ restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error) {
+		gotAttempt = attempt
+		return outcome, nil
+	})
+	coordinator, err := New(manager, executor, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := waitForStatus(t, manager, job.ID, restjobs.StatusSucceeded)
+	if gotAttempt.JobID != job.ID || gotAttempt.Generation <= 0 || result.Provider == nil || *result.Provider != *outcome {
+		t.Fatalf("attempt=%+v result=%+v", gotAttempt, result)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWorkerDoesNotAcceptUnexpectedUnrequiredProviderOutcome(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "unexpected-provider-result")
+	outcome := &restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}
+	var calls atomic.Int32
+	executor := plainResultExecutorFunc(func(context.Context, restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+		calls.Add(1)
+		return outcome, nil
+	})
+	coordinator, err := New(manager, executor, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := waitForStatus(t, manager, job.ID, restjobs.StatusFailed)
+	if calls.Load() != 1 || result.Provider != nil {
+		t.Fatalf("unexpected outcome was accepted: calls=%d result=%+v", calls.Load(), result)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -287,8 +384,8 @@ func TestRequestCancelDoesNotFabricateCanceledAfterProviderAttempt(t *testing.T)
 	manager := newTestManager(t, 1, 1)
 	job := admit(t, manager, "provider-side-effect")
 	started := make(chan struct{})
-	executor := requiredResultExecutorFunc(func(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
-		if err := manager.AddEvent(job.ID, "provider_attempt", "Persisted provider write identity"); err != nil {
+	executor := attemptRequiredResultExecutorFunc(func(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error) {
+		if err := manager.AddEventForAttempt(attempt, "provider_attempt", "Persisted provider write identity"); err != nil {
 			return nil, err
 		}
 		close(started)
@@ -318,6 +415,16 @@ func TestRequestCancelDoesNotFabricateCanceledAfterProviderAttempt(t *testing.T)
 	}
 }
 
+type plainResultExecutorFunc func(context.Context, restjobs.Snapshot) (*restjobs.ProviderOutcome, error)
+
+func (f plainResultExecutorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error {
+	_, err := f(ctx, job)
+	return err
+}
+func (f plainResultExecutorFunc) ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+	return f(ctx, job)
+}
+
 type requiredResultExecutorFunc func(context.Context, restjobs.Snapshot) (*restjobs.ProviderOutcome, error)
 
 func (f requiredResultExecutorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error {
@@ -328,6 +435,17 @@ func (f requiredResultExecutorFunc) ExecuteWithResult(ctx context.Context, job r
 	return f(ctx, job)
 }
 func (requiredResultExecutorFunc) RequiresProviderOutcome() bool { return true }
+
+type attemptRequiredResultExecutorFunc func(context.Context, restjobs.Snapshot, restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error)
+
+func (f attemptRequiredResultExecutorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error {
+	_, err := f(ctx, job, restjobs.AttemptHandle{})
+	return err
+}
+func (f attemptRequiredResultExecutorFunc) ExecuteWithAttemptResult(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error) {
+	return f(ctx, job, attempt)
+}
+func (attemptRequiredResultExecutorFunc) RequiresProviderOutcome() bool { return true }
 
 func TestRequestCancelCancelsOnlySelectedRunningExecutor(t *testing.T) {
 	manager := newTestManager(t, 2, 2)

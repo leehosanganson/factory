@@ -450,6 +450,50 @@ func TestSQLiteStorePersistsJobHistoryAndIdempotencyAcrossRestart(t *testing.T) 
 	}
 }
 
+func TestSQLiteRestartPreservesOwnershipButFencesInterruptedWorker(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "ownership.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("ownership-audit", Request{Repository: "widget", Task: "retain claim ownership"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner string
+	var generation int64
+	if err := store.db.QueryRow(`SELECT owner_token,generation FROM factory_worker_ownership WHERE job_id=?`, job.ID).Scan(&owner, &generation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	var retainedOwner string
+	var retainedGeneration int64
+	if err := reopened.db.QueryRow(`SELECT owner_token,generation FROM factory_worker_ownership WHERE job_id=?`, job.ID).Scan(&retainedOwner, &retainedGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if retainedOwner != owner || retainedGeneration != generation || generation != 1 {
+		t.Fatalf("persisted ownership=(%q,%d), original=(%q,%d)", retainedOwner, retainedGeneration, owner, generation)
+	}
+	if err := reopened.HeartbeatAttempt(claim.Attempt); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("interrupted worker heartbeat = %v, want stale attempt", err)
+	}
+	if _, err := reopened.ClaimNextAttempt(); !errors.Is(err, ErrNoQueuedJobs) {
+		t.Fatalf("claim after restart = %v, want no queued jobs (running work is never reclaimed)", err)
+	}
+}
+
 func TestSQLiteStoreRecoveryResumesQueuedButHoldsRunningForOperator(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 8})

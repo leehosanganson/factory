@@ -434,20 +434,40 @@ func (s *SQLiteStore) AdmitAs(key, principalID string, request Request) (Snapsho
 	return Snapshot{ID: id, Submitter: principalID, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}, false, nil
 }
 
+// ClaimNext is an unfenced single-process/admin compatibility claim. It does
+// not create worker ownership state and must never be used by distributed
+// workers. Use ClaimNextAttempt for worker execution.
 func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
+	claim, err := s.claimNext(false)
+	return claim.Job, err
+}
+
+func (s *SQLiteStore) ClaimNextAttempt() (AttemptClaim, error) {
+	return s.claimNext(true)
+}
+
+func (s *SQLiteStore) claimNext(attemptAware bool) (AttemptClaim, error) {
 	if err := s.checkAccepting(); err != nil {
-		return Snapshot{}, err
+		return AttemptClaim{}, err
+	}
+	var token string
+	var err error
+	if attemptAware {
+		token, err = newOwnerToken()
+		if err != nil {
+			return AttemptClaim{}, err
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Snapshot{}, errors.New("SQLite job store unavailable")
+		return AttemptClaim{}, errors.New("SQLite job store unavailable")
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `SELECT id FROM factory_jobs WHERE status='running'`)
 	if err != nil {
-		return Snapshot{}, errors.New("read SQLite worker capacity")
+		return AttemptClaim{}, errors.New("read SQLite worker capacity")
 	}
 	s.recoveryMu.RLock()
 	running := 0
@@ -456,7 +476,7 @@ func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
 		if err := rows.Scan(&runningID); err != nil {
 			s.recoveryMu.RUnlock()
 			_ = rows.Close()
-			return Snapshot{}, errors.New("read SQLite worker capacity")
+			return AttemptClaim{}, errors.New("read SQLite worker capacity")
 		}
 		if _, interrupted := s.recoveryNeeded[runningID]; !interrupted {
 			running++
@@ -466,61 +486,93 @@ func (s *SQLiteStore) ClaimNext() (Snapshot, error) {
 	s.recoveryMu.RUnlock()
 	_ = rows.Close()
 	if rowsErr != nil {
-		return Snapshot{}, errors.New("read SQLite worker capacity")
+		return AttemptClaim{}, errors.New("read SQLite worker capacity")
 	}
 	if running >= s.config.MaxConcurrentJobs {
-		return Snapshot{}, ErrNoWorkerSlots
+		return AttemptClaim{}, ErrNoWorkerSlots
 	}
 	var id string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM factory_jobs WHERE status='queued' ORDER BY queue_sequence LIMIT 1`).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Snapshot{}, ErrNoQueuedJobs
+		return AttemptClaim{}, ErrNoQueuedJobs
 	}
 	if err != nil {
-		return Snapshot{}, errors.New("read SQLite queue")
+		return AttemptClaim{}, errors.New("read SQLite queue")
 	}
 	now := time.Now().UTC()
+	var generation int64
+	if attemptAware {
+		if err := tx.QueryRowContext(ctx, `SELECT generation FROM factory_worker_ownership WHERE job_id=?`, id).Scan(&generation); errors.Is(err, sql.ErrNoRows) {
+			generation = 0
+		} else if err != nil {
+			return AttemptClaim{}, errors.New("read SQLite worker generation")
+		}
+		if generation == int64(^uint64(0)>>1) {
+			return AttemptClaim{}, ErrInvalidTransition
+		}
+		generation++
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='running',updated_at=? WHERE id=? AND status='queued'`, now.Format(time.RFC3339Nano), id)
 	if err != nil {
-		return Snapshot{}, errors.New("claim SQLite job")
+		return AttemptClaim{}, errors.New("claim SQLite job")
 	}
 	changed, err := result.RowsAffected()
 	if err != nil || changed != 1 {
-		return Snapshot{}, ErrNoWorkerSlots
+		return AttemptClaim{}, ErrNoWorkerSlots
+	}
+	if attemptAware {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_worker_ownership(job_id,owner_token,generation,acquired_at,lease_until) VALUES(?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET owner_token=excluded.owner_token,generation=excluded.generation,acquired_at=excluded.acquired_at,lease_until=excluded.lease_until`, id, token, generation, now.Format(time.RFC3339Nano), now.Add(attemptLeaseDuration).Format(time.RFC3339Nano)); err != nil {
+			return AttemptClaim{}, errors.New("record SQLite worker ownership")
+		}
 	}
 	if err := insertEvent(ctx, tx, id, "running", "Job started", now, s.config.MaxEventsPerJob); err != nil {
-		return Snapshot{}, errors.New("record SQLite job start")
+		return AttemptClaim{}, errors.New("record SQLite job start")
 	}
 	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
 	if err != nil {
-		return Snapshot{}, errors.New("read claimed SQLite job")
+		return AttemptClaim{}, errors.New("read claimed SQLite job")
 	}
 	if err := tx.Commit(); err != nil {
-		return Snapshot{}, errors.New("commit SQLite job claim")
+		return AttemptClaim{}, errors.New("commit SQLite job claim")
 	}
-	return snapshot, nil
+	claim := AttemptClaim{Job: snapshot}
+	if attemptAware {
+		claim.Attempt = AttemptHandle{JobID: id, Generation: generation, OwnerToken: token}
+	}
+	return claim, nil
 }
 
+// WaitClaim is an unfenced single-process/admin compatibility API. It must
+// never be used by distributed workers; use WaitClaimAttempt instead.
 func (s *SQLiteStore) WaitClaim(ctx context.Context) (Snapshot, error) {
+	claim, err := s.waitClaim(ctx, false)
+	return claim.Job, err
+}
+
+func (s *SQLiteStore) WaitClaimAttempt(ctx context.Context) (AttemptClaim, error) {
+	return s.waitClaim(ctx, true)
+}
+
+func (s *SQLiteStore) waitClaim(ctx context.Context, attemptAware bool) (AttemptClaim, error) {
 	if ctx == nil {
-		return Snapshot{}, ErrInvalidInput
+		return AttemptClaim{}, ErrInvalidInput
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
-			return Snapshot{}, err
+			return AttemptClaim{}, err
 		}
-		snapshot, err := s.ClaimNext()
+		claim, err := s.claimNext(attemptAware)
 		if err == nil {
-			return snapshot, nil
+			return claim, nil
 		}
 		if !errors.Is(err, ErrNoQueuedJobs) && !errors.Is(err, ErrNoWorkerSlots) {
-			return Snapshot{}, err
+			return AttemptClaim{}, err
 		}
 		select {
 		case <-ctx.Done():
-			return Snapshot{}, ctx.Err()
+			return AttemptClaim{}, ctx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -615,6 +667,241 @@ func validateProviderAttempt(attempt ProviderAttempt) error {
 	return nil
 }
 
+func (s *SQLiteStore) hasWorkerOwnershipTx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	var count int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_worker_ownership WHERE job_id=?`, id).Scan(&count); err != nil {
+		return false, errors.New("read SQLite worker ownership")
+	}
+	return count != 0, nil
+}
+
+func (s *SQLiteStore) checkAttemptTx(ctx context.Context, tx *sql.Tx, attempt AttemptHandle) error {
+	if !validAttemptHandle(attempt) {
+		return ErrInvalidInput
+	}
+	var status, owner string
+	var generation int64
+	var leaseUntil sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT j.status,COALESCE(o.generation,0),COALESCE(o.owner_token,''),o.lease_until FROM factory_jobs j LEFT JOIN factory_worker_ownership o ON o.job_id=j.id WHERE j.id=?`, attempt.JobID).Scan(&status, &generation, &owner, &leaseUntil)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return errors.New("read SQLite worker ownership")
+	}
+	if status != string(StatusRunning) || generation != attempt.Generation || owner != attempt.OwnerToken || !leaseUntil.Valid {
+		return ErrStaleAttempt
+	}
+	leaseTime, err := time.Parse(time.RFC3339Nano, leaseUntil.String)
+	if err != nil || !time.Now().UTC().Before(leaseTime) {
+		return ErrStaleAttempt
+	}
+	s.recoveryMu.RLock()
+	_, interrupted := s.recoveryNeeded[attempt.JobID]
+	s.recoveryMu.RUnlock()
+	if interrupted {
+		return ErrStaleAttempt
+	}
+	return nil
+}
+
+func (s *SQLiteStore) beginAttemptTx(attempt AttemptHandle) (*sql.Tx, context.Context, context.CancelFunc, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, nil, nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		cancel()
+		return nil, nil, nil, errors.New("SQLite job store unavailable")
+	}
+	if err := s.checkAttemptTx(ctx, tx, attempt); err != nil {
+		_ = tx.Rollback()
+		cancel()
+		return nil, nil, nil, err
+	}
+	return tx, ctx, cancel, nil
+}
+
+func (s *SQLiteStore) HeartbeatAttempt(attempt AttemptHandle) error {
+	tx, ctx, cancel, err := s.beginAttemptTx(attempt)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	var persistedLease string
+	if err := tx.QueryRowContext(ctx, `SELECT lease_until FROM factory_worker_ownership WHERE job_id=? AND generation=? AND owner_token=?`, attempt.JobID, attempt.Generation, attempt.OwnerToken).Scan(&persistedLease); err != nil {
+		return ErrStaleAttempt
+	}
+	leaseTime, err := time.Parse(time.RFC3339Nano, persistedLease)
+	if err != nil {
+		return ErrStaleAttempt
+	}
+	now := time.Now().UTC()
+	if !now.Before(leaseTime) {
+		return ErrStaleAttempt
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE factory_worker_ownership SET lease_until=? WHERE job_id=? AND generation=? AND owner_token=? AND lease_until=? AND EXISTS(SELECT 1 FROM factory_jobs WHERE id=? AND status='running')`, now.Add(attemptLeaseDuration).Format(time.RFC3339Nano), attempt.JobID, attempt.Generation, attempt.OwnerToken, persistedLease, attempt.JobID)
+	if err != nil {
+		return errors.New("renew SQLite worker lease")
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrStaleAttempt
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) AddEventForAttempt(attempt AttemptHandle, eventType, message string) error {
+	eventType, message = strings.TrimSpace(eventType), strings.TrimSpace(message)
+	if !validAttemptHandle(attempt) || !validText(eventType, 1, 64, false) || !validText(message, 0, maxEventBytes, true) {
+		return ErrInvalidInput
+	}
+	tx, ctx, cancel, err := s.beginAttemptTx(attempt)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM factory_worker_ownership WHERE job_id=? AND generation=? AND owner_token=?)`, now.Format(time.RFC3339Nano), attempt.JobID, attempt.JobID, attempt.Generation, attempt.OwnerToken); err != nil {
+		return errors.New("update SQLite job event")
+	}
+	if err := insertEvent(ctx, tx, attempt.JobID, eventType, message, now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite job event")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) RecordProviderAttemptForAttempt(handle AttemptHandle, attempt ProviderAttempt) error {
+	if !validAttemptHandle(handle) || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+handle.JobID || !validCommitID(attempt.Commit) {
+		return ErrInvalidInput
+	}
+	encoded, err := json.Marshal(attempt)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	tx, ctx, cancel, err := s.beginAttemptTx(handle)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	var existing string
+	err = tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, handle.JobID).Scan(&existing)
+	if err == nil {
+		if existing != string(encoded) {
+			return ErrInvalidTransition
+		}
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("read SQLite provider attempt")
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_attempts(job_id,attempt_json,updated_at) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM factory_jobs j JOIN factory_worker_ownership o ON o.job_id=j.id WHERE j.id=? AND j.status='running' AND o.generation=? AND o.owner_token=?)`, handle.JobID, string(encoded), now, handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("record SQLite provider attempt")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) MarkProviderAttemptUncertainForAttempt(handle AttemptHandle) error {
+	tx, ctx, cancel, err := s.beginAttemptTx(handle)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	var encoded string
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, handle.JobID).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidTransition
+	} else if err != nil {
+		return errors.New("read SQLite provider attempt")
+	}
+	var attempt ProviderAttempt
+	if json.Unmarshal([]byte(encoded), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+handle.JobID || !validCommitID(attempt.Commit) {
+		return errors.New("SQLite provider attempt is invalid")
+	}
+	attempt.Uncertain = true
+	encodedBytes, _ := json.Marshal(attempt)
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_job_provider_attempts SET attempt_json=?,updated_at=? WHERE job_id=? AND EXISTS(SELECT 1 FROM factory_jobs j JOIN factory_worker_ownership o ON o.job_id=j.id WHERE j.id=? AND j.status='running' AND o.generation=? AND o.owner_token=?)`, string(encodedBytes), time.Now().UTC().Format(time.RFC3339Nano), handle.JobID, handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("mark SQLite provider attempt uncertain")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) RecordProviderOutcomeForAttempt(handle AttemptHandle, outcome ProviderOutcome) error {
+	if !validAttemptHandle(handle) || validateProviderOutcome(outcome) != nil {
+		return ErrInvalidInput
+	}
+	encoded, err := json.Marshal(outcome)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	tx, ctx, cancel, err := s.beginAttemptTx(handle)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM factory_jobs j JOIN factory_worker_ownership o ON o.job_id=j.id WHERE j.id=? AND j.status='running' AND o.generation=? AND o.owner_token=?) ON CONFLICT(job_id) DO UPDATE SET provider_json=excluded.provider_json,updated_at=excluded.updated_at`, handle.JobID, string(encoded), now, handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("record SQLite provider outcome")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM factory_worker_ownership WHERE job_id=? AND generation=? AND owner_token=?)`, now, handle.JobID, handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("update SQLite job timestamp")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) RecordVerificationEvidenceForAttempt(handle AttemptHandle, evidence VerificationEvidence) error {
+	if !validAttemptHandle(handle) || validateVerificationEvidence(evidence) != nil {
+		return ErrInvalidInput
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	tx, ctx, cancel, err := s.beginAttemptTx(handle)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_verification_evidence(job_id,evidence_json,updated_at) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM factory_jobs j JOIN factory_worker_ownership o ON o.job_id=j.id WHERE j.id=? AND j.status='running' AND o.generation=? AND o.owner_token=?) ON CONFLICT(job_id) DO UPDATE SET evidence_json=excluded.evidence_json,updated_at=excluded.updated_at`, handle.JobID, string(encoded), now, handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("record SQLite verification evidence")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM factory_worker_ownership WHERE job_id=? AND generation=? AND owner_token=?)`, now, handle.JobID, handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("update SQLite job timestamp")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) FinishAttempt(handle AttemptHandle, status Status) error {
+	if !validAttemptHandle(handle) || !status.Terminal() {
+		return ErrInvalidTransition
+	}
+	tx, ctx, cancel, err := s.beginAttemptTx(handle)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,cancellation_requested=0,updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM factory_worker_ownership WHERE job_id=? AND generation=? AND owner_token=?)`, status, now.Format(time.RFC3339Nano), handle.JobID, handle.JobID, handle.Generation, handle.OwnerToken)
+	if err != nil {
+		return errors.New("finish SQLite job")
+	}
+	if changed, _ := result.RowsAffected(); changed != 1 {
+		return ErrStaleAttempt
+	}
+	if err := insertEvent(ctx, tx, handle.JobID, string(status), "Job finished", now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite job completion")
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) RecordProviderAttempt(id string, attempt ProviderAttempt) error {
 	if err := validateProviderAttempt(attempt); err != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
 		return ErrInvalidInput
@@ -641,6 +928,13 @@ func (s *SQLiteStore) RecordProviderAttempt(id string, attempt ProviderAttempt) 
 	}
 	if status != string(StatusRunning) {
 		return ErrInvalidTransition
+	}
+	owned, err := s.hasWorkerOwnershipTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return ErrStaleAttempt
 	}
 	var existing string
 	err = tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&existing)
@@ -684,6 +978,13 @@ func (s *SQLiteStore) MarkProviderAttemptUncertain(id string) error {
 	}
 	if status != string(StatusRunning) {
 		return ErrInvalidTransition
+	}
+	owned, err := s.hasWorkerOwnershipTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return ErrStaleAttempt
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
 		return ErrInvalidTransition
@@ -859,6 +1160,13 @@ func (s *SQLiteStore) RecordProviderOutcome(id string, outcome ProviderOutcome) 
 	if status != string(StatusRunning) {
 		return ErrInvalidTransition
 	}
+	owned, err := s.hasWorkerOwnershipTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return ErrStaleAttempt
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) VALUES(?,?,?) ON CONFLICT(job_id) DO UPDATE SET provider_json=excluded.provider_json,updated_at=excluded.updated_at`, id, string(encoded), now); err != nil {
 		return errors.New("record SQLite provider outcome")
@@ -895,6 +1203,13 @@ func (s *SQLiteStore) RecordVerificationEvidence(id string, evidence Verificatio
 	}
 	if status != string(StatusRunning) {
 		return ErrInvalidTransition
+	}
+	owned, err := s.hasWorkerOwnershipTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return ErrStaleAttempt
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_verification_evidence(job_id,evidence_json,updated_at) VALUES(?,?,?) ON CONFLICT(job_id) DO UPDATE SET evidence_json=excluded.evidence_json,updated_at=excluded.updated_at`, id, string(encoded), now); err != nil {
@@ -1102,6 +1417,13 @@ func (s *SQLiteStore) AddEvent(id, eventType, message string) error {
 		return errors.New("SQLite job store unavailable")
 	}
 	defer tx.Rollback()
+	owned, err := s.hasWorkerOwnershipTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return ErrStaleAttempt
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET updated_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), id)
 	if err != nil {
 		return errors.New("update SQLite job")
@@ -1268,6 +1590,13 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 		return errors.New("SQLite job store unavailable")
 	}
 	defer tx.Rollback()
+	owned, err := s.hasWorkerOwnershipTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	if owned {
+		return ErrStaleAttempt
+	}
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,cancellation_requested=0,updated_at=? WHERE id=? AND status='running'`, status, now.Format(time.RFC3339Nano), id)
 	if err != nil {

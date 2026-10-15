@@ -38,10 +38,10 @@ type FactoryExecutorConfig struct {
 	Workflow                     factory.Config
 	Workspaces                   map[string]WorkspaceManager
 	WorkflowObserver             factory.WorkflowObserver
-	RecordVerificationEvidence   func(string, restjobs.VerificationEvidence) error
+	RecordVerificationEvidence   func(restjobs.AttemptHandle, restjobs.VerificationEvidence) error
 	Provider                     restprovider.Publisher
-	RecordProviderAttempt        func(string, restjobs.ProviderAttempt) error
-	MarkProviderAttemptUncertain func(string) error
+	RecordProviderAttempt        func(restjobs.AttemptHandle, restjobs.ProviderAttempt) error
+	MarkProviderAttemptUncertain func(restjobs.AttemptHandle) error
 
 	// ValidateRepositoryRoot replaces Git-backed repository validation when set.
 	// It must honor ctx; this seam is intended for tests and controlled callers.
@@ -59,10 +59,10 @@ type FactoryExecutor struct {
 	agent                        func(factory.Config, []string, io.Writer) factory.Agent
 	validateRepositoryRoot       func(context.Context, string) error
 	observer                     factory.WorkflowObserver
-	recordVerificationEvidence   func(string, restjobs.VerificationEvidence) error
+	recordVerificationEvidence   func(restjobs.AttemptHandle, restjobs.VerificationEvidence) error
 	provider                     restprovider.Publisher
-	recordProviderAttempt        func(string, restjobs.ProviderAttempt) error
-	markProviderAttemptUncertain func(string) error
+	recordProviderAttempt        func(restjobs.AttemptHandle, restjobs.ProviderAttempt) error
+	markProviderAttemptUncertain func(restjobs.AttemptHandle) error
 	providerAttemptsMu           sync.Mutex
 	providerAttempts             map[string]bool
 }
@@ -230,8 +230,24 @@ func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot) er
 	return err
 }
 
+func (e *FactoryExecutor) ExecuteWithAttempt(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) error {
+	_, err := e.ExecuteWithAttemptResult(ctx, job, attempt)
+	return err
+}
+
 func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error) {
+	return e.executeWithAttemptResult(ctx, job, restjobs.AttemptHandle{})
+}
+
+func (e *FactoryExecutor) ExecuteWithAttemptResult(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error) {
+	return e.executeWithAttemptResult(ctx, job, attempt)
+}
+
+func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error) {
 	if ctx == nil {
+		return nil, errExecutionFailed
+	}
+	if (e.provider != nil || e.recordVerificationEvidence != nil || e.recordProviderAttempt != nil || e.markProviderAttemptUncertain != nil) && !validExecutorAttempt(attempt, job.ID) {
 		return nil, errExecutionFailed
 	}
 	jobCtx, cancel := context.WithTimeout(ctx, e.timeout)
@@ -249,7 +265,7 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 	if len(evidence.Checks) == 0 {
 		evidence.Limitations = append(evidence.Limitations, restjobs.LimitationNoChecksConfigured)
 	}
-	if e.recordVerificationEvidence != nil && e.recordVerificationEvidence(job.ID, evidence) != nil {
+	if e.recordVerificationEvidence != nil && e.recordVerificationEvidence(attempt, evidence) != nil {
 		return nil, errExecutionFailed
 	}
 	root, ok := e.server.Repositories[job.Request.Repository]
@@ -288,7 +304,7 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 			}
 			evidence.Checks[completedChecks].Outcome = outcome
 			completedChecks++
-			if e.recordVerificationEvidence != nil && e.recordVerificationEvidence(job.ID, evidence) != nil {
+			if e.recordVerificationEvidence != nil && e.recordVerificationEvidence(attempt, evidence) != nil {
 				return errExecutionFailed
 			}
 		}
@@ -322,13 +338,13 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 		e.providerAttemptsMu.Lock()
 		e.providerAttempts[job.ID] = true
 		e.providerAttemptsMu.Unlock()
-		if e.recordProviderAttempt != nil && e.recordProviderAttempt(job.ID, restjobs.ProviderAttempt{Provider: "github", Repository: repository, Branch: branch, Commit: commit}) != nil {
+		if e.recordProviderAttempt != nil && e.recordProviderAttempt(attempt, restjobs.ProviderAttempt{Provider: "github", Repository: repository, Branch: branch, Commit: commit}) != nil {
 			return nil, errExecutionFailed
 		}
 		published, err := e.provider.Publish(jobCtx, restprovider.PublishRequest{JobID: job.ID, Repository: repository, Worktree: workspace.WorktreePath, Branch: branch, Commit: commit, Title: job.Request.Task, Summary: "Factory completed configured workflow and verification checks.", BaseBranch: e.server.Provider.BaseBranch})
 		if err != nil {
 			if errors.Is(err, restprovider.ErrUncertain) && e.markProviderAttemptUncertain != nil {
-				_ = e.markProviderAttemptUncertain(job.ID)
+				_ = e.markProviderAttemptUncertain(attempt)
 			}
 			return nil, errExecutionFailed
 		}
@@ -340,6 +356,18 @@ func (e *FactoryExecutor) ExecuteWithResult(ctx context.Context, job restjobs.Sn
 		}
 	}
 	return providerOutcome, nil
+}
+
+func validExecutorAttempt(attempt restjobs.AttemptHandle, jobID string) bool {
+	if attempt.JobID != jobID || attempt.Generation <= 0 || len(attempt.OwnerToken) != 64 {
+		return false
+	}
+	for _, char := range attempt.OwnerToken {
+		if !(char >= '0' && char <= '9') && !(char >= 'a' && char <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func providerGitCommand(ctx context.Context, worktree string, args ...string) *exec.Cmd {
