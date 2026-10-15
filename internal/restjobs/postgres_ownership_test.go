@@ -178,18 +178,19 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("v1 migration preserves an active attempt for finish", func(t *testing.T) {
+	t.Run("v1 migration backfills only active running ownership", func(t *testing.T) {
 		db := scopedPostgresDB(t, admin, dsn)
 		ctx := context.Background()
-		const jobID = "123e4567-e89b-42d3-a456-426614174020"
+		const runningID = "123e4567-e89b-42d3-a456-426614174020"
+		const queuedID = "123e4567-e89b-42d3-a456-426614174021"
+		const terminalID = "123e4567-e89b-42d3-a456-426614174022"
 		mustExec(t, db, `CREATE TABLE factory_jobs (
 			id text PRIMARY KEY,
 			status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
 			queue_sequence bigint NOT NULL UNIQUE
 		)`)
-		if _, err := db.ExecContext(ctx, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ($1,'running',1)`, jobID); err != nil {
-			t.Fatalf("insert v1 running job: %v", err)
-		}
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES
+			('`+runningID+`','running',1), ('`+queuedID+`','queued',2), ('`+terminalID+`','succeeded',3)`)
 		mustExec(t, db, `CREATE TABLE factory_postgres_ownership_schema (
 			singleton smallint PRIMARY KEY CHECK (singleton = 1), version integer NOT NULL CHECK (version > 0)
 		)`)
@@ -202,29 +203,190 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 			lease_until timestamptz NOT NULL, updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 		)`)
 		const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-		if _, err := db.ExecContext(ctx, `INSERT INTO factory_job_ownership(job_id,generation,owner_token,worker_id,boot_id,lease_until,updated_at)
-			VALUES ($1,7,$2,'legacy-worker','legacy-boot',clock_timestamp()+interval '1 minute',clock_timestamp()-interval '2 minutes')`, jobID, token); err != nil {
-			t.Fatalf("insert v1 ownership: %v", err)
+		for i, jobID := range []string{runningID, queuedID, terminalID} {
+			if _, err := db.ExecContext(ctx, `INSERT INTO factory_job_ownership(job_id,generation,owner_token,worker_id,boot_id,lease_until,updated_at)
+				VALUES ($1,$2,$3,$4,$5,clock_timestamp()+interval '1 minute',clock_timestamp()-interval '2 minutes')`,
+				jobID, i+7, token, "legacy-worker", "legacy-boot"); err != nil {
+				t.Fatalf("insert v1 ownership for %s: %v", jobID, err)
+			}
 		}
 
 		ownership := NewPostgresOwnership(db)
 		if err := ownership.Migrate(ctx); err != nil {
 			t.Fatalf("upgrade v1 schema: %v", err)
 		}
-		assertPostgresAttemptHistory(t, db, jobID, 7, "legacy-worker", "legacy-boot", token, "")
+		assertPostgresAttemptHistory(t, db, runningID, 7, "legacy-worker", "legacy-boot", token, "")
+		assertPostgresHistoryCount(t, db, runningID, 1)
+		assertPostgresHistoryCount(t, db, queuedID, 0)
+		assertPostgresHistoryCount(t, db, terminalID, 0)
+		assertPostgresJobStatus(t, db, queuedID, "queued")
+		assertPostgresJobStatus(t, db, terminalID, "succeeded")
 		if err := ownership.Finish(ctx, PostgresAttempt{
-			JobID: jobID, Generation: 7, OwnerToken: token, WorkerID: "legacy-worker", BootID: "legacy-boot",
+			JobID: runningID, Generation: 7, OwnerToken: token, WorkerID: "legacy-worker", BootID: "legacy-boot",
 		}, StatusSucceeded); err != nil {
 			t.Fatalf("finish in-flight v1 attempt after upgrade: %v", err)
 		}
-		assertPostgresJobStatus(t, db, jobID, string(StatusSucceeded))
-		assertPostgresAttemptHistory(t, db, jobID, 7, "legacy-worker", "legacy-boot", token, string(StatusSucceeded))
+		assertPostgresJobStatus(t, db, runningID, string(StatusSucceeded))
+		assertPostgresAttemptHistory(t, db, runningID, 7, "legacy-worker", "legacy-boot", token, string(StatusSucceeded))
 		var version int
 		if err := db.QueryRow(`SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1`).Scan(&version); err != nil {
 			t.Fatal(err)
 		}
 		if version != postgresOwnershipSchemaVersion {
 			t.Fatalf("upgraded schema version = %d, want %d", version, postgresOwnershipSchemaVersion)
+		}
+	})
+
+	t.Run("v1 migration fails closed for running job without ownership", func(t *testing.T) {
+		db := scopedPostgresDB(t, admin, dsn)
+		ctx := context.Background()
+		const jobID = "123e4567-e89b-42d3-a456-426614174025"
+		mustExec(t, db, `CREATE TABLE factory_jobs (
+			id text PRIMARY KEY,
+			status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
+			queue_sequence bigint NOT NULL UNIQUE
+		)`)
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ('`+jobID+`','running',1)`)
+		mustExec(t, db, `CREATE TABLE factory_postgres_ownership_schema (
+			singleton smallint PRIMARY KEY CHECK (singleton = 1), version integer NOT NULL CHECK (version > 0)
+		)`)
+		mustExec(t, db, `INSERT INTO factory_postgres_ownership_schema(singleton,version) VALUES (1,1)`)
+		mustExec(t, db, `CREATE TABLE factory_job_ownership (
+			job_id text PRIMARY KEY REFERENCES factory_jobs(id), generation bigint NOT NULL CHECK (generation > 0),
+			owner_token text NOT NULL CHECK (length(owner_token) = 64),
+			worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
+			boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
+			lease_until timestamptz NOT NULL, updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+		)`)
+
+		if err := NewPostgresOwnership(db).Migrate(ctx); err == nil || err.Error() != "running PostgreSQL job has no ownership record" {
+			t.Fatalf("Migrate() without running ownership = %v, want fail-closed error", err)
+		}
+		var version int
+		if err := db.QueryRow(`SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if version != postgresOwnershipPreviousSchemaVersion {
+			t.Fatalf("schema version after rejected migration = %d, want v1", version)
+		}
+		var historyTableExists bool
+		if err := db.QueryRow(`SELECT to_regclass('factory_job_attempt_history') IS NOT NULL`).Scan(&historyTableExists); err != nil {
+			t.Fatal(err)
+		}
+		if historyTableExists {
+			t.Fatal("failed migration left the attempt-history table behind")
+		}
+	})
+
+	t.Run("v1 migration rejects conflicting active history", func(t *testing.T) {
+		db := scopedPostgresDB(t, admin, dsn)
+		ctx := context.Background()
+		const jobID = "123e4567-e89b-42d3-a456-426614174024"
+		mustExec(t, db, `CREATE TABLE factory_jobs (
+			id text PRIMARY KEY,
+			status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
+			queue_sequence bigint NOT NULL UNIQUE
+		)`)
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ('`+jobID+`','running',1)`)
+		mustExec(t, db, `CREATE TABLE factory_postgres_ownership_schema (
+			singleton smallint PRIMARY KEY CHECK (singleton = 1), version integer NOT NULL CHECK (version > 0)
+		)`)
+		mustExec(t, db, `INSERT INTO factory_postgres_ownership_schema(singleton,version) VALUES (1,1)`)
+		mustExec(t, db, `CREATE TABLE factory_job_ownership (
+			job_id text PRIMARY KEY REFERENCES factory_jobs(id), generation bigint NOT NULL CHECK (generation > 0),
+			owner_token text NOT NULL CHECK (length(owner_token) = 64),
+			worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
+			boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
+			lease_until timestamptz NOT NULL, updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+		)`)
+		mustExec(t, db, `INSERT INTO factory_job_ownership(job_id,generation,owner_token,worker_id,boot_id,lease_until,updated_at)
+			VALUES ('`+jobID+`',3,'0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef','current-worker','current-boot',
+			clock_timestamp()+interval '1 minute',clock_timestamp())`)
+		mustExec(t, db, `CREATE TABLE factory_job_attempt_history (
+			job_id text NOT NULL REFERENCES factory_jobs(id), generation bigint NOT NULL CHECK (generation > 0),
+			worker_id text NOT NULL, boot_id text NOT NULL, claimed_at timestamptz NOT NULL, started_at timestamptz NOT NULL,
+			lease_until timestamptz NOT NULL, finished_at timestamptz, status text,
+			PRIMARY KEY (job_id,generation), CHECK ((finished_at IS NULL AND status IS NULL) OR (finished_at IS NOT NULL AND status IS NOT NULL))
+		)`)
+		mustExec(t, db, `INSERT INTO factory_job_attempt_history(job_id,generation,worker_id,boot_id,claimed_at,started_at,lease_until)
+			VALUES ('`+jobID+`',3,'different-worker','current-boot',clock_timestamp(),clock_timestamp(),clock_timestamp()+interval '1 minute')`)
+
+		if err := NewPostgresOwnership(db).Migrate(ctx); err == nil || err.Error() != "conflicting PostgreSQL active attempt history" {
+			t.Fatalf("Migrate() with conflicting active history = %v, want conflict error", err)
+		}
+		var version int
+		if err := db.QueryRow(`SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if version != postgresOwnershipPreviousSchemaVersion {
+			t.Fatalf("schema version after rejected migration = %d, want v1", version)
+		}
+		assertPostgresHistoryCount(t, db, jobID, 1)
+	})
+
+	t.Run("v1 migration rolls back backfill and version upgrade before retry", func(t *testing.T) {
+		db := scopedPostgresDB(t, admin, dsn)
+		ctx := context.Background()
+		const jobID = "123e4567-e89b-42d3-a456-426614174023"
+		mustExec(t, db, `CREATE TABLE factory_jobs (
+			id text PRIMARY KEY,
+			status text NOT NULL CHECK (status IN ('queued','running','succeeded','failed','canceled')),
+			queue_sequence bigint NOT NULL UNIQUE
+		)`)
+		mustExec(t, db, `INSERT INTO factory_jobs(id,status,queue_sequence) VALUES ('`+jobID+`','running',1)`)
+		mustExec(t, db, `CREATE TABLE factory_postgres_ownership_schema (
+			singleton smallint PRIMARY KEY CHECK (singleton = 1), version integer NOT NULL CHECK (version > 0)
+		)`)
+		mustExec(t, db, `INSERT INTO factory_postgres_ownership_schema(singleton,version) VALUES (1,1)`)
+		mustExec(t, db, `CREATE TABLE factory_job_ownership (
+			job_id text PRIMARY KEY REFERENCES factory_jobs(id), generation bigint NOT NULL CHECK (generation > 0),
+			owner_token text NOT NULL CHECK (length(owner_token) = 64),
+			worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
+			boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
+			lease_until timestamptz NOT NULL, updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+		)`)
+		const token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+		mustExec(t, db, `INSERT INTO factory_job_ownership(job_id,generation,owner_token,worker_id,boot_id,lease_until,updated_at)
+			VALUES ('`+jobID+`',4,'`+token+`','migration-worker','migration-boot',clock_timestamp()+interval '1 minute',clock_timestamp())`)
+		mustExec(t, db, `CREATE FUNCTION reject_ownership_version_upgrade() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF NEW.version = 2 AND EXISTS (SELECT 1 FROM factory_job_attempt_history WHERE job_id = '`+jobID+`' AND generation = 4) THEN
+					RAISE EXCEPTION 'injected ownership schema upgrade failure';
+				END IF;
+				RETURN NEW;
+			END $$`)
+		mustExec(t, db, `CREATE TRIGGER reject_ownership_version_upgrade BEFORE UPDATE ON factory_postgres_ownership_schema
+			FOR EACH ROW EXECUTE FUNCTION reject_ownership_version_upgrade()`)
+
+		ownership := NewPostgresOwnership(db)
+		if err := ownership.Migrate(ctx); err == nil || err.Error() != "upgrade PostgreSQL ownership schema version" {
+			t.Fatalf("Migrate() with version-upgrade fault = %v, want generic version-upgrade failure", err)
+		}
+		var version int
+		if err := db.QueryRow(`SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1`).Scan(&version); err != nil {
+			t.Fatalf("read schema version after rollback: %v", err)
+		}
+		if version != postgresOwnershipPreviousSchemaVersion {
+			t.Fatalf("schema version after failed migration = %d, want v1", version)
+		}
+		var historyTableExists bool
+		if err := db.QueryRow(`SELECT to_regclass('factory_job_attempt_history') IS NOT NULL`).Scan(&historyTableExists); err != nil {
+			t.Fatal(err)
+		}
+		if historyTableExists {
+			t.Fatal("failed migration left the attempt-history table behind")
+		}
+		mustExec(t, db, `DROP TRIGGER reject_ownership_version_upgrade ON factory_postgres_ownership_schema`)
+		mustExec(t, db, `DROP FUNCTION reject_ownership_version_upgrade()`)
+		if err := ownership.Migrate(ctx); err != nil {
+			t.Fatalf("retry v1 migration after removing injected fault: %v", err)
+		}
+		assertPostgresAttemptHistory(t, db, jobID, 4, "migration-worker", "migration-boot", token, "")
+		if err := db.QueryRow(`SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1`).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		if version != postgresOwnershipSchemaVersion {
+			t.Fatalf("schema version after retry = %d, want v%d", version, postgresOwnershipSchemaVersion)
 		}
 	})
 
@@ -283,6 +445,52 @@ func TestPostgresOwnershipIntegration(t *testing.T) {
 		assertPostgresOwnershipGeneration(t, db, claimJobID, 1)
 		assertPostgresAttemptHistory(t, db, claimJobID, 1, claim.WorkerID, claim.BootID, claim.OwnerToken, "")
 		assertPostgresHistoryCount(t, db, claimJobID, 1)
+
+		mustExec(t, db, `CREATE FUNCTION reject_designated_heartbeat_history_update() RETURNS trigger
+			LANGUAGE plpgsql AS $$ BEGIN
+				IF NEW.job_id = '`+claimJobID+`' THEN
+					RAISE EXCEPTION 'injected heartbeat-history update failure';
+				END IF;
+				RETURN NEW;
+			END $$`)
+		mustExec(t, db, `CREATE TRIGGER reject_designated_heartbeat_history_update
+			BEFORE UPDATE ON factory_job_attempt_history
+			FOR EACH ROW EXECUTE FUNCTION reject_designated_heartbeat_history_update()`)
+		var ownershipLeaseBefore, historyLeaseBefore, ownershipLeaseAfter, historyLeaseAfter time.Time
+		if err := db.QueryRow(`SELECT lease_until FROM factory_job_ownership WHERE job_id = $1`, claimJobID).Scan(&ownershipLeaseBefore); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT lease_until FROM factory_job_attempt_history WHERE job_id = $1 AND generation = 1`, claimJobID).Scan(&historyLeaseBefore); err != nil {
+			t.Fatal(err)
+		}
+		if err := ownership.Heartbeat(ctx, claim.PostgresAttempt, time.Minute); err == nil || err.Error() != "renew PostgreSQL attempt history lease" {
+			t.Fatalf("Heartbeat() with history update fault = %v, want generic history failure", err)
+		}
+		if err := db.QueryRow(`SELECT lease_until FROM factory_job_ownership WHERE job_id = $1`, claimJobID).Scan(&ownershipLeaseAfter); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT lease_until FROM factory_job_attempt_history WHERE job_id = $1 AND generation = 1`, claimJobID).Scan(&historyLeaseAfter); err != nil {
+			t.Fatal(err)
+		}
+		if !ownershipLeaseAfter.Equal(ownershipLeaseBefore) || !historyLeaseAfter.Equal(historyLeaseBefore) {
+			t.Fatalf("leases after failed heartbeat: ownership %v (before %v), history %v (before %v); both must roll back",
+				ownershipLeaseAfter, ownershipLeaseBefore, historyLeaseAfter, historyLeaseBefore)
+		}
+		mustExec(t, db, `DROP TRIGGER reject_designated_heartbeat_history_update ON factory_job_attempt_history`)
+		mustExec(t, db, `DROP FUNCTION reject_designated_heartbeat_history_update()`)
+		if err := ownership.Heartbeat(ctx, claim.PostgresAttempt, time.Minute); err != nil {
+			t.Fatalf("Heartbeat() after removing history fault: %v", err)
+		}
+		if err := db.QueryRow(`SELECT lease_until FROM factory_job_ownership WHERE job_id = $1`, claimJobID).Scan(&ownershipLeaseAfter); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.QueryRow(`SELECT lease_until FROM factory_job_attempt_history WHERE job_id = $1 AND generation = 1`, claimJobID).Scan(&historyLeaseAfter); err != nil {
+			t.Fatal(err)
+		}
+		if !ownershipLeaseAfter.After(ownershipLeaseBefore) || !historyLeaseAfter.Equal(ownershipLeaseAfter) {
+			t.Fatalf("leases after successful heartbeat retry: ownership %v, history %v; want both renewed and equal",
+				ownershipLeaseAfter, historyLeaseAfter)
+		}
 
 		finishClaim, err := ownership.ClaimNext(ctx, "worker-finish-fault", "boot-finish-fault", time.Minute)
 		if err != nil {

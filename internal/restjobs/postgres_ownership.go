@@ -111,9 +111,36 @@ func (p *PostgresOwnership) Migrate(ctx context.Context) error {
 		return errors.New("create PostgreSQL attempt history table")
 	}
 	if version == postgresOwnershipPreviousSchemaVersion {
+		var runningJobWithoutOwnership bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM factory_jobs AS j
+			LEFT JOIN factory_job_ownership AS o ON o.job_id = j.id
+			WHERE j.status = 'running' AND o.job_id IS NULL
+		)`).Scan(&runningJobWithoutOwnership); err != nil {
+			return errors.New("check PostgreSQL running job ownership")
+		}
+		if runningJobWithoutOwnership {
+			return errors.New("running PostgreSQL job has no ownership record")
+		}
 		// v1 ownership predates durable attempt history. Preserve the currently
 		// running attempt so it can still finish; updated_at is the best available
 		// claim/start timestamp because v1 did not retain separate timestamps.
+		var conflictingHistory bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+			SELECT 1 FROM factory_job_ownership AS o
+			JOIN factory_jobs AS j ON j.id = o.job_id
+			JOIN factory_job_attempt_history AS h ON h.job_id = o.job_id AND h.generation = o.generation
+			WHERE j.status = 'running' AND (
+				h.worker_id IS DISTINCT FROM o.worker_id OR h.boot_id IS DISTINCT FROM o.boot_id OR
+				h.claimed_at IS DISTINCT FROM o.updated_at OR h.started_at IS DISTINCT FROM o.updated_at OR
+				h.lease_until IS DISTINCT FROM o.lease_until OR h.finished_at IS NOT NULL OR h.status IS NOT NULL
+			)
+		)`).Scan(&conflictingHistory); err != nil {
+			return errors.New("check PostgreSQL active attempt history conflicts")
+		}
+		if conflictingHistory {
+			return errors.New("conflicting PostgreSQL active attempt history")
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_attempt_history
 			(job_id, generation, worker_id, boot_id, claimed_at, started_at, lease_until)
 			SELECT o.job_id, o.generation, o.worker_id, o.boot_id, o.updated_at, o.updated_at, o.lease_until
