@@ -1,0 +1,94 @@
+# Attempt workspace and provider-write contract
+
+## Status and current boundary
+
+**Future distributed-worker contract only; no remote attempt workspace or publisher protocol is implemented.** The current REST runtime runs in-process workers. It creates one protected detached Git worktree and state/output directory per job (not per attempt generation), runs the workflow in that worktree, and keeps provider credentials in the server-side publisher. When configured, it records a provider attempt in the selected store before external publication and records outcome separately; this survives restart only with SQLite, not volatile memory mode. SQLite startup does not replay running work. Eligible explicit reconciliation validates the retained worktree/branch/commit and performs read-only provider lookup; it does not rerun the harness or write to the provider. These are existing single-server behaviors, not distributed generation isolation or exactly-once semantics. See [REST operations](../features/rest-server-operations.md) and [REST server](../features/rest-server.md).
+
+The isolated PostgreSQL ownership protocol is test-only. A generation/token fences protocol mutations only: it does not stop a stale process, fence a filesystem, or prevent a provider request already in flight. This contract adds no runtime behavior, Store, API, or recovery action.
+
+## Safety objective
+
+For a future independent worker design, each attempt generation must have isolated mutable storage and a trusted path for validated results. Only a trusted, serialized publisher may perform external writes. Do not start a competing publisher operation for the same job/branch while an earlier operation could still complete. A database lease, generation check immediately before an HTTP/Git request, worker cancellation, or read-only lookup that finds no result does not fence an already accepted or delayed provider request.
+
+If a write may still complete, keep that provider operation unresolved, block retries and competing writes for its identity, and retain the job, attempt evidence, and workspace/artifacts. The uncertainty ends only when authoritative provider state proves the exact operation's outcome and the original request can no longer produce a conflicting later effect, or an operator follows an explicitly reviewed provider-specific resolution procedure with equivalent evidence. A single instantaneous absence lookup is not such proof. If the provider has no idempotency/conditional fencing primitive and non-completion cannot be established, remain blocked for operator investigation; do not trade this safety invariant for availability. Do not claim exactly-once arbitrary workflow execution or provider effects.
+
+## Attempt-private workspace and source identity
+
+- Allocate a fresh, exclusive workspace/scratch namespace per `(job_id, generation)` under a trusted storage supervisor. It is never writable by another generation. A suspect/expired generation retains ownership of its storage; do not reuse, clean, or mount it writable into a replacement attempt until #260 stop proof and side-effect disposition are complete.
+- Record immutable source identity before execution: configured repository identity/alias, canonical repository identity, base branch/ref, exact commit/tree object, submodule/LFS policy and resolved object IDs, and snapshot construction version. A retry/recovery must not silently use a newer checkout HEAD or mutable shared Git object/config state.
+- Construct an attempt-private source snapshot. Do not mount a shared writable checkout, `.git` metadata/indirection, credential-bearing Git config, hooks, host home, provider credentials, or another job's data. Explicitly define submodules, LFS/filters, symlinks, ignored/untracked files, and Git hooks. For untrusted work use the selected #264 host profile; a worktree or container alone is not a sandbox.
+- Keep worker authentication, database authority, signing keys, and provider credentials in trusted supervisor/control-plane/publisher components, never in the harness, job environment, filesystem snapshot, inherited descriptor, logs, or task data. The worker can return only bounded candidate artifacts through an authenticated generation-scoped handoff.
+- Bound workspace, scratch, writable image layers, tmpfs, logs, and staging as one enforced quota; quota/accounting and post-run size checks do not enforce a limit. This host control is selected/tested under #264.
+
+## Artifact handoff and trusted integration
+
+Treat all worker-produced artifacts and metadata as hostile even after a worker reports success. Before use, a trusted integrator must:
+
+- bind each artifact manifest to the authenticated job, generation, source base identity, and expected output contract;
+- enforce aggregate file count, path length, per-file and total byte limits, and allowed file types;
+- reject absolute paths, `..`, traversal after normalization, duplicate/case-colliding names where relevant, symlinks, hardlinks, device/FIFO/socket entries, unexpected ownership/mode/setuid bits, path races, and writes outside a fresh staging root;
+- copy through safe file-descriptor-relative/no-follow operations into an isolated staging directory, revalidate source identities during transfer, and never trust archive extraction paths or worker-provided filesystem ownership;
+- verify that only allowed repository paths changed relative to the recorded base, and that no `.git` metadata, credential/config files, generated control metadata, or unapproved binary/special content is applied;
+- reconstruct/validate the final diff and commit in a trusted integration context, independently capture the exact commit/tree and evidence, then hand only that immutable result to the publisher;
+- reject stale-generation artifacts even if the database payload is otherwise valid; stale artifacts cannot overwrite a newer generation's result or publication branch.
+
+A failed validation leaves the job unresolved/failed for operator inspection and preserves bounded evidence; it does not auto-sanitize and publish. Integration itself must be generation-bound and transactional with durable artifact references, or be safely repeatable before any provider operation begins.
+
+## Trusted serialized publisher boundary
+
+Workers never receive provider tokens, Git push credentials, provider API sessions, or direct provider-write network access. The publisher is a trusted service with one serialization authority per stable external identity, at minimum `(provider, repository, job_id/branch)` and, where writes can conflict, the shared remote branch/ref. It accepts only a durable operation record bound to job, generation, exact source/base and commit, target repository, branch, and operation kind. It checks current ownership before accepting a new operation, but that check is not itself external fencing; the serialization authority must remain held until the result is conclusively classified.
+
+Persist the operation identity and intent **before** initiating any external write. Record state transitions with a durable linearization point:
+
+1. `prepared`: immutable operation ID, generation, repo/ref, expected base/commit, and request digest persisted; no external request started.
+2. `in_flight_or_unknown`: durably recorded before handing control to the transport. From this point, crash, timeout, disconnect, process exit, lost response, or uncertain database commit means the request may have reached or may later complete at the provider.
+3. `confirmed_applied`: an exact provider result and identity are visible and validated. Visibility alone does **not** release serialization or prove that the original request is quiescent; persist the observed state, but keep the operation blocked until provider-specific evidence establishes that the original request can no longer produce a conflicting later effect. Only then may the operation be closed and a later write considered.
+4. `conclusively_not_applied`: only with provider-specific evidence that the operation cannot still apply (not merely an immediate read showing absence), durably record why it is safe to close the operation. Only after that may a new operation be considered.
+5. `blocked_unknown`: outcome or request quiescence remains uncertain; keep serialization lock/ownership logically reserved, prohibit competing write/retry and automated reassignment, and surface an operator-visible recovery case.
+
+Database write/acknowledgement uncertainty at any transition is itself unresolved. Do not assume a failed commit rolled back. Recover against the authoritative database and provider using the same operation identity; if it cannot be established, stop further side effects and remain blocked. A publisher process restart must rediscover and reconcile unresolved operation records before it serves writes. A lease expiring cannot transfer a publisher lock while an old request may remain active or be accepted later.
+
+## Provider state and retry rules
+
+- A push timeout/error may mean the branch update succeeded, is still in flight, or did not apply. Verify exact remote ref/commit using a read-only provider operation and the selected provider's consistency guarantees. If lookup says absent once, keep blocked until the provider contract or an operation-specific fence proves delayed completion is impossible. Never overwrite a ref based on a generation check performed only before the push.
+- A PR create/update timeout/error may mean the request succeeded or may still complete. Read-only lookup can confirm an exact matching PR by provider/repository, stable Factory operation/job identity, source branch/head commit, base ref, and state. An immediate lookup absence does not prove non-completion; do not POST/PATCH again or allow another generation to do so while the first may still complete.
+- A provider lookup outage, partial/paginated result, duplicate/mismatched identities, eventual-consistency window, or ambiguous provider response leaves the operation blocked. Do not interpret malformed/empty/unavailable lookup as not applied.
+- A read-only exact match confirms only that the desired state was visible at lookup time. It does **not** by itself prove the original request has completed, cannot still complete again, or is safe to supersede. Keep the operation blocked until provider-specific evidence establishes both the exact outcome and quiescence/no future conflicting effect. If the provider cannot supply that evidence for the operation, retain `blocked_unknown` and require operator recovery; do not unlock because the desired state is visible. Never report `succeeded` until provider outcome and job outcome are both durably recorded. If provider confirmation succeeds but database outcome commit is ambiguous, do read-only recovery; do not republish.
+- `conclusively_not_applied` requires a documented provider-specific bound/acknowledgement or conditional idempotency/fencing primitive that rules out a delayed effect, together with an exact operation identity. If GitHub/provider offers no such proof for the particular failure, keep it blocked and require operator action. Operator disposition must record evidence and risk; it cannot truthfully convert uncertainty into provider non-occurrence or claim exactly-once.
+- Branch deletion/retry is itself a provider write and must be serialized/fenced against prior push or PR operations. Do not use cleanup as a way to clear uncertainty.
+
+## Cancellation, cleanup, backup, and restore
+
+Cancellation stops new stages and asks the trusted supervisor to stop the attempt; it does not cancel or roll back an external request already accepted by the provider. A stopped workload with an unresolved provider operation remains blocked. Cleanup requires exact generation stop proof from #260, durable preservation of required artifacts/evidence and provider operation history, and a retention-policy decision. Never clean suspect workspaces or discard the only recovery data.
+
+Backups must preserve the consistency relationship among job/attempt generations, immutable source identity, artifact manifest/objects, provider operation identity/state, and publisher serialization state. Restoring only the SQL database or only workspace data is not a complete recovery set. A restore may roll back generations or omit acknowledged operation records; it does not prove the provider write did not occur or the old process stopped. Follow #258's current test-only, single-primary/no-restore-guarantee boundary: no experimental restore may start workers or permit writes until old authority/processes are fenced and state is operator-reconciled.
+
+## Required deterministic tests before implementation gate
+
+Use independent control-plane, worker/supervisor, and publisher processes; a disposable database; barrier hooks; isolated temporary filesystems; and a fake provider that can accept an operation then delay its response or make it visible only after a controlled interval. These are future acceptance tests, not current evidence:
+
+1. Two generations attempt concurrent workspace creation/use for one job. Assert paths are distinct, old generation cannot write new workspace, and stale artifacts are rejected.
+2. Exercise source identity drift (checkout HEAD, branch, submodule/LFS objects, `.git` indirection/config) and assert execution is bound to the recorded immutable snapshot or refused.
+3. Attack artifact ingest with traversal, absolute paths, symlink/hardlink escape, special files, duplicate names, oversized files/manifests, ownership/mode tricks, path races, stale generation, and `.git`/secret injection. Assert no outside write and no provider call.
+4. Crash before operation persistence, after `prepared`, after `in_flight_or_unknown` but before transport, during request, after provider acceptance but before response, after response before DB confirmation, and after confirmation before job success. Assert durable classification and no blind second write.
+5. Fake provider accepts a push/create/update, delays completion beyond client timeout, and reports no result on immediate read-only lookup. Assert no second request, branch deletion, new generation publication, or lock release occurs while unresolved; only controlled conclusive resolution unlocks it.
+6. Fake provider makes the exact desired state visible while the original request is still pending and later completes that request. Assert visible match alone does not release serialization, permit another write, or mark the operation fully resolved; only provider-specific quiescence evidence may do so.
+7. Test exact matching observation, mismatched commit/base/repo/job marker, duplicate PRs, incomplete pagination, unavailable provider, eventual visibility, and observed provider success with lost database acknowledgement. Assert read-only recovery only and no duplicate write.
+7. Race generation ownership change after the last database check but before provider request; assert serialization gate prevents the old operation from overlapping a new one, while acknowledging the generation check is not provider-side fencing.
+8. Cancel/kill the worker with child processes and provider request active; prove workspace remains private/retained and no terminal success/cancel or cleanup is recorded without both stop proof and side-effect disposition.
+9. Restore deliberately mismatched database/workspace/provider-operation snapshots. Assert readiness/claims/writes remain blocked and operator diagnostics identify the mismatch without secrets or paths.
+10. Assert only a trusted publisher can access credentials/network; worker/harness process environment, descriptors, mounts, `/proc`, local sockets, and APIs cannot retrieve them. Verify all operation logs/history redact credentials and raw provider responses.
+
+CI protocol tests do not establish the provider's live consistency/fencing guarantees, host filesystem/kernel isolation, production backup/restore, or exact-once effects. Validate those separately against the selected provider and deployment profile before support claims.
+
+## Dependencies and gates
+
+- #258: PostgreSQL remains an isolated test-only protocol with no production failover/restore or ambiguous-commit resolution guarantee.
+- #259: authenticated worker principal/session is design-only in PR #270; only the trusted supervisor may hold its credentials.
+- #260: stop proof, suspect state, cancellation/drain, and recovery are design-only; no workspace cleanup/reassignment before implementation and validation.
+- #264/#250: host isolation, storage quotas, network denial, and secret containment; OCI/container alone is not a security boundary.
+- #248: production ownership/worker runtime integration remains blocked until topology, identity, cancellation, workspaces, and provider handoff are implemented and validated.
+- #247/#262: submitter credentials/attribution are separate from worker and publisher identities; progress remains gated on safe ownership state.
+- #249: Kubernetes is downstream and cannot provide provider-side fencing or substitute for attempt-private storage/publisher serialization.
+
+This contract does not authorize Store/runtime integration, automatic reassignment, retry after uncertain writes, Kubernetes packaging, or a provider-specific exactly-once guarantee. Keep current REST runtime behavior and explicit read-only recovery boundary unchanged.
