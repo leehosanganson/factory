@@ -7,6 +7,21 @@ on:
     branches: [main]
 
 jobs:
+  commit-attribution:
+    name: Commit attribution
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject Factory Agent attribution
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: .github/workflows/check-commit-attribution.sh "$BASE_SHA" "$HEAD_SHA"
+
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
