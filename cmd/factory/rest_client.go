@@ -24,7 +24,8 @@ func restClientHelp() []helpCommand {
 		{"factory rest submit --repository <alias> [--idempotency-key <key>] [--json] <task>", "Submit work to the configured REST server."},
 		{"factory rest issue --repository <alias> --issue-repository <owner/repo> [--confirm-version <sha256>] [--json] <issue-number>", "Preview a GitHub issue snapshot or confirm dispatch as a REST job."},
 		{"factory rest get [--json] <job-id>", "Inspect a remote job."},
-		{"factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json]", "List retained remote jobs."},
+		{"factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json]", "List retained remote jobs (operator listing)."},
+		{"factory rest list --mine [--limit <1..100>] [--cursor <opaque-cursor>] [--json]", "List jobs submitted by the authenticated principal."},
 		{"factory rest history [--json] <job-id>", "Inspect bounded remote job history."},
 		{"factory rest watch [--poll-interval <duration>] [--json] <job-id>", "Follow one job; poll status/history safely."},
 		{"factory rest cancel [--json] <job-id>", "Request cooperative cancellation of one remote job."},
@@ -54,8 +55,10 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker fa
 	confirmVersion := flags.String("confirm-version", "", "confirm dispatch only if the issue SHA-256 version still matches")
 	confirmDisposition := flags.Bool("confirm", false, "confirm the explicit failed or canceled disposition")
 	limit := flags.Int("limit", 0, "page size")
-	after := flags.Uint64("after", 0, "job-list continuation cursor")
-	snapshot := flags.Uint64("snapshot", 0, "job-list snapshot ceiling")
+	after := flags.Uint64("after", 0, "operator-list continuation sequence")
+	snapshot := flags.Uint64("snapshot", 0, "operator-list snapshot ceiling")
+	mine := flags.Bool("mine", false, "list jobs submitted by the authenticated principal")
+	cursor := flags.String("cursor", "", "opaque submitter-list continuation cursor (requires --mine)")
 	pollInterval := flags.Duration("poll-interval", time.Second, "watch polling interval")
 	if err := flags.Parse(args[1:]); err != nil {
 		return fmt.Errorf("invalid REST client options (try factory rest help)")
@@ -103,8 +106,31 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker fa
 		}
 		return writeRESTResult(out, *jsonOutput, "job", result, fmt.Sprintf("Job %s: %s", result.ID, result.Status))
 	case "list":
-		if flags.NArg() != 0 || ((*after == 0) != (*snapshot == 0)) {
-			return errors.New("usage: factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json]")
+		afterProvided, snapshotProvided, cursorProvided := false, false, false
+		flags.Visit(func(parsed *flag.Flag) {
+			switch parsed.Name {
+			case "after":
+				afterProvided = true
+			case "snapshot":
+				snapshotProvided = true
+			case "cursor":
+				cursorProvided = true
+			}
+		})
+		usage := "usage: factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json] or factory rest list --mine [--limit <1..100>] [--cursor <opaque-cursor>] [--json]"
+		if flags.NArg() != 0 || ((*after == 0) != (*snapshot == 0)) || (afterProvided != snapshotProvided) || (cursorProvided && (!*mine || *cursor == "")) || (!*mine && cursorProvided) || (*mine && (afterProvided || snapshotProvided)) {
+			return errors.New(usage)
+		}
+		if *mine {
+			result, err := client.ListForPrincipal(ctx, *limit, *cursor)
+			if err != nil {
+				return err
+			}
+			text := fmt.Sprintf("%d of your retained remote job(s). More: %t.", len(result.Jobs), result.HasMore)
+			if result.HasMore {
+				text += fmt.Sprintf(" Next cursor: %q.", result.NextCursor)
+			}
+			return writeRESTResult(out, *jsonOutput, "page", result, text)
 		}
 		result, err := client.List(ctx, *limit, *after, *snapshot)
 		if err != nil {
@@ -378,6 +404,18 @@ func safePage(page restjobs.JobPage) any {
 	}{jobs, page.SnapshotSequence, page.NextSequence, page.HasMore}
 }
 
+func safeSubmitterPage(page restclient.SubmitterJobPage) any {
+	jobs := make([]safeRESTJob, 0, len(page.Jobs))
+	for _, summary := range page.Jobs {
+		jobs = append(jobs, safeRESTJob{ID: summary.ID, Status: summary.Status, CreatedAt: summary.CreatedAt, UpdatedAt: summary.UpdatedAt})
+	}
+	return struct {
+		Jobs       []safeRESTJob `json:"jobs"`
+		HasMore    bool          `json:"has_more"`
+		NextCursor string        `json:"next_cursor"`
+	}{jobs, page.HasMore, page.NextCursor}
+}
+
 func writeRESTResult(out io.Writer, asJSON bool, name string, value any, text string) error {
 	if !asJSON {
 		fmt.Fprintln(out, text)
@@ -389,6 +427,8 @@ func writeRESTResult(out io.Writer, asJSON bool, name string, value any, text st
 		safeValue = safeJob(result)
 	case restjobs.JobPage:
 		safeValue = safePage(result)
+	case restclient.SubmitterJobPage:
+		safeValue = safeSubmitterPage(result)
 	case restjobs.History:
 		safeValue = safeHistory(result)
 	}

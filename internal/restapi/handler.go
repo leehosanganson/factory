@@ -4,6 +4,8 @@ package restapi
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -32,6 +35,8 @@ const (
 	eventStreamHeartbeat      = 15 * time.Second
 	eventStreamMaxLifetime    = 25 * time.Second
 	eventStreamWriteTimeout   = 2 * time.Second
+	submitterCursorTTL        = 15 * time.Minute
+	submitterCursorCapacity   = 10000
 )
 
 // Config bounds requests and exposes only operator-approved repository aliases.
@@ -53,6 +58,29 @@ type Handler struct {
 	config          Config
 	readinessChecks chan struct{}
 	eventStreams    chan struct{}
+	cursorMu        sync.Mutex
+	cursors         map[string]submitterCursor
+	cursorKeys      map[submitterCursorKey]string
+	now             func() time.Time
+}
+
+type submitterCursorKey struct {
+	principalID string
+	after       uint64
+	snapshot    uint64
+}
+
+type submitterCursor struct {
+	principalID string
+	after       uint64
+	snapshot    uint64
+	expiresAt   time.Time
+}
+
+type submitterJobPage struct {
+	Jobs       []restjobs.JobSummary `json:"jobs"`
+	HasMore    bool                  `json:"has_more"`
+	NextCursor string                `json:"next_cursor"`
 }
 
 var _ http.Handler = (*Handler)(nil)
@@ -70,7 +98,7 @@ func New(manager restjobs.Manager, key restserver.APIKey, config Config) (*Handl
 		aliases[alias] = struct{}{}
 	}
 	config.RepositoryAliases = aliases
-	return &Handler{manager: manager, key: key, config: config, readinessChecks: make(chan struct{}, readinessConcurrencyLimit), eventStreams: make(chan struct{}, eventStreamConcurrency)}, nil
+	return &Handler{manager: manager, key: key, config: config, readinessChecks: make(chan struct{}, readinessConcurrencyLimit), eventStreams: make(chan struct{}, eventStreamConcurrency), cursors: make(map[string]submitterCursor), cursorKeys: make(map[submitterCursorKey]string), now: time.Now}, nil
 }
 
 func (h *Handler) ready() bool {
@@ -128,7 +156,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
-	if !h.authorized(r) {
+	caller, ok := h.authenticate(r)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "Authentication is required.")
 		return
 	}
@@ -138,6 +167,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	path := r.URL.Path
+	if caller.Role == "submitter" && !submitterRoute(path, r.Method) {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
 	switch {
 	case path == "/v1/operations":
 		if r.Method != http.MethodGet {
@@ -147,14 +180,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.getOperations(w, r)
 	case path == "/v1/jobs":
 		if r.Method == http.MethodGet {
-			h.listJobs(w, r)
+			if caller.Role == "submitter" {
+				h.listJobsForPrincipal(w, r, caller.ID)
+			} else {
+				h.listJobs(w, r)
+			}
 			return
 		}
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 			return
 		}
-		h.createJob(w, r)
+		h.createJob(w, r, caller)
 	case strings.HasPrefix(path, "/v1/jobs/"):
 		tail := strings.TrimPrefix(path, "/v1/jobs/")
 		parts := strings.Split(tail, "/")
@@ -163,7 +200,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				methodNotAllowed(w, http.MethodGet)
 				return
 			}
-			h.getJob(w, parts[0])
+			if caller.Role == "submitter" {
+				h.getJobForPrincipal(w, parts[0], caller.ID)
+			} else {
+				h.getJob(w, parts[0])
+			}
 			return
 		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "history" {
@@ -171,7 +212,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				methodNotAllowed(w, http.MethodGet)
 				return
 			}
-			h.getHistory(w, parts[0])
+			if caller.Role == "submitter" {
+				h.getHistoryForPrincipal(w, parts[0], caller.ID)
+			} else {
+				h.getHistory(w, parts[0])
+			}
 			return
 		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "events" {
@@ -179,7 +224,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				methodNotAllowed(w, http.MethodGet)
 				return
 			}
-			h.streamEvents(w, r, parts[0])
+			if caller.Role == "submitter" {
+				h.streamEventsForPrincipal(w, r, parts[0], caller.ID)
+			} else {
+				h.streamEvents(w, r, parts[0])
+			}
 			return
 		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "cancel" {
@@ -212,6 +261,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func submitterRoute(path, method string) bool {
+	if path == "/v1/jobs" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	if !strings.HasPrefix(path, "/v1/jobs/") || method != http.MethodGet {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/v1/jobs/"), "/")
+	return len(parts) == 1 && parts[0] != "" || len(parts) == 2 && parts[0] != "" && (parts[1] == "history" || parts[1] == "events")
+}
+
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 	query, err := parseJobListQuery(r)
 	if err != nil {
@@ -232,6 +292,110 @@ type jobListQuery struct {
 	after    uint64
 	snapshot uint64
 	limit    int
+}
+
+func (h *Handler) listJobsForPrincipal(w http.ResponseWriter, r *http.Request, principalID string) {
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	for key, entries := range values {
+		if (key != "limit" && key != "cursor") || len(entries) != 1 {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+	}
+	limit := restjobs.DefaultJobListLimit
+	if value, exists := values["limit"]; exists {
+		parsed, parseErr := strconv.Atoi(value[0])
+		if parseErr != nil || parsed < 1 || parsed > restjobs.MaxJobListLimit {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+		limit = parsed
+	}
+	var after, snapshot uint64
+	if value, exists := values["cursor"]; exists {
+		state, ok := h.lookupSubmitterCursor(value[0], principalID)
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+		after, snapshot = state.after, state.snapshot
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	page, err := h.manager.ListForPrincipal(ctx, principalID, after, snapshot, limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	response := submitterJobPage{Jobs: page.Jobs, HasMore: page.HasMore}
+	if page.HasMore {
+		cursor, ok := h.storeSubmitterCursor(principalID, page.NextSequence, page.SnapshotSequence)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "cursor_capacity", "Pagination capacity is full.")
+			return
+		}
+		response.NextCursor = cursor
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) lookupSubmitterCursor(cursor, principalID string) (submitterCursor, bool) {
+	now := h.now()
+	h.cursorMu.Lock()
+	defer h.cursorMu.Unlock()
+	h.purgeSubmitterCursorsLocked(now)
+	state, ok := h.cursors[cursor]
+	if !ok || state.principalID != principalID {
+		return submitterCursor{}, false
+	}
+	return state, true
+}
+
+func (h *Handler) storeSubmitterCursor(principalID string, after, snapshot uint64) (string, bool) {
+	now := h.now()
+	h.cursorMu.Lock()
+	defer h.cursorMu.Unlock()
+	h.purgeSubmitterCursorsLocked(now)
+	key := submitterCursorKey{principalID: principalID, after: after, snapshot: snapshot}
+	if cursor, exists := h.cursorKeys[key]; exists {
+		if state, ok := h.cursors[cursor]; ok && state.principalID == principalID && state.after == after && state.snapshot == snapshot {
+			return cursor, true
+		}
+		delete(h.cursorKeys, key)
+	}
+	if len(h.cursors) >= submitterCursorCapacity {
+		return "", false
+	}
+	for range 3 {
+		var raw [32]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			return "", false
+		}
+		cursor := base64.RawURLEncoding.EncodeToString(raw[:])
+		if _, exists := h.cursors[cursor]; exists {
+			continue
+		}
+		h.cursors[cursor] = submitterCursor{principalID: principalID, after: after, snapshot: snapshot, expiresAt: now.Add(submitterCursorTTL)}
+		h.cursorKeys[key] = cursor
+		return cursor, true
+	}
+	return "", false
+}
+
+func (h *Handler) purgeSubmitterCursorsLocked(now time.Time) {
+	for cursor, state := range h.cursors {
+		if !now.Before(state.expiresAt) {
+			delete(h.cursors, cursor)
+			key := submitterCursorKey{principalID: state.principalID, after: state.after, snapshot: state.snapshot}
+			if h.cursorKeys[key] == cursor {
+				delete(h.cursorKeys, key)
+			}
+		}
+	}
 }
 
 func parseJobListQuery(r *http.Request) (jobListQuery, error) {
@@ -284,16 +448,20 @@ func isJobsPath(path string) bool {
 	return path == "/v1/jobs" || strings.HasPrefix(path, "/v1/jobs/")
 }
 
-func (h *Handler) authorized(r *http.Request) bool {
+func (h *Handler) authenticate(r *http.Request) (restserver.Principal, bool) {
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 {
-		return false
+		return restserver.Principal{}, false
 	}
 	fields := strings.Fields(values[0])
-	return len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") && h.key.Authenticate(fields[1])
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return restserver.Principal{}, false
+	}
+	resolved, ok := h.key.Resolve(fields[1])
+	return resolved, ok
 }
 
-func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) createJob(w http.ResponseWriter, r *http.Request, caller restserver.Principal) {
 	keyValues := r.Header.Values("Idempotency-Key")
 	if len(keyValues) != 1 || strings.TrimSpace(keyValues[0]) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
@@ -369,7 +537,7 @@ func (h *Handler) createJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	snapshot, replayed, err := h.manager.Admit(keyValues[0], request)
+	snapshot, replayed, err := h.manager.AdmitAs(keyValues[0], caller.ID, request)
 	if err != nil {
 		h.writeManagerError(w, err)
 		return
@@ -486,6 +654,23 @@ func bodyless(r *http.Request) bool {
 	return err == nil && len(body) == 0
 }
 
+func (h *Handler) getJobForPrincipal(w http.ResponseWriter, id, principalID string) {
+	snapshot, err := h.manager.GetForPrincipal(id, principalID)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func (h *Handler) getHistoryForPrincipal(w http.ResponseWriter, id, principalID string) {
+	if _, err := h.manager.GetForPrincipal(id, principalID); err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	h.getHistory(w, id)
+}
+
 func (h *Handler) getJob(w http.ResponseWriter, id string) {
 	snapshot, err := h.manager.Get(id)
 	if err != nil {
@@ -513,6 +698,14 @@ func (h *Handler) getHistory(w http.ResponseWriter, id string) {
 	}
 	history.Events = safeEvents
 	writeJSON(w, http.StatusOK, history)
+}
+
+func (h *Handler) streamEventsForPrincipal(w http.ResponseWriter, r *http.Request, id, principalID string) {
+	if _, err := h.manager.GetForPrincipal(id, principalID); err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	h.streamEvents(w, r, id)
 }
 
 func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request, id string) {

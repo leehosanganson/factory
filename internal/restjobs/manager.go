@@ -179,6 +179,7 @@ func validateVerificationEvidence(evidence VerificationEvidence) error {
 // check labels/outcomes and fixed limitation messages, never command output.
 type Snapshot struct {
 	ID                    string                `json:"id"`
+	Submitter             string                `json:"submitted_by"`
 	Request               Request               `json:"request"`
 	Status                Status                `json:"status"`
 	CancellationRequested bool                  `json:"cancellation_requested,omitempty"`
@@ -261,12 +262,15 @@ type RecoveryReport struct {
 // finish.
 type Store interface {
 	Admit(idempotencyKey string, request Request) (Snapshot, bool, error)
+	AdmitAs(idempotencyKey, principalID string, request Request) (Snapshot, bool, error)
 	ResolveInterrupted(id string, disposition InterruptedDisposition) error
 	ClaimNext() (Snapshot, error)
 	WaitClaim(ctx context.Context) (Snapshot, error)
 	Close()
 	Get(id string) (Snapshot, error)
+	GetForPrincipal(id, principalID string) (Snapshot, error)
 	ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error)
+	ListForPrincipal(ctx context.Context, principalID string, afterSequence, snapshotSequence uint64, limit int) (JobPage, error)
 	History(id string) (History, error)
 	EventStreamState(ctx context.Context, id string) (Snapshot, History, error)
 	AddEvent(id, eventType, message string) error
@@ -325,6 +329,11 @@ type issueProvenanceKey struct {
 	version          string
 }
 
+type idempotencyIdentity struct {
+	principalID string
+	key         string
+}
+
 type job struct {
 	snapshot       Snapshot
 	sequence       uint64
@@ -334,12 +343,14 @@ type job struct {
 	accountedBytes uint64
 }
 
+const legacySharedPrincipalID = "legacy-shared"
+
 // LocalManager is an in-memory bounded registry and pending queue.
 type LocalManager struct {
 	mu            sync.Mutex
 	config        Config
 	jobs          map[string]*job
-	idempotency   map[string]string
+	idempotency   map[idempotencyIdentity]string
 	provenance    map[issueProvenanceKey]string
 	queue         []string
 	running       int
@@ -378,7 +389,7 @@ func NewManager(config Config) (*LocalManager, error) {
 	return &LocalManager{
 		config:      config,
 		jobs:        make(map[string]*job),
-		idempotency: make(map[string]string),
+		idempotency: make(map[idempotencyIdentity]string),
 		provenance:  make(map[issueProvenanceKey]string),
 		notify:      make(chan struct{}),
 	}, nil
@@ -387,8 +398,18 @@ func NewManager(config Config) (*LocalManager, error) {
 // Admit validates and normalizes the key and payload before atomically checking
 // replay/capacity rules and enqueuing a new record. replay is true when an
 // identical retained request already exists for the key.
-func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot Snapshot, replay bool, err error) {
+func (m *LocalManager) Admit(idempotencyKey string, request Request) (Snapshot, bool, error) {
+	return m.AdmitAs(idempotencyKey, legacySharedPrincipalID, request)
+}
+
+// AdmitAs atomically admits a job attributed to principalID. Idempotency keys
+// are scoped to that principal, while issue provenance remains globally unique.
+func (m *LocalManager) AdmitAs(idempotencyKey, principalID string, request Request) (snapshot Snapshot, replay bool, err error) {
 	key, normalized, err := normalizeAdmission(idempotencyKey, request, m.config.MaxTaskBytes)
+	if err != nil {
+		return Snapshot{}, false, err
+	}
+	principalID, err = normalizePrincipalID(principalID)
 	if err != nil {
 		return Snapshot{}, false, err
 	}
@@ -398,35 +419,41 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 	if m.closed {
 		return Snapshot{}, false, ErrManagerClosed
 	}
-	if id, ok := m.idempotency[key]; ok {
+	var provenanceEntry *job
+	if normalized.IssueProvenance != nil {
+		provenanceKey := keyForIssueProvenance(*normalized.IssueProvenance)
+		if id, ok := m.provenance[provenanceKey]; ok {
+			provenanceEntry = m.jobs[id]
+			if provenanceEntry == nil {
+				delete(m.provenance, provenanceKey)
+			} else if provenanceEntry.snapshot.Submitter != principalID {
+				return Snapshot{}, false, ErrProvenanceConflict
+			}
+		}
+	}
+	identity := idempotencyIdentity{principalID: principalID, key: key}
+	if id, ok := m.idempotency[identity]; ok {
 		existing := m.jobs[id]
 		if existing == nil {
-			delete(m.idempotency, key)
+			delete(m.idempotency, identity)
 		} else if !sameRequest(existing.snapshot.Request, normalized) {
 			return Snapshot{}, false, ErrIdempotencyConflict
 		} else {
 			return cloneSnapshot(existing.snapshot), true, nil
 		}
 	}
-	if normalized.IssueProvenance != nil {
-		provenanceKey := keyForIssueProvenance(*normalized.IssueProvenance)
-		if id, ok := m.provenance[provenanceKey]; ok {
-			existing := m.jobs[id]
-			if existing == nil {
-				delete(m.provenance, provenanceKey)
-			} else if !sameRequest(existing.snapshot.Request, normalized) {
-				return Snapshot{}, false, ErrProvenanceConflict
-			} else {
-				keyBytes := uint64(recordOverheadBytes + len(key))
-				if !m.makeByteRoomLocked(keyBytes, existing) {
-					return Snapshot{}, false, ErrRegistryFull
-				}
-				existing.accountedBytes += keyBytes
-				m.registryBytes += keyBytes
-				m.idempotency[key] = id
-				return cloneSnapshot(existing.snapshot), true, nil
-			}
+	if provenanceEntry != nil {
+		if !sameRequest(provenanceEntry.snapshot.Request, normalized) {
+			return Snapshot{}, false, ErrProvenanceConflict
 		}
+		keyBytes := uint64(recordOverheadBytes + len(key))
+		if !m.makeByteRoomLocked(keyBytes, provenanceEntry) {
+			return Snapshot{}, false, ErrRegistryFull
+		}
+		provenanceEntry.accountedBytes += keyBytes
+		m.registryBytes += keyBytes
+		m.idempotency[identity] = provenanceEntry.snapshot.ID
+		return cloneSnapshot(provenanceEntry.snapshot), true, nil
 	}
 	if len(m.queue) >= m.config.QueueCapacity {
 		return Snapshot{}, false, ErrQueueFull
@@ -437,10 +464,10 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 	}
 	now := time.Now().UTC()
 	m.nextSequence++
-	created := Snapshot{ID: id, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}
+	created := Snapshot{ID: id, Submitter: principalID, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}
 	entry := &job{snapshot: created, sequence: m.nextSequence}
 	initialEvent := Event{Type: "queued", Message: "Job admitted"}
-	recordCharge := recordBytes(normalized, key)
+	recordCharge := recordBytes(normalized, key, principalID)
 	initialCharge := eventBytes(initialEvent)
 	if !m.makeRoomLocked(recordCharge + initialCharge) {
 		return Snapshot{}, false, ErrRegistryFull
@@ -453,7 +480,7 @@ func (m *LocalManager) Admit(idempotencyKey string, request Request) (snapshot S
 		m.registryBytes -= recordCharge
 		return Snapshot{}, false, ErrRegistryFull
 	}
-	m.idempotency[key] = id
+	m.idempotency[identity] = id
 	if normalized.IssueProvenance != nil {
 		m.provenance[keyForIssueProvenance(*normalized.IssueProvenance)] = id
 	}
@@ -568,9 +595,38 @@ func (m *LocalManager) Get(id string) (Snapshot, error) {
 	return cloneSnapshot(entry.snapshot), nil
 }
 
+// GetForPrincipal returns only a job attributed to principalID. Missing and
+// differently attributed jobs have the same store-level result.
+func (m *LocalManager) GetForPrincipal(id, principalID string) (Snapshot, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.jobs[id]
+	if entry == nil || entry.snapshot.Submitter != principalID {
+		return Snapshot{}, ErrNotFound
+	}
+	return cloneSnapshot(entry.snapshot), nil
+}
+
 // ListJobs returns summaries in immutable admission order. The first page captures
 // a ceiling so subsequent admissions cannot shift a client's traversal.
 func (m *LocalManager) ListJobs(ctx context.Context, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
+	return m.listJobs(ctx, "", afterSequence, snapshotSequence, limit)
+}
+
+// ListForPrincipal filters by submitter before pagination is applied.
+func (m *LocalManager) ListForPrincipal(ctx context.Context, principalID string, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return JobPage{}, err
+	}
+	return m.listJobs(ctx, principalID, afterSequence, snapshotSequence, limit)
+}
+
+func (m *LocalManager) listJobs(ctx context.Context, principalID string, afterSequence, snapshotSequence uint64, limit int) (JobPage, error) {
 	if err := validateJobPageRequest(ctx, afterSequence, snapshotSequence, limit); err != nil {
 		return JobPage{}, err
 	}
@@ -584,7 +640,7 @@ func (m *LocalManager) ListJobs(ctx context.Context, afterSequence, snapshotSequ
 	}
 	ordered := make([]*job, 0, limit+1)
 	for _, entry := range m.jobs {
-		if entry.sequence <= afterSequence || entry.sequence > snapshotSequence {
+		if (principalID != "" && entry.snapshot.Submitter != principalID) || entry.sequence <= afterSequence || entry.sequence > snapshotSequence {
 			continue
 		}
 		index := sort.Search(len(ordered), func(i int) bool { return ordered[i].sequence >= entry.sequence })
@@ -976,9 +1032,9 @@ func (m *LocalManager) removeJobLocked(entry *job) {
 	if entry.snapshot.Request.IssueProvenance != nil {
 		delete(m.provenance, keyForIssueProvenance(*entry.snapshot.Request.IssueProvenance))
 	}
-	for key, id := range m.idempotency {
+	for identity, id := range m.idempotency {
 		if id == entry.snapshot.ID {
-			delete(m.idempotency, key)
+			delete(m.idempotency, identity)
 		}
 	}
 }
@@ -1039,8 +1095,8 @@ func (m *LocalManager) removeOldestEventLocked(entry *job) {
 	entry.truncated = true
 }
 
-func recordBytes(request Request, key string) uint64 {
-	size := uint64(recordOverheadBytes) + uint64(len(request.Task)) + uint64(len(request.Repository)) + uint64(len(key))
+func recordBytes(request Request, key, principalID string) uint64 {
+	size := uint64(recordOverheadBytes) + uint64(len(request.Task)) + uint64(len(request.Repository)) + uint64(len(key)) + uint64(len(principalID))
 	if request.IssueProvenance != nil {
 		provenance := request.IssueProvenance
 		size += uint64(len(provenance.Tracker) + len(provenance.SourceRepository) + len(provenance.Version) + len(provenance.URL) + len(provenance.Title) + 32)
@@ -1071,12 +1127,20 @@ func (m *LocalManager) evictOldestTerminalExceptLocked(protected *job) bool {
 	if oldest.snapshot.Request.IssueProvenance != nil {
 		delete(m.provenance, keyForIssueProvenance(*oldest.snapshot.Request.IssueProvenance))
 	}
-	for key, id := range m.idempotency {
+	for identity, id := range m.idempotency {
 		if id == oldestID {
-			delete(m.idempotency, key)
+			delete(m.idempotency, identity)
 		}
 	}
 	return true
+}
+
+func normalizePrincipalID(principalID string) (string, error) {
+	principalID = strings.TrimSpace(principalID)
+	if !validText(principalID, 1, maxAliasBytes, false) {
+		return "", ErrInvalidInput
+	}
+	return principalID, nil
 }
 
 func normalizeAdmission(key string, request Request, maxTaskBytes int) (string, Request, error) {

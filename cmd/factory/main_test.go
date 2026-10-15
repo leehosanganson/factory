@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,7 +28,7 @@ func TestRESTClientCommandHelp(t *testing.T) {
 	if err := run([]string{"rest", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {
 		t.Fatalf("rest help: %v", err)
 	}
-	for _, want := range []string{"factory rest", "submit", "get", "list", "watch", "cancel", "operations", "disposition", "reconcile"} {
+	for _, want := range []string{"factory rest", "submit", "get", "list", "--mine", "--cursor", "watch", "cancel", "operations", "disposition", "reconcile"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("REST client help missing %q: %s", want, out.String())
 		}
@@ -614,6 +616,7 @@ func TestServerBackupCommandCreatesSQLiteBackupWithoutLaunchingServer(t *testing
 	config.Harness = restserver.HarnessConfig{Executable: "pi", Args: []string{"{task}", "{system_prompt}"}}
 	config.Repositories = map[string]string{"trusted": repository}
 	config.APIKeyFile = filepath.Join(dir, "api-key")
+	config.Principals = []restserver.PrincipalConfig{{ID: "backup-operator", Role: "operator", TokenFile: filepath.Join(dir, "backup-verifier.json"), Enabled: true}}
 	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(dir, "jobs.db")}
 	configPath := filepath.Join(dir, "server.json")
 	configData, err := json.Marshal(config)
@@ -697,6 +700,26 @@ func TestServerDoctorProcessIsLocalOnlyAndReadOnly(t *testing.T) {
 	config.Repositories = map[string]string{"private-alias": repository}
 	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{system_prompt}", "{task}"}}
 	config.APIKeyFile = apiKey
+	verifierPath := filepath.Join(root, "operator-verifier.json")
+	verifierToken := []byte("doctor-operator-token")
+	digest := sha256.Sum256(verifierToken)
+	verifierData, err := json.Marshal(struct {
+		Version    int `json:"version"`
+		Principals []struct {
+			ID          string `json:"id"`
+			TokenSHA256 string `json:"token_sha256"`
+		} `json:"principals"`
+	}{Version: 1, Principals: []struct {
+		ID          string `json:"id"`
+		TokenSHA256 string `json:"token_sha256"`
+	}{{ID: "doctor-operator", TokenSHA256: hex.EncodeToString(digest[:])}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(verifierPath, verifierData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Principals = []restserver.PrincipalConfig{{ID: "doctor-operator", Role: "operator", TokenFile: verifierPath, Enabled: true}}
 	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"private-alias": "acme/private-repo"}}
 	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(root, "sqlite", "jobs.db")}
 	if err := os.Mkdir(filepath.Dir(config.Persistence.Path), 0o700); err != nil {

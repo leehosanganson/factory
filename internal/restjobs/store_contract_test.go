@@ -202,15 +202,79 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 	t.Run("admission replay and conflict", func(t *testing.T) {
 		store := newStore(t)
 		first, replay, err := store.Admit("contract-key", Request{Repository: "widget", Task: "task"})
-		if err != nil || replay {
+		if err != nil || replay || first.Submitter != legacySharedPrincipalID {
 			t.Fatalf("initial admission = (%+v, %v, %v), want a new job", first, replay, err)
 		}
 		again, replay, err := store.Admit("contract-key", Request{Repository: "widget", Task: "task"})
-		if err != nil || !replay || again.ID != first.ID {
-			t.Fatalf("identical admission = (%+v, %v, %v), want same job replay", again, replay, err)
+		if err != nil || !replay || again.ID != first.ID || again.Submitter != first.Submitter {
+			t.Fatalf("identical admission = (%+v, %v, %v), want same job and immutable attribution", again, replay, err)
+		}
+		encoded, err := json.Marshal(again)
+		if err != nil || !strings.Contains(string(encoded), `"submitted_by":"legacy-shared"`) {
+			t.Fatalf("snapshot omitted persisted submitter attribution: %s err=%v", encoded, err)
 		}
 		if _, _, err := store.Admit("contract-key", Request{Repository: "widget", Task: "different"}); !errors.Is(err, ErrIdempotencyConflict) {
 			t.Fatalf("changed payload error = %v, want ErrIdempotencyConflict", err)
+		}
+	})
+
+	t.Run("principal-scoped idempotency and globally unique provenance", func(t *testing.T) {
+		store := newStore(t)
+		request := Request{Repository: "widget", Task: "same idempotency key from separate principals"}
+		first, replay, err := store.AdmitAs("shared-key", "alice", request)
+		if err != nil || replay || first.Submitter != "alice" {
+			t.Fatalf("first principal admission=(%+v,%t,%v)", first, replay, err)
+		}
+		first.Submitter = "caller-mutated"
+		again, replay, err := store.AdmitAs("shared-key", "alice", request)
+		if err != nil || !replay || again.ID != first.ID || again.Submitter != "alice" {
+			t.Fatalf("same-principal replay=(%+v,%t,%v)", again, replay, err)
+		}
+		second, replay, err := store.AdmitAs("shared-key", "bob", request)
+		if err != nil || replay || second.ID == first.ID || second.Submitter != "bob" {
+			t.Fatalf("cross-principal key reuse=(%+v,%t,%v), want independent admission", second, replay, err)
+		}
+		if _, err := store.GetForPrincipal(first.ID, "bob"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("cross-principal get error=%v, want ErrNotFound", err)
+		}
+		if owned, err := store.GetForPrincipal(first.ID, "alice"); err != nil || owned.Submitter != "alice" {
+			t.Fatalf("owner get=(%+v,%v)", owned, err)
+		}
+		provenance := provenanceRequest("identical request")
+		provJob, replay, err := store.AdmitAs("prov-key-1", "alice", provenance)
+		if err != nil || replay {
+			t.Fatalf("first provenance admission=(%+v,%t,%v)", provJob, replay, err)
+		}
+		attached, replay, err := store.AdmitAs("prov-key-2", "alice", provenance)
+		if err != nil || !replay || attached.ID != provJob.ID {
+			t.Fatalf("same-principal provenance replay=(%+v,%t,%v)", attached, replay, err)
+		}
+		other := provenanceRequest("unrelated payload must not affect cross-principal conflict")
+		if _, _, err := store.AdmitAs("other-principal-provenance", "charlie", other); !errors.Is(err, ErrProvenanceConflict) {
+			t.Fatalf("cross-principal provenance error=%v, want ErrProvenanceConflict regardless of payload", err)
+		}
+	})
+
+	t.Run("principal list filters before applying page limit", func(t *testing.T) {
+		store := newStore(t)
+		first, _, err := store.AdmitAs("owner-a-1", "alice", Request{Repository: "widget", Task: "first"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.AdmitAs("owner-b", "bob", Request{Repository: "widget", Task: "hidden"}); err != nil {
+			t.Fatal(err)
+		}
+		second, _, err := store.AdmitAs("owner-a-2", "alice", Request{Repository: "widget", Task: "second"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.ListForPrincipal(context.Background(), "alice", 0, 0, 1)
+		if err != nil || len(page.Jobs) != 1 || page.Jobs[0].ID != first.ID || !page.HasMore {
+			t.Fatalf("first owner page=(%+v,%v)", page, err)
+		}
+		next, err := store.ListForPrincipal(context.Background(), "alice", page.NextSequence, page.SnapshotSequence, 1)
+		if err != nil || len(next.Jobs) != 1 || next.Jobs[0].ID != second.ID || next.HasMore {
+			t.Fatalf("second owner page=(%+v,%v)", next, err)
 		}
 	})
 

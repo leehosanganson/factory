@@ -79,6 +79,51 @@ func TestLoadConfigRejectsInvalidParallelSubtasksConfig(t *testing.T) {
 	}
 }
 
+func TestLoadConfigMapsNamedPrincipalConfiguration(t *testing.T) {
+	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"submit-bot","role":"submitter","token_file":"/run/submit-verifier.json","enabled":true},{"id":"disabled-operator","role":"operator","token_file":"/run/disabled-verifier.json","enabled":false},{"id":"admin","role":"operator","token_file":"/run/admin-verifier.json","enabled":true}]}`)
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Principals) != 3 || config.Principals[0] != (PrincipalConfig{ID: "submit-bot", Role: "submitter", TokenFile: "/run/submit-verifier.json", Enabled: true}) || config.Principals[1].Enabled || config.Principals[2].Role != "operator" {
+		t.Fatalf("principals = %+v, want exact identity, role, path, enabled mapping", config.Principals)
+	}
+}
+
+func TestLoadConfigRequiresNamedOperatorEvenWithLegacyKey(t *testing.T) {
+	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key"}`
+	for _, document := range []string{
+		strings.TrimSuffix(base, "}") + `,"principals":[]}`,
+		strings.TrimSuffix(base, "}") + `,"principals":[{"id":"submitter","role":"submitter","token_file":"/run/token","enabled":true}]}`,
+		strings.TrimSuffix(base, "}") + `,"principals":[{"id":"operator","role":"operator","token_file":"/run/token","enabled":false}]}`,
+	} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(path); err == nil {
+			t.Errorf("LoadConfig accepted configuration without an enabled named operator")
+		}
+	}
+}
+
+func TestLoadConfigRejectsInvalidNamedPrincipals(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key"`
+	for _, value := range []string{
+		`[{"id":"same","role":"operator","token_file":"/run/a","enabled":true},{"id":"same","role":"submitter","token_file":"/run/b","enabled":true}]`,
+		`[{"id":"bad id","role":"operator","token_file":"/run/a","enabled":true}]`,
+		`[{"id":"admin","role":"owner","token_file":"/run/a","enabled":true}]`,
+		`[{"id":"legacy-shared","role":"operator","token_file":"/run/a","enabled":true}]`,
+		`[{"id":"admin","role":"operator","token_file":"relative","enabled":true}]`,
+		`[{"id":"admin","role":"operator","token_file":"/run/a","enabled":false}]`,
+		`[{"id":"submit","role":"submitter","token_file":"/run/a","enabled":true}]`,
+	} {
+		if _, err := LoadConfig(writeConfig(t, `{`+base+`,"principals":`+value+`}`)); err == nil {
+			t.Errorf("LoadConfig accepted principals %s", value)
+		}
+	}
+}
+
 func TestLoadConfigSelectsMemoryPersistenceExplicitly(t *testing.T) {
 	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"memory"}}`)
 	config, err := LoadConfig(path)
@@ -170,6 +215,7 @@ func TestLoadConfigReportsSanitizedFieldForWrongTypes(t *testing.T) {
 	}{
 		{"root credential field", `{` + strings.Replace(valid, `"api_key_file":"/run/key"`, `"api_key_file":["api-secret-value"]`, 1) + `}`, "api_key_file", "api-secret-value"},
 		{"provider credential field", `{` + valid + `,"provider":{"backend":"github","token_file":["provider-secret-value"],"base_branch":"main","repositories":{"widget":"acme/widget"}}}`, "provider.token_file", "provider-secret-value"},
+		{"named verifier path", `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"api_key_file":"/run/key","principals":[{"id":"operator","role":"operator","token_file":["verifier-secret-path"],"enabled":true}]}`, "principals.token_file", "verifier-secret-path"},
 		{"SQLite field", `{` + valid + `,"persistence":{"backend":"sqlite","path":["database-path"]}}`, "persistence.path", "database-path"},
 	}
 	for _, tc := range cases {
@@ -302,11 +348,15 @@ func validConfig() Config {
 	config.Repositories = map[string]string{"widget": "/srv/widget"}
 	config.Harness = HarnessConfig{Executable: "pi", Args: []string{"-p", "{system_prompt}", "{task}"}}
 	config.APIKeyFile = "/run/secrets/api-key"
+	config.Principals = []PrincipalConfig{{ID: "test-operator", Role: "operator", TokenFile: "/run/test-token", Enabled: true}}
 	return config
 }
 
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
+	if !strings.Contains(content, `"principals"`) {
+		content = strings.TrimSuffix(strings.TrimSpace(content), "}") + `,"principals":[{"id":"test-operator","role":"operator","token_file":"/run/test-token","enabled":true}]}`
+	}
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)

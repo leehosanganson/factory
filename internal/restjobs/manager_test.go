@@ -346,7 +346,7 @@ func TestRegistryEvictsOldestTerminalAndPreservesActiveJobs(t *testing.T) {
 func TestRegistryBudgetAcceptsExactAccountingBoundary(t *testing.T) {
 	request := Request{Repository: "repo", Task: "boundary"}
 	key := "boundary-key"
-	budget := recordBytes(request, key) + eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	budget := recordBytes(request, key, legacySharedPrincipalID) + eventBytes(Event{Type: "queued", Message: "Job admitted"})
 	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 1, MaxTaskBytes: 128, RegistryBytes: int64(budget)})
 	if _, _, err := manager.Admit(key, request); err != nil {
 		t.Fatalf("admission at exact logical budget: %v", err)
@@ -394,14 +394,14 @@ func TestVerificationEvidenceRejectionDoesNotEvictTerminalJobs(t *testing.T) {
 	targetRequest := Request{Repository: "repo", Task: "target"}
 	queuedRequest := Request{Repository: "repo", Task: "queued"}
 	terminalKey, targetKey, queuedKey := "terminal-key", "target-key", "queued-key"
-	setupBytes := recordBytes(terminalRequest, terminalKey) +
+	setupBytes := recordBytes(terminalRequest, terminalKey, legacySharedPrincipalID) +
 		eventBytes(Event{Type: "queued", Message: "Job admitted"}) +
 		eventBytes(Event{Type: "running", Message: "Job started"}) +
 		eventBytes(Event{Type: "succeeded", Message: "Job finished"}) +
-		recordBytes(targetRequest, targetKey) +
+		recordBytes(targetRequest, targetKey, legacySharedPrincipalID) +
 		eventBytes(Event{Type: "queued", Message: "Job admitted"}) +
 		eventBytes(Event{Type: "running", Message: "Job started"}) +
-		recordBytes(queuedRequest, queuedKey) +
+		recordBytes(queuedRequest, queuedKey, legacySharedPrincipalID) +
 		eventBytes(Event{Type: "queued", Message: "Job admitted"})
 	manager := testManager(t, Config{
 		QueueCapacity: 3, MaxConcurrentJobs: 2, MaxRecords: 3, MaxEventsPerJob: 4,
@@ -455,7 +455,7 @@ func TestVerificationEvidenceRejectionDoesNotEvictTerminalJobs(t *testing.T) {
 			history  History
 		}{snapshot: cloneSnapshot(entry.snapshot), history: History{JobID: id, Events: append([]Event(nil), entry.events...), Truncated: entry.truncated}}
 	}
-	keysBefore := make(map[string]string, len(manager.idempotency))
+	keysBefore := make(map[idempotencyIdentity]string, len(manager.idempotency))
 	for key, id := range manager.idempotency {
 		keysBefore[key] = id
 	}
@@ -526,7 +526,7 @@ func TestRegistryBudgetAccountsForAdmissionLifecycleAndEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstExpected := recordBytes(first.Request, "first-key") + eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	firstExpected := recordBytes(first.Request, "first-key", legacySharedPrincipalID) + eventBytes(Event{Type: "queued", Message: "Job admitted"})
 	if manager.registryBytes != firstExpected {
 		t.Fatalf("new admission charge = %d, want %d", manager.registryBytes, firstExpected)
 	}
@@ -564,8 +564,8 @@ func TestRegistryBudgetAccountsForAdmissionLifecycleAndEviction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	thirdCharge := recordBytes(third.Request, "third-key") + eventBytes(Event{Type: "queued", Message: "Job admitted"})
-	if manager.registryBytes != beforeEvict+thirdCharge-(recordBytes(first.Request, "first-key")+eventBytes(Event{Type: "succeeded", Message: "Job finished"})+eventBytes(Event{Type: "extra", Message: "history payload"})) {
+	thirdCharge := recordBytes(third.Request, "third-key", legacySharedPrincipalID) + eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	if manager.registryBytes != beforeEvict+thirdCharge-(recordBytes(first.Request, "first-key", legacySharedPrincipalID)+eventBytes(Event{Type: "succeeded", Message: "Job finished"})+eventBytes(Event{Type: "extra", Message: "history payload"})) {
 		t.Fatalf("eviction charge incorrect: got %d", manager.registryBytes)
 	}
 	if _, err := manager.Get(first.ID); !errors.Is(err, ErrNotFound) {
@@ -595,7 +595,7 @@ func TestRegistryBudgetAccountsForAdmissionLifecycleAndEviction(t *testing.T) {
 }
 
 func TestCloseMarksTruncatedWhenCancellationEventCannotFit(t *testing.T) {
-	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 360})
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 373})
 	job, _, err := manager.Admit("close-key", Request{Repository: "repo", Task: "task"})
 	if err != nil {
 		t.Fatal(err)
@@ -691,7 +691,7 @@ func TestRegistryBudgetReclaimsOldestHistoryAcrossRecords(t *testing.T) {
 }
 
 func TestLifecycleTransitionsTruncateHistoryWhenEventCannotFit(t *testing.T) {
-	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 349})
+	manager := testManager(t, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 1, MaxEventsPerJob: 4, MaxTaskBytes: 128, RegistryBytes: 362})
 	job, _, err := manager.Admit("key", Request{Repository: "repo", Task: "task"})
 	if err != nil {
 		t.Fatal(err)

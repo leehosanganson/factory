@@ -20,6 +20,90 @@ import (
 	"github.com/leehosanganson/factory/internal/restserver"
 )
 
+func TestRESTListMineUsesSubmitterCursorDTOAndRejectsMixedPagination(t *testing.T) {
+	const token = "rest-list-test-token"
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		requests = append(requests, r.Method+" "+r.URL.RequestURI())
+		if _, exists := r.URL.Query()["cursor"]; exists && r.URL.Query().Get("cursor") != "opaque /+=" {
+			t.Errorf("cursor query = %q, want opaque cursor", r.URL.Query().Get("cursor"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"jobs":[{"id":"mine-1","status":"queued","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}],"has_more":true,"next_cursor":"opaque /+="}`)
+	}))
+	defer server.Close()
+	root := t.TempDir()
+	tokenPath := filepath.Join(root, "token")
+	if err := os.WriteFile(tokenPath, []byte(token), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "client.json")
+	if err := os.WriteFile(configPath, []byte(`{"base_url":"`+server.URL+`","token_file":"token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := runRESTClient([]string{"list", "--mine", "--limit", "2", "--json", "--config", configPath}, &out); err != nil {
+		t.Fatalf("first submitter page: %v", err)
+	}
+	var response struct {
+		SchemaVersion int `json:"schema_version"`
+		Result        struct {
+			Page map[string]json.RawMessage `json:"page"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &response); err != nil {
+		t.Fatalf("decode submitter JSON %q: %v", out.String(), err)
+	}
+	if response.SchemaVersion != 1 || len(response.Result.Page) != 3 {
+		t.Fatalf("submitter JSON page fields = %v", response.Result.Page)
+	}
+	var nextCursor string
+	if err := json.Unmarshal(response.Result.Page["next_cursor"], &nextCursor); err != nil || nextCursor != "opaque /+=" {
+		t.Fatalf("submitter next_cursor = %q, err=%v; want opaque cursor preserved", nextCursor, err)
+	}
+	for _, field := range []string{"snapshot_sequence", "next_sequence", "submitted_by"} {
+		if _, ok := response.Result.Page[field]; ok {
+			t.Errorf("submitter JSON exposed operator/identity field %q: %s", field, out.String())
+		}
+	}
+	if len(requests) != 1 || requests[0] != "GET /v1/jobs?limit=2" {
+		t.Fatalf("first-page requests = %v", requests)
+	}
+
+	out.Reset()
+	if err := runRESTClient([]string{"list", "--mine", "--cursor", "opaque /+=", "--config", configPath}, &out); err != nil {
+		t.Fatalf("submitter continuation: %v", err)
+	}
+	if len(requests) != 2 || requests[1] != "GET /v1/jobs?cursor=opaque+%2F%2B%3D" {
+		t.Fatalf("submitter continuation request = %v", requests)
+	}
+	out.Reset()
+	if err := runRESTClient([]string{"list", "--mine", "--cursor", "opaque /+=", "--config", configPath}, &out); err != nil {
+		t.Fatalf("text submitter continuation: %v", err)
+	}
+	if !strings.Contains(out.String(), `Next cursor: "opaque /+="`) || strings.Contains(out.String(), "snapshot_sequence") || strings.Contains(out.String(), "next_sequence") {
+		t.Fatalf("submitter text output did not safely preserve cursor: %q", out.String())
+	}
+
+	for _, args := range [][]string{
+		{"list", "--cursor", "opaque", "--config", configPath},
+		{"list", "--mine", "--cursor", "opaque", "--after", "1", "--snapshot", "2", "--config", configPath},
+		{"list", "--mine", "--after", "1", "--config", configPath},
+		{"list", "--mine", "--cursor=", "--config", configPath},
+	} {
+		if err := runRESTClient(args, &out); err == nil || !strings.Contains(err.Error(), "usage:") {
+			t.Errorf("invalid list arguments %v: error=%v, want usage error", args, err)
+		}
+	}
+	if len(requests) != 3 {
+		t.Fatalf("invalid pagination arguments sent requests: %v", requests)
+	}
+}
+
 func TestRESTOperationsProcessIsReadOnlyAndReturnsCuratedSummary(t *testing.T) {
 	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10})
 	if err != nil {

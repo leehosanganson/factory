@@ -2,6 +2,8 @@ package restjobs
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -523,6 +525,184 @@ func TestSQLiteStoreCloseCancelsQueuedButPreservesRunningForRecovery(t *testing.
 	job, err = reopened.Get(queued.ID)
 	if err != nil || job.Status != StatusCanceled {
 		t.Fatalf("queued job after shutdown = (%+v,%v)", job, err)
+	}
+}
+
+func TestSQLiteStoreConcurrentConnectionsScopeIdempotencyAndRejectForeignProvenance(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	stores := make([]*SQLiteStore, 2)
+	for i := range stores {
+		store, err := OpenSQLiteStore(path, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = store
+		defer store.CloseStore()
+	}
+	const callers = 12
+	start := make(chan struct{})
+	type result struct {
+		job Snapshot
+		err error
+	}
+	results := make(chan result, callers)
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			job, _, err := stores[index%len(stores)].AdmitAs("shared-key", "alice", Request{Repository: "widget", Task: "same"})
+			results <- result{job: job, err: err}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	var id string
+	for result := range results {
+		if result.err != nil {
+			t.Errorf("concurrent principal admission: %v", result.err)
+			continue
+		}
+		if id == "" {
+			id = result.job.ID
+		}
+		if result.job.ID != id || result.job.Submitter != "alice" {
+			t.Errorf("admission=(%+v), expected one alice job", result.job)
+		}
+	}
+	if id == "" {
+		t.Fatal("no concurrent admission succeeded")
+	}
+	other, replay, err := stores[1].AdmitAs("shared-key", "bob", Request{Repository: "widget", Task: "same"})
+	if err != nil || replay || other.ID == id || other.Submitter != "bob" {
+		t.Fatalf("same key for second principal=(%+v,%t,%v), want independent admission", other, replay, err)
+	}
+	start = make(chan struct{})
+	provenanceResults := make(chan result, 2)
+	for index, principal := range []string{"carol", "dave"} {
+		wg.Add(1)
+		go func(index int, principal string) {
+			defer wg.Done()
+			<-start
+			job, _, err := stores[index].AdmitAs("parallel-provenance", principal, provenanceRequest("payload from "+principal))
+			provenanceResults <- result{job: job, err: err}
+		}(index, principal)
+	}
+	close(start)
+	wg.Wait()
+	close(provenanceResults)
+	admitted, conflicts := 0, 0
+	for result := range provenanceResults {
+		if result.err == nil {
+			admitted++
+			if result.job.Submitter != "carol" && result.job.Submitter != "dave" {
+				t.Errorf("unexpected provenance winner attribution: %+v", result.job)
+			}
+		} else if errors.Is(result.err, ErrProvenanceConflict) {
+			conflicts++
+		} else {
+			t.Errorf("unexpected cross-principal provenance race error: %v", result.err)
+		}
+	}
+	if admitted != 1 || conflicts != 1 {
+		t.Fatalf("concurrent foreign provenance admissions: admitted=%d conflicts=%d, want one each", admitted, conflicts)
+	}
+}
+
+func TestSQLitePrincipalAttributionMigrationBackfillsAndPreservesRecords(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "legacy.db")
+	dsn, err := sqliteDSN(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`CREATE TABLE factory_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	files, err := MigrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, name := range files[:7] {
+		payload, err := migrationFiles.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(string(payload)); err != nil {
+			t.Fatalf("apply legacy migration %s: %v", name, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO factory_schema_migrations(version,name,applied_at) VALUES(?,?,?)`, index+1, filepath.Base(name), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request, err := json.Marshal(provenanceRequest("preserved task"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.Exec(`INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,history_truncated,event_sequence) VALUES('legacy-job',?,'queued',?,?,1,0,1)`, string(request), created, created); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO factory_job_idempotency(key,job_id,request_json) VALUES('legacy-key','legacy-job',?)`, string(request)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO factory_job_issue_provenance(tracker,source_repository,issue_number,version,job_id) VALUES('github','acme/widget',42,?,'legacy-job')`, strings.Repeat("a", 64)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(`INSERT INTO factory_job_events(job_id,sequence,at,type,message) VALUES('legacy-job',1,?,'queued','Job admitted')`, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	got, err := store.Get("legacy-job")
+	if err != nil || got.Submitter != legacySharedPrincipalID || got.Request.Task != "preserved task" || got.Request.IssueProvenance == nil {
+		t.Fatalf("migrated record=(%+v,%v)", got, err)
+	}
+	replay, isReplay, err := store.Admit("legacy-key", provenanceRequest("preserved task"))
+	if err != nil || !isReplay || replay.ID != "legacy-job" || replay.Submitter != legacySharedPrincipalID {
+		t.Fatalf("legacy idempotency replay=(%+v,%t,%v)", replay, isReplay, err)
+	}
+	if _, _, err := store.AdmitAs("legacy-key", "new-principal", provenanceRequest("different task")); !errors.Is(err, ErrProvenanceConflict) {
+		t.Fatalf("migrated provenance ownership conflict=%v, want conflict", err)
+	}
+	var jobs, keys, provenance, compositeKeyColumns int
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM factory_jobs WHERE id='legacy-job'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM factory_job_idempotency WHERE principal_id='legacy-shared' AND key='legacy-key'`).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM factory_job_issue_provenance WHERE job_id='legacy-job'`).Scan(&provenance); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('factory_job_idempotency') WHERE pk>0`).Scan(&compositeKeyColumns); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 || keys != 1 || provenance != 1 || compositeKeyColumns != 2 {
+		t.Fatalf("migration data/schema jobs=%d keys=%d provenance=%d primary-key columns=%d", jobs, keys, provenance, compositeKeyColumns)
 	}
 }
 

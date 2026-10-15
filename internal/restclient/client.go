@@ -101,6 +101,54 @@ func (c *Client) List(ctx context.Context, limit int, after, snapshot uint64) (r
 	return result, err
 }
 
+// SubmitterJobPage is a principal-filtered page with an opaque continuation
+// cursor. It deliberately has no operator admission-sequence metadata.
+type SubmitterJobPage struct {
+	Jobs       []restjobs.JobSummary `json:"jobs"`
+	HasMore    bool                  `json:"has_more"`
+	NextCursor string                `json:"next_cursor"`
+}
+
+// ListForPrincipal lists jobs visible to the authenticated submitter. The
+// cursor is opaque and is bound by the server to both the principal and process.
+func (c *Client) ListForPrincipal(ctx context.Context, limit int, cursor string) (SubmitterJobPage, error) {
+	values := url.Values{}
+	if limit > 0 {
+		values.Set("limit", strconv.Itoa(limit))
+	}
+	if cursor != "" {
+		values.Set("cursor", cursor)
+	}
+	path := "/v1/jobs"
+	if encoded := values.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var result SubmitterJobPage
+	decode := func(response *http.Response) error {
+		var fields map[string]json.RawMessage
+		if err := json.NewDecoder(response.Body).Decode(&fields); err != nil {
+			return err
+		}
+		for _, name := range []string{"jobs", "has_more", "next_cursor"} {
+			if _, exists := fields[name]; !exists {
+				return errors.New("response is not a submitter job page")
+			}
+		}
+		for name := range fields {
+			if name != "jobs" && name != "has_more" && name != "next_cursor" {
+				return errors.New("response is not a submitter job page")
+			}
+		}
+		data, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		return json.Unmarshal(data, &result)
+	}
+	err := c.request(ctx, http.MethodGet, path, nil, http.StatusOK, decode, nil)
+	return result, err
+}
+
 func (c *Client) History(ctx context.Context, id string) (restjobs.History, error) {
 	var result restjobs.History
 	err := c.request(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(id)+"/history", nil, http.StatusOK, decodeJSON(&result), nil)
