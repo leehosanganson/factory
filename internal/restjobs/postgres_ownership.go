@@ -8,13 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"time"
 )
 
 const (
-	postgresOwnershipSchemaVersion               = 2
-	postgresOwnershipPreviousSchemaVersion       = 1
-	postgresOwnershipMigrationLockKey      int64 = 0x464143544F5259 // "FACTORY", reserved for ownership migrations.
+	postgresOwnershipInitializationLockKey int64 = 0x464143544F5259 // "FACTORY", reserved for ownership initialization.
 	postgresMinLease                             = 5 * time.Second
 	postgresMaxLease                             = 10 * time.Minute
 	postgresMaxOwnerIDBytes                      = 128
@@ -50,112 +49,192 @@ func NewPostgresOwnership(db *sql.DB) *PostgresOwnership {
 	return &PostgresOwnership{db: db}
 }
 
-// Migrate creates the ownership and attempt-history schema, upgrading v1
-// ownership metadata when needed. The foreign keys make migration fail closed
-// when factory_jobs is absent.
-func (p *PostgresOwnership) Migrate(ctx context.Context) error {
+// Initialize creates the ownership and attempt-history schema in one
+// transaction. The foreign keys make initialization fail closed when
+// factory_jobs is absent.
+func (p *PostgresOwnership) Initialize(ctx context.Context) error {
 	if ctx == nil || p == nil || p.db == nil {
 		return ErrInvalidInput
 	}
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
-		return errors.New("begin PostgreSQL ownership migration")
+		return errors.New("begin PostgreSQL ownership initialization")
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresOwnershipMigrationLockKey); err != nil {
-		return errors.New("lock PostgreSQL ownership migration")
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresOwnershipInitializationLockKey); err != nil {
+		return errors.New("lock PostgreSQL ownership initialization")
 	}
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS factory_postgres_ownership_schema (
-		singleton smallint PRIMARY KEY CHECK (singleton = 1),
-		version integer NOT NULL CHECK (version > 0)
-	)`); err != nil {
-		return errors.New("create PostgreSQL ownership schema")
+	var ownershipExists, historyExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT
+		to_regclass('factory_job_ownership') IS NOT NULL,
+		to_regclass('factory_job_attempt_history') IS NOT NULL`).Scan(&ownershipExists, &historyExists); err != nil {
+		return errors.New("check existing PostgreSQL ownership tables")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_postgres_ownership_schema(singleton, version)
-		VALUES (1, $1) ON CONFLICT (singleton) DO NOTHING`, postgresOwnershipSchemaVersion); err != nil {
-		return errors.New("record PostgreSQL ownership schema version")
+	if ownershipExists != historyExists {
+		return errors.New("incomplete PostgreSQL ownership schema; fresh initialization required")
 	}
-	var version int
-	if err := tx.QueryRowContext(ctx, `SELECT version FROM factory_postgres_ownership_schema WHERE singleton = 1 FOR UPDATE`).Scan(&version); err != nil {
-		return errors.New("read PostgreSQL ownership schema version")
-	}
-	if version != postgresOwnershipSchemaVersion && version != postgresOwnershipPreviousSchemaVersion {
-		return fmt.Errorf("unsupported PostgreSQL ownership schema version %d", version)
-	}
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS factory_job_ownership (
-		job_id text PRIMARY KEY REFERENCES factory_jobs(id),
-		generation bigint NOT NULL CHECK (generation > 0),
-		owner_token text NOT NULL CHECK (length(owner_token) = 64),
-		worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
-		boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
-		lease_until timestamptz NOT NULL,
-		updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
-	)`); err != nil {
-		return errors.New("create PostgreSQL ownership table")
-	}
-	// Worker and boot IDs are operator-chosen labels, not credentials. The
-	// bearer owner token is deliberately absent from durable attempt history.
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS factory_job_attempt_history (
-		job_id text NOT NULL REFERENCES factory_jobs(id),
-		generation bigint NOT NULL CHECK (generation > 0),
-		worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
-		boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
-		claimed_at timestamptz NOT NULL,
-		started_at timestamptz NOT NULL,
-		lease_until timestamptz NOT NULL,
-		finished_at timestamptz,
-		status text CHECK (status IN ('succeeded', 'failed', 'canceled')),
-		PRIMARY KEY (job_id, generation),
-		CHECK ((finished_at IS NULL AND status IS NULL) OR (finished_at IS NOT NULL AND status IS NOT NULL))
-	)`); err != nil {
-		return errors.New("create PostgreSQL attempt history table")
-	}
-	if version == postgresOwnershipPreviousSchemaVersion {
-		var runningJobWithoutOwnership bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
-			SELECT 1 FROM factory_jobs AS j
-			LEFT JOIN factory_job_ownership AS o ON o.job_id = j.id
-			WHERE j.status = 'running' AND o.job_id IS NULL
-		)`).Scan(&runningJobWithoutOwnership); err != nil {
-			return errors.New("check PostgreSQL running job ownership")
+	if ownershipExists {
+		if err := validatePostgresOwnershipTableColumns(ctx, tx); err != nil {
+			return err
 		}
-		if runningJobWithoutOwnership {
-			return errors.New("running PostgreSQL job has no ownership record")
+		if err := validatePostgresOwnershipConstraints(ctx, tx); err != nil {
+			return err
 		}
-		// v1 ownership predates durable attempt history. Preserve the currently
-		// running attempt so it can still finish; updated_at is the best available
-		// claim/start timestamp because v1 did not retain separate timestamps.
-		var conflictingHistory bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
-			SELECT 1 FROM factory_job_ownership AS o
-			JOIN factory_jobs AS j ON j.id = o.job_id
-			JOIN factory_job_attempt_history AS h ON h.job_id = o.job_id AND h.generation = o.generation
-			WHERE j.status = 'running' AND (
-				h.worker_id IS DISTINCT FROM o.worker_id OR h.boot_id IS DISTINCT FROM o.boot_id OR
-				h.claimed_at IS DISTINCT FROM o.updated_at OR h.started_at IS DISTINCT FROM o.updated_at OR
-				h.lease_until IS DISTINCT FROM o.lease_until OR h.finished_at IS NOT NULL OR h.status IS NOT NULL
+	} else {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE factory_job_ownership (
+			job_id text PRIMARY KEY REFERENCES factory_jobs(id),
+			generation bigint NOT NULL CHECK (generation > 0),
+			owner_token text NOT NULL CHECK (length(owner_token) = 64),
+			worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
+			boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
+			lease_until timestamptz NOT NULL,
+			updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+		)`); err != nil {
+			return errors.New("create PostgreSQL ownership table")
+		}
+		// Worker and boot IDs are operator-chosen labels, not credentials. The
+		// bearer owner token is deliberately absent from durable attempt history.
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE factory_job_attempt_history (
+			job_id text NOT NULL REFERENCES factory_jobs(id),
+			generation bigint NOT NULL CHECK (generation > 0),
+			worker_id text NOT NULL CHECK (length(worker_id) BETWEEN 1 AND 128),
+			boot_id text NOT NULL CHECK (length(boot_id) BETWEEN 1 AND 128),
+			claimed_at timestamptz NOT NULL,
+			started_at timestamptz NOT NULL,
+			lease_until timestamptz NOT NULL,
+			finished_at timestamptz,
+			status text CHECK (status IN ('succeeded', 'failed', 'canceled')),
+			PRIMARY KEY (job_id, generation),
+			CHECK ((finished_at IS NULL AND status IS NULL) OR (finished_at IS NOT NULL AND status IS NOT NULL))
+		)`); err != nil {
+			return errors.New("create PostgreSQL attempt history table")
+		}
+	}
+	var incompleteRunningAttempt bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
+		SELECT 1 FROM factory_jobs AS j
+		LEFT JOIN factory_job_ownership AS o ON o.job_id = j.id
+		WHERE j.status = 'running' AND (
+			o.job_id IS NULL OR NOT EXISTS (
+				SELECT 1 FROM factory_job_attempt_history AS h
+				WHERE h.job_id = o.job_id AND h.generation = o.generation
+				AND h.worker_id = o.worker_id AND h.boot_id = o.boot_id
+				AND h.lease_until = o.lease_until AND h.finished_at IS NULL AND h.status IS NULL
 			)
-		)`).Scan(&conflictingHistory); err != nil {
-			return errors.New("check PostgreSQL active attempt history conflicts")
-		}
-		if conflictingHistory {
-			return errors.New("conflicting PostgreSQL active attempt history")
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_attempt_history
-			(job_id, generation, worker_id, boot_id, claimed_at, started_at, lease_until)
-			SELECT o.job_id, o.generation, o.worker_id, o.boot_id, o.updated_at, o.updated_at, o.lease_until
-			FROM factory_job_ownership AS o
-			JOIN factory_jobs AS j ON j.id = o.job_id
-			WHERE j.status = 'running'
-			ON CONFLICT (job_id, generation) DO NOTHING`); err != nil {
-			return errors.New("backfill PostgreSQL active attempt history")
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE factory_postgres_ownership_schema SET version = $1 WHERE singleton = 1`, postgresOwnershipSchemaVersion); err != nil {
-			return errors.New("upgrade PostgreSQL ownership schema version")
-		}
+		)
+	)`).Scan(&incompleteRunningAttempt); err != nil {
+		return errors.New("validate PostgreSQL running attempt history")
+	}
+	if incompleteRunningAttempt {
+		return errors.New("running PostgreSQL job lacks matching active ownership history")
 	}
 	if err := tx.Commit(); err != nil {
-		return errors.New("commit PostgreSQL ownership migration")
+		return errors.New("commit PostgreSQL ownership initialization")
+	}
+	return nil
+}
+
+func validatePostgresOwnershipTableColumns(ctx context.Context, tx *sql.Tx) error {
+	for table, want := range map[string][]string{
+		"factory_job_ownership": {
+			"job_id:text:NO", "generation:bigint:NO", "owner_token:text:NO", "worker_id:text:NO",
+			"boot_id:text:NO", "lease_until:timestamp with time zone:NO", "updated_at:timestamp with time zone:NO",
+		},
+		"factory_job_attempt_history": {
+			"job_id:text:NO", "generation:bigint:NO", "worker_id:text:NO", "boot_id:text:NO",
+			"claimed_at:timestamp with time zone:NO", "started_at:timestamp with time zone:NO",
+			"lease_until:timestamp with time zone:NO", "finished_at:timestamp with time zone:YES", "status:text:YES",
+		},
+	} {
+		rows, err := tx.QueryContext(ctx, `SELECT column_name || ':' || data_type || ':' || is_nullable
+			FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1
+			ORDER BY ordinal_position`, table)
+		if err != nil {
+			return errors.New("inspect PostgreSQL ownership table columns")
+		}
+		var got []string
+		for rows.Next() {
+			var column string
+			if err := rows.Scan(&column); err != nil {
+				rows.Close()
+				return errors.New("read PostgreSQL ownership table columns")
+			}
+			got = append(got, column)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return errors.New("read PostgreSQL ownership table columns")
+		}
+		if err := rows.Close(); err != nil {
+			return errors.New("close PostgreSQL ownership table columns")
+		}
+		if len(got) != len(want) {
+			return errors.New("incompatible PostgreSQL ownership schema; fresh initialization required")
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				return errors.New("incompatible PostgreSQL ownership schema; fresh initialization required")
+			}
+		}
+	}
+	return nil
+}
+
+func validatePostgresOwnershipConstraints(ctx context.Context, tx *sql.Tx) error {
+	want := map[string][]string{
+		"factory_job_ownership": {
+			"p:PRIMARY KEY (job_id)",
+			"f:FOREIGN KEY (job_id) REFERENCES factory_jobs(id)",
+			"c:CHECK ((generation > 0))",
+			"c:CHECK ((length(owner_token) = 64))",
+			"c:CHECK (((length(worker_id) >= 1) AND (length(worker_id) <= 128)))",
+			"c:CHECK (((length(boot_id) >= 1) AND (length(boot_id) <= 128)))",
+		},
+		"factory_job_attempt_history": {
+			"p:PRIMARY KEY (job_id, generation)",
+			"f:FOREIGN KEY (job_id) REFERENCES factory_jobs(id)",
+			"c:CHECK ((generation > 0))",
+			"c:CHECK (((length(worker_id) >= 1) AND (length(worker_id) <= 128)))",
+			"c:CHECK (((length(boot_id) >= 1) AND (length(boot_id) <= 128)))",
+			"c:CHECK ((((finished_at IS NULL) AND (status IS NULL)) OR ((finished_at IS NOT NULL) AND (status IS NOT NULL))))",
+			"c:CHECK ((status = ANY (ARRAY['succeeded'::text, 'failed'::text, 'canceled'::text])))",
+		},
+	}
+	for table, wantConstraints := range want {
+		rows, err := tx.QueryContext(ctx, `SELECT contype::text || ':' || pg_get_constraintdef(c.oid) || CASE WHEN c.convalidated THEN '' ELSE ':NOT VALID' END
+			FROM pg_constraint AS c JOIN pg_namespace AS n ON n.oid = c.connamespace
+			WHERE c.conrelid = to_regclass($1) AND n.nspname = current_schema()
+				AND c.contype IN ('p', 'f', 'c', 'u')
+			ORDER BY c.contype, c.conname`, table)
+		if err != nil {
+			return errors.New("inspect PostgreSQL ownership table constraints")
+		}
+		var got []string
+		for rows.Next() {
+			var constraint string
+			if err := rows.Scan(&constraint); err != nil {
+				rows.Close()
+				return errors.New("read PostgreSQL ownership table constraints")
+			}
+			got = append(got, constraint)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return errors.New("read PostgreSQL ownership table constraints")
+		}
+		if err := rows.Close(); err != nil {
+			return errors.New("close PostgreSQL ownership table constraints")
+		}
+		sort.Strings(got)
+		sort.Strings(wantConstraints)
+		if len(got) != len(wantConstraints) {
+			return errors.New("incompatible PostgreSQL ownership schema; fresh initialization required")
+		}
+		for i := range got {
+			if got[i] != wantConstraints[i] {
+				return fmt.Errorf("incompatible PostgreSQL ownership schema; fresh initialization required (%s: got %q, want %q)", table, got[i], wantConstraints[i])
+			}
+		}
 	}
 	return nil
 }

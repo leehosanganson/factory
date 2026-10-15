@@ -49,3 +49,7 @@ factory rest help
 ```
 
 Run `factory server doctor --config /absolute/path/to/server.json` for a local-only, read-only preflight of strict configuration and local prerequisites. It does not test provider reachability and does not open/create SQLite, start a listener, or run the workflow. See [REST job server](docs/features/rest-server.md) for current setup and limits. Do not expose the service beyond a trusted network without appropriate authentication and network controls; local-process/container execution is not a security sandbox.
+
+### PostgreSQL ownership protocol tests
+
+The isolated PostgreSQL ownership protocol integration tests require PostgreSQL 18. With Docker Compose available, run `make test-postgres`; this starts the disposable service defined in [`docker-compose.postgres-test.yml`](docker-compose.postgres-test.yml), waits for readiness, and runs the required integration suite. Stop it with `make test-postgres-down`. The service binds only to loopback on port `55432` and stores data in a dedicated named test volume; `make test-postgres-down` removes the container and that volume/data. This test service is not a production persistence backend and does not enable PostgreSQL runtime integration.
