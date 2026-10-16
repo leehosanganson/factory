@@ -20,6 +20,52 @@ import (
 	"github.com/leehosanganson/factory/internal/restserver"
 )
 
+func TestRESTIssueProvenanceCommandUsesNarrowInspectionRoute(t *testing.T) {
+	const token = "provenance-cli-token"
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		_, _ = io.WriteString(w, `{"job_id":"job-42","issue_provenance":{"tracker":"github","source_repository":"acme/widget","issue_number":42,"version":"`+strings.Repeat("a", 64)+`","url":"https://github.com/acme/widget/issues/42","title":"Bounded title"}}`)
+	}))
+	defer server.Close()
+	configPath := writeRESTClientTestConfig(t, server.URL, token)
+
+	var out bytes.Buffer
+	if err := runRESTClient([]string{"issue-provenance", "--json", "--config", configPath, "job-42"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "task") || strings.Contains(out.String(), "issue body") || !strings.Contains(out.String(), "Bounded title") {
+		t.Fatalf("provenance JSON output = %s", out.String())
+	}
+	out.Reset()
+	if err := runRESTClient([]string{"issue-provenance", "--config", configPath, "job-42"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "Bounded title") || strings.Contains(out.String(), "issue body") || !strings.Contains(out.String(), "acme/widget#42") {
+		t.Fatalf("provenance text output = %s", out.String())
+	}
+	if len(requests) != 2 || requests[0] != "GET /v1/jobs/job-42/issue-provenance" || requests[1] != requests[0] {
+		t.Fatalf("requests = %v", requests)
+	}
+}
+
+func writeRESTClientTestConfig(t *testing.T, baseURL, token string) string {
+	t.Helper()
+	root := t.TempDir()
+	tokenPath := filepath.Join(root, "token")
+	if err := os.WriteFile(tokenPath, []byte(token), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "client.json")
+	if err := os.WriteFile(configPath, []byte(`{"base_url":"`+baseURL+`","token_file":"token"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return configPath
+}
+
 func TestRESTListMineUsesSubmitterCursorDTOAndRejectsMixedPagination(t *testing.T) {
 	const token = "rest-list-test-token"
 	var requests []string

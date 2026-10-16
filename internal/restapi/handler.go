@@ -207,6 +207,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "issue-provenance" {
+			if r.Method != http.MethodGet {
+				methodNotAllowed(w, http.MethodGet)
+				return
+			}
+			if caller.Role == "submitter" {
+				h.getIssueProvenanceForPrincipal(w, parts[0], caller.ID)
+			} else {
+				h.getIssueProvenance(w, parts[0])
+			}
+			return
+		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "history" {
 			if r.Method != http.MethodGet {
 				methodNotAllowed(w, http.MethodGet)
@@ -269,7 +281,7 @@ func submitterRoute(path, method string) bool {
 		return false
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/v1/jobs/"), "/")
-	return len(parts) == 1 && parts[0] != "" || len(parts) == 2 && parts[0] != "" && (parts[1] == "history" || parts[1] == "events")
+	return len(parts) == 1 && parts[0] != "" || len(parts) == 2 && parts[0] != "" && (parts[1] == "history" || parts[1] == "events" || parts[1] == "issue-provenance")
 }
 
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
@@ -661,6 +673,37 @@ func (h *Handler) getJobForPrincipal(w http.ResponseWriter, id, principalID stri
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+type issueProvenanceResponse struct {
+	JobID      string                   `json:"job_id"`
+	Provenance restjobs.IssueProvenance `json:"issue_provenance"`
+}
+
+func (h *Handler) getIssueProvenanceForPrincipal(w http.ResponseWriter, id, principalID string) {
+	snapshot, err := h.manager.GetForPrincipal(id, principalID)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	writeIssueProvenance(w, snapshot)
+}
+
+func (h *Handler) getIssueProvenance(w http.ResponseWriter, id string) {
+	snapshot, err := h.manager.Get(id)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	writeIssueProvenance(w, snapshot)
+}
+
+func writeIssueProvenance(w http.ResponseWriter, snapshot restjobs.Snapshot) {
+	if snapshot.Request.IssueProvenance == nil {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
+	writeJSON(w, http.StatusOK, issueProvenanceResponse{JobID: snapshot.ID, Provenance: *snapshot.Request.IssueProvenance})
 }
 
 func (h *Handler) getHistoryForPrincipal(w http.ResponseWriter, id, principalID string) {

@@ -155,8 +155,10 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 					In   string `json:"in"`
 				} `json:"parameters"`
 				Responses map[string]struct {
-					Content map[string]struct {
+					Description string `json:"description"`
+					Content     map[string]struct {
 						Schema struct {
+							Ref   string `json:"$ref"`
 							OneOf []struct {
 								Ref string `json:"$ref"`
 							} `json:"oneOf"`
@@ -167,16 +169,37 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 		} `json:"paths"`
 		Components struct {
 			Schemas map[string]struct {
-				Required   []string                   `json:"required"`
-				Properties map[string]json.RawMessage `json:"properties"`
+				Required             []string                   `json:"required"`
+				Properties           map[string]json.RawMessage `json:"properties"`
+				AdditionalProperties *bool                      `json:"additionalProperties"`
 			} `json:"schemas"`
 		} `json:"components"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.4.0" {
-		t.Errorf("OpenAPI version = %q, want 1.4.0", document.Info.Version)
+	if document.Info.Version != "1.4.1" {
+		t.Errorf("OpenAPI version = %q, want 1.4.1", document.Info.Version)
+	}
+	provenanceRoute, ok := document.Paths["/v1/jobs/{id}/issue-provenance"]
+	if !ok {
+		t.Fatal("OpenAPI spec is missing GET /v1/jobs/{id}/issue-provenance")
+	}
+	provenance200, ok := provenanceRoute.Get.Responses["200"]
+	if !ok {
+		t.Fatal("provenance route is missing its 200 response")
+	}
+	provenanceSchema := provenance200.Content["application/json"].Schema.Ref
+	if provenanceSchema != "#/components/schemas/JobIssueProvenance" {
+		t.Errorf("provenance response schema = %q", provenanceSchema)
+	}
+	if provenanceRoute.Get.Description == "" {
+		t.Error("provenance route is missing its behavior and authorization description")
+	}
+	for _, status := range []string{"401", "404", "405", "500", "503"} {
+		if _, exists := provenanceRoute.Get.Responses[status]; !exists {
+			t.Errorf("provenance route is missing documented HTTP %s response", status)
+		}
 	}
 	listing, ok := document.Paths["/v1/jobs"]
 	if !ok {
@@ -202,8 +225,9 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 		t.Errorf("GET /v1/jobs response oneOf refs = %v", refs)
 	}
 	for name, required := range map[string][]string{
-		"SubmitterJobPage": {"jobs", "has_more", "next_cursor"},
-		"JobSnapshot":      {"submitted_by"},
+		"SubmitterJobPage":   {"jobs", "has_more", "next_cursor"},
+		"JobSnapshot":        {"submitted_by"},
+		"JobIssueProvenance": {"job_id", "issue_provenance"},
 	} {
 		schema, exists := document.Components.Schemas[name]
 		if !exists {
@@ -217,6 +241,9 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 			if _, exists := schema.Properties[field]; !exists {
 				t.Errorf("%s properties omit %q", name, field)
 			}
+		}
+		if name == "JobIssueProvenance" && (schema.AdditionalProperties == nil || *schema.AdditionalProperties) {
+			t.Error("JobIssueProvenance must reject fields outside the provenance projection")
 		}
 	}
 	for _, expected := range []string{"submitter", "operator", "15 minutes", "restart", "process memory"} {
@@ -277,6 +304,7 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"GET /v1/jobs":                            "listJobs",
 		"POST /v1/jobs":                           "createJob",
 		"GET /v1/jobs/{id}":                       "getJob",
+		"GET /v1/jobs/{id}/issue-provenance":      "getJobIssueProvenance",
 		"GET /v1/jobs/{id}/history":               "getJobHistory",
 		"GET /v1/jobs/{id}/events":                "streamJobEvents",
 		"POST /v1/jobs/{id}/cancel":               "cancelJob",

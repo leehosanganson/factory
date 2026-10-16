@@ -24,6 +24,7 @@ func restClientHelp() []helpCommand {
 		{"factory rest submit --repository <alias> [--idempotency-key <key>] [--json] <task>", "Submit work to the configured REST server."},
 		{"factory rest issue --repository <alias> --issue-repository <owner/repo> [--confirm-version <sha256>] [--json] <issue-number>", "Preview a GitHub issue snapshot or confirm dispatch as a REST job."},
 		{"factory rest get [--json] <job-id>", "Inspect a remote job."},
+		{"factory rest issue-provenance [--json] <job-id>", "Inspect bounded issue provenance without task text."},
 		{"factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json]", "List retained remote jobs (operator listing)."},
 		{"factory rest list --mine [--limit <1..100>] [--cursor <opaque-cursor>] [--json]", "List jobs submitted by the authenticated principal."},
 		{"factory rest history [--json] <job-id>", "Inspect bounded remote job history."},
@@ -96,6 +97,15 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker fa
 		return nil
 	case "issue":
 		return runRESTIssue(ctx, flags, out, *repository, *issueRepository, *confirmVersion, *jsonOutput, tracker, client, *key)
+	case "issue-provenance":
+		if flags.NArg() != 1 {
+			return errors.New("usage: factory rest issue-provenance [--json] <job-id>")
+		}
+		result, err := client.IssueProvenance(ctx, flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		return writeRESTResult(out, *jsonOutput, "issue_provenance", result, fmt.Sprintf("Issue provenance for job %s: %s#%d at version %s", result.JobID, result.Provenance.SourceRepository, result.Provenance.IssueNumber, result.Provenance.Version))
 	case "get":
 		if flags.NArg() != 1 {
 			return errors.New("usage: factory rest get [--json] <job-id>")
@@ -429,6 +439,8 @@ func writeRESTResult(out io.Writer, asJSON bool, name string, value any, text st
 		safeValue = safePage(result)
 	case restclient.SubmitterJobPage:
 		safeValue = safeSubmitterPage(result)
+	case restclient.IssueProvenanceResult:
+		safeValue = result
 	case restjobs.History:
 		safeValue = safeHistory(result)
 	}

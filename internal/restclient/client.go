@@ -83,6 +83,18 @@ func (c *Client) Get(ctx context.Context, id string) (restjobs.Snapshot, error) 
 	return result, err
 }
 
+type IssueProvenanceResult struct {
+	JobID      string                   `json:"job_id"`
+	Provenance restjobs.IssueProvenance `json:"issue_provenance"`
+}
+
+// IssueProvenance returns only the bounded issue identity metadata for a job.
+func (c *Client) IssueProvenance(ctx context.Context, id string) (IssueProvenanceResult, error) {
+	var result IssueProvenanceResult
+	err := c.request(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(id)+"/issue-provenance", nil, http.StatusOK, decodeJSON(&result), nil)
+	return result, err
+}
+
 func (c *Client) List(ctx context.Context, limit int, after, snapshot uint64) (restjobs.JobPage, error) {
 	values := url.Values{}
 	if limit > 0 {
