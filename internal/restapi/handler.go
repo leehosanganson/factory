@@ -672,6 +672,14 @@ func (h *Handler) getJobForPrincipal(w http.ResponseWriter, id, principalID stri
 		h.writeManagerError(w, err)
 		return
 	}
+	if history, historyErr := h.manager.History(id); historyErr == nil {
+		if snapshot.Worker == nil {
+			snapshot.Worker = history.Worker
+		}
+		if snapshot.Progress == nil {
+			snapshot.Progress = history.Progress
+		}
+	}
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
@@ -720,7 +728,35 @@ func (h *Handler) getJob(w http.ResponseWriter, id string) {
 		h.writeManagerError(w, err)
 		return
 	}
+	if history, historyErr := h.manager.History(id); historyErr == nil {
+		if snapshot.Worker == nil {
+			snapshot.Worker = history.Worker
+		}
+		if snapshot.Progress == nil {
+			snapshot.Progress = history.Progress
+		}
+	}
 	writeJSON(w, http.StatusOK, snapshot)
+}
+
+func cloneWorkerSummary(worker *restjobs.WorkerSummary) *restjobs.WorkerSummary {
+	if worker == nil {
+		return nil
+	}
+	copy := *worker
+	return &copy
+}
+
+func latestProgress(events []restjobs.Event) *restjobs.ProgressSummary {
+	for index := len(events) - 1; index >= 0; index-- {
+		if events[index].Type == "stage_progress" {
+			progress, ok := restjobs.ParseProgressEvent(events[index].Message)
+			if ok {
+				return progress
+			}
+		}
+	}
+	return nil
 }
 
 func (h *Handler) getHistory(w http.ResponseWriter, id string) {
@@ -729,6 +765,10 @@ func (h *Handler) getHistory(w http.ResponseWriter, id string) {
 		h.writeManagerError(w, err)
 		return
 	}
+	if progress := latestProgress(history.Events); progress != nil {
+		history.Progress = progress
+	}
+	history.Worker = cloneWorkerSummary(history.Worker)
 	safeEvents := make([]restjobs.Event, 0, len(history.Events))
 	for _, event := range history.Events {
 		if !safeEventType(event.Type) {
@@ -815,8 +855,15 @@ func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request, id string
 	heartbeat := time.NewTicker(eventStreamHeartbeat)
 	defer heartbeat.Stop()
 	sentTerminalEvent := false
+	var lastProgress *restjobs.ProgressSummary
 	for {
 		state := initial
+		if state.Snapshot.Progress != nil && !sameProgress(lastProgress, state.Snapshot.Progress) {
+			if writeStreamProgress(w, controller, streamDeadline, *state.Snapshot.Progress) != nil {
+				return
+			}
+			lastProgress = state.Snapshot.Progress
+		}
 		initial = streamState{}
 		for _, event := range state.History.Events {
 			if event.Sequence <= cursor {
@@ -864,6 +911,12 @@ func (h *Handler) streamEvents(w http.ResponseWriter, r *http.Request, id string
 				return
 			}
 			initial = state
+			if state.Snapshot.Progress != nil && !sameProgress(lastProgress, state.Snapshot.Progress) {
+				if writeStreamProgress(w, controller, streamDeadline, *state.Snapshot.Progress) != nil {
+					return
+				}
+				lastProgress = state.Snapshot.Progress
+			}
 			if state.Snapshot.Status.Terminal() {
 				for _, event := range state.History.Events {
 					if event.Sequence <= cursor {
@@ -917,7 +970,27 @@ func staleEventCursor(history restjobs.History, cursor uint64) string {
 }
 
 func writeStreamEvent(w http.ResponseWriter, controller *http.ResponseController, streamDeadline time.Time, event restjobs.Event) error {
-	return writeStreamFrame(w, controller, streamDeadline, fmt.Sprintf("id: %d\nevent: %s\ndata: {\"at\":%q,\"type\":%q}\n\n", event.Sequence, event.Type, event.At.UTC().Format(time.RFC3339Nano), event.Type))
+	data := fmt.Sprintf("{\"at\":%q,\"type\":%q}", event.At.UTC().Format(time.RFC3339Nano), event.Type)
+	if event.Type == "stage_progress" {
+		progress, ok := restjobs.ParseProgressEvent(event.Message)
+		if !ok {
+			return nil
+		}
+		data = fmt.Sprintf("{\"at\":%q,\"type\":%q,\"stage\":%q,\"state\":%q}", event.At.UTC().Format(time.RFC3339Nano), event.Type, progress.Stage, progress.State)
+	}
+	return writeStreamFrame(w, controller, streamDeadline, fmt.Sprintf("id: %d\nevent: %s\ndata: %s\n\n", event.Sequence, event.Type, data))
+}
+
+func sameProgress(left, right *restjobs.ProgressSummary) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func writeStreamProgress(w http.ResponseWriter, controller *http.ResponseController, streamDeadline time.Time, progress restjobs.ProgressSummary) error {
+	data := fmt.Sprintf(`{"stage":%q,"state":%q}`, progress.Stage, progress.State)
+	return writeStreamControl(w, controller, streamDeadline, "workflow_progress", data)
 }
 
 func writeStreamHeartbeat(w http.ResponseWriter, controller *http.ResponseController, streamDeadline time.Time) error {
@@ -962,7 +1035,7 @@ func clearStreamWriteDeadline(controller *http.ResponseController) error {
 
 func safeEventType(value string) bool {
 	switch value {
-	case "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition":
+	case "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition", "stage_progress":
 		return true
 	default:
 		return false

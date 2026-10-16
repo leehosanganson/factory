@@ -24,21 +24,23 @@ func CheckLocalPrerequisites(config Config) []string {
 			}
 		}
 	}
-	if config.Provider.Backend == "github" {
-		if _, err := LoadProviderToken(config.Provider.TokenFile); err != nil {
-			issues = append(issues, "provider.token_file: unavailable or invalid")
-		}
-	}
 	if config.Persistence.Backend == PersistenceBackendSQLite {
 		if err := checkSQLitePathMetadata(config.Persistence.Path); err != nil {
 			issues = append(issues, "persistence.path: unavailable or unsafe")
 		}
 	}
-	if err := config.ValidateRepositoryRoots(); err != nil {
-		issues = append(issues, "repositories: local checkout validation failed")
-	}
-	if _, err := exec.LookPath(config.Harness.Executable); err != nil {
-		issues = append(issues, "harness.executable: not found")
+	if config.WorkersEnabledValue() {
+		if config.Provider.Backend == "github" {
+			if _, err := LoadProviderToken(config.Provider.TokenFile); err != nil {
+				issues = append(issues, "provider.token_file: unavailable or invalid")
+			}
+		}
+		if err := config.ValidateRepositoryRoots(); err != nil {
+			issues = append(issues, "repositories: local checkout validation failed")
+		}
+		if _, err := exec.LookPath(config.Harness.Executable); err != nil {
+			issues = append(issues, "harness.executable: not found")
+		}
 	}
 	return issues
 }

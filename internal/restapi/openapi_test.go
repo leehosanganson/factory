@@ -30,6 +30,24 @@ func isOpenAPI3Version(version string) bool {
 	return err == nil && major == 3
 }
 
+func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
+	if err != nil {
+		t.Fatalf("read OpenAPI spec: %v", err)
+	}
+	var document struct {
+		Info struct {
+			Version string `json:"version"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatalf("decode OpenAPI spec: %v", err)
+	}
+	if document.Info.Version != "1.5.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.5.0", document.Info.Version)
+	}
+}
+
 func TestOpenAPIDocumentationNavigationAndVersionPolicy(t *testing.T) {
 	link := "[OpenAPI specification](../openapi/rest-api-v1.json)"
 	policy := "Compatible API changes update the spec and info.version; incompatible API changes publish a new versioned document."
@@ -178,8 +196,8 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.4.1" {
-		t.Errorf("OpenAPI version = %q, want 1.4.1", document.Info.Version)
+	if document.Info.Version != "1.5.0" {
+		t.Errorf("OpenAPI version = %q, want 1.5.0", document.Info.Version)
 	}
 	provenanceRoute, ok := document.Paths["/v1/jobs/{id}/issue-provenance"]
 	if !ok {

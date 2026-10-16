@@ -2,13 +2,13 @@
 
 ## Status
 
-**Test-only protocol; no supported production PostgreSQL deployment.** The isolated `PostgresOwnership` API has PostgreSQL 18 integration coverage, but is not a `Store`, REST persistence backend, server option, or production worker coordinator. Current REST persistence remains memory or single-server SQLite with in-process workers. These restrictions are deliberate deployment prohibitions, not verified HA behavior.
+**Test-only protocol fixture; no production failover/HA guarantee.** The isolated `PostgresOwnership` API has PostgreSQL 18 integration coverage, but is not itself the REST Store, runtime option, or worker coordinator and provides no production ownership/failover/recovery authority. Separately, PostgreSQL REST persistence and separately launched workers are implemented; the server can use PostgreSQL with all-in-one workers or a workers-disabled API control plane sharing storage with `factory worker` processes. All-in-one workers remain the default, and there is no fleet coordinator. See the [implemented REST server features](../features/README.md), [PostgreSQL Store](../features/postgres-store.md), and [REST worker process](../features/rest-worker.md). These protocol-test restrictions are deliberate deployment prohibitions, not verified HA behavior.
 
 ## Supported topology for the protocol tests
 
 - PostgreSQL 18, one writable primary, one process/test harness at a time except where independent clients are deliberately used to test concurrency.
 - The PostgreSQL test fixture uses the server's default `READ COMMITTED` isolation. Claims and lifecycle mutations use transactions, row locks and conditional writes; lease checks use the database clock. Claim, heartbeat, and terminal finish update job/ownership/history records atomically within their transactions.
-- CI and local Compose exercise a PostgreSQL 18 primary. They do not test replication, failover, promotion, proxy routing, backup/restore, or runtime integration.
+- The isolated protocol fixture's CI and local Compose tests exercise a PostgreSQL 18 primary. They do not test replication, failover, promotion, proxy routing, backup/restore, or production HA. Separate current Store/runtime coverage is documented in the [PostgreSQL Store feature](../features/postgres-store.md) and [REST worker feature](../features/rest-worker.md).
 - No connection pooler/proxy behavior is included in the supported protocol-test contract. Any deployment integration requires its own reviewed assumptions and tests.
 
 ## Explicitly prohibited deployment assumptions
@@ -42,7 +42,7 @@ Initialization is fresh-schema-only. Existing partial or incompatible ownership/
 
 ## Gate before production integration
 
-Before a PostgreSQL `Store`, REST runtime option, independent production workers, or multi-host claim is proposed, a separate reviewed design must select and test:
+Before this isolated protocol is treated as production HA/failover authority, or used to authorize automatic worker reassignment or multi-host recovery, a separate reviewed design must select and test:
 
 - supported primary/replica/failover manager and topology, including enforceable old-primary/client fencing and split-brain prevention;
 - durability, acknowledged-commit RPO, recovery-point selection, RTO, backup/restore, and ambiguous commit resolution;
@@ -51,4 +51,4 @@ Before a PostgreSQL `Store`, REST runtime option, independent production workers
 - authenticated worker identity, process supervision, cancellation/drain, workspaces/artifacts, and external provider-write uncertainty handling;
 - deterministic integration/fault tests of the selected production topology, not only a local primary.
 
-Until those gates are satisfied, keep REST execution single-server with its supported memory/SQLite modes. Lease expiry remains suspect, never automatic reassignment authority. This contract does not make containers a security sandbox or provide exactly-once workflow/provider effects.
+Until those gates are satisfied, do not treat the isolated ownership protocol as a supported production HA/failover authority, or infer automatic reassignment from lease expiry. The current REST service supports memory, SQLite, and PostgreSQL persistence, including separately launched PostgreSQL workers, but does not provide a fleet coordinator or production failover/restore guarantees. Lease expiry remains suspect, never automatic reassignment authority under this protocol. This contract does not make containers a security sandbox or provide exactly-once workflow/provider effects.

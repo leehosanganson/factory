@@ -144,19 +144,67 @@ func request(handler http.Handler, method, path, body string, authenticated bool
 	return recorder
 }
 
+func TestSafeStageSummaryDoesNotExposePrivateEventMessages(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("safe-stage-summary", restjobs.Request{Repository: "widget", Task: "private task payload"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RecordProgressForAttempt(claim.Attempt, restjobs.ProgressSummary{Stage: "implement", State: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEventForAttempt(claim.Attempt, "private_event", "secret transcript /private/path"); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	get := principalRequest(handler, http.MethodGet, "/v1/jobs/"+job.ID, "", testAPIKey)
+	for _, want := range []string{`"stage":"implement"`, `"state":"started"`} {
+		if !strings.Contains(get.Body.String(), want) {
+			t.Fatalf("GET omitted stage summary %s: %s", want, get.Body.String())
+		}
+	}
+	for _, secret := range []string{"secret transcript", "/private/path"} {
+		if strings.Contains(get.Body.String(), secret) {
+			t.Fatalf("GET leaked %q: %s", secret, get.Body.String())
+		}
+	}
+	history := principalRequest(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/history", "", testAPIKey)
+	if !strings.Contains(history.Body.String(), `"progress":{"stage":"implement","state":"started"}`) {
+		t.Fatalf("history omitted dedicated progress summary: %s", history.Body.String())
+	}
+	for _, want := range []string{`"stage":"implement"`, `"state":"started"`} {
+		if !strings.Contains(history.Body.String(), want) {
+			t.Fatalf("history omitted safe summary %s: %s", want, history.Body.String())
+		}
+	}
+	for _, secret := range []string{"secret transcript", "/private/path", "private_event"} {
+		if strings.Contains(history.Body.String(), secret) {
+			t.Fatalf("history leaked %q: %s", secret, history.Body.String())
+		}
+	}
+}
+
 func TestJobEventStreamReplaysSafeOrderedHistoryAndClosesAtTerminal(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 4))
 	job, _, err := manager.Admit("event-stream", restjobs.Request{Repository: "widget", Task: "private task payload"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := manager.ClaimNext(); err != nil {
+	claim, err := manager.ClaimNextAttempt()
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.AddEvent(job.ID, "running", "/workspace/private-log credential-secret"); err != nil {
+	if err := manager.AddEventForAttempt(claim.Attempt, "running", "/workspace/private-log credential-secret"); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Finish(job.ID, restjobs.StatusSucceeded); err != nil {
+	if err := manager.RecordProgressForAttempt(claim.Attempt, restjobs.ProgressSummary{Stage: "implement", State: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.FinishAttempt(claim.Attempt, restjobs.StatusSucceeded); err != nil {
 		t.Fatal(err)
 	}
 
@@ -166,7 +214,7 @@ func TestJobEventStreamReplaysSafeOrderedHistoryAndClosesAtTerminal(t *testing.T
 	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("event stream response status=%d content-type=%q body=%q", response.Code, response.Header().Get("Content-Type"), body)
 	}
-	for _, event := range []string{"id: 1", "event: queued", "id: 2", "event: running", "id: 3", "event: succeeded"} {
+	for _, event := range []string{"id: 1", "event: queued", "id: 2", "event: running", "event: workflow_progress", `"stage":"implement"`, `"state":"started"`, "id: 3", "event: succeeded"} {
 		if !strings.Contains(body, event) {
 			t.Errorf("event stream omitted %q: %q", event, body)
 		}

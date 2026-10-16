@@ -39,6 +39,7 @@ type FactoryExecutorConfig struct {
 	Workspaces                   map[string]WorkspaceManager
 	WorkflowObserver             factory.WorkflowObserver
 	RecordVerificationEvidence   func(restjobs.AttemptHandle, restjobs.VerificationEvidence) error
+	RecordProgress               func(restjobs.AttemptHandle, restjobs.ProgressSummary) error
 	Provider                     restprovider.Publisher
 	RecordProviderAttempt        func(restjobs.AttemptHandle, restjobs.ProviderAttempt) error
 	MarkProviderAttemptUncertain func(restjobs.AttemptHandle) error
@@ -59,6 +60,7 @@ type FactoryExecutor struct {
 	agent                        func(factory.Config, []string, io.Writer) factory.Agent
 	validateRepositoryRoot       func(context.Context, string) error
 	observer                     factory.WorkflowObserver
+	progress                     func(restjobs.AttemptHandle, restjobs.ProgressSummary) error
 	recordVerificationEvidence   func(restjobs.AttemptHandle, restjobs.VerificationEvidence) error
 	provider                     restprovider.Publisher
 	recordProviderAttempt        func(restjobs.AttemptHandle, restjobs.ProviderAttempt) error
@@ -120,7 +122,7 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 	}
 	return &FactoryExecutor{
 		server: cloneServerConfig(config.Server), workflow: cloneWorkflowConfig(config.Workflow), workspaces: workspaces,
-		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, recordVerificationEvidence: config.RecordVerificationEvidence, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain, providerAttempts: make(map[string]bool),
+		timeout: timeout, env: allowlistedEnvironment(os.Environ()), validateRepositoryRoot: validateRoot, observer: config.WorkflowObserver, progress: config.RecordProgress, recordVerificationEvidence: config.RecordVerificationEvidence, provider: config.Provider, recordProviderAttempt: config.RecordProviderAttempt, markProviderAttemptUncertain: config.MarkProviderAttemptUncertain, providerAttempts: make(map[string]bool),
 		agent: func(workflow factory.Config, env []string, output io.Writer) factory.Agent {
 			return factory.Runner{Config: workflow, Env: env, OutputWriter: output, DisableTranscript: true}
 		},
@@ -128,8 +130,8 @@ func newFactoryExecutor(ctx context.Context, config FactoryExecutorConfig, valid
 }
 
 // NewLocalJobManager builds the selected job store from validated trusted
-// server settings. A configured SQLite failure is returned directly; there is
-// no fallback to volatile memory.
+// server settings. A configured durable-store failure is returned directly;
+// there is no fallback to volatile memory.
 func NewLocalJobManager(config restserver.Config) (restjobs.Store, error) {
 	return newLocalJobManager(config, false)
 }
@@ -150,13 +152,20 @@ func newLocalJobManager(config restserver.Config, server bool) (restjobs.Store, 
 		MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob,
 		MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
 	}
-	if config.Persistence.Backend == restserver.PersistenceBackendSQLite {
+	switch config.Persistence.Backend {
+	case restserver.PersistenceBackendSQLite:
 		if server {
 			return restjobs.OpenSQLiteServerStore(config.Persistence.Path, limits)
 		}
 		return restjobs.OpenSQLiteStore(config.Persistence.Path, limits)
+	case restserver.PersistenceBackendPostgres:
+		if server {
+			return restjobs.OpenPostgresServerStore(config.Persistence.DSN, limits)
+		}
+		return restjobs.OpenPostgresStore(config.Persistence.DSN, limits)
+	default:
+		return restjobs.NewManager(limits)
 	}
-	return restjobs.NewManager(limits)
 }
 
 // Execute bounds workspace provisioning, every workflow stage, and configured
@@ -294,6 +303,14 @@ func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job rest
 	workflowConfig.AutoPublish = false
 	completedChecks := 0
 	observer := factory.WorkflowObserverFunc(func(event factory.WorkflowEvent) error {
+		if event.Type == "stage.started" || event.Type == "stage.completed" || event.Type == "stage.failed" {
+			state := map[string]string{"stage.started": "started", "stage.completed": "completed", "stage.failed": "failed"}[event.Type]
+			if recorder, ok := e.progressRecorder(); ok {
+				if err := recorder(attempt, restjobs.ProgressSummary{Stage: event.Stage, State: state}); err != nil {
+					return errExecutionFailed
+				}
+			}
+		}
 		if event.Type == "check.completed" && completedChecks < len(evidence.Checks) {
 			outcome := restjobs.VerificationFailed
 			switch event.Outcome {
@@ -356,6 +373,10 @@ func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job rest
 		}
 	}
 	return providerOutcome, nil
+}
+
+func (e *FactoryExecutor) progressRecorder() (func(restjobs.AttemptHandle, restjobs.ProgressSummary) error, bool) {
+	return e.progress, e.progress != nil
 }
 
 func validExecutorAttempt(attempt restjobs.AttemptHandle, jobID string) bool {

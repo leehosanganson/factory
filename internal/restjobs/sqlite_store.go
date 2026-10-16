@@ -521,7 +521,7 @@ func (s *SQLiteStore) claimNext(attemptAware bool) (AttemptClaim, error) {
 		return AttemptClaim{}, ErrNoWorkerSlots
 	}
 	if attemptAware {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_worker_ownership(job_id,owner_token,generation,acquired_at,lease_until) VALUES(?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET owner_token=excluded.owner_token,generation=excluded.generation,acquired_at=excluded.acquired_at,lease_until=excluded.lease_until`, id, token, generation, now.Format(time.RFC3339Nano), now.Add(attemptLeaseDuration).Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_worker_ownership(job_id,owner_token,generation,acquired_at,lease_until,worker_id,boot_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET owner_token=excluded.owner_token,generation=excluded.generation,acquired_at=excluded.acquired_at,lease_until=excluded.lease_until,worker_id=excluded.worker_id,boot_id=excluded.boot_id`, id, token, generation, now.Format(time.RFC3339Nano), now.Add(attemptLeaseDuration).Format(time.RFC3339Nano), "worker-local", "boot-local"); err != nil {
 			return AttemptClaim{}, errors.New("record SQLite worker ownership")
 		}
 	}
@@ -752,6 +752,40 @@ func (s *SQLiteStore) HeartbeatAttempt(attempt AttemptHandle) error {
 	return tx.Commit()
 }
 
+func (s *SQLiteStore) SetAttemptIdentity(attempt AttemptHandle) error {
+	tx, ctx, cancel, err := s.beginAttemptTx(attempt)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_worker_ownership SET worker_id=?,boot_id=? WHERE job_id=? AND generation=? AND owner_token=?`, defaultWorkerLabel(attempt.WorkerID), defaultWorkerLabel(attempt.BootID), attempt.JobID, attempt.Generation, attempt.OwnerToken); err != nil {
+		return errors.New("record SQLite worker identity")
+	}
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) RecordProgressForAttempt(attempt AttemptHandle, progress ProgressSummary) error {
+	if !validProgress(progress) {
+		return ErrInvalidInput
+	}
+	tx, ctx, cancel, err := s.beginAttemptTx(attempt)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	defer tx.Rollback()
+	if attempt.WorkerID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE factory_worker_ownership SET worker_id=?,boot_id=? WHERE job_id=? AND generation=? AND owner_token=?`, attempt.WorkerID, attempt.BootID, attempt.JobID, attempt.Generation, attempt.OwnerToken); err != nil {
+			return errors.New("record SQLite worker identity")
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_progress(job_id,stage,state,updated_at) VALUES(?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET stage=excluded.stage,state=excluded.state,updated_at=excluded.updated_at`, attempt.JobID, progress.Stage, progress.State, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return errors.New("record SQLite stage progress")
+	}
+	return tx.Commit()
+}
+
 func (s *SQLiteStore) AddEventForAttempt(attempt AttemptHandle, eventType, message string) error {
 	eventType, message = strings.TrimSpace(eventType), strings.TrimSpace(message)
 	if !validAttemptHandle(attempt) || !validText(eventType, 1, 64, false) || !validText(message, 0, maxEventBytes, true) {
@@ -898,6 +932,9 @@ func (s *SQLiteStore) FinishAttempt(handle AttemptHandle, status Status) error {
 	}
 	if err := insertEvent(ctx, tx, handle.JobID, string(status), "Job finished", now, s.config.MaxEventsPerJob); err != nil {
 		return errors.New("record SQLite job completion")
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_worker_ownership SET lease_until=? WHERE job_id=? AND generation=? AND owner_token=?`, now.Format(time.RFC3339Nano), handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
+		return errors.New("release SQLite worker ownership")
 	}
 	return tx.Commit()
 }
@@ -1232,6 +1269,9 @@ func (s *SQLiteStore) Get(id string) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, errors.New("read SQLite job")
 	}
+	if err := s.loadSnapshotSummaries(&snapshot); err != nil {
+		return Snapshot{}, err
+	}
 	return snapshot, nil
 }
 
@@ -1250,7 +1290,29 @@ func (s *SQLiteStore) GetForPrincipal(id, principalID string) (Snapshot, error) 
 	if err != nil {
 		return Snapshot{}, errors.New("read SQLite job")
 	}
+	if err := s.loadSnapshotSummaries(&snapshot); err != nil {
+		return Snapshot{}, err
+	}
 	return snapshot, nil
+}
+
+func (s *SQLiteStore) loadSnapshotSummaries(snapshot *Snapshot) error {
+	var workerID, bootID sql.NullString
+	if err := s.db.QueryRow(`SELECT worker_id,boot_id FROM factory_worker_ownership WHERE job_id=?`, snapshot.ID).Scan(&workerID, &bootID); err == nil && workerID.Valid && bootID.Valid {
+		snapshot.Worker = &WorkerSummary{WorkerID: workerID.String, BootID: bootID.String}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("read SQLite worker identity")
+	}
+	var stage, state sql.NullString
+	if err := s.db.QueryRow(`SELECT stage,state FROM factory_job_progress WHERE job_id=?`, snapshot.ID).Scan(&stage, &state); err == nil && stage.Valid && state.Valid {
+		progress := ProgressSummary{Stage: stage.String, State: state.String}
+		if validProgress(progress) {
+			snapshot.Progress = &progress
+		}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("read SQLite stage progress")
+	}
+	return nil
 }
 
 // ListJobs returns a bounded page in immutable admission order. The snapshot
@@ -1393,6 +1455,23 @@ func (s *SQLiteStore) eventStreamState(ctx context.Context, id string) (Snapshot
 		return Snapshot{}, History{}, errors.New("read SQLite history marker")
 	}
 	history.Truncated = truncated != 0
+	var workerID, bootID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT worker_id,boot_id FROM factory_worker_ownership WHERE job_id=?`, id).Scan(&workerID, &bootID); err == nil && workerID.Valid && bootID.Valid {
+		worker := &WorkerSummary{WorkerID: workerID.String, BootID: bootID.String}
+		snapshot.Worker = worker
+		history.Worker = worker
+	}
+	var stage, state sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT stage,state FROM factory_job_progress WHERE job_id=?`, id).Scan(&stage, &state); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return Snapshot{}, History{}, errors.New("read SQLite stage progress")
+	}
+	if stage.Valid && state.Valid {
+		progress := ProgressSummary{Stage: stage.String, State: state.String}
+		if validProgress(progress) {
+			snapshot.Progress = &progress
+			history.Progress = &progress
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return Snapshot{}, History{}, err
 	}
