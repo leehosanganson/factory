@@ -8,7 +8,7 @@ The target MVP has one service and one job lifecycle—not separate REST-task an
 
 **request → durable admission → bounded execution → verification → provider PR create/update → inspectable outcome**
 
-Issue details may be supplied as context; future issue intake should submit into the same job lifecycle, while issue polling/reconciliation is not a separate MVP. Provider-neutral interfaces keep repository hosting replaceable; each supported provider must implement the same scoped branch/PR behavior.
+Issue details may be supplied as context or admitted by the implemented separate poller into the same job lifecycle; issue polling/reconciliation is not a separate MVP. Provider-neutral interfaces keep repository hosting replaceable; each supported provider must implement the same scoped branch/PR behavior.
 
 ## Persistence and runtime
 
@@ -43,14 +43,14 @@ The CLI's `implement`, `tidy`, `monitor`, detached jobs, and `work` commands rem
 5. **Integrate and validate the request-to-PR path (core gates implemented; validation remains):** process-level tests cover request-to-PR execution, concurrent admission, duplicate/idempotent requests, shutdown cancellation, queued-job restart resumption, interrupted-running retention, and fake-provider failure/lost-response and explicit operator reconciliation. Merged PR #128 adds production GitHub adapter tests against GitHub REST-shaped `httptest` endpoints for an accepted PR create with a lost response, failed lookups, exact read-only reconciliation mapping, token redaction, and no duplicate write. These deterministic tests do not establish live GitHub account/repository behavior; a live account/provider run remains unverified and owner-gated by open issue #134 (#135 is also open). Merged PR #155 adds a manual-only, guarded live App harness, while merged PR #157 adds atomic compare-and-swap cleanup; neither constitutes that live account/provider validation. Automatic recovery/reconciliation and workflow checkpoints for interrupted running jobs, and fleet coordination, remain unimplemented; PostgreSQL worker ownership/leases are implemented.
 6. **Operational hardening (core documentation and support implemented; validation remains):** setup/configuration and security boundaries, health/readiness, SQLite recovery and retention, a consistent database backup command with restore guidance, and authenticated count-only operational status are documented and shipped. PR #131's backup/restore process E2E does not constitute a production restore drill. Merged PR #133 superseded #117 and adds startup logging of the selected persistence mode after listener readiness; it does not disclose the SQLite path or secrets. Database backup excludes separate workspaces. This is operational support, not general metrics/telemetry; unresolved interrupted work still needs operator investigation.
 
-These are dependency gates, not dates. Further issue reconciliation, provider events, additional code hosts, fleet coordination, reusable workflow catalogs, and deployment orchestration remain future possibilities.
+These are dependency gates, not dates. The optional `factory issue-poller` process admits exact-allowlisted GitHub issues into the same canonical PostgreSQL job Store and does not create a separate execution queue or lifecycle. Further issue reconciliation, provider events, additional code hosts, fleet coordination, reusable workflow catalogs, and deployment orchestration remain future possibilities.
 
 ## Explicit exclusions
 
 - No merge, release, or deployment authority.
 - No general arbitrary-command endpoint or caller-selected executable.
 - No claim that an agent, process, Nix shell, or container is sandboxed.
-- No separate MVP for autonomous issue polling; future issue intake should use the same job lifecycle.
+- No separate MVP for autonomous issue polling; the implemented poller feeds the same job lifecycle.
 - No fleet coordinator or distributed broker requirement for the initial service; separately launched PostgreSQL workers are supported without those guarantees.
 
 See the [REST job contract](rest-api-contract.md) for API and reliability requirements, [execution modes](execution-modes.md) for the server/executor boundary, the [PostgreSQL ownership deployment contract](postgresql-ownership-deployment-contract.md) for the isolated protocol's test-only boundary and failover prohibitions, the [worker identity and credential contract](worker-identity-credential-contract.md), the [worker recovery/cancellation contract](worker-recovery-cancellation-contract.md), the [attempt workspace/provider-write contract](attempt-workspace-provider-write-contract.md), and the [OCI sandbox host contract](oci-sandbox-host-contract.md) for candidate host prerequisites and refusal boundaries.
