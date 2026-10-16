@@ -36,7 +36,9 @@ type ResultCompletionExecutor interface {
 // CoordinatorConfig selects the maximum number of executor goroutines. The
 // manager independently enforces its own MaxConcurrentJobs bound.
 type CoordinatorConfig struct {
-	Workers int
+	Workers  int
+	WorkerID string
+	BootID   string
 }
 
 // Coordinator dispatches manager claims to a fixed set of workers.
@@ -47,23 +49,46 @@ type Coordinator struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 
-	mu      sync.Mutex
-	stopped bool
-	stop    sync.Once
-	wg      sync.WaitGroup
-	jobsMu  sync.Mutex
-	jobs    map[string]context.CancelFunc
+	mu       sync.Mutex
+	stopped  bool
+	stop     sync.Once
+	wg       sync.WaitGroup
+	jobsMu   sync.Mutex
+	jobs     map[string]context.CancelFunc
+	workerID string
+	bootID   string
 }
 
 // New starts the configured fixed set of worker goroutines.
+func validCoordinatorIdentity(value string) bool {
+	if value == "" {
+		return true
+	}
+	return restjobs.WorkerIdentityValid(value)
+}
+
+func defaultCoordinatorIdentity(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
 func New(manager restjobs.Manager, executor Executor, config CoordinatorConfig) (*Coordinator, error) {
-	if manager == nil || executor == nil || config.Workers < 1 {
+	if manager == nil || executor == nil || config.Workers < 1 || !validCoordinatorIdentity(config.WorkerID) || !validCoordinatorIdentity(config.BootID) {
 		return nil, fmt.Errorf("%w: manager, executor, and positive worker count are required", ErrInvalidConfig)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	workerID, bootID := config.WorkerID, config.BootID
+	if workerID == "" {
+		workerID = "worker-local"
+	}
+	if bootID == "" {
+		bootID = "boot-local"
+	}
 	coordinator := &Coordinator{
 		manager: manager, executor: executor, ctx: ctx, cancel: cancel,
-		done: make(chan struct{}), jobs: make(map[string]context.CancelFunc),
+		done: make(chan struct{}), jobs: make(map[string]context.CancelFunc), workerID: workerID, bootID: bootID,
 	}
 	coordinator.wg.Add(config.Workers)
 	for i := 0; i < config.Workers; i++ {
@@ -139,6 +164,13 @@ func (c *Coordinator) worker() {
 			_ = c.manager.FinishAttempt(claim.Attempt, restjobs.StatusCanceled)
 			return
 		}
+		claim.Attempt.WorkerID = defaultCoordinatorIdentity(claim.Attempt.WorkerID, c.workerID)
+		claim.Attempt.BootID = defaultCoordinatorIdentity(claim.Attempt.BootID, c.bootID)
+		if _, ok := c.manager.(*restjobs.PostgresStore); !ok {
+			if identityStore, ok := c.manager.(restjobs.AttemptIdentityStore); ok {
+				_ = identityStore.SetAttemptIdentity(claim.Attempt)
+			}
+		}
 		c.execute(claim.Job, claim.Attempt)
 	}
 }
@@ -156,6 +188,10 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 				return
 			case <-ticker.C:
 				if err := c.manager.HeartbeatAttempt(attempt); err != nil {
+					cancel()
+					return
+				}
+				if current, err := c.manager.Get(job.ID); err != nil || current.CancellationRequested {
 					cancel()
 					return
 				}

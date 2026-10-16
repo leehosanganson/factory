@@ -2530,7 +2530,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		t.Fatalf("inspect SQLite history while write lock held: %v", err)
 	}
 	attemptDuringLock, err := providerAttemptStore.ProviderAttempt(admitted.ID)
-	if err != nil || !reflect.DeepEqual(lockedJob, lockedJobBefore) || !samePublicJobHistory(lockedHistory, lockedHistoryBefore) || attemptDuringLock != attemptBeforeLock {
+	if err != nil || !samePublicJobSnapshot(lockedJob, lockedJobBefore) || !samePublicJobHistory(lockedHistory, lockedHistoryBefore) || attemptDuringLock != attemptBeforeLock {
 		t.Fatalf("SQLite lock changed persisted reconciliation state: before=(%+v,%+v,%+v) after=(%+v,%+v,%+v) err=%v", lockedJobBefore, lockedHistoryBefore, attemptBeforeLock, lockedJob, lockedHistory, attemptDuringLock, err)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
@@ -2984,6 +2984,10 @@ func waitForProcessFailure(t *testing.T, client *http.Client, baseURL, id, apiKe
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("job %s did not fail before timeout", id)
+}
+
+func samePublicJobSnapshot(left, right restjobs.Snapshot) bool {
+	return left.ID == right.ID && left.Submitter == right.Submitter && reflect.DeepEqual(left.Request, right.Request) && left.Status == right.Status && left.CancellationRequested == right.CancellationRequested && left.CreatedAt.Equal(right.CreatedAt) && left.UpdatedAt.Equal(right.UpdatedAt) && reflect.DeepEqual(left.Provider, right.Provider) && reflect.DeepEqual(left.Verification, right.Verification)
 }
 
 func samePublicJobHistory(left, right restjobs.History) bool {

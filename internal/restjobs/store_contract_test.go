@@ -33,6 +33,10 @@ func forceAttemptLeaseExpired(t *testing.T, store Store, id string) {
 		if _, err := typed.db.Exec(`UPDATE factory_worker_ownership SET lease_until=? WHERE job_id=?`, past, id); err != nil {
 			t.Fatal(err)
 		}
+	case *PostgresStore:
+		if _, err := typed.db.Exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()-interval '1 minute' WHERE job_id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
 	default:
 		t.Fatalf("unsupported test store %T", store)
 	}
@@ -52,6 +56,12 @@ func setListTestCreatedAt(t *testing.T, store Store, ids ...string) {
 	case *SQLiteStore:
 		for _, id := range ids {
 			if _, err := typed.db.Exec(`UPDATE factory_jobs SET created_at=? WHERE id=?`, tied, id); err != nil {
+				t.Fatal(err)
+			}
+		}
+	case *PostgresStore:
+		for _, id := range ids {
+			if _, err := typed.db.Exec(`UPDATE factory_jobs SET created_at=$1 WHERE id=$2`, tied, id); err != nil {
 				t.Fatal(err)
 			}
 		}

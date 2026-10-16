@@ -7,19 +7,23 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const configFileLimit = 1 << 20
 const maxParallelSubtasks = 8
 
 const (
-	PersistenceBackendMemory = "memory"
-	PersistenceBackendSQLite = "sqlite"
+	PersistenceBackendMemory   = "memory"
+	PersistenceBackendSQLite   = "sqlite"
+	PersistenceBackendPostgres = "postgres"
 )
 
 const (
@@ -63,6 +67,8 @@ type Config struct {
 	Principals         []PrincipalConfig       `json:"principals,omitempty"`
 	Persistence        PersistenceConfig       `json:"persistence"`
 	Provider           ProviderConfig          `json:"provider"`
+	WorkersEnabled     *bool                   `json:"workers_enabled,omitempty"`
+	WorkerID           string                  `json:"worker_id,omitempty"`
 	Limits             Limits                  `json:"limits"`
 }
 
@@ -92,11 +98,12 @@ type Limits struct {
 	HarnessOutput    int    `json:"harness_output_bytes"`
 }
 
-// PersistenceConfig selects volatile memory or an explicitly configured
-// file-backed SQLite store.
+// PersistenceConfig selects a volatile memory, file-backed SQLite, or
+// explicitly configured PostgreSQL store.
 type PersistenceConfig struct {
 	Backend string `json:"backend"`
 	Path    string `json:"path,omitempty"`
+	DSN     string `json:"dsn,omitempty"`
 }
 
 // PrincipalConfig binds a stable caller identity and role to a protected bearer-token file.
@@ -118,9 +125,10 @@ type ProviderConfig struct {
 // Aliases, harness, and key path remain deployment-specific.
 func DefaultConfig() Config {
 	return Config{
-		Mode:          "local_process",
-		ListenAddress: defaultListenAddress,
-		Persistence:   PersistenceConfig{Backend: PersistenceBackendMemory},
+		Mode:           "local_process",
+		ListenAddress:  defaultListenAddress,
+		Persistence:    PersistenceConfig{Backend: PersistenceBackendMemory},
+		WorkersEnabled: boolPointer(true),
 		Limits: Limits{
 			RequestBodyBytes: defaultRequestBodyBytes,
 			TaskBytes:        defaultTaskBytes,
@@ -136,7 +144,36 @@ func DefaultConfig() Config {
 }
 
 // LoadConfig reads a strict JSON config. Omitted resource limits receive defaults.
-func LoadConfig(path string) (Config, error) {
+func LoadConfig(path string) (Config, error) { return loadConfig(path, true) }
+
+// LoadControlPlaneConfig requires PostgreSQL persistence and explicitly disabled local workers.
+func LoadControlPlaneConfig(path string) (Config, error) {
+	config, err := LoadConfig(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if config.Persistence.Backend != PersistenceBackendPostgres {
+		return Config{}, errors.New("control-plane mode requires PostgreSQL persistence")
+	}
+	if config.WorkersEnabledValue() {
+		return Config{}, errors.New("control-plane mode requires workers_enabled: false")
+	}
+	return config, nil
+}
+
+// LoadWorkerConfig validates the same strict operator config without requiring or loading API caller credentials.
+func LoadWorkerConfig(path string) (Config, error) {
+	config, err := loadConfig(path, false)
+	if err != nil {
+		return Config{}, err
+	}
+	if config.Persistence.Backend != PersistenceBackendPostgres {
+		return Config{}, errors.New("worker mode requires PostgreSQL persistence")
+	}
+	return config, nil
+}
+
+func loadConfig(path string, requireAuth bool) (Config, error) {
 	if path == "" {
 		return Config{}, errors.New("REST server config path must not be empty")
 	}
@@ -175,11 +212,18 @@ func LoadConfig(path string) (Config, error) {
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return Config{}, errors.New("parse REST server config: expected one JSON value")
 	}
+	if !requireAuth {
+		config.APIKeyFile = ""
+	}
 	if err := config.Validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid REST server config: %w", err)
 	}
-	if !enabledNamedOperator(config.Principals) {
-		return Config{}, errors.New("invalid REST server config: principals must contain at least one enabled operator")
+	if requireAuth {
+		if err := config.ValidateServerAuth(); err != nil {
+			return Config{}, fmt.Errorf("invalid REST server config: %w", err)
+		}
+	} else {
+		config.Principals = nil
 	}
 	return config, nil
 }
@@ -191,15 +235,35 @@ func (c Config) Validate() error {
 	}
 	switch c.Persistence.Backend {
 	case PersistenceBackendMemory:
-		if c.Persistence.Path != "" {
-			return errors.New("persistence.path is only valid with sqlite backend")
+		if c.Persistence.Path != "" || c.Persistence.DSN != "" {
+			return errors.New("persistence.path and persistence.dsn are only valid with their matching backend")
 		}
 	case PersistenceBackendSQLite:
 		if !filepath.IsAbs(c.Persistence.Path) || strings.TrimSpace(c.Persistence.Path) == "" || strings.ContainsRune(c.Persistence.Path, 0) {
 			return errors.New("persistence.path must be an absolute SQLite database file path")
 		}
+		if c.Persistence.DSN != "" {
+			return errors.New("persistence.dsn is only valid with postgres backend")
+		}
+	case PersistenceBackendPostgres:
+		if c.Persistence.Path != "" {
+			return errors.New("persistence.path is only valid with sqlite backend")
+		}
+		if strings.TrimSpace(c.Persistence.DSN) == "" || strings.ContainsRune(c.Persistence.DSN, 0) {
+			return errors.New("persistence.dsn must be a valid PostgreSQL connection string")
+		}
+		parsed, err := url.Parse(c.Persistence.DSN)
+		if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Hostname() == "" || strings.Trim(parsed.Path, "/") == "" {
+			return errors.New("persistence.dsn must be a PostgreSQL URL with a host and database name")
+		}
+		if _, err := url.ParseQuery(parsed.RawQuery); err != nil {
+			return errors.New("persistence.dsn must be a valid PostgreSQL URL")
+		}
+		if _, err := pgx.ParseConfig(c.Persistence.DSN); err != nil {
+			return errors.New("persistence.dsn must be a valid PostgreSQL URL")
+		}
 	default:
-		return errors.New("persistence.backend must be memory or sqlite")
+		return errors.New("persistence.backend must be memory, sqlite, or postgres")
 	}
 	if c.Provider.Backend != "" && c.Provider.Backend != "github" {
 		return errors.New("provider.backend must be github when configured")
@@ -248,7 +312,7 @@ func (c Config) Validate() error {
 	if c.ParallelSubtasks != nil && c.ParallelSubtasks.MaxConcurrency != nil && (*c.ParallelSubtasks.MaxConcurrency < 1 || *c.ParallelSubtasks.MaxConcurrency > maxParallelSubtasks) {
 		return fmt.Errorf("parallel_subtasks.max_concurrency must be between 1 and %d when set", maxParallelSubtasks)
 	}
-	if !filepath.IsAbs(c.APIKeyFile) || strings.TrimSpace(c.APIKeyFile) == "" || strings.ContainsRune(c.APIKeyFile, 0) {
+	if c.APIKeyFile != "" && (!filepath.IsAbs(c.APIKeyFile) || strings.TrimSpace(c.APIKeyFile) == "" || strings.ContainsRune(c.APIKeyFile, 0)) {
 		return errors.New("api_key_file must be an absolute path")
 	}
 	principalIDs := make(map[string]struct{}, len(c.Principals))
@@ -273,8 +337,11 @@ func (c Config) Validate() error {
 			hasEnabledOperator = true
 		}
 	}
-	if c.Principals != nil && !hasEnabledOperator {
+	if c.Principals != nil && !hasEnabledOperator && c.APIKeyFile != "" {
 		return errors.New("principals must contain at least one enabled operator")
+	}
+	if c.WorkerID != "" && !postgresWorkerIDPattern.MatchString(c.WorkerID) {
+		return errors.New("worker_id must contain only letters, digits, dot, underscore, colon, or hyphen")
 	}
 	if err := c.Limits.validate(); err != nil {
 		return err
@@ -299,6 +366,19 @@ func validateListenAddress(address string) error {
 	var portNumber int
 	if _, err := fmt.Sscanf(port, "%d", &portNumber); err != nil || portNumber < 1 || portNumber > 65535 || fmt.Sprintf("%d", portNumber) != port {
 		return errors.New("listen_address port must be between 1 and 65535")
+	}
+	return nil
+}
+
+var postgresWorkerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+func boolPointer(value bool) *bool { return &value }
+
+func (c Config) WorkersEnabledValue() bool { return c.WorkersEnabled == nil || *c.WorkersEnabled }
+
+func (c Config) ValidateServerAuth() error {
+	if !filepath.IsAbs(c.APIKeyFile) || strings.TrimSpace(c.APIKeyFile) == "" || strings.ContainsRune(c.APIKeyFile, 0) || !enabledNamedOperator(c.Principals) {
+		return errors.New("REST server config requires api_key_file and at least one enabled named operator")
 	}
 	return nil
 }
@@ -456,7 +536,7 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "parallel_subtasks":
@@ -464,7 +544,7 @@ func configFieldAllowed(parent, key string) bool {
 	case "principals":
 		fields = map[string]struct{}{"id": {}, "role": {}, "token_file": {}, "enabled": {}}
 	case "persistence":
-		fields = map[string]struct{}{"backend": {}, "path": {}}
+		fields = map[string]struct{}{"backend": {}, "path": {}, "dsn": {}}
 	case "provider":
 		if key == "backend" || key == "token_file" || key == "base_branch" {
 			return true
@@ -507,7 +587,7 @@ func validateRequiredConfigFields(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return errors.New("invalid root object")
 	}
-	for _, field := range []string{"mode", "repositories", "harness", "api_key_file", "principals"} {
+	for _, field := range []string{"mode", "repositories", "harness"} {
 		if _, ok := fields[field]; !ok {
 			return fmt.Errorf("required field %q is missing", field)
 		}
@@ -522,8 +602,10 @@ func validateRequiredConfigFields(data []byte) error {
 		}
 	}
 	var principals []map[string]json.RawMessage
-	if err := json.Unmarshal(fields["principals"], &principals); err != nil {
-		return errors.New("principals must be an array")
+	if raw, exists := fields["principals"]; exists {
+		if err := json.Unmarshal(raw, &principals); err != nil {
+			return errors.New("principals must be an array")
+		}
 	}
 	for index, principal := range principals {
 		for _, field := range []string{"id", "role", "token_file", "enabled"} {

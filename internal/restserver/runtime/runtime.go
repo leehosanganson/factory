@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/leehosanganson/factory/internal/factory"
@@ -44,14 +46,14 @@ type runtimeOptions struct {
 	SweepInterval   time.Duration
 }
 
-type sqliteProviderReconciliationStore interface {
+type providerReconciliationStore interface {
 	Get(string) (restjobs.Snapshot, error)
 	ProviderAttempt(string) (restjobs.ProviderAttempt, error)
 	ReconcileProviderOutcome(string, restjobs.ProviderOutcome) error
 	RecoveryNeeded(string) bool
 }
 
-type sqliteInterruptedDispositionStore interface {
+type interruptedDispositionStore interface {
 	ResolveInterrupted(string, restjobs.InterruptedDisposition) error
 	RecoveryNeeded(string) bool
 }
@@ -76,8 +78,8 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("invalid REST server config: %w", err)
 	}
-	if !principalsConfigured(config) {
-		return errors.New("invalid REST server config: principals must include an enabled operator")
+	if err := config.ValidateServerAuth(); err != nil {
+		return fmt.Errorf("invalid REST server config: %w", err)
 	}
 	principals, err := restserver.LoadPrincipalResolver(config)
 	if err != nil {
@@ -92,8 +94,22 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err != nil {
 		return err
 	}
+	workersEnabled := config.WorkersEnabledValue()
+	workerID := config.WorkerID
+	if workerID == "" {
+		workerID = fmt.Sprintf("factory-%d", os.Getpid())
+	}
+	bootID := processBootID()
+	if workersEnabled {
+		if identityStore, ok := store.(interface{ SetWorkerIdentity(string, string) error }); ok {
+			if err := identityStore.SetWorkerIdentity(workerID, bootID); err != nil {
+				closeLocalStore(store)
+				return err
+			}
+		}
+	}
 	publisher := options.Publisher
-	if publisher == nil && config.Provider.Backend == "github" {
+	if publisher == nil && config.Provider.Backend == "github" && workersEnabled {
 		token, err := restserver.LoadProviderToken(config.Provider.TokenFile)
 		if err != nil {
 			closeLocalStore(store)
@@ -107,7 +123,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			closeLocalStore(store)
 			return errors.New("configured GitHub provider is unavailable")
 		}
-	} else if publisher != nil {
+	} else if publisher != nil && workersEnabled {
 		probeCtx, cancelProbe := context.WithTimeout(ctx, 5*time.Second)
 		probeErr := publisher.Ping(probeCtx)
 		cancelProbe()
@@ -129,16 +145,18 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		}
 	}
 	// Repository validation must complete before any listener is opened.
-	if err := config.ValidateRepositoryRoots(); err != nil {
-		closeStore()
-		return err
+	if workersEnabled {
+		if err := config.ValidateRepositoryRoots(); err != nil {
+			closeStore()
+			return err
+		}
 	}
 	logger := options.Log
 	if logger == nil {
 		logger = log.Default()
 	}
 	resultsBase := options.ResultsBase
-	if resultsBase == "" {
+	if workersEnabled && resultsBase == "" {
 		resultsBase, err = serverResultsBase()
 		if err != nil {
 			closeStore()
@@ -147,19 +165,21 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	workspaces := make(map[string]restworker.WorkspaceManager, len(config.Repositories))
 	workspaceManagers := make(map[string]*restworkspace.Manager, len(config.Repositories))
-	for alias, root := range config.Repositories {
-		workspace, err := restworkspace.New(restworkspace.Config{
-			RepositoryRoot: root,
-			ResultsRoot:    filepath.Join(resultsBase, aliasDirectory(alias), "results"),
-			RunGit:         options.WorkspaceGit,
-			Now:            options.WorkspaceNow,
-		})
-		if err != nil {
-			closeStore()
-			return fmt.Errorf("initialize workspace for repository %q: %w", alias, err)
+	if workersEnabled {
+		for alias, root := range config.Repositories {
+			workspace, err := restworkspace.New(restworkspace.Config{
+				RepositoryRoot: root,
+				ResultsRoot:    filepath.Join(resultsBase, aliasDirectory(alias), "results"),
+				RunGit:         options.WorkspaceGit,
+				Now:            options.WorkspaceNow,
+			})
+			if err != nil {
+				closeStore()
+				return fmt.Errorf("initialize workspace for repository %q: %w", alias, err)
+			}
+			workspaces[alias] = workspace
+			workspaceManagers[alias] = workspace
 		}
-		workspaces[alias] = workspace
-		workspaceManagers[alias] = workspace
 	}
 	workflowConfig := factory.DefaultConfig()
 	workflowConfig.AutoPublish = false
@@ -173,12 +193,13 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		workflowConfig.ParallelImplementation = &factory.ParallelImplementationConfig{Enabled: true, MaxConcurrency: maxConcurrency}
 	}
 	executor := options.Executor
-	if executor == nil {
+	if workersEnabled && executor == nil {
 		executor, err = restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
 			Server: config, Workflow: workflowConfig, Workspaces: workspaces, Provider: publisher,
 			RecordProviderAttempt:        manager.RecordProviderAttemptForAttempt,
 			MarkProviderAttemptUncertain: manager.MarkProviderAttemptUncertainForAttempt,
 			RecordVerificationEvidence:   manager.RecordVerificationEvidenceForAttempt,
+			RecordProgress:               manager.RecordProgressForAttempt,
 		})
 		if err != nil {
 			closeStore()
@@ -191,31 +212,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if probe, ok := store.(interface{ Ping(context.Context) error }); ok {
 		readyCheck = probe.Ping
 	}
-	apiHandler, err := restapi.New(manager, key, restapi.Config{
-		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
-		MaxTaskBytes:        config.Limits.TaskBytes,
-		RepositoryAliases:   repositoryAliases(config.Repositories),
-		CancelJob: func(requestCtx context.Context, id string) (restjobs.Snapshot, error) {
-			if err := requestCtx.Err(); err != nil {
-				return restjobs.Snapshot{}, restjobs.ErrInvalidTransition
-			}
-			return coordinator.RequestCancel(id)
-		},
-		ResolveInterrupted: func(requestCtx context.Context, id string, disposition restjobs.InterruptedDisposition) error {
-			if err := requestCtx.Err(); err != nil {
-				return restjobs.ErrInvalidTransition
-			}
-			sqliteStore, ok := store.(sqliteInterruptedDispositionStore)
-			if !ok {
-				return restjobs.ErrInvalidTransition
-			}
-			if !sqliteStore.RecoveryNeeded(id) {
-				return restjobs.ErrInvalidTransition
-			}
-			return sqliteStore.ResolveInterrupted(id, disposition)
-		},
-		ReconcileProvider: func(requestCtx context.Context, id string) error {
-			sqliteStore, ok := store.(sqliteProviderReconciliationStore)
+	var reconcileProvider func(context.Context, string) error
+	if workersEnabled {
+		reconcileProvider = func(requestCtx context.Context, id string) error {
+			recoveryStore, ok := store.(providerReconciliationStore)
 			if !ok || publisher == nil {
 				return restjobs.ErrInvalidTransition
 			}
@@ -227,11 +227,11 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			if !ok {
 				return restjobs.ErrInvalidTransition
 			}
-			job, getErr := sqliteStore.Get(id)
+			job, getErr := recoveryStore.Get(id)
 			if getErr != nil {
 				return getErr
 			}
-			attempt, attemptErr := sqliteStore.ProviderAttempt(id)
+			attempt, attemptErr := recoveryStore.ProviderAttempt(id)
 			if errors.Is(attemptErr, restjobs.ErrInvalidTransition) && job.Provider != nil {
 				attempt = restjobs.ProviderAttempt{Provider: job.Provider.Provider, Repository: job.Provider.Repository, Branch: job.Provider.Branch, Commit: job.Provider.Commit}
 				attemptErr = nil
@@ -245,19 +245,47 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			if job.Status == restjobs.StatusSucceeded && job.Provider != nil && job.Provider.Provider == attempt.Provider && job.Provider.Repository == attempt.Repository && job.Provider.Branch == attempt.Branch && job.Provider.Commit == attempt.Commit {
 				return nil
 			}
-			if job.Status != restjobs.StatusFailed && (job.Status != restjobs.StatusRunning || !sqliteStore.RecoveryNeeded(id)) {
+			if job.Status != restjobs.StatusFailed && (job.Status != restjobs.StatusRunning || !recoveryStore.RecoveryNeeded(id)) {
 				return restjobs.ErrInvalidTransition
 			}
 			outcome, reconcileErr := factoryExecutor.ReconcileInterruptedProvider(requestCtx, job, attempt, reconciler)
 			if reconcileErr != nil {
 				return restjobs.ErrInvalidTransition
 			}
-			if err := sqliteStore.ReconcileProviderOutcome(id, outcome); err != nil {
+			if err := recoveryStore.ReconcileProviderOutcome(id, outcome); err != nil {
 				return restjobs.ErrInvalidTransition
 			}
 			return nil
+		}
+	}
+	apiHandler, err := restapi.New(manager, key, restapi.Config{
+		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
+		MaxTaskBytes:        config.Limits.TaskBytes,
+		RepositoryAliases:   repositoryAliases(config.Repositories),
+		CancelJob: func(requestCtx context.Context, id string) (restjobs.Snapshot, error) {
+			if err := requestCtx.Err(); err != nil {
+				return restjobs.Snapshot{}, restjobs.ErrInvalidTransition
+			}
+			if coordinator == nil {
+				return manager.Cancel(id)
+			}
+			return coordinator.RequestCancel(id)
 		},
-		Ready: func() bool { return ready.Load() },
+		ResolveInterrupted: func(requestCtx context.Context, id string, disposition restjobs.InterruptedDisposition) error {
+			if err := requestCtx.Err(); err != nil {
+				return restjobs.ErrInvalidTransition
+			}
+			recoveryStore, ok := store.(interruptedDispositionStore)
+			if !ok {
+				return restjobs.ErrInvalidTransition
+			}
+			if !recoveryStore.RecoveryNeeded(id) {
+				return restjobs.ErrInvalidTransition
+			}
+			return recoveryStore.ResolveInterrupted(id, disposition)
+		},
+		ReconcileProvider: reconcileProvider,
+		Ready:             func() bool { return ready.Load() },
 		ReadyError: func(requestCtx context.Context) error {
 			if !ready.Load() {
 				return errors.New("server not initialized")
@@ -297,10 +325,12 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	sweepDone := make(chan struct{})
 	go sweepWorkspaces(sweepCtx, sweepDone, workspaceManagers, logger, options.SweepInterval)
 
-	coordinator, err = restworker.New(manager, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers})
-	if err != nil {
-		closeStore()
-		return err
+	if workersEnabled {
+		coordinator, err = restworker.New(manager, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers, WorkerID: workerID, BootID: bootID})
+		if err != nil {
+			closeStore()
+			return err
+		}
 	}
 	server := &http.Server{
 		Handler:           apiHandler,
@@ -320,9 +350,14 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		defer cancel()
 		cancelSweep()
 		_ = waitForSweep(shutdownCtx, sweepDone)
-		_ = coordinator.Shutdown(shutdownCtx)
+		if coordinator != nil {
+			_ = coordinator.Shutdown(shutdownCtx)
+		}
 		closeStore()
-		return fmt.Errorf("listen for REST server: %w", err)
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return errors.New("listen for REST server: address already in use")
+		}
+		return errors.New("listen for REST server")
 	}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
@@ -340,14 +375,19 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
 	defer cancel()
 	ready.Store(false)
-	manager.Close()
+	if workersEnabled {
+		manager.Close()
+	}
 	cancelSweep()
 	sweepErr := waitForSweep(shutdownCtx, sweepDone)
 	shutdownErr := server.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
 		_ = server.Close()
 	}
-	workerErr := coordinator.Shutdown(shutdownCtx)
+	var workerErr error
+	if coordinator != nil {
+		workerErr = coordinator.Shutdown(shutdownCtx)
+	}
 	closeStore()
 	if serveErr != nil {
 		return serveErr
@@ -362,6 +402,14 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		return fmt.Errorf("stop REST workspace sweeper: %w", sweepErr)
 	}
 	return nil
+}
+
+func processBootID() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return fmt.Sprintf("boot-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(value[:])
 }
 
 func principalsConfigured(config restserver.Config) bool {

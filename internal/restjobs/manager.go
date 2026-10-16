@@ -180,10 +180,31 @@ func validateVerificationEvidence(evidence VerificationEvidence) error {
 
 // AttemptHandle is the immutable fencing identity issued for one worker claim.
 // Its owner token is opaque and must not be exposed to job clients.
+type ProgressEventStore interface {
+	RecordProgressForAttempt(AttemptHandle, ProgressSummary) error
+}
+
+type AttemptIdentityStore interface{ SetAttemptIdentity(AttemptHandle) error }
+
 type AttemptHandle struct {
 	JobID      string `json:"-"`
 	Generation int64  `json:"-"`
 	OwnerToken string `json:"-"`
+	WorkerID   string `json:"-"`
+	BootID     string `json:"-"`
+}
+
+// WorkerSummary is safe attribution metadata for the currently or most recently
+// persisted attempt. It contains no lease token or host-specific path.
+type WorkerSummary struct {
+	WorkerID string `json:"worker_id"`
+	BootID   string `json:"boot_id"`
+}
+
+// ProgressSummary is a bounded allowlisted workflow stage and state.
+type ProgressSummary struct {
+	Stage string `json:"stage"`
+	State string `json:"state"`
 }
 
 // AttemptClaim pairs a claimed job snapshot with its fencing identity.
@@ -204,6 +225,8 @@ type Snapshot struct {
 	UpdatedAt             time.Time             `json:"updated_at"`
 	Provider              *ProviderOutcome      `json:"provider,omitempty"`
 	Verification          *VerificationEvidence `json:"verification,omitempty"`
+	Worker                *WorkerSummary        `json:"worker,omitempty"`
+	Progress              *ProgressSummary      `json:"progress,omitempty"`
 }
 
 // Event is one bounded history entry.
@@ -211,15 +234,19 @@ type Event struct {
 	At       time.Time `json:"at"`
 	Type     string    `json:"type"`
 	Message  string    `json:"message,omitempty"`
+	Stage    string    `json:"stage,omitempty"`
+	State    string    `json:"state,omitempty"`
 	Sequence uint64    `json:"-"`
 }
 
 // History is a bounded copy of one job's retained event stream.
 type History struct {
-	JobID          string  `json:"job_id"`
-	Events         []Event `json:"events"`
-	Truncated      bool    `json:"truncated"`
-	LatestSequence uint64  `json:"-"`
+	JobID          string           `json:"job_id"`
+	Events         []Event          `json:"events"`
+	Truncated      bool             `json:"truncated"`
+	Worker         *WorkerSummary   `json:"worker,omitempty"`
+	Progress       *ProgressSummary `json:"progress,omitempty"`
+	LatestSequence uint64           `json:"-"`
 }
 
 // JobSummary is the safe, compact representation returned by collection listing.
@@ -288,6 +315,7 @@ type Store interface {
 	WaitClaimAttempt(ctx context.Context) (AttemptClaim, error)
 	HeartbeatAttempt(AttemptHandle) error
 	AddEventForAttempt(AttemptHandle, string, string) error
+	RecordProgressForAttempt(AttemptHandle, ProgressSummary) error
 	RecordProviderAttemptForAttempt(AttemptHandle, ProviderAttempt) error
 	MarkProviderAttemptUncertainForAttempt(AttemptHandle) error
 	RecordProviderOutcomeForAttempt(AttemptHandle, ProviderOutcome) error
@@ -685,7 +713,7 @@ func newOwnerToken() (string, error) {
 }
 
 func validAttemptHandle(attempt AttemptHandle) bool {
-	if !validJobID(attempt.JobID) || attempt.Generation <= 0 || len(attempt.OwnerToken) != 64 {
+	if !validJobID(attempt.JobID) || attempt.Generation <= 0 || len(attempt.OwnerToken) != 64 || (attempt.WorkerID == "") != (attempt.BootID == "") {
 		return false
 	}
 	for _, char := range attempt.OwnerToken {
@@ -693,7 +721,51 @@ func validAttemptHandle(attempt AttemptHandle) bool {
 			return false
 		}
 	}
+	if attempt.WorkerID != "" && (!validWorkerIdentity(attempt.WorkerID) || !validWorkerIdentity(attempt.BootID)) {
+		return false
+	}
 	return true
+}
+
+func WorkerIdentityValid(value string) bool { return validWorkerIdentity(value) }
+
+func defaultWorkerLabel(value string) string {
+	if value == "" {
+		return "worker-local"
+	}
+	return value
+}
+
+func validWorkerIdentity(value string) bool {
+	if len(value) < 1 || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= 'a' && char <= 'z') && !(char >= 'A' && char <= 'Z') && !(char >= '0' && char <= '9') && char != '.' && char != '_' && char != ':' && char != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func validProgress(progress ProgressSummary) bool {
+	stage := progress.Stage == "requirements" || progress.Stage == "implement" || progress.Stage == "review" || progress.Stage == "document"
+	state := progress.State == "started" || progress.State == "completed" || progress.State == "failed"
+	return stage && state
+}
+
+func ParseProgressEvent(message string) (*ProgressSummary, bool) {
+	fields := strings.Split(message, " ")
+	if len(fields) != 2 || !strings.HasPrefix(fields[0], "stage=") || !strings.HasPrefix(fields[1], "state=") {
+		return nil, false
+	}
+	stage, state := strings.TrimPrefix(fields[0], "stage="), strings.TrimPrefix(fields[1], "state=")
+	validStage := stage == "requirements" || stage == "implement" || stage == "review" || stage == "document"
+	validState := state == "started" || state == "completed" || state == "failed"
+	if !validStage || !validState {
+		return nil, false
+	}
+	return &ProgressSummary{Stage: stage, State: state}, true
 }
 
 func (m *LocalManager) ownsAttemptLocked(attempt AttemptHandle) (*job, error) {
@@ -818,7 +890,7 @@ func (m *LocalManager) History(id string) (History, error) {
 		return History{}, ErrNotFound
 	}
 	events := append([]Event(nil), entry.events...)
-	return History{JobID: id, Events: events, Truncated: entry.truncated, LatestSequence: entry.nextEvent}, nil
+	return History{JobID: id, Events: events, Truncated: entry.truncated, Worker: cloneWorker(entry.snapshot.Worker), Progress: cloneProgress(entry.snapshot.Progress), LatestSequence: entry.nextEvent}, nil
 }
 
 func (m *LocalManager) EventStreamState(ctx context.Context, id string) (Snapshot, History, error) {
@@ -838,7 +910,7 @@ func (m *LocalManager) EventStreamState(ctx context.Context, id string) (Snapsho
 		return Snapshot{}, History{}, ErrNotFound
 	}
 	events := append([]Event(nil), entry.events...)
-	history := History{JobID: id, Events: events, Truncated: entry.truncated, LatestSequence: entry.nextEvent}
+	history := History{JobID: id, Events: events, Truncated: entry.truncated, Worker: cloneWorker(entry.snapshot.Worker), Progress: cloneProgress(entry.snapshot.Progress), LatestSequence: entry.nextEvent}
 	return cloneSnapshot(entry.snapshot), history, nil
 }
 
@@ -939,6 +1011,33 @@ func (m *LocalManager) HeartbeatAttempt(attempt AttemptHandle) error {
 	return nil
 }
 
+func (m *LocalManager) SetAttemptIdentity(attempt AttemptHandle) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	entry.snapshot.Worker = &WorkerSummary{WorkerID: defaultWorkerLabel(attempt.WorkerID), BootID: defaultWorkerLabel(attempt.BootID)}
+	return nil
+}
+
+func (m *LocalManager) RecordProgressForAttempt(attempt AttemptHandle, progress ProgressSummary) error {
+	if !validProgress(progress) {
+		return ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, err := m.ownsAttemptLocked(attempt)
+	if err != nil {
+		return err
+	}
+	entry.snapshot.Progress = cloneProgress(&progress)
+	entry.snapshot.Worker = &WorkerSummary{WorkerID: defaultWorkerLabel(attempt.WorkerID), BootID: defaultWorkerLabel(attempt.BootID)}
+	entry.snapshot.UpdatedAt = time.Now().UTC()
+	return nil
+}
+
 func (m *LocalManager) AddEventForAttempt(attempt AttemptHandle, eventType, message string) error {
 	eventType, message = strings.TrimSpace(eventType), strings.TrimSpace(message)
 	if !validAttemptHandle(attempt) || !validText(eventType, 1, 64, false) || !validText(message, 0, maxEventBytes, true) {
@@ -953,6 +1052,12 @@ func (m *LocalManager) AddEventForAttempt(attempt AttemptHandle, eventType, mess
 	if !m.appendEventLocked(entry, eventType, message) {
 		return ErrRegistryFull
 	}
+	if eventType == "stage_progress" {
+		if progress, ok := ParseProgressEvent(message); ok {
+			entry.snapshot.Progress = progress
+		}
+	}
+	entry.snapshot.Worker = &WorkerSummary{WorkerID: defaultWorkerLabel(attempt.WorkerID), BootID: defaultWorkerLabel(attempt.BootID)}
 	entry.leaseUntil = time.Now().UTC().Add(attemptLeaseDuration)
 	return nil
 }
@@ -1508,6 +1613,22 @@ func sameIssueProvenance(a, b *IssueProvenance) bool {
 	return *a == *b
 }
 
+func cloneWorker(worker *WorkerSummary) *WorkerSummary {
+	if worker == nil {
+		return nil
+	}
+	copy := *worker
+	return &copy
+}
+
+func cloneProgress(progress *ProgressSummary) *ProgressSummary {
+	if progress == nil {
+		return nil
+	}
+	copy := *progress
+	return &copy
+}
+
 func cloneSnapshot(snapshot Snapshot) Snapshot {
 	if snapshot.Status.Terminal() {
 		snapshot.CancellationRequested = false
@@ -1524,6 +1645,8 @@ func cloneSnapshot(snapshot Snapshot) Snapshot {
 		copy := cloneVerificationEvidence(*snapshot.Verification)
 		snapshot.Verification = &copy
 	}
+	snapshot.Worker = cloneWorker(snapshot.Worker)
+	snapshot.Progress = cloneProgress(snapshot.Progress)
 	return snapshot
 }
 

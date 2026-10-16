@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -51,7 +52,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "rest" && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "doctor" && args[0] != "--gate" {
+		if len(args) > 1 && args[0] != "rest" && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "worker" && args[0] != "doctor" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
@@ -65,6 +66,18 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 				return fmt.Errorf("usage: factory doctor")
 			}
 			return runDoctor(out)
+		case "worker":
+			configPath, err := parseWorkerOptions(args[1:])
+			if err != nil {
+				return err
+			}
+			config, err := restserver.LoadWorkerConfig(configPath)
+			if err != nil {
+				return err
+			}
+			ctx, stop := foregroundContext()
+			defer stop()
+			return serverruntime.RunWorker(ctx, config)
 		case "server":
 			if len(args) > 1 && args[1] == "doctor" {
 				configPath, err := parseServerDoctorOptions(args[2:])
@@ -90,6 +103,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 				config, err := restserver.LoadConfig(configPath)
 				if err != nil {
 					return err
+				}
+				if config.Persistence.Backend != restserver.PersistenceBackendSQLite {
+					return errors.New("server backup requires configured SQLite persistence")
 				}
 				return restjobs.BackupSQLiteDatabase(context.Background(), config.Persistence.Path, destination)
 			}
@@ -233,10 +249,13 @@ func commandHelpRequested(args []string) bool {
 		return false
 	}
 	if args[0] == "server" {
-		return len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") || len(args) == 3 && args[1] == "doctor" && (args[2] == "-h" || args[2] == "--help" || args[2] == "help")
+		if len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") {
+			return true
+		}
+		return len(args) == 3 && args[1] == "doctor" && (args[2] == "-h" || args[2] == "--help" || args[2] == "help")
 	}
 	switch args[0] {
-	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor":
+	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -263,6 +282,10 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "doctor":
 		title = "Setup diagnostics"
 		commands = []helpCommand{{"factory doctor", "Check config and required executables without starting work."}}
+	case "worker":
+		title = "PostgreSQL job worker"
+		commands = []helpCommand{{"factory worker --config <absolute-path>", "Run a PostgreSQL-backed worker without opening an HTTP listener."}}
+		paragraphs = []string{"Requires a worker-mode server JSON config with PostgreSQL persistence. See docs/features/rest-worker.md."}
 	case "implement":
 		title = "Implement workflow"
 		commands = []helpCommand{
@@ -481,6 +504,13 @@ func runServerDoctor(out io.Writer, config restserver.Config) error {
 func parseServerOptions(args []string) (string, error) {
 	if len(args) != 2 || args[0] != "--config" || !filepath.IsAbs(args[1]) {
 		return "", fmt.Errorf("usage: factory server --config <absolute-path>")
+	}
+	return args[1], nil
+}
+
+func parseWorkerOptions(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--config" || !filepath.IsAbs(args[1]) {
+		return "", fmt.Errorf("usage: factory worker --config <absolute-path>")
 	}
 	return args[1], nil
 }
@@ -805,6 +835,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory job <command>", "Manage detached jobs."},
 		{"factory run <command>", "Manage gated runs."},
 		{"factory server --config <absolute-path>", "Start the REST API server."},
+		{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."},
 		{"factory rest <command>", "Submit and inspect jobs on a configured REST server."},
 		{"factory doctor", "Check local setup without starting work."},
 		{"factory version", "Print the build version."},

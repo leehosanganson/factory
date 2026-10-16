@@ -509,6 +509,7 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
 		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server doctor --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "factory server bundle create --config <absolute-path> --destination <absolute-path>", "factory server bundle verify --source <absolute-path>", "factory server bundle inspect --source <absolute-path>", "factory server bundle restore --source <absolute-path> --destination <absolute-path>", "server-only JSON config", "provider reachability is not tested"}, omit: []string{"api-key-value"}},
+		{name: "worker help", args: []string{"worker", "--help"}, want: []string{"PostgreSQL job worker", "factory worker --config <absolute-path>", "without opening an HTTP listener", "worker-mode server JSON config", "PostgreSQL persistence", "docs/features/rest-worker.md"}, omit: []string{"api-key-value"}},
 		{name: "server doctor help", args: []string{"server", "doctor", "--help"}, want: []string{"REST server preflight", "factory server doctor --config <absolute-path>", "Local-only, read-only", "Provider reachability is not tested", "no database is opened or created"}, omit: []string{"api-key-value"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "factory job list [--json] [--details]", "queued, running, complete", "Filters affect listing only", "factory job list --scan-limit 100 --status failed", "Omitted jobs remain addressable by ID", "factory job list without --scan-limit reconciles all records", "schema version 1", "read-only inspection", "{repo}"}, omit: []string{"factory run", "Monitor management"}},
@@ -593,6 +594,28 @@ func TestServerBackupCommandRequiresExactConfigAndDestinationSyntax(t *testing.T
 		err := run(args, strings.NewReader(""), &out, &errOut)
 		if err == nil || !strings.Contains(err.Error(), "usage: factory server backup --config <absolute-path> --destination <absolute-path>") {
 			t.Errorf("run(%v) error=%v, want strict syntax error", args, err)
+		}
+	}
+}
+
+func TestServerBackupAndBundleRejectPostgresConfiguration(t *testing.T) {
+	root := t.TempDir()
+	config := `{"mode":"local_process","repositories":{"trusted":"/srv/trusted"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"api_key_file":"/run/key","principals":[{"id":"operator","role":"operator","token_file":"/run/verifier","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://factory:secret@localhost/factory"}}`
+	configPath := filepath.Join(root, "server.json")
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"server", "backup", "--config", configPath, "--destination", filepath.Join(root, "backup.db")},
+		{"server", "bundle", "create", "--config", configPath, "--destination", filepath.Join(root, "bundle.tar.gz")},
+	} {
+		var out, errOut bytes.Buffer
+		err := run(args, strings.NewReader(""), &out, &errOut)
+		if err == nil || !strings.Contains(err.Error(), "configured SQLite persistence") {
+			t.Errorf("run(%v) error=%v, want explicit SQLite-only rejection", args, err)
+		}
+		if strings.Contains(fmt.Sprint(err), "secret") || strings.Contains(errOut.String(), "secret") {
+			t.Errorf("run(%v) leaked PostgreSQL DSN credentials", args)
 		}
 	}
 }
@@ -837,6 +860,25 @@ func TestServerDoctorProcessIsLocalOnlyAndReadOnly(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Errorf("preflight created or executed into %q: stat error=%v", path, err)
 		}
+	}
+}
+
+func TestWorkerCommandRequiresExactAbsoluteConfigSyntax(t *testing.T) {
+	for _, args := range [][]string{{"worker"}, {"worker", "--config", "relative.json"}, {"worker", "--config", "/tmp/config.json", "extra"}} {
+		if err := run(args, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "factory worker --config") {
+			t.Errorf("run(%v) error=%v, want worker usage", args, err)
+		}
+	}
+}
+
+func TestWorkerCommandRejectsInvalidWorkerConfigBeforeRuntime(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "worker.json")
+	config := `{"mode":"local_process","repositories":{"trusted":"/srv/trusted"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"persistence":{"backend":"sqlite","path":"/tmp/jobs.db"}}`
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"worker", "--config", path}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "worker mode requires PostgreSQL persistence") {
+		t.Fatalf("worker with SQLite config error=%v, want PostgreSQL-only validation before runtime", err)
 	}
 }
 

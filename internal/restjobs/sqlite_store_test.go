@@ -103,6 +103,46 @@ func TestSQLiteListingIncludesInterruptedAndTerminalJobsWithoutReplayingThem(t *
 	}
 }
 
+func TestSQLiteSafeProgressAndWorkerIdentityPersistWithoutEventMessages(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.Admit("progress-persist", Request{Repository: "widget", Task: "safe progress"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.Attempt.WorkerID, claim.Attempt.BootID = "worker-one", "boot-one"
+	if err := store.SetAttemptIdentity(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	progress := ProgressSummary{Stage: "review", State: "started"}
+	if err := store.RecordProgressForAttempt(claim.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	snapshot, err := store.Get(job.ID)
+	if err != nil || snapshot.Progress == nil || *snapshot.Progress != progress || snapshot.Worker == nil || snapshot.Worker.WorkerID != "worker-one" {
+		t.Fatalf("snapshot lost persisted safe metadata: %+v %v", snapshot, err)
+	}
+	_, history, err := store.EventStreamState(context.Background(), job.ID)
+	if err != nil || history.Progress == nil || *history.Progress != progress || history.Worker == nil || history.Worker.WorkerID != "worker-one" {
+		t.Fatalf("history safe metadata=%+v err=%v", history, err)
+	}
+}
+
 func TestSQLiteCancellationRequestInterruptedByRestartIsNotAcceptedAsLive(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())

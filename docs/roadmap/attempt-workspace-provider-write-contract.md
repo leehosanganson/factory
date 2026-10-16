@@ -2,9 +2,9 @@
 
 ## Status and current boundary
 
-**Future distributed-worker contract only; no remote attempt workspace or publisher protocol is implemented.** The current REST runtime runs in-process workers. It creates one protected detached Git worktree and state/output directory per job (not per attempt generation), runs the workflow in that worktree, and keeps provider credentials in the server-side publisher. When configured, it records a provider attempt in the selected store before external publication and records outcome separately; this survives restart only with SQLite, not volatile memory mode. SQLite startup does not replay running work. Eligible explicit reconciliation validates the retained worktree/branch/commit and performs read-only provider lookup; it does not rerun the harness or write to the provider. These are existing single-server behaviors, not distributed generation isolation or exactly-once semantics. See [REST operations](../features/rest-server-operations.md) and [REST server](../features/rest-server.md).
+**Future distributed-worker contract only; no remote attempt workspace or publisher protocol is implemented.** The current REST runtime uses in-process workers by default and also supports PostgreSQL shared storage with a workers-disabled API control plane and separately launched workers. It creates one protected detached Git worktree and state/output directory per job (not per attempt generation), runs the workflow in that worktree, and keeps provider credentials in the server-side publisher. When configured, it records a provider attempt in the selected store before external publication and records outcome separately; this survives restart with SQLite or PostgreSQL, not volatile memory mode. Durable-store startup does not replay running work. Eligible explicit reconciliation validates the retained worktree/branch/commit and performs read-only provider lookup; it does not rerun the harness or write to the provider. These are existing REST behaviors, not distributed generation isolation or exactly-once semantics. See [implemented REST server features](../features/README.md), [REST operations](../features/rest-server-operations.md), [PostgreSQL Store](../features/postgres-store.md), and [REST worker process](../features/rest-worker.md).
 
-The isolated PostgreSQL ownership protocol is test-only. A generation/token fences protocol mutations only: it does not stop a stale process, fence a filesystem, or prevent a provider request already in flight. This contract adds no runtime behavior, Store, API, or recovery action.
+Only the isolated `PostgresOwnership` protocol fixture is test-only. Its generation/token fences protocol mutations only: it does not stop a stale process, fence a filesystem, or prevent a provider request already in flight; it establishes no production failover/HA guarantee. This contract adds no remote attempt-workspace/publisher protocol or distributed recovery action.
 
 ## Safety objective
 
@@ -83,11 +83,11 @@ CI protocol tests do not establish the provider's live consistency/fencing guara
 
 ## Dependencies and gates
 
-- #258: PostgreSQL remains an isolated test-only protocol with no production failover/restore or ambiguous-commit resolution guarantee.
+- #258: the isolated `PostgresOwnership` protocol fixture has no production failover/restore or ambiguous-commit resolution guarantee; this does not describe the separately implemented PostgreSQL REST Store/runtime/workers.
 - #259: authenticated worker principal/session is design-only in PR #270; only the trusted supervisor may hold its credentials.
 - #260: stop proof, suspect state, cancellation/drain, and recovery are design-only; no workspace cleanup/reassignment before implementation and validation.
 - #264/#250: host isolation, storage quotas, network denial, and secret containment; OCI/container alone is not a security boundary.
-- #248: production ownership/worker runtime integration remains blocked until topology, identity, cancellation, workspaces, and provider handoff are implemented and validated.
+- #248: future distributed ownership/attempt-generation recovery integration remains gated on topology, identity, cancellation, isolated workspaces, and provider handoff. This does not block the existing PostgreSQL REST Store/runtime or separately launched worker support; see the current feature guides.
 - #247/#262: submitter credentials/attribution are separate from worker and publisher identities; progress remains gated on safe ownership state.
 - #249: Kubernetes is downstream and cannot provide provider-side fencing or substitute for attempt-private storage/publisher serialization.
 

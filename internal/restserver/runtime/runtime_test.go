@@ -22,6 +22,7 @@ import (
 	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restprovider"
 	"github.com/leehosanganson/factory/internal/restserver"
+	"github.com/leehosanganson/factory/internal/restworker"
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
 
@@ -34,6 +35,20 @@ func (f runtimeExecutor) Execute(ctx context.Context, request restjobs.Snapshot)
 type readinessStore struct {
 	restjobs.Store
 	up atomic.Bool
+}
+
+type closeTrackingStore struct {
+	restjobs.Store
+	closed bool
+}
+
+func (s *closeTrackingStore) CloseStore() error {
+	s.closed = true
+	if closer, ok := s.Store.(interface{ CloseStore() error }); ok {
+		return closer.CloseStore()
+	}
+	s.Store.Close()
+	return nil
 }
 
 func (s *readinessStore) Ping(ctx context.Context) error {
@@ -58,6 +73,161 @@ func (p *readinessPublisher) Ping(context.Context) error {
 
 func (p *readinessPublisher) Publish(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
 	return restprovider.Outcome{}, errors.New("not used in readiness test")
+}
+
+func TestRunWorkersDisabledListenerFailureClosesStoreAndSanitizesError(t *testing.T) {
+	for _, backend := range []string{restserver.PersistenceBackendSQLite, restserver.PersistenceBackendPostgres} {
+		t.Run(backend, func(t *testing.T) {
+			config, _ := runtimeFixture(t)
+			disabled := false
+			config.WorkersEnabled = &disabled
+			if backend == restserver.PersistenceBackendSQLite {
+				stateDir := filepath.Join(t.TempDir(), "private-state")
+				if err := os.Mkdir(stateDir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				config.Persistence = restserver.PersistenceConfig{Backend: backend, Path: filepath.Join(stateDir, "jobs.db")}
+			} else {
+				config.Persistence = restserver.PersistenceConfig{Backend: backend, DSN: "postgres://factory:private-password@db.example/factory"}
+			}
+			var underlying restjobs.Store
+			var err error
+			if backend == restserver.PersistenceBackendSQLite {
+				underlying, err = restworker.NewLocalServerJobManager(config)
+			} else {
+				underlying, err = restjobs.NewManager(restjobs.Config{
+					QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers,
+					MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob,
+					MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
+				})
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &closeTrackingStore{Store: underlying}
+			const privateListenError = "bind 127.0.0.1:8080: private-listener-detail"
+			gotErr := run(context.Background(), config, runtimeOptions{
+				OpenStore: func(restserver.Config) (restjobs.Store, error) { return store, nil },
+				Listen:    func(string, string) (net.Listener, error) { return nil, errors.New(privateListenError) },
+			})
+			if gotErr == nil || gotErr.Error() != "listen for REST server" {
+				t.Fatalf("listener failure = %v, want generic sanitized listen error", gotErr)
+			}
+			if strings.Contains(gotErr.Error(), "private") {
+				t.Fatalf("listener error leaked details: %v", gotErr)
+			}
+			if !store.closed {
+				t.Fatal("configured store was not closed after listener failure")
+			}
+		})
+	}
+}
+
+func TestRunListenerAddressInUseUsesFixedDiagnosticAndClosesStore(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer occupied.Close()
+
+	config, _ := runtimeFixture(t)
+	underlying, err := restjobs.NewManager(restjobs.Config{
+		QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers,
+		MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob,
+		MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &closeTrackingStore{Store: underlying}
+	gotErr := run(context.Background(), config, runtimeOptions{
+		OpenStore: func(restserver.Config) (restjobs.Store, error) { return store, nil },
+		Listen: func(network, _ string) (net.Listener, error) {
+			return net.Listen(network, occupied.Addr().String())
+		},
+	})
+	if gotErr == nil || gotErr.Error() != "listen for REST server: address already in use" {
+		t.Fatalf("listener failure = %v, want fixed address-in-use diagnostic", gotErr)
+	}
+	for _, address := range []string{occupied.Addr().String(), config.ListenAddress} {
+		if strings.Contains(gotErr.Error(), address) {
+			t.Fatalf("listener diagnostic disclosed address %q: %v", address, gotErr)
+		}
+	}
+	if !store.closed {
+		t.Fatal("configured store was not closed after listener failure")
+	}
+}
+
+func TestRunWithWorkersDisabledDoesNotExecuteOrLoadProvider(t *testing.T) {
+	config, key := runtimeFixture(t)
+	disabled := false
+	config.WorkersEnabled = &disabled
+	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: "/missing/provider-token", BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
+	listenerReady := make(chan net.Listener, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{Listen: func(network, _ string) (net.Listener, error) {
+			l, err := net.Listen(network, "127.0.0.1:0")
+			if err == nil {
+				listenerReady <- l
+			}
+			return l, err
+		}})
+	}()
+	listener := <-listenerReady
+	waitForStatus(t, "http://"+listener.Addr().String()+"/readyz", http.StatusOK)
+	request, _ := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/v1/jobs", strings.NewReader(`{"repository":"trusted","task":"must remain queued"}`))
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "workers-disabled")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admitted struct {
+		Job restjobs.Snapshot `json:"job"`
+	}
+	decodeErr := json.NewDecoder(response.Body).Decode(&admitted)
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || decodeErr != nil {
+		t.Fatalf("admission status=%d err=%v", response.StatusCode, decodeErr)
+	}
+	reconcile, err := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/v1/jobs/"+admitted.Job.ID+"/reconcile", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcile.Header.Set("Authorization", "Bearer "+key)
+	reconcileResponse, err := http.DefaultClient.Do(reconcile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileBody, readErr := io.ReadAll(reconcileResponse.Body)
+	reconcileResponse.Body.Close()
+	if readErr != nil || reconcileResponse.StatusCode != http.StatusConflict || !strings.Contains(string(reconcileBody), `"code":"reconciliation_unavailable"`) {
+		t.Fatalf("workers-disabled reconciliation status=%d body=%s err=%v", reconcileResponse.StatusCode, reconcileBody, readErr)
+	}
+	time.Sleep(100 * time.Millisecond)
+	get, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/v1/jobs/"+admitted.Job.ID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get.Header.Set("Authorization", "Bearer "+key)
+	response, err = http.DefaultClient.Do(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current restjobs.Snapshot
+	decodeErr = json.NewDecoder(response.Body).Decode(&current)
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || decodeErr != nil || current.Status != restjobs.StatusQueued {
+		t.Fatalf("workers-disabled job=(%+v status=%d decode=%v)", current, response.StatusCode, decodeErr)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestRunNamedPrincipalAndLegacyBearerCredentialsAuthenticate(t *testing.T) {
@@ -269,6 +439,7 @@ func TestRunLogsSelectedPersistenceAfterListenerReadiness(t *testing.T) {
 	}{
 		{name: "memory defaults", backend: restserver.PersistenceBackendMemory},
 		{name: "selected SQLite", backend: restserver.PersistenceBackendSQLite},
+		{name: "selected PostgreSQL", backend: restserver.PersistenceBackendPostgres},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			config, key := runtimeFixture(t)
@@ -288,6 +459,11 @@ func TestRunLogsSelectedPersistenceAfterListenerReadiness(t *testing.T) {
 				if err := os.MkdirAll(filepath.Dir(config.Persistence.Path), 0o700); err != nil {
 					t.Fatal(err)
 				}
+			} else if test.backend == restserver.PersistenceBackendPostgres {
+				config.Persistence = restserver.PersistenceConfig{
+					Backend: test.backend,
+					DSN:     "postgres://factory:private-dsn-secret@localhost/factory?sslmode=disable",
+				}
 			}
 			resultsBase := testResultsBase(t)
 			var output bytes.Buffer
@@ -297,7 +473,17 @@ func TestRunLogsSelectedPersistenceAfterListenerReadiness(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				done <- run(ctx, config, runtimeOptions{
-					Log:         log.New(&output, "", 0),
+					Log: log.New(&output, "", 0),
+					OpenStore: func(serverConfig restserver.Config) (restjobs.Store, error) {
+						if test.backend != restserver.PersistenceBackendPostgres {
+							return restworker.NewLocalServerJobManager(serverConfig)
+						}
+						return restjobs.NewManager(restjobs.Config{
+							QueueCapacity: serverConfig.Limits.QueueCapacity, MaxConcurrentJobs: serverConfig.Limits.Workers,
+							MaxRecords: serverConfig.Limits.MaxRecords, MaxEventsPerJob: serverConfig.Limits.MaxEventsPerJob,
+							MaxTaskBytes: serverConfig.Limits.TaskBytes, RegistryBytes: serverConfig.Limits.RegistryBytes,
+						})
+					},
 					Publisher:   readyPublisherForRuntimeTest(),
 					ResultsBase: resultsBase,
 					Listen: func(network, _ string) (net.Listener, error) {
@@ -343,7 +529,7 @@ func TestRunLogsSelectedPersistenceAfterListenerReadiness(t *testing.T) {
 			if got := output.String(); got != want {
 				t.Fatalf("startup log = %q, want exactly %q", got, want)
 			}
-			for _, secret := range []string{key, "private-provider-token-secret", config.Persistence.Path, providerTokenPath, "owner/private-config-repository", config.APIKeyFile, config.Harness.Executable, config.Repositories["trusted"], config.ListenAddress} {
+			for _, secret := range []string{key, "private-provider-token-secret", "private-dsn-secret", config.Persistence.DSN, config.Persistence.Path, providerTokenPath, "owner/private-config-repository", config.APIKeyFile, config.Harness.Executable, config.Repositories["trusted"], config.ListenAddress} {
 				if secret != "" && strings.Contains(output.String(), secret) {
 					t.Errorf("startup log disclosed %q: %q", secret, output.String())
 				}
@@ -827,6 +1013,32 @@ func TestRunRecordsExecutorFailureWithoutExposingDetails(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not shut down")
+	}
+}
+
+func TestRunConfiguredPostgresStartupFailureDoesNotOpenListenerOrLeakDSN(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	config.Persistence = restserver.PersistenceConfig{
+		Backend: restserver.PersistenceBackendPostgres,
+		DSN:     "postgres://factory:credential-secret@127.0.0.1:1/factory?connect_timeout=1",
+	}
+	listenerCalled := false
+	var output bytes.Buffer
+	err := run(context.Background(), config, runtimeOptions{
+		Log: log.New(&output, "", 0),
+		Listen: func(string, string) (net.Listener, error) {
+			listenerCalled = true
+			return nil, errors.New("listener should not be reached")
+		},
+	})
+	if err == nil || listenerCalled {
+		t.Fatalf("PostgreSQL startup error=%v listener called=%v; configured storage failure must abort before accepting jobs", err, listenerCalled)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("startup log before listener readiness = %q, want none", output.String())
+	}
+	if strings.Contains(err.Error(), "credential-secret") || strings.Contains(output.String(), "credential-secret") {
+		t.Fatalf("PostgreSQL startup leaked DSN credentials: error=%v log=%q", err, output.String())
 	}
 }
 

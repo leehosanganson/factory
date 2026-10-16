@@ -16,7 +16,7 @@ Mode and executable selection are operator-configured. A request cannot choose a
 
 The server offers volatile in-memory state for local development and tests; process exit loses job status, history, idempotency data, and execution state.
 
-Optional SQLite persistence is available for single-server deployments requiring restart durability. The backend provides transactional admission/idempotency and durable job/history state. Queued jobs are safe candidates for resumption; jobs interrupted after entering the running state require operator reconciliation and are not automatically replayed. If explicitly configured storage is unavailable, the server fails closed rather than falling back to memory. Backend selection does not change the REST job contract. Durable worker leases, checkpoints, and multi-host ownership remain future work.
+Optional SQLite persistence is available for single-server deployments requiring restart durability. PostgreSQL persistence is also available when configured; a workers-disabled API control plane can share it with separately launched `factory worker` processes. All-in-one server workers remain the default, and there is no fleet coordinator. Both durable backends provide persisted job/history state; queued jobs are safe candidates for resumption, while jobs interrupted after entering the running state require operator investigation and are not automatically replayed. If explicitly configured storage is unavailable, the server fails closed rather than falling back to memory. Backend selection does not change the REST job contract. Durable distributed-worker recovery, stop proof, and multi-host failover/HA guarantees remain future work. See the [implemented REST server features](../features/README.md) and [PostgreSQL Store](../features/postgres-store.md) for current behavior.
 
 ## Required provider outcome
 
@@ -26,7 +26,7 @@ Credentials are configured by the operator, least-privilege, and available only 
 
 ## Later execution options
 
-An operator may later choose an ephemeral container or Kubernetes Pod executor, provided it preserves the API/job contract and its isolation properties are explicitly threat-modeled. A container or Pod is not automatically a security boundary. Horizontal fleet scheduling, remote workers, and a separate control plane are outside the initial service MVP and depend on proven durable ownership and recovery semantics.
+An operator may later choose an ephemeral container or Kubernetes Pod executor, provided it preserves the API/job contract and its isolation properties are explicitly threat-modeled. A container or Pod is not automatically a security boundary. PostgreSQL-backed separate workers and a workers-disabled API control plane are supported current behavior, but there is no fleet coordinator. Horizontal fleet scheduling and the distributed stop-proof/recovery semantics needed for safe automatic reassignment remain future work; see the [PostgreSQL ownership deployment contract](postgresql-ownership-deployment-contract.md).
 
 ## Lifecycle constraints
 
@@ -36,4 +36,4 @@ An operator may later choose an ephemeral container or Kubernetes Pod executor, 
 - Do not merge PRs, release, or deploy.
 - Do not report job success before verification evidence and confirmed PR outcome are durably recorded when a durable backend is selected.
 
-SQLite persistence and configured GitHub provider writes are implemented as documented in the [server configuration guide](../features/rest-server-config.md). Durable worker leases/checkpoints, automatic replay of interrupted running jobs, and container execution remain outside the current implementation.
+Configured SQLite/PostgreSQL persistence and GitHub provider writes are implemented as documented in the [server configuration guide](../features/rest-server-config.md) and [implemented REST server features](../features/README.md). The isolated `PostgresOwnership` protocol fixture does not provide production failover/HA guarantees. Durable distributed-worker leases/checkpoints, automatic replay of interrupted running jobs, and container execution remain outside the current implementation.

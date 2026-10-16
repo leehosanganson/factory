@@ -300,14 +300,23 @@ func TestNewLocalJobManagerUsesServerRegistryLimits(t *testing.T) {
 	}
 }
 
-func TestNewLocalJobManagerReturnsConfiguredSQLiteOpenFailure(t *testing.T) {
-	config := restserver.DefaultConfig()
-	config.Repositories = map[string]string{"trusted": t.TempDir()}
-	config.Harness = restserver.HarnessConfig{Executable: "agent", Args: []string{"{task}", "{system_prompt}"}}
-	config.APIKeyFile = filepath.Join(t.TempDir(), "api-key")
-	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: "relative.db"}
-	if _, err := NewLocalJobManager(config); err == nil {
-		t.Fatal("configured SQLite open failure silently fell back to memory")
+func TestNewLocalJobManagerReturnsConfiguredDurableStoreOpenFailures(t *testing.T) {
+	for _, persistence := range []restserver.PersistenceConfig{
+		{Backend: restserver.PersistenceBackendSQLite, Path: "relative.db"},
+		{Backend: restserver.PersistenceBackendPostgres, DSN: "postgres://factory:credential-secret@127.0.0.1:1/factory?connect_timeout=1"},
+	} {
+		t.Run(persistence.Backend, func(t *testing.T) {
+			config := restserver.DefaultConfig()
+			config.Repositories = map[string]string{"trusted": t.TempDir()}
+			config.Harness = restserver.HarnessConfig{Executable: "agent", Args: []string{"{task}", "{system_prompt}"}}
+			config.APIKeyFile = filepath.Join(t.TempDir(), "api-key")
+			config.Persistence = persistence
+			if _, err := NewLocalJobManager(config); err == nil {
+				t.Fatal("configured durable-store failure silently fell back to memory")
+			} else if strings.Contains(err.Error(), "credential-secret") {
+				t.Fatalf("store open error leaked DSN credentials: %v", err)
+			}
+		})
 	}
 }
 

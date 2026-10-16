@@ -2,7 +2,6 @@ name: CI
 
 on:
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
@@ -50,8 +49,8 @@ jobs:
       - name: Vet
         run: make vet
 
-  postgres-ownership:
-    name: PostgreSQL 18 ownership integration
+  postgres-store-integration:
+    name: PostgreSQL 18 Store and separate worker integration
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -79,5 +78,5 @@ jobs:
         with:
           go-version: '1.26.3'
 
-      - name: Run PostgreSQL ownership integration test
-        run: go test ./internal/restjobs -run '^TestPostgresOwnershipIntegration$' -count=1 -v
+      - name: Run PostgreSQL ownership, Store, and runtime integration tests
+        run: go test ./internal/restjobs ./internal/restserver/runtime -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess)$' -count=1 -v

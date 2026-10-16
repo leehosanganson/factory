@@ -160,12 +160,16 @@ func (ProviderToken) GoString() string { return "[REDACTED]" }
 
 // LoadPrincipalResolver loads named credentials and the legacy shared key into an immutable resolver.
 func LoadPrincipalResolver(config Config) (*PrincipalResolver, error) {
-	key, err := LoadAPIKey(config.APIKeyFile)
-	if err != nil {
-		return nil, err
+	entries := make([]principalCredential, 0, len(config.Principals)+1)
+	seenDigests := make(map[[sha256.Size]byte]struct{})
+	if config.APIKeyFile != "" {
+		key, err := LoadAPIKey(config.APIKeyFile)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, principalCredential{id: "legacy-shared", role: "operator", digest: key.digest})
+		seenDigests[key.digest] = struct{}{}
 	}
-	entries := []principalCredential{{id: "legacy-shared", role: "operator", digest: key.digest}}
-	seenDigests := map[[sha256.Size]byte]struct{}{entries[0].digest: {}}
 	for _, principal := range config.Principals {
 		if !principal.Enabled {
 			continue

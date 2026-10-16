@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.4.1",
+    "version": "1.5.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -84,7 +84,7 @@
         "operationId": "createJob",
         "summary": "Submit a job",
         "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter" ],
-        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries are scoped to the authenticated principal: same-principal retries with the same normalized payload return the retained job, while reuse for different payload conflicts; different principals may use the same key independently. Optional issue_provenance stores bounded GitHub source identity, exact snapshot version, canonical issue URL, and sanitized title only; the submitted task remains ordinary visible request.task content. Across principals and idempotency keys, the tuple (tracker, source_repository, issue_number, version) maps to one retained job. A tuple already reserved by another principal/job returns a generic sanitized conflict that does not reveal the owner or job; changed complete content also conflicts. A changed version is a distinct identity. Provenance is caller-supplied metadata and the server does not fetch GitHub or verify snapshot authenticity. Named submitters may submit but can inspect only their own jobs; operators can inspect all jobs. Memory persistence is volatile and jobs are lost on process restart. With SQLite, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
+        "description": "Admits a bounded request for an operator-configured repository alias. Idempotency-Key retries are scoped to the authenticated principal: same-principal retries with the same normalized payload return the retained job, while reuse for different payload conflicts; different principals may use the same key independently. Optional issue_provenance stores bounded GitHub source identity, exact snapshot version, canonical issue URL, and sanitized title only; the submitted task remains ordinary visible request.task content. Across principals and idempotency keys, the tuple (tracker, source_repository, issue_number, version) maps to one retained job. A tuple already reserved by another principal/job returns a generic sanitized conflict that does not reveal the owner or job; changed complete content also conflicts. A changed version is a distinct identity. Provenance is caller-supplied metadata and the server does not fetch GitHub or verify snapshot authenticity. Named submitters may submit but can inspect only their own jobs; operators can inspect all jobs. Memory persistence is volatile and jobs are lost on process restart. With SQLite or PostgreSQL, queued jobs resume after restart, but interrupted running jobs are not replayed and require operator investigation. Configured PR publication is a delivery condition, not proof of correctness; agent-reported completion is not an independent correctness verdict. Responses omit credentials, host paths, raw logs, and agent transcripts, but include the submitted request fields.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "$ref": "#/components/parameters/IdempotencyKey" }
@@ -213,14 +213,14 @@
         "operationId": "streamJobEvents",
         "summary": "Stream bounded lifecycle events for a job",
         "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own jobs only)" ],
-        "description": "Read-only bearer-authenticated Server-Sent Events stream for one retained job. Events are read from bounded retained history, in monotonically increasing per-job sequence order. Event IDs are decimal sequence cursors; reconnect with Last-Event-ID to replay only newer retained events without duplicates. If the cursor has expired, the HTTP response is 409 cursor_expired before streaming, or an in-stream reset event is sent and the connection closes; fetch GET /v1/jobs/{id} and /history, then reconnect without a cursor to start from retained history. If history is already truncated at initial connect for an active job, the route returns 409 so status/history can establish the baseline; terminal jobs replay the retained tail and close. If the terminal lifecycle event was evicted, a synthetic terminal_snapshot control frame reports only the current terminal status and has no event ID. Events expose only timestamp and allowlisted lifecycle type, never messages, requests, provider details, logs, credentials, or paths. A 250 ms history poll closes the initial-read/subscription race without subscriber queues. The process admits at most 16 streams; excess requests fail with 503 stream_capacity. Each stream sends a 15 second heartbeat, has a 25 second maximum lifetime and a 2 second write deadline, and releases capacity on disconnect/closure. Clients should reconnect as needed or fall back to polling GET status/history.",
+        "description": "Read-only bearer-authenticated Server-Sent Events stream for one retained job. Events are read from bounded retained history, in monotonically increasing per-job sequence order. Event IDs are decimal sequence cursors; reconnect with Last-Event-ID to replay only newer retained events without duplicates. If the cursor has expired, the HTTP response is 409 cursor_expired before streaming, or an in-stream reset event is sent and the connection closes; fetch GET /v1/jobs/{id} and /history, then reconnect without a cursor to start from retained history. If history is already truncated at initial connect for an active job, the route returns 409 so status/history can establish the baseline; terminal jobs replay the retained tail and close. If the terminal lifecycle event was evicted, a synthetic terminal_snapshot control frame reports only the current terminal status and has no event ID. Events expose only timestamps and allowlisted lifecycle types; stage_progress frames additionally expose only validated stage and state. No raw messages, requests, provider details, logs, credentials, or paths are streamed. A 250 ms history poll closes the initial-read/subscription race without subscriber queues. The process admits at most 16 streams; excess requests fail with 503 stream_capacity. Each stream sends a 15 second heartbeat, has a 25 second maximum lifetime and a 2 second write deadline, and releases capacity on disconnect/closure. Clients should reconnect as needed or fall back to polling GET status/history.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "$ref": "#/components/parameters/JobId" },
           { "name": "Last-Event-ID", "in": "header", "required": false, "description": "Last decimal event sequence delivered by the prior stream.", "schema": { "type": "string", "pattern": "^[0-9]+$" } }
         ],
         "responses": {
-          "200": { "description": "Server-Sent Events stream with bounded JobEvent frames.", "content": { "text/event-stream": { "schema": { "type": "string", "description": "SSE frames conform to JobEvent; heartbeats are SSE comments, reset controls have event reset, and an evicted terminal lifecycle event is represented by terminal_snapshot with the current status only." } } } },
+          "200": { "description": "Server-Sent Events stream with bounded lifecycle and progress frames.", "content": { "text/event-stream": { "schema": { "type": "string", "description": "Sequenced lifecycle frames conform to JobHistoryEvent; the stage_progress event uses StageProgressEventData. Unsequenced workflow_progress control frames use WorkflowProgressControlFrame. Heartbeats are SSE comments, reset controls have event reset, and an evicted terminal lifecycle event is represented by terminal_snapshot with the current status only.", "x-sse-control-frame-schemas": [ { "$ref": "#/components/schemas/WorkflowProgressControlFrame" } ] } } } },
           "400": { "$ref": "#/components/responses/InvalidRequest" },
           "401": { "$ref": "#/components/responses/Unauthenticated" },
           "404": { "$ref": "#/components/responses/NotFound" },
@@ -274,7 +274,7 @@
         "operationId": "reconcileJob",
         "summary": "Confirm an uncertain provider outcome",
         "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
-        "description": "Bodyless, authenticated operator action. Eligibility is limited to SQLite jobs with a persisted provider attempt/outcome and retained workspace: startup-interrupted running jobs or failed jobs. It validates retained repository/branch/commit identity and performs read-only provider confirmation; it does not run the harness or write to the provider. Only a matching confirmed open PR and successful atomic recording can mark the job succeeded. Memory storage has no durable startup-recovery classification and does not support this recovery. Failed or ambiguous reconciliation remains unresolved for operator investigation. PR publication and agent completion are not independent correctness verdicts.",
+        "description": "Bodyless, authenticated operator action. Eligibility is limited to SQLite or PostgreSQL jobs with a persisted provider attempt/outcome and retained workspace: startup-interrupted running jobs or terminal failed jobs. It validates retained repository/branch/commit identity and performs read-only provider confirmation; it does not run the harness or write to the provider. Only a matching confirmed open PR and successful atomic recording can mark the job succeeded. Memory storage has no durable startup-recovery classification and does not support this recovery. Reconciliation is unavailable through a PostgreSQL API process configured with workers_enabled=false because that API process lacks the worker-local workspace and provider reconciliation executor callback; shared storage alone does not supply the callback. Failed or ambiguous reconciliation remains unresolved for operator investigation. PR publication and agent completion are not independent correctness verdicts.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
         "responses": {
@@ -304,7 +304,7 @@
         "operationId": "dispositionJobFailed",
         "summary": "Record an interrupted job as failed",
         "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
-        "description": "Bodyless, authenticated operator action available only for SQLite jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected failed disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
+        "description": "Bodyless, authenticated operator action available only for SQLite or PostgreSQL jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected failed disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
         "responses": {
@@ -334,7 +334,7 @@
         "operationId": "dispositionJobCanceled",
         "summary": "Record an interrupted job as canceled",
         "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
-        "description": "Bodyless, authenticated operator action available only for SQLite jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected canceled disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
+        "description": "Bodyless, authenticated operator action available only for SQLite or PostgreSQL jobs classified by this store instance as interrupted while running and having no persisted provider attempt or outcome. It records only the selected canceled disposition and a bounded audit event, retaining existing verification evidence. It cannot accept caller-supplied evidence or declare success. Memory storage has no durable interrupted-job classification. This disposition is not a correctness verdict.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
         "responses": {
@@ -364,7 +364,7 @@
         "operationId": "getOperations",
         "summary": "Get aggregate service counters",
         "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
-        "description": "Returns bounded aggregate counts and capacity indicators only, without job IDs, requests, events, provider details, host paths, or credentials. Memory-mode records are volatile and lost at restart. SQLite queued jobs resume after restart; interrupted running jobs require operator investigation and are not replayed.",
+        "description": "Returns bounded aggregate counts and capacity indicators only, without job IDs, requests, events, provider details, host paths, or credentials. Memory-mode records are volatile and lost at restart. SQLite/PostgreSQL queued jobs resume after restart; interrupted running jobs require operator investigation and are not replayed.",
         "security": [ { "bearerAuth": [] } ],
         "responses": {
           "200": {
@@ -521,7 +521,9 @@
           "created_at": { "type": "string", "format": "date-time" },
           "updated_at": { "type": "string", "format": "date-time" },
           "provider": { "$ref": "#/components/schemas/ProviderOutcome" },
-          "verification": { "$ref": "#/components/schemas/VerificationEvidence" }
+          "verification": { "$ref": "#/components/schemas/VerificationEvidence" },
+          "worker": { "$ref": "#/components/schemas/WorkerSummary" },
+          "progress": { "$ref": "#/components/schemas/ProgressSummary" }
         }
       },
       "JobRequest": {
@@ -603,8 +605,29 @@
           "outcome": { "type": "string", "enum": [ "not_completed", "passed", "failed", "canceled" ] }
         }
       },
+      "WorkerSummary": {
+        "type": "object",
+        "description": "Safe attribution for the current or most recent worker attempt; contains no lease token or host-specific path.",
+        "required": [ "worker_id", "boot_id" ],
+        "properties": {
+          "worker_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "boot_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "additionalProperties": false
+      },
+      "ProgressSummary": {
+        "type": "object",
+        "description": "Current bounded workflow stage and lifecycle state; no raw progress message is exposed.",
+        "required": [ "stage", "state" ],
+        "properties": {
+          "stage": { "type": "string", "enum": [ "requirements", "implement", "review", "document" ] },
+          "state": { "type": "string", "enum": [ "started", "completed", "failed" ] }
+        },
+        "additionalProperties": false
+      },
       "JobEventStreamData": {
         "type": "object",
+        "description": "Data for a curated retained lifecycle event; internal event messages are never included.",
         "required": [ "at", "type" ],
         "properties": {
           "at": { "type": "string", "format": "date-time" },
@@ -617,35 +640,68 @@
         "required": [ "id", "event", "data" ],
         "properties": {
           "id": { "type": "string", "pattern": "^[0-9]+$", "description": "Monotonic per-job event sequence used as Last-Event-ID." },
-          "event": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition" ] },
-          "data": { "$ref": "#/components/schemas/JobEventStreamData" }
+          "event": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition", "stage_progress" ] },
+          "data": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/JobEventStreamData" },
+              { "$ref": "#/components/schemas/StageProgressEventData" }
+            ],
+            "description": "Ordinary lifecycle data or the safe stage_progress projection."
+          }
+        },
+        "additionalProperties": false
+      },
+      "StageProgressEventData": {
+        "type": "object",
+        "description": "Safe projection of stage_progress; the underlying event message is omitted.",
+        "required": [ "at", "type", "stage", "state" ],
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "type": { "type": "string", "enum": [ "stage_progress" ] },
+          "stage": { "type": "string", "enum": [ "requirements", "implement", "review", "document" ] },
+          "state": { "type": "string", "enum": [ "started", "completed", "failed" ] }
+        },
+        "additionalProperties": false
+      },
+      "WorkflowProgressControlFrame": {
+        "type": "object",
+        "description": "Unsequenced workflow_progress SSE control frame; it has no event ID and contains only the bounded stage and state, never a raw message.",
+        "required": [ "event", "data" ],
+        "properties": {
+          "event": { "type": "string", "enum": [ "workflow_progress" ] },
+          "data": { "$ref": "#/components/schemas/ProgressSummary" }
         },
         "additionalProperties": false
       },
       "JobHistory": {
         "type": "object",
+        "description": "Safe bounded history with worker and latest progress summaries; raw internal event messages are filtered or omitted.",
         "required": [ "job_id", "events", "truncated" ],
         "properties": {
           "job_id": { "type": "string" },
           "events": {
             "type": "array",
             "maxItems": 200,
-            "items": { "$ref": "#/components/schemas/JobEvent" }
+            "items": { "$ref": "#/components/schemas/JobHistoryEvent" }
           },
-          "truncated": { "type": "boolean", "description": "True when older events were omitted from bounded history." }
+          "truncated": { "type": "boolean", "description": "True when older events were omitted from bounded history." },
+          "worker": { "$ref": "#/components/schemas/WorkerSummary" },
+          "progress": { "$ref": "#/components/schemas/ProgressSummary" }
         }
       },
-      "JobEvent": {
+      "JobHistoryEvent": {
         "type": "object",
+        "description": "Safe retained lifecycle summary. Internal stage_progress messages are omitted; the latest validated stage and state are exposed in JobHistory.progress.",
         "required": [ "at", "type" ],
         "properties": {
           "at": { "type": "string", "format": "date-time" },
           "type": {
             "type": "string",
-            "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition" ]
+            "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition", "stage_progress" ]
           },
-          "message": { "type": "string", "description": "Only allowlisted fixed messages are returned; unrecognized messages are blanked." }
-        }
+          "message": { "type": "string", "enum": [ "Job admitted", "Job started", "Cancellation requested", "Job canceled before start", "Operator confirmed provider outcome", "failed", "canceled", "Job finished" ], "description": "Only known fixed lifecycle messages may be returned; raw stage-progress messages and unrecognized messages are omitted." }
+        },
+        "additionalProperties": false
       },
       "OperationalSummary": {
         "type": "object",
