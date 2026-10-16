@@ -23,6 +23,25 @@ import (
 	"github.com/leehosanganson/factory/internal/restserver"
 )
 
+func TestControlPlaneImageModeRejectsNonServerCommandsAndUnsafeServerModes(t *testing.T) {
+	original := imageControlPlaneOnly
+	imageControlPlaneOnly = "true"
+	t.Cleanup(func() { imageControlPlaneOnly = original })
+	for _, args := range [][]string{{}, {"rest", "help"}, {"worker", "--config", "/tmp/config.json"}, {"server", "doctor", "--config", "/tmp/config.json"}, {"server", "bundle", "verify", "--source", "/tmp/bundle"}} {
+		if err := run(args, strings.NewReader(""), io.Discard, io.Discard); err == nil {
+			t.Errorf("control-plane image accepted %v", args)
+		}
+	}
+	configPath := filepath.Join(t.TempDir(), "server.json")
+	config := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"admin","role":"operator","token_file":"/run/admin","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://factory:password@database/factory"},"workers_enabled":true}`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"server", "--config", configPath}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "workers_enabled: false") {
+		t.Fatalf("control-plane image accepted worker-enabled config: %v", err)
+	}
+}
+
 func TestRESTClientCommandHelp(t *testing.T) {
 	var out bytes.Buffer
 	if err := run([]string{"rest", "--help"}, strings.NewReader(""), &out, &bytes.Buffer{}); err != nil {

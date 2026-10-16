@@ -49,6 +49,7 @@ type Config struct {
 	ReconcileProvider   func(context.Context, string) error
 	ResolveInterrupted  func(context.Context, string, restjobs.InterruptedDisposition) error
 	CancelJob           func(context.Context, string) (restjobs.Snapshot, error)
+	DashboardOperatorID string
 }
 
 // Handler serves the REST API using the supplied manager and immutable API key.
@@ -125,6 +126,34 @@ func (h *Handler) readinessError(ctx context.Context) error {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.serveHTTP(w, r, nil)
+}
+
+// ServeAsDashboardOperator serves only the narrow job routes exposed by the
+// embedded UI, for the named operator selected by server configuration.
+func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Request) {
+	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || !dashboardRoute(r.URL.Path, r.Method) {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
+	h.serveHTTP(w, r, &restserver.Principal{ID: h.config.DashboardOperatorID, Role: "operator"})
+}
+
+func dashboardRoute(path, method string) bool {
+	if path == "/v1/jobs" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	if !strings.HasPrefix(path, "/v1/jobs/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/v1/jobs/"), "/")
+	if len(parts) == 1 && parts[0] != "" {
+		return method == http.MethodGet
+	}
+	return len(parts) == 2 && parts[0] != "" && ((parts[1] == "history" || parts[1] == "events") && method == http.MethodGet || parts[1] == "cancel" && method == http.MethodPost)
+}
+
+func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticated *restserver.Principal) {
 	if r.URL.Path == "/healthz" && r.URL.EscapedPath() == "/healthz" {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", http.MethodGet)
@@ -156,10 +185,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
-	caller, ok := h.authenticate(r)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthenticated", "Authentication is required.")
-		return
+	var caller restserver.Principal
+	if authenticated != nil {
+		caller = *authenticated
+	} else {
+		var ok bool
+		caller, ok = h.authenticate(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthenticated", "Authentication is required.")
+			return
+		}
 	}
 	if r.URL.EscapedPath() != r.URL.Path {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
@@ -458,6 +493,11 @@ func (h *Handler) getOperations(w http.ResponseWriter, r *http.Request) {
 
 func isJobsPath(path string) bool {
 	return path == "/v1/jobs" || strings.HasPrefix(path, "/v1/jobs/")
+}
+
+func (h *Handler) AuthenticateDashboardOperator(token string) bool {
+	principal, ok := h.key.Resolve(token)
+	return h.config.DashboardOperatorID != "" && ok && principal.ID == h.config.DashboardOperatorID && principal.Role == "operator"
 }
 
 func (h *Handler) authenticate(r *http.Request) (restserver.Principal, bool) {

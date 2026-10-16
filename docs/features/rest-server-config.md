@@ -37,6 +37,10 @@ This file describes strict server JSON for the implemented `factory server` comm
     "backend": "sqlite",
     "path": "/var/lib/factory/jobs.db"
   },
+  "web_ui": {
+    "enabled": true,
+    "operator_id": "factory-operator"
+  },
   "provider": {
     "backend": "github",
     "token_file": "/run/secrets/github-token",
@@ -69,7 +73,7 @@ This file describes strict server JSON for the implemented `factory server` comm
 
 For `factory server`, `workers_enabled` defaults to `true`; set it to `false` only for a PostgreSQL-backed API control plane intended to share the database with separately launched workers. `factory worker` uses the same strict JSON schema but requires `persistence.backend: "postgres"`; its config may omit `api_key_file` and `principals` because the worker opens no HTTP API. Keep trusted repository, harness, limits, provider, and PostgreSQL settings consistent across processes. In particular, every process sharing the database must use the same `limits.workers` value, which is the database-wide execution cap. Worker deployments and limitations are detailed in [REST worker process](rest-worker.md).
 
-`listen_address` defaults to `127.0.0.1:8080`; explicitly binding a non-loopback address exposes the API on that interface and requires suitable network controls. `repositories` maps a validated alias to an absolute checkout root; callers cannot supply paths. Before listening, the server verifies each configured path is an existing directory and the exact canonical Git working-tree root. Subdirectories, bare repositories, and symlink/path-indirected roots are rejected; linked worktree roots are accepted. Git must be installed. Validation errors identify the alias without echoing configured paths.
+`web_ui` is optional and disabled by default. When enabled, `operator_id` must identify an enabled named operator; the UI is served on the same listener and uses only that named credential. HTTPS is required for its Secure session cookie. See [the embedded REST operator dashboard guide](rest-web-ui.md) for the narrow proxy routes, sessions, CSRF, and container image. `listen_address` defaults to `127.0.0.1:8080`; explicitly binding a non-loopback address exposes the API on that interface and requires suitable network controls. `repositories` maps a validated alias to an absolute checkout root; callers cannot supply paths. Before listening, the server verifies each configured path is an existing directory and the exact canonical Git working-tree root. Subdirectories, bare repositories, and symlink/path-indirected roots are rejected; linked worktree roots are accepted. Git must be installed. Validation errors identify the alias without echoing configured paths.
 
 `harness` is a fixed executable and argv, never shell text. Arguments must contain `{task}` and `{system_prompt}` exactly once; other placeholders are rejected. `verification_checks` is an optional list of trusted operator-configured argv arrays invoked after workflow stages; callers cannot provide or change checks. Empty/omitted checks mean no external checks run. The strict schema bounds this list to 16 commands, 32 nonempty argv elements per command, and 16 KiB total argv bytes per command. Only `mode: local_process` is accepted.
 

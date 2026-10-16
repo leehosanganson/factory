@@ -49,6 +49,16 @@ jobs:
       - name: Vet
         run: make vet
 
+  container-image:
+    name: REST control-plane image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build image
+        run: make container-build
+
   postgres-store-integration:
     name: PostgreSQL 18 Store and separate worker integration
     runs-on: ubuntu-latest

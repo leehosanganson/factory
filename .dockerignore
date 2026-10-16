@@ -1,0 +1,4 @@
+.git
+bin
+factory.test
+**/*_test.go

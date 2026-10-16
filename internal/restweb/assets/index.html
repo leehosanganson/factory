@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Factory Control Plane</title>
+  <link rel="stylesheet" href="/ui/assets/dashboard.css">
+  <script defer src="/ui/assets/dashboard.js"></script>
+</head>
+<body>
+  <header class="topbar"><a class="brand" href="/ui">Factory <span>Control Plane</span></a><button id="logout" class="quiet hidden" type="button">Sign out</button></header>
+  <main>
+    <section id="login-panel" class="panel narrow" aria-labelledby="login-title">
+      <p class="eyebrow">OPERATOR ACCESS</p><h1 id="login-title">Sign in</h1>
+      <p class="muted">Use the configured named operator token. It is held only in this form and is not saved.</p>
+      <form id="login-form"><label for="token">Operator token</label><input id="token" name="token" type="password" autocomplete="current-password" required><button type="submit">Sign in</button></form>
+      <p id="login-error" class="error" role="alert"></p>
+    </section>
+    <section id="dashboard" class="hidden" aria-label="Job control plane">
+      <div class="welcome"><div><p class="eyebrow">LOCAL JOB SERVICE</p><h1>Jobs</h1><p class="muted">Admit work, monitor safe lifecycle progress, and inspect outcomes.</p></div><button id="refresh" class="secondary" type="button">Refresh</button></div>
+      <div id="notice" class="notice" role="status" aria-live="polite"></div>
+      <div class="layout">
+        <section class="panel admission" aria-labelledby="admit-title">
+          <h2 id="admit-title">Admit a job</h2>
+          <form id="admit-form">
+            <label for="repository">Repository alias</label><input id="repository" name="repository" maxlength="64" required autocomplete="off">
+            <label for="task">Task</label><textarea id="task" name="task" rows="6" maxlength="262144" required></textarea>
+            <button type="submit">Queue job</button>
+          </form>
+        </section>
+        <section class="panel jobs-panel" aria-labelledby="jobs-title">
+          <div class="section-heading"><h2 id="jobs-title">Recent jobs</h2><span id="loading" class="muted" role="status"></span></div>
+          <div id="job-list" class="job-list" aria-live="polite"><p class="muted">Loading jobs…</p></div>
+        </section>
+      </div>
+      <section id="detail" class="panel detail hidden" aria-labelledby="detail-title" aria-live="polite"></section>
+    </section>
+  </main>
+</body>
+</html>

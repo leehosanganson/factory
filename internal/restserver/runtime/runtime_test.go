@@ -230,6 +230,54 @@ func TestRunWithWorkersDisabledDoesNotExecuteOrLoadProvider(t *testing.T) {
 	}
 }
 
+func TestRunDashboardRoutesAreIntegratedWithoutChangingAPIListener(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	config.WebUI = restserver.WebUIConfig{Enabled: true, OperatorID: "runtime-operator"}
+	listenerReady := make(chan net.Listener, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{Listen: func(network, _ string) (net.Listener, error) {
+			listener, err := net.Listen(network, "127.0.0.1:0")
+			if err == nil {
+				listenerReady <- listener
+			}
+			return listener, err
+		}})
+	}()
+	var listener net.Listener
+	select {
+	case listener = <-listenerReady:
+	case err := <-done:
+		t.Fatalf("server exited before listener startup: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start a listener")
+	}
+	defer listener.Close()
+	baseURL := "http://" + listener.Addr().String()
+	for path, wantType := range map[string]string{"/": "text/html", "/ui/assets/dashboard.js": "text/javascript", "/healthz": "application/json"} {
+		response, err := http.Get(baseURL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || !strings.Contains(response.Header.Get("Content-Type"), wantType) {
+			t.Errorf("GET %s status=%d content-type=%q", path, response.StatusCode, response.Header.Get("Content-Type"))
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not shut down")
+	}
+}
+
 func TestRunNamedPrincipalAndLegacyBearerCredentialsAuthenticate(t *testing.T) {
 	config, legacyToken := runtimeFixture(t)
 	resolver, err := restserver.LoadPrincipalResolver(config)

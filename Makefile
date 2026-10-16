@@ -1,8 +1,11 @@
-.PHONY: build test fmt vet test-postgres-up test-postgres test-postgres-down clean help
+.PHONY: build container-build test fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
 	go build -o bin/factory ./cmd/factory
+
+container-build:
+	docker build --build-arg VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo dev) -t factory-web:local .
 
 test:
 	go test ./...
@@ -28,6 +31,7 @@ clean:
 help:
 	@printf '%-8s %s\n' \
 		build 'Compile the Factory CLI' \
+		container-build 'Build the REST control-plane image' \
 		test 'Run all Go tests' \
 		fmt 'Format Go source files' \
 		vet 'Run go vet' \
