@@ -1,0 +1,6 @@
+# Session observation: named operator verifier setup
+
+- **Verified friction:** the clean REST setup walkthrough had no provisioning instructions for the enabled named operator verifier required by strict server config. With the verifier path missing, `factory server doctor` reports an unavailable or invalid token verifier.
+- **Change:** documented initial local provisioning using Python 3, a high-entropy token, a digest-only version-1 verifier, private token/verifier files, matching config paths, and safe refusal/recovery guidance. The existing shared API key remains separately required.
+- **Verification:** ran the exact extracted snippet in a private temporary directory; token and verifier modes were 0600, the stored digest matched the raw token, the verifier contained no raw token, a second run refused to overwrite, and `factory server doctor` accepted the resulting temporary strict config. Temporary checkout, config, credentials, verifier, and state were deleted.
+- **Review:** independent evaluator identified provisioning overwrite/race/cleanup concerns; the snippet was revised to create the destination exclusively, stage the credential pair, clean up on normal exceptions, and document interruption recovery. Follow-up review found no actionable remaining issue.

@@ -232,6 +232,48 @@ This walkthrough starts with a trusted local checkout and an installed harness e
    chmod 600 /var/lib/factory/secrets/api-key
    ```
 
+   The config also requires at least one enabled named operator; the shared API key remains a separate operator credential. Provision an operator token and digest-only verifier with Python 3, without passing the raw token in arguments or storing it in shell history. This example writes the token and matching verifier to separate protected files:
+
+   ```sh
+   umask 077
+   python3 - <<'PY'
+   import hashlib, json, os, secrets, shutil, tempfile
+   from pathlib import Path
+
+   secrets_dir = Path("/var/lib/factory/secrets")
+   final_dir = secrets_dir / "operator-auth"
+   stage_dir = Path(tempfile.mkdtemp(prefix=".operator-auth-", dir=secrets_dir))
+   published = False
+   try:
+       token = secrets.token_urlsafe(32)
+       (stage_dir / "operator-token").write_text(token + "\n")
+       verifier = {
+           "version": 1,
+           "principals": [{"id": "factory-operator", "token_sha256": hashlib.sha256(token.encode()).hexdigest()}],
+       }
+       (stage_dir / "operator-verifier.json").write_text(json.dumps(verifier) + "\n")
+       (stage_dir / "operator-token").chmod(0o600)
+       (stage_dir / "operator-verifier.json").chmod(0o600)
+       try:
+           final_dir.mkdir(mode=0o700)
+       except FileExistsError:
+           raise SystemExit("operator-auth already exists; inspect it and follow the credential-rotation procedure")
+       published = True
+       os.rename(stage_dir / "operator-token", final_dir / "operator-token")
+       os.rename(stage_dir / "operator-verifier.json", final_dir / "operator-verifier.json")
+   except BaseException:
+       if published:
+           (final_dir / "operator-token").unlink(missing_ok=True)
+           (final_dir / "operator-verifier.json").unlink(missing_ok=True)
+           final_dir.rmdir()
+       raise
+   finally:
+       shutil.rmtree(stage_dir)
+   PY
+   ```
+
+   The command does not print the bearer token. The raw operator token is in `/var/lib/factory/secrets/operator-auth/operator-token` for the first-party client; the server verifier at `/var/lib/factory/secrets/operator-auth/operator-verifier.json` contains only its SHA-256 digest. The script creates the directory exclusively and moves the files from private staging; it refuses to overwrite an existing `operator-auth` path. If interrupted, inspect `/var/lib/factory/secrets` for a leftover `.operator-auth-*` staging directory or incomplete `operator-auth` directory before retrying; never delete or replace files until you have confirmed no provisioning process is active. This is initial provisioning, not a token-rotation procedure. Keep the files private and owned by the effective service user, and do not put the token in server JSON, command arguments, task text, or logs. Ensure the example config's enabled operator has `id: "factory-operator"` and points `token_file` to `/var/lib/factory/secrets/operator-auth/operator-verifier.json`. The client config's `token_file` should reference `/var/lib/factory/secrets/operator-auth/operator-token`. For manual provisioning, the verifier schema is `{"version":1,"principals":[{"id":"factory-operator","token_sha256":"<64 lowercase hex SHA-256 digest>"}]}`; calculate the digest over the exact token bytes excluding the final newline used when saving the client token. Use `factory server doctor --config /var/lib/factory/server.json` to check the local verifier and other prerequisites without starting the server.
+
    If enabling GitHub PR publication, provision a least-privilege GitHub token into `/var/lib/factory/secrets/github-token` using the operator's secret manager. Do not put the token value in JSON, shell arguments, repository remote URLs, or task text. Both credential files must be private regular files owned by the effective service user; restart the server after rotating them.
 3. Create `/var/lib/factory/server.json` using the complete [server config example](rest-server-config.md) as a template. Replace the repository checkout, harness executable, API-key path, SQLite path, and (if enabled) GitHub token path and repository mapping with operator-selected values. `/var/lib/factory` is private for the SQLite file and config. Keep the listener at its loopback default unless operator-managed network controls are in place. With `umask 077` still set, create and edit the config file:
 
