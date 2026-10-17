@@ -75,6 +75,44 @@ func writeRESTClientTestConfig(t *testing.T, baseURL, token string) string {
 	return configPath
 }
 
+func TestRESTUnknownCommandIsRejectedBeforeLoadingClientConfig(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "factory")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory CLI: %v\n%s", err, output)
+	}
+
+	root := t.TempDir()
+	configHome := filepath.Join(root, "missing-config-home")
+	configPath := filepath.Join(configHome, "factory", "rest-client.json")
+	run := func(args ...string) (string, error) {
+		t.Helper()
+		command := exec.Command(binary, args...)
+		command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome)
+		output, err := command.CombinedOutput()
+		return string(output), err
+	}
+
+	output, err := run("rest", "nonsense")
+	if err == nil || !strings.Contains(output, `unknown REST client command "nonsense" (try factory rest help)`) {
+		t.Fatalf("unknown command output = %q, err=%v; want useful unknown-command hint", output, err)
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("unknown command created or exposed client config path: stat error=%v", err)
+	}
+	if _, err := os.Stat(configHome); !os.IsNotExist(err) {
+		t.Fatalf("unknown command created config directory: stat error=%v", err)
+	}
+
+	output, err = run("rest", "operations")
+	if err == nil || !strings.Contains(output, "REST client config is unavailable or not private") {
+		t.Fatalf("known command without config output = %q, err=%v; want existing config-required error", output, err)
+	}
+	if _, err := os.Stat(configHome); !os.IsNotExist(err) {
+		t.Fatalf("known command created config directory: stat error=%v", err)
+	}
+}
+
 func TestRESTListMineUsesSubmitterCursorDTOAndRejectsMixedPagination(t *testing.T) {
 	const token = "rest-list-test-token"
 	var requests []string
