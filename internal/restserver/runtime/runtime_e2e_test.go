@@ -182,6 +182,119 @@ func TestRESTServerJobListingProcessE2E(t *testing.T) {
 	child = nil
 }
 
+func TestRESTServerMemoryPersistenceLostOnProcessRestartE2E(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
+		t.Skip("process-level REST E2E requires supported local process semantics")
+	}
+	config, apiKey := runtimeFixture(t)
+	harness := filepath.Join(t.TempDir(), "harness.sh")
+	if err := os.WriteFile(harness, []byte("#!/bin/sh\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config.Harness = restserver.HarnessConfig{Executable: harness, Args: []string{"{task}", "{system_prompt}"}}
+	configFile := filepath.Join(t.TempDir(), "server.json")
+	configData, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configFile, configData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateHome := testProcessStateHome(t)
+	startServer := func(name string) (*exec.Cmd, <-chan error, string, string) {
+		t.Helper()
+		readyPath := filepath.Join(t.TempDir(), name+"-ready")
+		logPath := filepath.Join(t.TempDir(), name+"-server.log")
+		logFile, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		child := exec.Command(os.Args[0], "-test.run=^TestRESTServerProcessHelper$")
+		child.Env = append(os.Environ(), "XDG_STATE_HOME="+stateHome, "FACTORY_E2E_HELPER=1", "FACTORY_E2E_NO_PROVIDER=1", "FACTORY_E2E_REPORT_RUNTIME_ERRORS=1", "FACTORY_E2E_CONFIG="+configFile, "FACTORY_E2E_READY="+readyPath)
+		child.Stdout, child.Stderr = logFile, logFile
+		if err := child.Start(); err != nil {
+			_ = logFile.Close()
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			done <- child.Wait()
+			_ = logFile.Close()
+		}()
+		return child, done, readyPath, logPath
+	}
+	stopServer := func(child *exec.Cmd, done <-chan error) {
+		t.Helper()
+		if child.Process == nil || child.ProcessState != nil {
+			return
+		}
+		if err := child.Process.Signal(syscall.SIGTERM); err != nil {
+			t.Errorf("stop REST server process: %v", err)
+			return
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("REST server process shutdown: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			_ = child.Process.Kill()
+			<-done
+			t.Error("REST server process did not stop cleanly")
+		}
+	}
+
+	firstChild, firstDone, firstReady, firstLog := startServer("first")
+	firstStopped := false
+	defer func() {
+		if !firstStopped {
+			stopServer(firstChild, firstDone)
+		}
+	}()
+	firstURL := waitForProcessURL(t, firstDone, firstReady, firstLog)
+	client := &http.Client{Timeout: 5 * time.Second}
+	waitForStatus(t, firstURL+"/readyz", http.StatusOK)
+	const key = "memory-restart-replay"
+	admitted, err := submitProcessJob(client, firstURL, apiKey, "trusted", "memory restart test", key)
+	if err != nil || admitted.StatusCode != http.StatusAccepted || admitted.ID == "" {
+		t.Fatalf("memory-backed job admission=%+v err=%v", admitted, err)
+	}
+	waitForProcessStatus(t, client, firstURL, admitted.ID, apiKey, restjobs.StatusFailed)
+	stopServer(firstChild, firstDone)
+	firstStopped = true
+
+	secondChild, secondDone, secondReady, secondLog := startServer("second")
+	secondStopped := false
+	defer func() {
+		if !secondStopped {
+			stopServer(secondChild, secondDone)
+		}
+	}()
+	secondURL := waitForProcessURL(t, secondDone, secondReady, secondLog)
+	waitForStatus(t, secondURL+"/readyz", http.StatusOK)
+	listRequest, err := http.NewRequest(http.MethodGet, secondURL+"/v1/jobs?limit=10", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listRequest.Header.Set("Authorization", "Bearer "+apiKey)
+	listResponse, err := client.Do(listRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page restjobs.JobPage
+	decodeErr := json.NewDecoder(listResponse.Body).Decode(&page)
+	_ = listResponse.Body.Close()
+	if decodeErr != nil || listResponse.StatusCode != http.StatusOK || len(page.Jobs) != 0 {
+		t.Fatalf("memory job list after restart status=%d page=%+v decodeErr=%v, want empty page", listResponse.StatusCode, page, decodeErr)
+	}
+	replayed, err := submitProcessJob(client, secondURL, apiKey, "trusted", "memory restart test", key)
+	if err != nil || replayed.StatusCode != http.StatusAccepted || replayed.Replayed || replayed.ID == "" || replayed.ID == admitted.ID {
+		t.Fatalf("same-key admission after memory restart=%+v err=%v, want new distinct job from lost record %q", replayed, err, admitted.ID)
+	}
+	stopServer(secondChild, secondDone)
+	secondStopped = true
+}
+
 func TestRESTServerBackupRestoreProcessE2E(t *testing.T) {
 	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
 		t.Skip("process-level REST E2E requires supported local process signal semantics")
