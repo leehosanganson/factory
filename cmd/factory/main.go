@@ -40,7 +40,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 		if err := rejectRemovedAlias(args); err != nil {
 			return err
 		}
-		if err := validateIssuePollerCommand(args); err != nil {
+		if err := validateNestedCommand(args); err != nil {
 			return err
 		}
 		if commandHelpRequested(args) {
@@ -60,8 +60,8 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "rest" && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "worker" && args[0] != "issue-poller" && args[0] != "doctor" && args[0] != "--gate" {
-			return fmt.Errorf("%s does not accept extra arguments", args[0])
+		if len(args) > 1 && args[0] == "version" {
+			return fmt.Errorf("version does not accept extra arguments")
 		}
 		switch args[0] {
 		case "version":
@@ -256,16 +256,30 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	return runPipelineContext(ctx, nil, false, in, out)
 }
 
-func validateIssuePollerCommand(args []string) error {
-	if len(args) < 2 || args[0] != "issue-poller" || args[1] == "" || strings.HasPrefix(args[1], "-") {
+func validateNestedCommand(args []string) error {
+	if len(args) < 2 || args[1] == "" || strings.HasPrefix(args[1], "-") {
 		return nil
 	}
-	switch args[1] {
-	case "list", "resolve", "help":
-		return nil
-	default:
-		return fmt.Errorf("unknown issue-poller command %q (try factory issue-poller help)", args[1])
+	switch args[0] {
+	case "server":
+		if strings.ContainsAny(args[1], "./\\") {
+			return nil
+		}
+		switch args[1] {
+		case "doctor", "backup", "bundle", "help":
+			return nil
+		default:
+			return fmt.Errorf("unknown server subcommand %q (try factory server help)", args[1])
+		}
+	case "issue-poller":
+		switch args[1] {
+		case "list", "resolve", "help":
+			return nil
+		default:
+			return fmt.Errorf("unknown issue-poller command %q (try factory issue-poller help)", args[1])
+		}
 	}
+	return nil
 }
 
 func rejectRemovedAlias(args []string) error {
@@ -956,8 +970,12 @@ func printHelpCommands(out io.Writer, commands []helpCommand, width int) {
 		usageLines := wrapHelpText(command.usage, usageWidth)
 		descLines := wrapHelpText(command.desc, descWidth)
 		if helpTextWidth(command.usage) > usageWidth {
-			for _, usage := range usageLines {
-				fmt.Fprintf(out, "  %s\n", usage)
+			for i, usage := range usageLines {
+				indent := "  "
+				if i > 0 {
+					indent = "    "
+				}
+				fmt.Fprintf(out, "%s%s\n", indent, usage)
 			}
 			for _, desc := range descLines {
 				fmt.Fprintf(out, "    %s\n", desc)

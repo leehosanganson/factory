@@ -20,6 +20,15 @@ import (
 	"github.com/leehosanganson/factory/internal/restserver"
 )
 
+func TestRESTUnknownCommandIsDiagnosedBeforeOptionParsing(t *testing.T) {
+	for _, args := range [][]string{{"unknown", "--badflag"}, {"unknown", "--config", "missing.json"}} {
+		err := runRESTClient(args, io.Discard)
+		if err == nil || err.Error() != `unknown REST client command "unknown" (try factory rest help)` {
+			t.Errorf("runRESTClient(%v) error = %v", args, err)
+		}
+	}
+}
+
 func TestRESTIssueProvenanceCommandUsesNarrowInspectionRoute(t *testing.T) {
 	const token = "provenance-cli-token"
 	var requests []string

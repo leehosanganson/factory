@@ -46,6 +46,11 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker fa
 		return nil
 	}
 	command := args[0]
+	switch command {
+	case "submit", "issue", "issue-provenance", "get", "list", "history", "cancel", "operations", "disposition", "reconcile", "watch":
+	default:
+		return fmt.Errorf("unknown REST client command %q (try factory rest help)", command)
+	}
 	flags := flag.NewFlagSet("factory rest "+command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "", "REST client config")
