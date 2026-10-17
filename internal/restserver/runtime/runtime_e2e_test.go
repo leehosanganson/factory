@@ -768,8 +768,19 @@ func TestRESTServerPerJobCancellationProcessE2E(t *testing.T) {
 	if status, body := postCancel(running.ID, true); status != http.StatusAccepted || !strings.Contains(body, `"cancellation_requested":true`) {
 		t.Fatalf("running cancel status=%d body=%s, want accepted cancellation request", status, body)
 	}
-	if status, body := postCancel(running.ID, true); status != http.StatusAccepted || !strings.Contains(body, `"cancellation_requested":true`) {
-		t.Fatalf("repeated running cancel status=%d body=%s, want idempotent pending request", status, body)
+	if status, body := postCancel(running.ID, true); status == http.StatusAccepted {
+		if !strings.Contains(body, `"cancellation_requested":true`) {
+			t.Fatalf("repeated running cancel status=%d body=%s, want pending cancellation flag", status, body)
+		}
+	} else if status == http.StatusConflict {
+		if !strings.Contains(body, `"code":"job_not_cancelable"`) {
+			t.Fatalf("repeated running cancel status=%d body=%s, want job_not_cancelable error", status, body)
+		}
+		if job := getProcessJob(t, client, baseURL, running.ID, apiKey); job.Status != restjobs.StatusCanceled {
+			t.Fatalf("repeated running cancel status=%d body=%s, job status=%s; want already canceled", status, body, job.Status)
+		}
+	} else {
+		t.Fatalf("repeated running cancel status=%d body=%s, want 202 pending or 409 after cancellation", status, body)
 	}
 	waitForProcessStatus(t, client, baseURL, running.ID, apiKey, restjobs.StatusCanceled)
 	canceledRunning := getProcessJob(t, client, baseURL, running.ID, apiKey)
