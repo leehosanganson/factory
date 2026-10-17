@@ -89,6 +89,12 @@ Use this checklist to verify the documented single-host job lifecycle after a cl
   go test ./internal/restserver/runtime -run '^(TestRESTServerJobListingProcessE2E|TestRESTServerPerJobCancellationProcessE2E|TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider)$' -count=1
   ```
 
+- [ ] Verify first-party client `watch` follows lifecycle events, falls back to status/history polling when event streaming is unavailable, reconnects without duplicate events at terminal transition, and does not cancel the remote job when the observer exits. These process tests use an in-process test server and fake executor:
+
+  ```sh
+  go test ./cmd/factory -run '^TestRESTWatchProcess(FallsBackToHistoryWithoutDuplicateEvents|ReconnectsWithoutDuplicatingEventsAtTerminalTransition|CancellationLeavesJobRunning|SanitizesAuthReadinessAndStreamErrors)$' -count=1
+  ```
+
 - [ ] Verify deterministic production GitHub adapter behavior against GitHub-shaped test endpoints, including a lost create response and read-only reconciliation without duplicate writes. These tests use no credentials and do not contact GitHub:
 
   ```sh
@@ -103,7 +109,11 @@ Use this checklist to verify the documented single-host job lifecycle after a cl
   make build
   ```
 
-**Recorded result (2026-10-17):** all targeted checklist commands passed locally, including the doctor preflight; process tests for memory volatility, SQLite restart/fail-closed/backup behavior, lifecycle/cancellation, and verification evidence; and deterministic GitHub adapter tests. `make test`, `make vet`, and `make build` also passed. These automated tests use temporary repositories/configuration and fake providers; no production restore drill or live GitHub validation was performed. Live GitHub validation remains separately owner-gated by issues #134/#135 and is not required for this local acceptance. Ordinary local processes, worktrees, Nix shells, and containers are not sandboxes; run only repositories and harnesses trusted with the server account's authority. SQLite backups do not include separate workspaces, and interrupted running jobs are not automatically replayed.
+**Recorded result (2026-10-17):** all targeted checklist commands passed locally, including the doctor preflight; process tests for memory volatility, SQLite restart/fail-closed/backup behavior, lifecycle/cancellation, and verification evidence; and deterministic GitHub adapter tests. `make test`, `make vet`, and `make build` also passed. These automated tests use temporary repositories/configuration and fake providers; no production restore drill or live GitHub validation was performed.
+
+**Recorded local smoke run (2026-10-17):** from a temporary checkout, I generated private shared-key and operator-verifier files, ran `factory server doctor`, then started the built `factory server` with SQLite, a synthetic successful agent, and one configured verification check. The doctor reported valid config and local prerequisites. `/healthz` and `/readyz` returned success; authenticated HTTP submission returned a job ID; authenticated job detail/history/list showed a terminal `succeeded` job, a passed `check-01`, history `queued → running → succeeded`, and one listed record. The runtime log reported the selected SQLite backend. The test directory, config, credentials, database, and harness were temporary and deleted after the run. This validates the HTTP lifecycle with a deterministic local substitute, not an actual Pi coding-agent run or GitHub PR publication. Client watch behavior is separately exercised by the process tests listed above; these use an in-process test server rather than the local-server smoke.
+
+Live GitHub validation remains separately owner-gated by issues #134/#135 and is not required for this local acceptance. Ordinary local processes, worktrees, Nix shells, and containers are not sandboxes; run only repositories and harnesses trusted with the server account's authority. SQLite backups do not include separate workspaces, and interrupted running jobs are not automatically replayed.
 
 ## Per-job cancellation
 
@@ -215,9 +225,33 @@ For a dedicated service-user unit with the installed binary, shutdown/start-rate
 
 ## Clean setup and first client request
 
-This walkthrough starts with a trusted local checkout and an installed harness executable. Use a dedicated service account where practical: the server runs its configured workflow with that account's local authority, and neither the process nor a container is a security sandbox. Keep the repository, harness, config, API key, and any provider credentials operator-controlled.
+This walkthrough is for a developer setting up a local server from a Factory source checkout. It does not install an agent or choose a distribution source for one: use only a harness executable you have independently selected, verified, and installed. Use a dedicated service account where practical: the server runs its configured workflow with that account's local authority, and neither the process nor a container is a security sandbox. Keep the repository, harness, config, API key, and any provider credentials operator-controlled.
 
-1. Prepare an exact Git working-tree root for the configured repository alias. The server rejects paths that are not the canonical checkout root. Install the configured harness and make sure it can run non-interactively as the service account.
+### Build Factory and prepare a trusted repository
+
+Install Go 1.26.3 or later, Git, Python 3, and the local utilities used below (`make`, `openssl`, `curl`, and `install`). Obtain Factory from a source/origin you trust, then build and run the local CLI binary. This does not put `factory` on `PATH`; use the explicit `./bin/factory` path, or install/copy the binary to an operator-controlled location on `PATH` and verify that `command -v factory` resolves to it.
+
+```sh
+cd /path/to/factory
+make build
+./bin/factory help
+```
+
+Prepare the target repository as an exact Git working-tree root, not a subdirectory or bare repository. Use only repositories you trust with the server account's local authority. For an existing checkout, verify its root and current branch before configuring it. For a new checkout, choose a parent directory writable only by the service/operator account, obtain the repository from a trusted source, and verify its remote and branch before configuring it. For example:
+
+```sh
+install -d -m 700 /srv/factory/checkouts
+git clone <trusted-repository-url> /srv/factory/checkouts/widget
+git -C /srv/factory/checkouts/widget rev-parse --show-toplevel
+git -C /srv/factory/checkouts/widget remote -v
+git -C /srv/factory/checkouts/widget status --short --branch
+```
+
+If `/srv/factory/checkouts` is not writable by the account that will run Factory, choose a private parent directory owned by that account instead. For a provider-free smoke test, a new local Git repository can be initialized and given a local-only test commit; no remote is required.
+
+The REST service requires a configured harness executable available to the service account. Install and verify that harness separately using its trusted installation instructions; do not assume `pi` or another agent is installed with Factory. It must run non-interactively with the configured fixed arguments and placeholders. A smoke test can use an operator-controlled synthetic harness instead of an agent, but that only validates the local REST lifecycle, not coding-agent behavior. Do not enable a GitHub provider for a provider-free smoke test.
+
+1. Set the `repositories` map in the server config so the `widget` alias points to the exact Git working-tree root above; `widget` is the alias used by the sample request. The server rejects paths that are not the canonical checkout root. Set `harness.executable` to the verified harness executable and ensure it can run non-interactively as the service account.
 2. Create private state and secret directories, then generate a fresh shared API key. These commands print no credential:
 
    ```sh
@@ -228,21 +262,67 @@ This walkthrough starts with a trusted local checkout and an installed harness e
    chmod 600 /var/lib/factory/secrets/api-key
    ```
 
-   If enabling GitHub PR publication, provision a least-privilege GitHub token into `/var/lib/factory/secrets/github-token` using the operator's secret manager. Do not put the token value in JSON, shell arguments, repository remote URLs, or task text. Both credential files must be private regular files owned by the effective service user; restart the server after rotating them.
-3. Create `/var/lib/factory/server.json` using the complete [server config example](rest-server-config.md) as a template. Replace the repository checkout, harness executable, API-key path, SQLite path, and (if enabled) GitHub token path and repository mapping with operator-selected values. `/var/lib/factory` is private for the SQLite file and config. Keep the listener at its loopback default unless operator-managed network controls are in place. With `umask 077` still set, create and edit the config file:
+   The shared API key is required; the strict server config also requires at least one enabled named operator with a private digest-verifier file. The following Python 3 example provisions an operator token directly into a private token file and writes only its SHA-256 digest to the matching verifier. It creates the destination exclusively and refuses to overwrite it:
+
+   ```sh
+   umask 077
+   python3 - <<'PY'
+   import hashlib, json, os, secrets, shutil, tempfile
+   from pathlib import Path
+
+   secrets_dir = Path("/var/lib/factory/secrets")
+   final_dir = secrets_dir / "operator-auth"
+   stage_dir = Path(tempfile.mkdtemp(prefix=".operator-auth-", dir=secrets_dir))
+   published = False
+   try:
+       token = secrets.token_urlsafe(32)
+       (stage_dir / "operator-token").write_text(token + "\n")
+       verifier = {
+           "version": 1,
+           "principals": [{"id": "factory-operator", "token_sha256": hashlib.sha256(token.encode()).hexdigest()}],
+       }
+       (stage_dir / "operator-verifier.json").write_text(json.dumps(verifier) + "\n")
+       (stage_dir / "operator-token").chmod(0o600)
+       (stage_dir / "operator-verifier.json").chmod(0o600)
+       try:
+           final_dir.mkdir(mode=0o700)
+       except FileExistsError:
+           raise SystemExit("operator-auth already exists; inspect it and follow the credential-rotation procedure")
+       published = True
+       os.rename(stage_dir / "operator-token", final_dir / "operator-token")
+       os.rename(stage_dir / "operator-verifier.json", final_dir / "operator-verifier.json")
+   except BaseException:
+       if published:
+           (final_dir / "operator-token").unlink(missing_ok=True)
+           (final_dir / "operator-verifier.json").unlink(missing_ok=True)
+           final_dir.rmdir()
+       raise
+   finally:
+       shutil.rmtree(stage_dir)
+   PY
+   ```
+
+   The raw token is saved in `/var/lib/factory/secrets/operator-auth/operator-token` and is never printed; the server verifier is `/var/lib/factory/secrets/operator-auth/operator-verifier.json`. Set the example principal's ID to `factory-operator` and its `token_file` to the verifier path; the client token file path is used separately by `factory rest`. This is initial provisioning, not rotation. If interrupted, inspect for a leftover `.operator-auth-*` staging directory or incomplete `operator-auth` before retrying; do not remove files while a provisioning process may still be active. Keep both final files private and owned by the service user. If enabling GitHub PR publication, provision a least-privilege GitHub token into `/var/lib/factory/secrets/github-token` using the operator's secret manager. Do not put the token value in JSON, shell arguments, repository remote URLs, or task text. Credential files must be private regular files owned by the effective service user; restart the server after rotating them.
+3. Create `/var/lib/factory/server.json` using the complete [server config example](rest-server-config.md) as a template. Replace the repository checkout, harness executable, API-key path, SQLite path, and (if enabled) GitHub token path and repository mapping with operator-selected values. Set the example operator's `token_file` to `/var/lib/factory/secrets/operator-auth/operator-verifier.json`; retain the raw token only in `/var/lib/factory/secrets/operator-auth/operator-token` for use by the first-party REST client. For a provider-free local smoke test, remove the entire `provider` object and its token-file requirement from the example. `/var/lib/factory` is private for the SQLite file and config. Keep the listener at its loopback default unless operator-managed network controls are in place. Run these commands as the account that owns the server state. With `umask 077` still set, create and edit the config file:
 
    ```sh
    $EDITOR /var/lib/factory/server.json
    ```
 
-   The JSON uses fixed executable/argv values, including `{system_prompt}` and `{task}` exactly once each; do not replace these placeholders with shell text. The example's verification commands are trusted operator settings, not caller-supplied checks. Validate the complete schema and startup dependencies by launching the server; invalid or unavailable settings fail before it accepts jobs, with sanitized diagnostics.
+   The JSON uses fixed executable/argv values, including `{system_prompt}` and `{task}` exactly once each; do not replace these placeholders with shell text. The example's verification commands are trusted operator settings, not caller-supplied checks. Before startup, validate the complete schema and local prerequisites without opening the database, starting a listener, or running the harness:
+
+   ```sh
+   /path/to/factory/bin/factory server doctor --config /var/lib/factory/server.json
+   ```
+
+   The doctor output names failing config fields/categories only. For `config: invalid`, check the JSON syntax and required/allowed fields against the [server config reference](rest-server-config.md); do not paste config contents into an untrusted support channel. For `api_key_file` or `principals` verifier errors, confirm the corresponding file exists, is a private regular file owned by the service user, and follows the verifier schema in the [server configuration reference](rest-server-config.md). For `persistence.path`, create the parent directory with owner-only permissions and select a private absolute database path. For `repositories`, check that Git is installed and that each configured value is an existing canonical Git checkout root (for example, `git -C <checkout> rev-parse --show-toplevel`); do not change it to a subdirectory. For `harness.executable`, confirm the chosen executable is installed and available to the service user's `PATH`. If a provider token is configured, verify its private file; provider reachability is not tested by doctor. Do not make secrets or directories broadly readable to clear a diagnostic. Correct the underlying safe configuration and rerun doctor; if doctor reports valid but server startup fails, inspect only operator-controlled local config/state and follow the sanitized startup diagnostic.
 4. Start the service as the account that owns the secret files and repository. Keep it running in this terminal or under the operator's process supervisor:
 
    ```sh
-   factory server --config /var/lib/factory/server.json
+   /path/to/factory/bin/factory server --config /var/lib/factory/server.json
    ```
 
-5. In another terminal, confirm liveness and readiness. Build a private curl header file without displaying the key, then submit one bounded request with a stable idempotency key:
+5. In another terminal, confirm liveness and readiness. Build a private curl header file without displaying the key, then submit one bounded request with a stable idempotency key. These API requests use `curl`; they do not require the Factory binary on this terminal's `PATH`.
 
    ```sh
    umask 077
@@ -260,7 +340,7 @@ This walkthrough starts with a trusted local checkout and an installed harness e
      "$base_url/v1/jobs"
    ```
 
-   A successful submission returns HTTP `202` with a job ID and inspection links; this confirms admission, not completion. Copy the returned ID into `job_id`, then use these authenticated requests to inspect the job and its bounded history:
+   A successful submission returns HTTP `202` with a job ID and inspection links; this confirms admission, not completion. Choose either the curl request above or the following CLI command for the first submission; do not run both expecting the same job, because the shared API key and named operator token have different idempotency scopes. For the CLI alternative, configure the [first-party REST client](rest-client.md) with the raw operator token saved at `/var/lib/factory/secrets/operator-auth/operator-token` and run `/path/to/factory/bin/factory rest submit --repository widget --idempotency-key operator-smoke-001 'Review the configured repository and summarize the current test status.'`; the client config points to the token file and server URL separately, and does not bypass server authentication. Then copy the ID returned by the chosen submission into `job_id` and use these authenticated requests to inspect that job and its bounded history.
 
    ```sh
    job_id='<job-id-from-response>'
@@ -268,7 +348,7 @@ This walkthrough starts with a trusted local checkout and an installed harness e
    curl --fail-with-body --silent --show-error --header @/var/lib/factory/curl-headers "$base_url/v1/jobs/$job_id/history"
    ```
 
-   A terminal `succeeded` status is the completed-job result. When GitHub is configured, it includes the confirmed PR outcome; without a provider, the current server does not publish a PR. If a provider outcome is uncertain, inspect the failed job and follow the [operator reconciliation recipe](#operator-reconciliation-recipe) when it meets the durable-store eligibility checks; retrying submission with the same idempotency key only returns the existing record. Remove the temporary header file when finished and never print or log it.
+   A terminal `succeeded` status is the completed-job result. When GitHub is configured, it includes the confirmed PR outcome; without a provider, the current server does not publish a PR. If a provider outcome is uncertain, inspect the failed job and follow the [reconciliation result and limits guidance](#reconciliation-result-and-limits) when it meets the durable-store eligibility checks; retrying submission with the same idempotency key only returns the existing record. Remove the temporary header file when finished and never print or log it.
 
 For durable deployments, also verify status/history after a clean restart and perform the [backup and restore drill](#backup-and-restore) using a disposable database copy. Never use production credentials or repositories for recovery tests.
 
