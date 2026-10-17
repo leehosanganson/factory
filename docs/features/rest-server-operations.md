@@ -89,6 +89,12 @@ Use this checklist to verify the documented single-host job lifecycle after a cl
   go test ./internal/restserver/runtime -run '^(TestRESTServerJobListingProcessE2E|TestRESTServerPerJobCancellationProcessE2E|TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider)$' -count=1
   ```
 
+- [ ] Verify first-party client `watch` follows lifecycle events, falls back to status/history polling when event streaming is unavailable, reconnects without duplicate events at terminal transition, and does not cancel the remote job when the observer exits. These process tests use an in-process test server and fake executor:
+
+  ```sh
+  go test ./cmd/factory -run '^TestRESTWatchProcess(FallsBackToHistoryWithoutDuplicateEvents|ReconnectsWithoutDuplicatingEventsAtTerminalTransition|CancellationLeavesJobRunning|SanitizesAuthReadinessAndStreamErrors)$' -count=1
+  ```
+
 - [ ] Verify deterministic production GitHub adapter behavior against GitHub-shaped test endpoints, including a lost create response and read-only reconciliation without duplicate writes. These tests use no credentials and do not contact GitHub:
 
   ```sh
@@ -105,7 +111,7 @@ Use this checklist to verify the documented single-host job lifecycle after a cl
 
 **Recorded result (2026-10-17):** all targeted checklist commands passed locally, including the doctor preflight; process tests for memory volatility, SQLite restart/fail-closed/backup behavior, lifecycle/cancellation, and verification evidence; and deterministic GitHub adapter tests. `make test`, `make vet`, and `make build` also passed. These automated tests use temporary repositories/configuration and fake providers; no production restore drill or live GitHub validation was performed.
 
-**Recorded local smoke run (2026-10-17):** from a temporary checkout, I generated private shared-key and operator-verifier files, ran `factory server doctor`, then started the built `factory server` with SQLite, a synthetic successful agent, and one configured verification check. The doctor reported valid config and local prerequisites. `/healthz` and `/readyz` returned success; authenticated HTTP submission returned a job ID; authenticated job detail/history/list showed a terminal `succeeded` job, a passed `check-01`, history `queued → running → succeeded`, and one listed record. The runtime log reported the selected SQLite backend. The test directory, config, credentials, database, and harness were temporary and deleted after the run. This validates the HTTP lifecycle with a deterministic local substitute, not an actual Pi coding-agent run or GitHub PR publication.
+**Recorded local smoke run (2026-10-17):** from a temporary checkout, I generated private shared-key and operator-verifier files, ran `factory server doctor`, then started the built `factory server` with SQLite, a synthetic successful agent, and one configured verification check. The doctor reported valid config and local prerequisites. `/healthz` and `/readyz` returned success; authenticated HTTP submission returned a job ID; authenticated job detail/history/list showed a terminal `succeeded` job, a passed `check-01`, history `queued → running → succeeded`, and one listed record. The runtime log reported the selected SQLite backend. The test directory, config, credentials, database, and harness were temporary and deleted after the run. This validates the HTTP lifecycle with a deterministic local substitute, not an actual Pi coding-agent run or GitHub PR publication. Client watch behavior is separately exercised by the process tests listed above; these use an in-process test server rather than the local-server smoke.
 
 Live GitHub validation remains separately owner-gated by issues #134/#135 and is not required for this local acceptance. Ordinary local processes, worktrees, Nix shells, and containers are not sandboxes; run only repositories and harnesses trusted with the server account's authority. SQLite backups do not include separate workspaces, and interrupted running jobs are not automatically replayed.
 
