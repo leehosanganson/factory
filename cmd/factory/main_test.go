@@ -528,8 +528,14 @@ func TestCommandHelpRoutesBeforeConfigAndWorkflowDispatch(t *testing.T) {
 	}{
 		{name: "implement", args: []string{"implement", "--help"}, want: []string{"Implement workflow", "factory implement"}, omit: []string{"factory pipeline", "Examples:", "Ctrl-C", "interactive terminal"}},
 		{name: "server help", args: []string{"server", "--help"}, want: []string{"REST API server", "factory server --config <absolute-path>", "factory server doctor --config <absolute-path>", "factory server backup --config <absolute-path> --destination <absolute-path>", "factory server bundle create --config <absolute-path> --destination <absolute-path>", "factory server bundle verify --source <absolute-path>", "factory server bundle inspect --source <absolute-path>", "factory server bundle restore --source <absolute-path> --destination <absolute-path>", "server-only JSON config", "provider reachability is not tested"}, omit: []string{"api-key-value"}},
-		{name: "worker help", args: []string{"worker", "--help"}, want: []string{"PostgreSQL job worker", "factory worker --config <absolute-path>", "without opening an HTTP listener", "worker-mode server JSON config", "PostgreSQL persistence", "docs/features/rest-worker.md"}, omit: []string{"api-key-value"}},
 		{name: "server doctor help", args: []string{"server", "doctor", "--help"}, want: []string{"REST server preflight", "factory server doctor --config <absolute-path>", "Local-only, read-only", "Provider reachability is not tested", "no database is opened or created"}, omit: []string{"api-key-value"}},
+		{name: "worker help", args: []string{"worker", "--help"}, want: []string{"REST job worker", "factory worker --config <absolute-path>", "PostgreSQL-backed worker", "without an HTTP listener", "matching limits.workers", "caller API credentials are not required"}, omit: []string{"secret", "password"}},
+		{name: "server backup help", args: []string{"server", "backup", "--help"}, want: []string{"SQLite online backup", "factory server backup --config <absolute-path> --destination <absolute-path>", "SQLite-only", "server may remain running", "not separate retained workspaces"}, omit: []string{"usage:"}},
+		{name: "server bundle overview help", args: []string{"server", "bundle", "--help"}, want: []string{"Portable recovery bundle", "factory server bundle create --config <absolute-path> --destination <absolute-path>", "factory server bundle verify --source <absolute-path>", "factory server bundle inspect --source <absolute-path>", "factory server bundle restore --source <absolute-path> --destination <absolute-path>", "SQLite-only", "stopped server", "Verify and inspect accept only a source"}, omit: []string{"usage:"}},
+		{name: "server bundle create help", args: []string{"server", "bundle", "create", "--help"}, want: []string{"factory server bundle create --config <absolute-path> --destination <absolute-path>", "SQLite-only", "stopped server"}, omit: []string{"factory server bundle verify", "factory server bundle restore"}},
+		{name: "server bundle verify help", args: []string{"server", "bundle", "verify", "--help"}, want: []string{"factory server bundle verify --source <absolute-path>", "source"}, omit: []string{"factory server bundle create", "factory server bundle restore"}},
+		{name: "server bundle inspect help", args: []string{"server", "bundle", "inspect", "--help"}, want: []string{"factory server bundle inspect --source <absolute-path>", "source"}, omit: []string{"factory server bundle create", "factory server bundle restore"}},
+		{name: "server bundle restore help", args: []string{"server", "bundle", "restore", "--help"}, want: []string{"factory server bundle restore --source <absolute-path> --destination <absolute-path>", "source and destination"}, omit: []string{"factory server bundle create", "factory server bundle verify"}},
 		{name: "tidy focused", args: []string{"tidy", "--help"}, want: []string{"Tidy workflow", "factory tidy"}, omit: []string{"factory clean", "Detached jobs", "factory job", "Monitor management", "Dirty safe mode", "make clean"}},
 		{name: "job overview", args: []string{"job", "--help"}, want: []string{"Detached jobs", "Configuration: worktree_parent", "factory job list [--json] [--details]", "queued, running, complete", "Filters affect listing only", "factory job list --scan-limit 100 --status failed", "Omitted jobs remain addressable by ID", "factory job list without --scan-limit reconciles all records", "schema version 1", "read-only inspection", "{repo}"}, omit: []string{"factory run", "Monitor management"}},
 		{name: "job subcommand", args: []string{"job", "start", "--help"}, want: []string{"Detached jobs", "factory job start implementation", "factory job start tidy", "factory job start monitor"}, omit: []string{"factory run", "Monitor management", "Example:"}},
@@ -1063,6 +1069,28 @@ func TestServerCommandRequiresExactAbsoluteConfigSyntax(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "usage: factory server --config <absolute-path>") {
 			t.Errorf("run(%v) error=%v, want strict syntax error", args, err)
 		}
+	}
+}
+
+func TestRootCommandArgumentErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown", args: []string{"bogus"}, want: `unknown command "bogus" (try factory help)`},
+		{name: "unknown with args", args: []string{"bogus", "arg"}, want: `unknown command "bogus" (try factory help)`},
+		{name: "version extra", args: []string{"version", "extra"}, want: "version does not accept extra arguments"},
+		{name: "help extra", args: []string{"help", "extra"}, want: "help does not accept extra arguments"},
+		{name: "doctor extra", args: []string{"doctor", "extra"}, want: "usage: factory doctor"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			err := run(tc.args, strings.NewReader(""), &out, &errOut)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("run(%v) error = %v, want %q", tc.args, err, tc.want)
+			}
+		})
 	}
 }
 

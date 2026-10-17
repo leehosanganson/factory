@@ -60,8 +60,8 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] == "version" {
-			return fmt.Errorf("version does not accept extra arguments")
+		if len(args) > 1 && (args[0] == "version" || args[0] == "help" || args[0] == "-h" || args[0] == "--help") {
+			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
 		case "version":
@@ -311,7 +311,10 @@ func commandHelpRequested(args []string) bool {
 		if len(args) == 2 && (args[1] == "-h" || args[1] == "--help" || args[1] == "help") {
 			return true
 		}
-		return len(args) == 3 && args[1] == "doctor" && (args[2] == "-h" || args[2] == "--help" || args[2] == "help")
+		if len(args) == 3 && (args[1] == "doctor" || args[1] == "backup" || args[1] == "bundle") && (args[2] == "-h" || args[2] == "--help" || args[2] == "help") {
+			return true
+		}
+		return len(args) == 4 && args[1] == "bundle" && (args[2] == "create" || args[2] == "verify" || args[2] == "inspect" || args[2] == "restore") && (args[3] == "-h" || args[3] == "--help" || args[3] == "help")
 	}
 	switch args[0] {
 	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker", "issue-poller":
@@ -329,6 +332,9 @@ func printCommandHelp(out io.Writer, args []string) {
 	if len(args) > 1 {
 		subcommand = args[1]
 	}
+	if command == "server" && subcommand == "bundle" && len(args) > 2 {
+		subcommand += "/" + args[2]
+	}
 	canonical := command
 
 	var title string
@@ -342,9 +348,9 @@ func printCommandHelp(out io.Writer, args []string) {
 		title = "Setup diagnostics"
 		commands = []helpCommand{{"factory doctor", "Check config and required executables without starting work."}}
 	case "worker":
-		title = "PostgreSQL job worker"
-		commands = []helpCommand{{"factory worker --config <absolute-path>", "Run a PostgreSQL-backed worker without opening an HTTP listener."}}
-		paragraphs = []string{"Requires a worker-mode server JSON config with PostgreSQL persistence. See docs/features/rest-worker.md."}
+		title = "REST job worker (PostgreSQL job worker)"
+		commands = []helpCommand{{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."}}
+		paragraphs = []string{"Uses a worker-mode server JSON config for the same PostgreSQL persistence as the API. Worker configs require trusted repositories, harness settings, and matching limits.workers; caller API credentials are not required. The worker runs without opening an HTTP listener. See docs/features/rest-worker.md for operating constraints."}
 	case "implement":
 		title = "Implement workflow"
 		commands = []helpCommand{
@@ -376,6 +382,32 @@ func printCommandHelp(out io.Writer, args []string) {
 			title = "REST server preflight"
 			commands = []helpCommand{{"factory server doctor --config <absolute-path>", "Check strict config and local prerequisites without starting the server."}}
 			paragraphs = []string{"Local-only, read-only checks. Provider reachability is not tested; no database is opened or created and no listener or workflow is started."}
+			break
+		}
+		if subcommand == "backup" {
+			title = "SQLite online backup"
+			commands = []helpCommand{{"factory server backup --config <absolute-path> --destination <absolute-path>", "Create a consistent online SQLite database backup."}}
+			paragraphs = []string{"SQLite-only. The server may remain running; the backup contains the database, not separate retained workspaces. The destination directory must already exist and be private."}
+			break
+		}
+		if subcommand == "bundle" || strings.HasPrefix(subcommand, "bundle/") {
+			title = "Portable recovery bundle"
+			commands = []helpCommand{
+				{"factory server bundle create --config <absolute-path> --destination <absolute-path>", "Create a SQLite and retained-workspace recovery bundle."},
+				{"factory server bundle verify --source <absolute-path>", "Validate a recovery bundle without extracting it."},
+				{"factory server bundle inspect --source <absolute-path>", "Display bounded recovery bundle job metadata."},
+				{"factory server bundle restore --source <absolute-path> --destination <absolute-path>", "Restore a verified bundle into a new private directory."},
+			}
+			paragraphs = []string{"Bundle creation is SQLite-only and requires a stopped server and stopped workspace writers. Verify and inspect accept only a source; restore accepts a source and destination. Bundles do not replay interrupted work."}
+			if strings.HasPrefix(subcommand, "bundle/") {
+				selected := strings.TrimPrefix(subcommand, "bundle/")
+				for _, command := range commands {
+					if strings.Contains(command.usage, "bundle "+selected+" ") {
+						commands = []helpCommand{command}
+						break
+					}
+				}
+			}
 			break
 		}
 		title = "REST API server"
