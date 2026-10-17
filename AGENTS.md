@@ -8,12 +8,13 @@
 - Clarify user goals, constraints, and acceptance criteria before consequential choices. Keep the user in control; request explicit approval for proposed usability fixes before implementation. Approval gates are opt-in unless requested.
 - Treat successful agent exit as process success, not an independent correctness verdict. Inspect the resulting diff and run relevant checks.
 - Commit authorship/co-authorship must identify human contributors only. Never set an agent/tool as author or committer and never add agent `Co-authored-by` trailers; Factory assistance is not authorship.
+- Do not make changes in `main` branch directly, start a feature branch ideally with a worktree and raise a PR against `main`.
 
 ## Positive feedback loop
 
 Use Factory to build Factory: make regular, focused usability audits with a local development build, not only in response to user reports. Run `make build`, then exercise `./bin/factory` through realistic workflows. Record reproducible product friction in [usability issues](docs/issues/usability-issues.md), separating user reports from verified observations and capturing reproduction steps, impact, evidence, and current status. Store each finding in its own file under `docs/issues/usability/`; store each session's observations in a new dated file under `docs/issues/usability/session-observations/`. Do not append to shared issue lists or the historical archive. Propose one bounded issue at a time with a desired outcome and acceptance criteria; get explicit user approval via `factory implement --gate <task>` before fixing it. If already in an active Factory run, do not nest another workflow. After approval, inspect the diff, run relevant Make targets, rebuild and validate with `./bin/factory`, then update the individual issue file. Keep audits focused; do not treat `./bin/factory` as a versioned artifact.
 
-At the end of each task, record concise session feedback about using Factory in a new, dated file under `docs/issues/usability/session-observations/`. Note what worked or caused friction, including bad surprises, and concrete ideas for improvement. Keep observations factual, distinguish them from user-reported findings, and do not infer causes without evidence.
+At the end of each task, record concise session feedback about using Factory in a new, dated file under `docs/issues/usability/session-observations/` and keep them as part of the PR. Note what worked or caused friction, including bad surprises, and concrete ideas for improvement. Keep observations factual, distinguish them from user-reported findings, and do not infer causes without evidence.
 
 Actionable code-review findings belong in `docs/to-fix.md` only when a code review is requested or produced and that workflow applies. Usability audits do not go there. See [issue documentation](docs/issues/README.md) for the distinction.
 
