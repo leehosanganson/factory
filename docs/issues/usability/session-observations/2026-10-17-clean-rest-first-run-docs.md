@@ -1,0 +1,7 @@
+# 2026-10-17 clean REST first-run documentation
+
+- **Verified gap:** the local REST setup walkthrough assumed an existing checkout, prebuilt CLI on `PATH`, installed harness, and a named operator verifier; the README states the Go/build entry point, and the REST setup path did not connect those prerequisites to its first request.
+- **Change prepared:** documented building/running the local CLI, trusted checkout preparation, operator-selected harness caveat, actionable sanitized-doctor next steps, named verifier provisioning, and the first authenticated local request. The operations checklist also points to separate first-party client watch process tests.
+- **Verification:** `make build` and local CLI help passed. The exact embedded Python provisioning snippet parsed and was executed under temporary state; permissions, digest correspondence, token omission from verifier, and refusal to overwrite were checked. Markdown links/anchors and `git diff --check` passed. The first-party watch fallback/reconnect/observer-cancellation/sanitization process tests passed locally. No live provider or GitHub call was used.
+- **Review:** an independent evaluator found no actionable documentation issues after correcting the repository map alias, reconciliation anchor, Python prerequisite, and principal-scoped idempotency distinction.
+- **Boundary:** a synthetic or operator-selected harness remains a separate dependency; no agent installation source is prescribed. Documentation is prepared in an isolated worktree and has not been published.
