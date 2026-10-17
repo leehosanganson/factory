@@ -58,6 +58,7 @@ var principalIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`)
 // Config contains server-only settings. It is independent of the CLI config.
 type Config struct {
 	Mode               string                  `json:"mode"`
+	Execution          *ExecutionConfig        `json:"execution,omitempty"`
 	ListenAddress      string                  `json:"listen_address"`
 	Repositories       map[string]string       `json:"repositories"`
 	Harness            HarnessConfig           `json:"harness"`
@@ -71,6 +72,11 @@ type Config struct {
 	WorkersEnabled     *bool                   `json:"workers_enabled,omitempty"`
 	WorkerID           string                  `json:"worker_id,omitempty"`
 	Limits             Limits                  `json:"limits"`
+}
+
+// ExecutionConfig selects the operator-owned REST job execution mode.
+type ExecutionConfig struct {
+	Mode string `json:"mode"`
 }
 
 // ParallelSubtasksConfig opts REST jobs into Factory's planner-driven parallel
@@ -132,6 +138,7 @@ type ProviderConfig struct {
 func DefaultConfig() Config {
 	return Config{
 		Mode:           "local_process",
+		Execution:      &ExecutionConfig{Mode: "local"},
 		ListenAddress:  defaultListenAddress,
 		Persistence:    PersistenceConfig{Backend: PersistenceBackendMemory},
 		WorkersEnabled: boolPointer(true),
@@ -270,6 +277,20 @@ func (c Config) Validate() error {
 		}
 	default:
 		return errors.New("persistence.backend must be memory, sqlite, or postgres")
+	}
+	executionMode := "local"
+	if c.Execution != nil {
+		executionMode = c.Execution.Mode
+	}
+	switch executionMode {
+	case "local":
+	case "kubernetes":
+		if c.Persistence.Backend != PersistenceBackendPostgres {
+			return errors.New("execution.mode kubernetes requires PostgreSQL persistence")
+		}
+		return errors.New("Kubernetes execution is not implemented")
+	default:
+		return errors.New("execution.mode must be local or kubernetes")
 	}
 	if c.Provider.Backend != "" && c.Provider.Backend != "github" {
 		return errors.New("provider.backend must be github when configured")
@@ -559,7 +580,9 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
+	case "execution":
+		fields = map[string]struct{}{"mode": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "parallel_subtasks":
@@ -626,6 +649,15 @@ func validateRequiredConfigFields(data []byte) error {
 			return fmt.Errorf("required harness field %q is missing", field)
 		}
 	}
+	if raw, exists := fields["execution"]; exists {
+		var execution map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &execution); err != nil {
+			return errors.New("execution must be an object")
+		}
+		if _, exists := execution["mode"]; !exists {
+			return errors.New("required execution field \"mode\" is missing")
+		}
+	}
 	if raw, exists := fields["web_ui"]; exists {
 		var webUI map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &webUI); err != nil {
@@ -660,7 +692,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "repositories", "verification_checks":
+	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "repositories", "verification_checks", "execution":
 		return key
 	default:
 		return ""

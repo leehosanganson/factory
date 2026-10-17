@@ -1064,6 +1064,34 @@ func TestRunRecordsExecutorFailureWithoutExposingDetails(t *testing.T) {
 	}
 }
 
+func TestKubernetesExecutionGateRejectsBeforeRuntimeResources(t *testing.T) {
+	config := restserver.DefaultConfig()
+	config.Execution = &restserver.ExecutionConfig{Mode: "kubernetes"}
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendPostgres, DSN: "postgres://worker:secret@localhost/factory"}
+	storeOpened, listenerOpened := false, false
+	err := run(context.Background(), config, runtimeOptions{
+		OpenStore: func(restserver.Config) (restjobs.Store, error) {
+			storeOpened = true
+			return nil, errors.New("store must not open")
+		},
+		Listen: func(string, string) (net.Listener, error) {
+			listenerOpened = true
+			return nil, errors.New("listener must not open")
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "Kubernetes execution is not implemented") {
+		t.Fatalf("run() error = %v, want unavailable execution error", err)
+	}
+	if storeOpened || listenerOpened {
+		t.Fatalf("runtime resources opened despite execution gate: store=%v listener=%v", storeOpened, listenerOpened)
+	}
+
+	err = RunWorker(context.Background(), config)
+	if err == nil || !strings.Contains(err.Error(), "Kubernetes execution is not implemented") {
+		t.Fatalf("RunWorker() error = %v, want unavailable execution error", err)
+	}
+}
+
 func TestRunConfiguredPostgresStartupFailureDoesNotOpenListenerOrLeakDSN(t *testing.T) {
 	config, _ := runtimeFixture(t)
 	config.Persistence = restserver.PersistenceConfig{

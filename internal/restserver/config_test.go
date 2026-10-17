@@ -31,6 +31,9 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 	if config.Persistence.Backend != PersistenceBackendMemory {
 		t.Fatalf("default persistence backend = %q, want %q", config.Persistence.Backend, PersistenceBackendMemory)
 	}
+	if config.Execution == nil || config.Execution.Mode != "local" {
+		t.Fatalf("default execution = %+v, want local", config.Execution)
+	}
 }
 
 func TestWebUIRequiresAnEnabledNamedOperatorAndCanBeDisabled(t *testing.T) {
@@ -193,6 +196,59 @@ func TestLoadWorkerConfigDoesNotRequireCallerCredentialsButKeepsStrictConfig(t *
 	}
 	if _, err := LoadConfig(writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}}`)); err == nil {
 		t.Fatal("server config accepted without caller authentication")
+	}
+}
+
+func TestExecutionModeCompatibilityGate(t *testing.T) {
+	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key"}`
+	for _, tc := range []struct {
+		name          string
+		execution     string
+		persistence   string
+		wantBackend   string
+		wantExecution string
+		wantError     string
+	}{
+		{"omitted mode defaults to local memory", "", `{"backend":"memory"}`, PersistenceBackendMemory, "local", ""},
+		{"local memory", `,"execution":{"mode":"local"}`, `{"backend":"memory"}`, PersistenceBackendMemory, "local", ""},
+		{"local SQLite", `,"execution":{"mode":"local"}`, `{"backend":"sqlite","path":"/var/lib/factory/jobs.db"}`, PersistenceBackendSQLite, "local", ""},
+		{"local PostgreSQL", `,"execution":{"mode":"local"}`, `{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}`, PersistenceBackendPostgres, "local", ""},
+		{"Kubernetes memory rejected", `,"execution":{"mode":"kubernetes"}`, `{"backend":"memory"}`, PersistenceBackendMemory, "kubernetes", "execution.mode kubernetes requires PostgreSQL persistence"},
+		{"Kubernetes SQLite rejected", `,"execution":{"mode":"kubernetes"}`, `{"backend":"sqlite","path":"/var/lib/factory/jobs.db"}`, PersistenceBackendSQLite, "kubernetes", "execution.mode kubernetes requires PostgreSQL persistence"},
+		{"Kubernetes PostgreSQL unavailable", `,"execution":{"mode":"kubernetes"}`, `{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}`, PersistenceBackendPostgres, "kubernetes", "Kubernetes execution is not implemented"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := strings.TrimSuffix(base, "}") + tc.execution + `,"persistence":` + tc.persistence + `}`
+			config, err := LoadConfig(writeConfig(t, root))
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+					t.Fatalf("LoadConfig() error = %v, want %q", err, tc.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadConfig() error = %v", err)
+			}
+			if config.Execution == nil || config.Execution.Mode != tc.wantExecution || config.Persistence.Backend != tc.wantBackend {
+				t.Fatalf("execution=%+v persistence=%+v, want mode %q and backend %q", config.Execution, config.Persistence, tc.wantExecution, tc.wantBackend)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRejectsInvalidOrIncompleteExecutionSelector(t *testing.T) {
+	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key"}`
+	for _, execution := range []string{
+		`{}`, `{"mode":"docker"}`, `{"mode":"local","extra":true}`, `{"mode":"local","mode":"kubernetes"}`, `{"extra":"value"}`, `[]`, `null`,
+	} {
+		if _, err := LoadConfig(writeConfig(t, strings.TrimSuffix(base, "}")+`,"execution":`+execution+`}`)); err == nil {
+			t.Errorf("LoadConfig() accepted execution selector %s", execution)
+		}
+	}
+	for _, field := range []string{`"mode":"local","Mode":"kubernetes"`, `"mode":null`} {
+		if _, err := LoadConfig(writeConfig(t, strings.TrimSuffix(base, "}")+`,"execution":{`+field+`}}`)); err == nil {
+			t.Errorf("LoadConfig() accepted invalid execution object field %s", field)
+		}
 	}
 }
 
