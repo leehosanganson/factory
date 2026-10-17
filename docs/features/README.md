@@ -7,12 +7,13 @@ This section describes implemented behavior, distinct from the remaining target 
 - [Tidy workflow](tidy.md) — repository review/fix/document/verify, with foreground publishing safeguards and a nonpublishing detached mode.
 - [Detached jobs](jobs.md) — durable lifecycle for detached implementation, tidy, and monitor jobs.
 - [PR monitor](monitor.md) — detached, guarded maintenance of an existing open pull request.
-- [Issue work intake and tracking](work.md) — local durable submission and inspection of provider-neutral issue work requests, one-shot refresh/history, opt-in foreground GitHub issue polling, and version-pinned human-direction records; requests remain queued because no autonomous worker is implemented.
+- [Issue work intake and tracking](work.md) — local work commands do not start an autonomous worker; this feature is separate from the REST issue poller.
 - [REST job server](rest-server.md) — current authenticated job execution, persistence modes, provider PR writes, readiness, graceful runtime lifecycle, and local-only read-only configuration preflight.
 - [REST server configuration](rest-server-config.md) — strict server JSON, memory/SQLite/PostgreSQL selection, worker-mode settings, and operational limits.
 - [PostgreSQL Store](postgres-store.md) — PostgreSQL-backed REST persistence and shared-store behavior.
 - [REST worker process](rest-worker.md) — separate PostgreSQL worker and workers-disabled API control-plane operation.
 - [Embedded REST operator dashboard](rest-web-ui.md) — optional same-listener browser UI and control-plane container image.
+- [Autonomous GitHub issue poller](issue-poller.md) — dedicated PostgreSQL-backed admission into the shared REST job queue.
 - [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, SQLite backup and portable recovery bundles, restart recovery classification, limits, and trusted-network operations.
 - [REST job client](rest-client.md) — separate protected client configuration and CLI commands for remote submit, inspect, watch, cooperative cancellation, read-only aggregate operations, and explicit SQLite interrupted-job recovery actions.
 - [Supervised systemd deployment](rest-server-systemd.md) — dedicated service account, private paths, installed binary unit, lifecycle, and single-host operations.

@@ -600,6 +600,48 @@ func TestServerBundleCommandsRequireExactSyntax(t *testing.T) {
 	}
 }
 
+func TestIssuePollerHelpDocumentsDedicatedAdmissionProcess(t *testing.T) {
+	var output strings.Builder
+	if err := run([]string{"issue-poller", "--help"}, strings.NewReader(""), &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "factory issue-poller --config") || !strings.Contains(output.String(), "PostgreSQL") {
+		t.Fatalf("issue-poller help missing contract: %q", output.String())
+	}
+}
+
+func TestIssuePollerOperatorHelpDocumentsBoundedResolutionCommands(t *testing.T) {
+	var output strings.Builder
+	if err := run([]string{"issue-poller", "--help"}, strings.NewReader(""), &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"issue-poller list", "issue-poller resolve", "--version <sha256>", "issue text", "secrets"} {
+		if !strings.Contains(output.String(), required) {
+			t.Errorf("issue-poller help missing %q: %s", required, output.String())
+		}
+	}
+}
+
+func TestIssuePollerUnknownCommandIsDiagnosedBeforeConfigValidation(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "missing-config-home"))
+	var out, errOut bytes.Buffer
+	err := run([]string{"issue-poller", "unknown"}, strings.NewReader(""), &out, &errOut)
+	if err == nil || err.Error() != `unknown issue-poller command "unknown" (try factory issue-poller help)` {
+		t.Fatalf("unknown issue-poller command error = %v", err)
+	}
+}
+
+func TestIssuePollerCommandRequiresAbsoluteStrictConfigPath(t *testing.T) {
+	for _, args := range [][]string{{"relative.json"}, {"--config", "relative.json"}, {"--config", "/etc/factory/poller.json", "extra"}} {
+		if _, err := parseIssuePollerOptions(args); err == nil {
+			t.Errorf("parseIssuePollerOptions(%v) unexpectedly succeeded", args)
+		}
+	}
+	if got, err := parseIssuePollerOptions([]string{"--config", "/etc/factory/poller.json"}); err != nil || got != "/etc/factory/poller.json" {
+		t.Fatalf("parseIssuePollerOptions=(%q,%v)", got, err)
+	}
+}
+
 func TestServerBackupCommandRequiresExactConfigAndDestinationSyntax(t *testing.T) {
 	for _, args := range [][]string{
 		{"server", "backup"},

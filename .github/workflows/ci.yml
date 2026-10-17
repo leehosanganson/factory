@@ -88,5 +88,5 @@ jobs:
         with:
           go-version: '1.26.3'
 
-      - name: Run PostgreSQL ownership, Store, and runtime integration tests
-        run: go test ./internal/restjobs ./internal/restserver/runtime -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess)$' -count=1 -v
+      - name: Run PostgreSQL ownership, Store, runtime, and issue-poller integration tests
+        run: go test ./internal/restjobs ./internal/restserver/runtime ./internal/issuepoller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan)$' -count=1 -v

@@ -16,6 +16,7 @@ import (
 	"unicode"
 
 	"github.com/leehosanganson/factory/internal/factory"
+	"github.com/leehosanganson/factory/internal/issuepoller"
 	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restserver"
 	serverruntime "github.com/leehosanganson/factory/internal/restserver/runtime"
@@ -39,6 +40,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 		if err := rejectRemovedAlias(args); err != nil {
 			return err
 		}
+		if err := validateIssuePollerCommand(args); err != nil {
+			return err
+		}
 		if commandHelpRequested(args) {
 			printCommandHelp(out, args)
 			return nil
@@ -56,7 +60,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return factory.MonitorCommand(append([]string{"--worker"}, args[1:]...), cfg, "", in, out, errOut)
 		}
-		if len(args) > 1 && args[0] != "rest" && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "worker" && args[0] != "doctor" && args[0] != "--gate" {
+		if len(args) > 1 && args[0] != "rest" && args[0] != "job" && args[0] != "run" && args[0] != "implement" && args[0] != "tidy" && args[0] != "monitor" && args[0] != "work" && args[0] != "server" && args[0] != "worker" && args[0] != "issue-poller" && args[0] != "doctor" && args[0] != "--gate" {
 			return fmt.Errorf("%s does not accept extra arguments", args[0])
 		}
 		switch args[0] {
@@ -82,6 +86,23 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			ctx, stop := foregroundContext()
 			defer stop()
 			return serverruntime.RunWorker(ctx, config)
+		case "issue-poller":
+			if len(args) > 1 && (args[1] == "list" || args[1] == "resolve") {
+				ctx, stop := foregroundContext()
+				defer stop()
+				return issuepoller.OperatorCommand(ctx, args[1:], out)
+			}
+			configPath, err := parseIssuePollerOptions(args[1:])
+			if err != nil {
+				return err
+			}
+			config, err := issuepoller.LoadConfig(configPath)
+			if err != nil {
+				return err
+			}
+			ctx, stop := foregroundContext()
+			defer stop()
+			return issuepoller.Run(ctx, config)
 		case "server":
 			if imageControlPlaneOnly == "true" && len(args) > 1 && (args[1] == "doctor" || args[1] == "bundle" || args[1] == "backup") {
 				return errors.New("this Factory image only supports the REST control plane")
@@ -235,6 +256,18 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	return runPipelineContext(ctx, nil, false, in, out)
 }
 
+func validateIssuePollerCommand(args []string) error {
+	if len(args) < 2 || args[0] != "issue-poller" || args[1] == "" || strings.HasPrefix(args[1], "-") {
+		return nil
+	}
+	switch args[1] {
+	case "list", "resolve", "help":
+		return nil
+	default:
+		return fmt.Errorf("unknown issue-poller command %q (try factory issue-poller help)", args[1])
+	}
+}
+
 func rejectRemovedAlias(args []string) error {
 	if len(args) == 0 {
 		return nil
@@ -267,7 +300,7 @@ func commandHelpRequested(args []string) bool {
 		return len(args) == 3 && args[1] == "doctor" && (args[2] == "-h" || args[2] == "--help" || args[2] == "help")
 	}
 	switch args[0] {
-	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker":
+	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker", "issue-poller":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -320,6 +353,10 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "work":
 		title = "Issue work requests"
 		commands, paragraphs = workHelp(subcommand)
+	case "issue-poller":
+		title = "GitHub issue poller"
+		commands = []helpCommand{{"factory issue-poller --config <absolute-path>", "Start a dedicated allowlisted GitHub issue admission process."}, {"factory issue-poller list --config <absolute-path> [--limit <1..100>]", "List safe unresolved quarantine/operator outcomes."}, {"factory issue-poller resolve --config <absolute-path> --source <owner/repo> --issue <number> --version <sha256>", "Record explicit handling of one unresolved issue-poller outcome."}}
+		paragraphs = []string{"Requires PostgreSQL shared with factory server/worker. Issue work enters the ordinary durable job queue; issue state and job delivery status remain distinct. Ledger queries expose identity/version/reason class only, not issue text or secrets."}
 	case "server":
 		if subcommand == "doctor" {
 			title = "REST server preflight"
@@ -523,6 +560,13 @@ func parseServerOptions(args []string) (string, error) {
 func parseWorkerOptions(args []string) (string, error) {
 	if len(args) != 2 || args[0] != "--config" || !filepath.IsAbs(args[1]) {
 		return "", fmt.Errorf("usage: factory worker --config <absolute-path>")
+	}
+	return args[1], nil
+}
+
+func parseIssuePollerOptions(args []string) (string, error) {
+	if len(args) != 2 || args[0] != "--config" || !filepath.IsAbs(args[1]) {
+		return "", fmt.Errorf("usage: factory issue-poller --config <absolute-path>")
 	}
 	return args[1], nil
 }
@@ -848,6 +892,8 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory run <command>", "Manage gated runs."},
 		{"factory server --config <absolute-path>", "Start the REST API server."},
 		{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."},
+		{"factory issue-poller --config <absolute-path>", "Poll allowlisted GitHub issues and admit jobs into PostgreSQL."},
+		{"factory issue-poller list|resolve --config <absolute-path>", "Inspect or resolve bounded issue-poller operator outcomes."},
 		{"factory rest <command>", "Submit and inspect jobs on a configured REST server."},
 		{"factory doctor", "Check local setup without starting work."},
 		{"factory version", "Print the build version."},

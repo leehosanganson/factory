@@ -275,10 +275,18 @@ func (s *PostgresStore) Admit(key string, request Request) (Snapshot, bool, erro
 }
 
 func (s *PostgresStore) AdmitAs(key, principalID string, request Request) (Snapshot, bool, error) {
-	return s.admitAsContext(context.Background(), key, principalID, request)
+	return s.admitAsContext(context.Background(), key, principalID, request, "")
 }
 
-func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID string, request Request) (Snapshot, bool, error) {
+// AdmitIssuePoller records the durable label-removal obligation with admission.
+func (s *PostgresStore) AdmitIssuePoller(ctx context.Context, key, principalID string, request Request, triggerLabel string) (Snapshot, bool, error) {
+	if ctx == nil || triggerLabel == "" {
+		return Snapshot{}, false, ErrInvalidInput
+	}
+	return s.admitAsContext(ctx, key, principalID, request, triggerLabel)
+}
+
+func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID string, request Request, triggerLabel string) (Snapshot, bool, error) {
 	s.admitMu.Lock()
 	defer s.admitMu.Unlock()
 	key, request, err := normalizeAdmission(key, request, s.config.MaxTaskBytes)
@@ -327,6 +335,11 @@ func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID 
 		if err != nil {
 			return Snapshot{}, false, errors.New("read PostgreSQL job record")
 		}
+		if triggerLabel != "" {
+			if err = recordIssuePollerAdmission(ctx, tx, request, existingID, triggerLabel); err != nil {
+				return Snapshot{}, false, errors.New("record PostgreSQL issue-poller admission")
+			}
+		}
 		if err = tx.Commit(); err != nil {
 			return Snapshot{}, false, errors.New("finish PostgreSQL idempotency lookup")
 		}
@@ -352,6 +365,11 @@ func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID 
 			snap, e := scanPostgresSnapshot(tx.QueryRowContext(ctx, pgSnapshotQuery()+`WHERE j.id=$1`, existingID))
 			if e != nil {
 				return Snapshot{}, false, errors.New("read PostgreSQL job record")
+			}
+			if triggerLabel != "" {
+				if e = recordIssuePollerAdmission(ctx, tx, request, existingID, triggerLabel); e != nil {
+					return Snapshot{}, false, errors.New("record PostgreSQL issue-poller admission")
+				}
 			}
 			if e = tx.Commit(); e != nil {
 				return Snapshot{}, false, errors.New("finish PostgreSQL provenance lookup")
@@ -401,6 +419,11 @@ func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID 
 	}
 	if err = insertPostgresEvent(ctx, tx, id, "queued", "Job admitted", s.config.MaxEventsPerJob); err != nil {
 		return Snapshot{}, false, errors.New("persist PostgreSQL admission history")
+	}
+	if triggerLabel != "" {
+		if err = recordIssuePollerAdmission(ctx, tx, request, id, triggerLabel); err != nil {
+			return Snapshot{}, false, errors.New("record PostgreSQL issue-poller admission")
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return Snapshot{}, false, errors.New("commit PostgreSQL job admission")
