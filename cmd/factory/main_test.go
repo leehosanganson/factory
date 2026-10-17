@@ -622,12 +622,118 @@ func TestIssuePollerOperatorHelpDocumentsBoundedResolutionCommands(t *testing.T)
 	}
 }
 
+func TestUnknownNestedCommandsAreDiagnosedBeforeOptionValidation(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "missing-config-home"))
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown server subcommand", args: []string{"server", "nope"}, want: `unknown server subcommand "nope" (try factory server help)`},
+		{name: "unknown REST command before invalid options", args: []string{"rest", "nonsense", "--badflag"}, want: `unknown REST client command "nonsense" (try factory rest help)`},
+		{name: "known server subcommand keeps option validation", args: []string{"server", "doctor", "--badflag"}, want: "usage: factory server doctor --config <absolute-path>"},
+		{name: "server keeps required config validation", args: []string{"server"}, want: "usage: factory server --config <absolute-path>"},
+		{name: "issue-poller keeps required config validation", args: []string{"issue-poller", "--config"}, want: "usage: factory issue-poller --config <absolute-path>"},
+		{name: "known REST command keeps option validation", args: []string{"rest", "operations", "--badflag"}, want: "invalid REST client options (try factory rest help)"},
+		{name: "known REST command keeps required config validation", args: []string{"rest", "operations"}, want: "REST client config is unavailable or not private"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			err := run(tc.args, strings.NewReader(""), &out, &errOut)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("run(%v) error=%v, want %q", tc.args, err, tc.want)
+			}
+		})
+	}
+}
+
 func TestIssuePollerUnknownCommandIsDiagnosedBeforeConfigValidation(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(t.TempDir(), "missing-config-home"))
 	var out, errOut bytes.Buffer
 	err := run([]string{"issue-poller", "unknown"}, strings.NewReader(""), &out, &errOut)
 	if err == nil || err.Error() != `unknown issue-poller command "unknown" (try factory issue-poller help)` {
 		t.Fatalf("unknown issue-poller command error = %v", err)
+	}
+}
+
+func TestVersionRejectsExtraArguments(t *testing.T) {
+	var out, errOut bytes.Buffer
+	err := run([]string{"version", "extra"}, strings.NewReader(""), &out, &errOut)
+	if err == nil || err.Error() != "version does not accept extra arguments" {
+		t.Fatalf("run(version extra) error = %v, want version extra-argument diagnostic", err)
+	}
+}
+
+func TestHelpCommandContinuationsAreIndentedAtDefaultWidth(t *testing.T) {
+	usage := "factory server bundle create --config <absolute-path> --destination <absolute-path>"
+	desc := "Create a SQLite and retained-workspace recovery bundle with private permissions."
+	command := []helpCommand{{usage: usage, desc: desc}}
+
+	var wide bytes.Buffer
+	printHelpCommands(&wide, command, 80)
+	lines := strings.Split(strings.TrimSuffix(wide.String(), "\n"), "\n")
+	usageLines := wrapHelpText(usage, 40)
+	descLines := wrapHelpText(desc, 36)
+	if len(lines) != len(usageLines)+len(descLines) {
+		t.Fatalf("80-column help has %d lines, want %d: %q", len(lines), len(usageLines)+len(descLines), wide.String())
+	}
+	var reconstructedUsage []string
+	for i := range usageLines {
+		prefix := "  "
+		if i > 0 {
+			prefix = "    "
+		}
+		if !strings.HasPrefix(lines[i], prefix) || strings.HasPrefix(lines[i], "      ") {
+			t.Errorf("80-column usage line %d has incorrect continuation indentation: %q", i+1, lines[i])
+		}
+		reconstructedUsage = append(reconstructedUsage, strings.TrimPrefix(lines[i], prefix))
+	}
+	if got := strings.Join(reconstructedUsage, " "); got != usage {
+		t.Errorf("80-column wrapped usage = %q, want exact command %q", got, usage)
+	}
+	for i, descLine := range descLines {
+		line := lines[len(usageLines)+i]
+		if !strings.HasPrefix(line, "    ") {
+			t.Errorf("80-column description line %d is not independently indented: %q", i+1, line)
+		}
+		if got := strings.TrimPrefix(line, "    "); got != descLine {
+			t.Errorf("80-column description line %d = %q, want %q", i+1, got, descLine)
+		}
+	}
+
+	var narrow bytes.Buffer
+	printHelpCommands(&narrow, command, 39)
+	narrowLines := strings.Split(strings.TrimSuffix(narrow.String(), "\n"), "\n")
+	narrowUsageLines := wrapHelpText(usage, 37)
+	narrowDescLines := wrapHelpText(desc, 35)
+	if len(narrowLines) != len(narrowUsageLines)+len(narrowDescLines) {
+		t.Fatalf("39-column help has %d lines, want %d: %q", len(narrowLines), len(narrowUsageLines)+len(narrowDescLines), narrow.String())
+	}
+	var narrowUsage []string
+	for i := range narrowUsageLines {
+		line := narrowLines[i]
+		if !strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "    ") {
+			t.Errorf("39-column usage line %d changed indentation: %q", i+1, line)
+		}
+		if got := helpTextWidth(line); got > 39 {
+			t.Errorf("39-column usage line %d has width %d: %q", i+1, got, line)
+		}
+		narrowUsage = append(narrowUsage, strings.TrimPrefix(line, "  "))
+	}
+	if got := strings.Join(narrowUsage, " "); got != usage {
+		t.Errorf("39-column wrapped usage = %q, want exact command %q", got, usage)
+	}
+	for i, descLine := range narrowDescLines {
+		line := narrowLines[len(narrowUsageLines)+i]
+		if !strings.HasPrefix(line, "    ") {
+			t.Errorf("39-column description line %d is not indented: %q", i+1, line)
+		}
+		if got := helpTextWidth(line); got > 39 {
+			t.Errorf("39-column description line %d has width %d: %q", i+1, got, line)
+		}
+		if got := strings.TrimPrefix(line, "    "); got != descLine {
+			t.Errorf("39-column description line %d = %q, want %q", i+1, got, descLine)
+		}
 	}
 }
 
