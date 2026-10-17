@@ -61,6 +61,50 @@ With SQLite configured, the database file is the durable job/history store. Only
 
 SQLite and PostgreSQL retention are bounded by the configured record limit. When the retained-record cap is reached, new admissions fail rather than evicting terminal history or idempotency records. Inspect capacity and plan backup/archive operations before the cap is reached.
 
+## Local REST MVP acceptance checklist
+
+Use this checklist to verify the documented single-host job lifecycle after a clean checkout or before a local rollout. It exercises synthetic repositories, harnesses, and fake providers; it does not require GitHub credentials or make live provider writes. It is regression evidence, not a production restore drill or a security/sandbox guarantee.
+
+- [ ] Run the documented local-only preflight test; it verifies diagnostics without starting a listener or creating configured state:
+
+  ```sh
+  go test ./cmd/factory -run '^TestServerDoctorProcessIsLocalOnlyAndReadOnly$' -count=1
+  ```
+
+- [ ] Verify volatile memory behavior across a real server-process restart. The job and idempotency record disappear; replaying the same key is a new admission:
+
+  ```sh
+  go test ./internal/restserver/runtime -run '^TestRESTServerMemoryPersistenceLostOnProcessRestartE2E$' -count=1
+  ```
+
+- [ ] Verify durable SQLite behavior and its failure/recovery boundaries: queued work resumes, interrupted running work is retained without replay, unavailable configured storage fails before listening, and backup/restore preserves inspectable records. The process tests use temporary state and synthetic workspaces:
+
+  ```sh
+  go test ./internal/restserver/runtime -run '^(TestRESTServerProcessRecoversQueuedAndRetainsInterruptedRunningSQLiteJobs|TestRESTServerProcessRejectsUnavailableSQLiteBeforeListening|TestRESTServerBackupRestoreProcessE2E|TestRESTServerProcessSQLiteWriteLockFailsReadinessAndAdmission)$' -count=1
+  ```
+
+- [ ] Verify authenticated lifecycle inspection/cancellation, recorded verification evidence, and required provider outcome using the process-level fake-provider tests:
+
+  ```sh
+  go test ./internal/restserver/runtime -run '^(TestRESTServerJobListingProcessE2E|TestRESTServerPerJobCancellationProcessE2E|TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider)$' -count=1
+  ```
+
+- [ ] Verify deterministic production GitHub adapter behavior against GitHub-shaped test endpoints, including a lost create response and read-only reconciliation without duplicate writes. These tests use no credentials and do not contact GitHub:
+
+  ```sh
+  go test ./internal/restprovider -run '^(TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI|TestGitHubPublisherReconcileRejectsMismatchedGitHubResponsesReadOnly|TestGitHubPublisherReconcilesAfterForwardedCreateResponseIsLostWithoutRetry)$' -count=1
+  ```
+
+- [ ] Run the repository-required checks:
+
+  ```sh
+  make test
+  make vet
+  make build
+  ```
+
+**Recorded result (2026-10-17):** all targeted checklist commands passed locally, including the doctor preflight; process tests for memory volatility, SQLite restart/fail-closed/backup behavior, lifecycle/cancellation, and verification evidence; and deterministic GitHub adapter tests. `make test`, `make vet`, and `make build` also passed. These automated tests use temporary repositories/configuration and fake providers; no production restore drill or live GitHub validation was performed. Live GitHub validation remains separately owner-gated by issues #134/#135 and is not required for this local acceptance. Ordinary local processes, worktrees, Nix shells, and containers are not sandboxes; run only repositories and harnesses trusted with the server account's authority. SQLite backups do not include separate workspaces, and interrupted running jobs are not automatically replayed.
+
 ## Per-job cancellation
 
 Use bodyless bearer-authenticated `POST /v1/jobs/{id}/cancel` to request cancellation of exactly one job. A queued job is canceled before claim and execution and returns `200` with the canceled snapshot. A running job returns `202` with its still-running snapshot and `cancellation_requested: true`; its worker context is canceled, but the terminal status/history event is written only after the executor exits. Repeating while cancellation is pending returns the same `202` state and does not append another request event. A terminal or otherwise ineligible job returns `409 job_not_cancelable` unchanged. Wrong methods return `405` with `Allow: POST`; nonempty bodies return `400 invalid_request`; unauthenticated requests return `401 unauthenticated` (readiness can reject first with `503 not_ready`).
