@@ -22,6 +22,7 @@ import (
 )
 
 var version = "dev"
+var imageControlPlaneOnly = "false"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
@@ -31,6 +32,9 @@ func main() {
 }
 
 func run(args []string, in io.Reader, out, errOut io.Writer) error {
+	if imageControlPlaneOnly == "true" && (len(args) == 0 || args[0] != "server" && args[0] != "version") {
+		return errors.New("this Factory image only supports the REST control plane")
+	}
 	if len(args) > 0 {
 		if err := rejectRemovedAlias(args); err != nil {
 			return err
@@ -79,6 +83,9 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			defer stop()
 			return serverruntime.RunWorker(ctx, config)
 		case "server":
+			if imageControlPlaneOnly == "true" && len(args) > 1 && (args[1] == "doctor" || args[1] == "bundle" || args[1] == "backup") {
+				return errors.New("this Factory image only supports the REST control plane")
+			}
 			if len(args) > 1 && args[1] == "doctor" {
 				configPath, err := parseServerDoctorOptions(args[2:])
 				if err != nil {
@@ -113,7 +120,12 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if err != nil {
 				return err
 			}
-			config, err := restserver.LoadConfig(configPath)
+			var config restserver.Config
+			if imageControlPlaneOnly == "true" {
+				config, err = restserver.LoadControlPlaneConfig(configPath)
+			} else {
+				config, err = restserver.LoadConfig(configPath)
+			}
 			if err != nil {
 				return err
 			}

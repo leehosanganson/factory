@@ -21,6 +21,7 @@ import (
 	"github.com/leehosanganson/factory/internal/restjobs"
 	"github.com/leehosanganson/factory/internal/restprovider"
 	"github.com/leehosanganson/factory/internal/restserver"
+	"github.com/leehosanganson/factory/internal/restweb"
 	"github.com/leehosanganson/factory/internal/restworker"
 	"github.com/leehosanganson/factory/internal/restworkspace"
 )
@@ -258,10 +259,15 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			return nil
 		}
 	}
+	dashboardOperatorID := ""
+	if config.WebUI.Enabled {
+		dashboardOperatorID = config.WebUI.OperatorID
+	}
 	apiHandler, err := restapi.New(manager, key, restapi.Config{
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
+		DashboardOperatorID: dashboardOperatorID,
 		CancelJob: func(requestCtx context.Context, id string) (restjobs.Snapshot, error) {
 			if err := requestCtx.Err(); err != nil {
 				return restjobs.Snapshot{}, restjobs.ErrInvalidTransition
@@ -332,8 +338,17 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			return err
 		}
 	}
+	httpHandler := http.Handler(apiHandler)
+	if config.WebUI.Enabled {
+		mux := http.NewServeMux()
+		mux.Handle("/healthz", apiHandler)
+		mux.Handle("/readyz", apiHandler)
+		mux.Handle("/v1/", apiHandler)
+		mux.Handle("/", restweb.New(apiHandler, config.WebUI.OperatorID))
+		httpHandler = mux
+	}
 	server := &http.Server{
-		Handler:           apiHandler,
+		Handler:           httpHandler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

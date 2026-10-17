@@ -144,6 +144,37 @@ func request(handler http.Handler, method, path, body string, authenticated bool
 	return recorder
 }
 
+func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	handler := newTestHandler(t, manager, func() bool { return true })
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"widget","task":"trusted frontend"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "frontend-trusted-request")
+	response := httptest.NewRecorder()
+	handler.config.DashboardOperatorID = "admin"
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("trusted principal admission status=%d body=%s", response.Code, response.Body.String())
+	}
+
+	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("dashboard exposed non-allowlisted path %s status=%d", path, response.Code)
+		}
+	}
+	request = httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"widget","task":"trusted frontend"}`))
+	request.URL.RawPath = "/v1%2Fjobs"
+	response = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Errorf("dashboard accepted escaped API path status=%d", response.Code)
+	}
+}
+
 func TestSafeStageSummaryDoesNotExposePrivateEventMessages(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 8))
 	job, _, err := manager.Admit("safe-stage-summary", restjobs.Request{Repository: "widget", Task: "private task payload"})

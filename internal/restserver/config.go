@@ -67,6 +67,7 @@ type Config struct {
 	Principals         []PrincipalConfig       `json:"principals,omitempty"`
 	Persistence        PersistenceConfig       `json:"persistence"`
 	Provider           ProviderConfig          `json:"provider"`
+	WebUI              WebUIConfig             `json:"web_ui,omitempty"`
 	WorkersEnabled     *bool                   `json:"workers_enabled,omitempty"`
 	WorkerID           string                  `json:"worker_id,omitempty"`
 	Limits             Limits                  `json:"limits"`
@@ -112,6 +113,11 @@ type PrincipalConfig struct {
 	Role      string `json:"role"`
 	TokenFile string `json:"token_file"`
 	Enabled   bool   `json:"enabled"`
+}
+
+type WebUIConfig struct {
+	Enabled    bool   `json:"enabled"`
+	OperatorID string `json:"operator_id,omitempty"`
 }
 
 type ProviderConfig struct {
@@ -340,6 +346,23 @@ func (c Config) Validate() error {
 	if c.Principals != nil && !hasEnabledOperator && c.APIKeyFile != "" {
 		return errors.New("principals must contain at least one enabled operator")
 	}
+	if c.WebUI.Enabled {
+		if !principalIDPattern.MatchString(c.WebUI.OperatorID) {
+			return errors.New("web_ui.operator_id must identify an enabled named operator")
+		}
+		found := false
+		for _, principal := range c.Principals {
+			if principal.ID == c.WebUI.OperatorID && principal.Role == "operator" && principal.Enabled {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return errors.New("web_ui.operator_id must identify an enabled named operator")
+		}
+	} else if c.WebUI.OperatorID != "" {
+		return errors.New("web_ui.operator_id requires web_ui.enabled")
+	}
 	if c.WorkerID != "" && !postgresWorkerIDPattern.MatchString(c.WorkerID) {
 		return errors.New("worker_id must contain only letters, digits, dot, underscore, colon, or hyphen")
 	}
@@ -536,7 +559,7 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
 	case "harness":
 		fields = map[string]struct{}{"executable": {}, "args": {}}
 	case "parallel_subtasks":
@@ -545,6 +568,8 @@ func configFieldAllowed(parent, key string) bool {
 		fields = map[string]struct{}{"id": {}, "role": {}, "token_file": {}, "enabled": {}}
 	case "persistence":
 		fields = map[string]struct{}{"backend": {}, "path": {}, "dsn": {}}
+	case "web_ui":
+		fields = map[string]struct{}{"enabled": {}, "operator_id": {}}
 	case "provider":
 		if key == "backend" || key == "token_file" || key == "base_branch" {
 			return true
@@ -601,6 +626,22 @@ func validateRequiredConfigFields(data []byte) error {
 			return fmt.Errorf("required harness field %q is missing", field)
 		}
 	}
+	if raw, exists := fields["web_ui"]; exists {
+		var webUI map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &webUI); err != nil {
+			return errors.New("web_ui must be an object")
+		}
+		if _, exists := webUI["enabled"]; !exists {
+			return errors.New("required web_ui field \"enabled\" is missing")
+		}
+		var enabled bool
+		_ = json.Unmarshal(webUI["enabled"], &enabled)
+		if enabled {
+			if _, exists := webUI["operator_id"]; !exists {
+				return errors.New("required web_ui field \"operator_id\" is missing")
+			}
+		}
+	}
 	var principals []map[string]json.RawMessage
 	if raw, exists := fields["principals"]; exists {
 		if err := json.Unmarshal(raw, &principals); err != nil {
@@ -619,7 +660,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "repositories", "verification_checks":
+	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "repositories", "verification_checks":
 		return key
 	default:
 		return ""

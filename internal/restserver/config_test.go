@@ -33,6 +33,28 @@ func TestLoadConfigAppliesConservativeDefaults(t *testing.T) {
 	}
 }
 
+func TestWebUIRequiresAnEnabledNamedOperatorAndCanBeDisabled(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"admin","role":"operator","token_file":"/run/admin.json","enabled":true}]`
+	config, err := LoadConfig(writeConfig(t, `{`+base+`,"web_ui":{"enabled":true,"operator_id":"admin"}}`))
+	if err != nil || !config.WebUI.Enabled || config.WebUI.OperatorID != "admin" {
+		t.Fatalf("valid UI config=%+v err=%v", config.WebUI, err)
+	}
+	for _, document := range []string{
+		`{"enabled":true,"operator_id":"missing"}`,
+		`{"enabled":true}`,
+		`{"enabled":false,"operator_id":"admin"}`,
+		`{"enabled":"yes","operator_id":"admin"}`,
+	} {
+		if _, err := LoadConfig(writeConfig(t, `{`+base+`,"web_ui":`+document+`}`)); err == nil {
+			t.Errorf("LoadConfig accepted invalid web_ui %s", document)
+		}
+	}
+	disabled, err := LoadConfig(writeConfig(t, `{`+base+`}`))
+	if err != nil || disabled.WebUI.Enabled {
+		t.Fatalf("omitted web_ui should stay disabled: %+v err=%v", disabled.WebUI, err)
+	}
+}
+
 func TestLoadConfigAcceptsOptInParallelSubtasks(t *testing.T) {
 	for _, tc := range []struct {
 		name            string
@@ -75,6 +97,22 @@ func TestLoadConfigRejectsInvalidParallelSubtasksConfig(t *testing.T) {
 	} {
 		if _, err := LoadConfig(writeConfig(t, `{`+base+`,"parallel_subtasks":`+parallel+`}`)); err == nil {
 			t.Errorf("LoadConfig() accepted parallel_subtasks %s", parallel)
+		}
+	}
+}
+
+func TestControlPlaneConfigRequiresPostgresAndDisabledWorkers(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","workers_enabled":false,"persistence":{"backend":"postgres","dsn":"postgres://factory:secret@localhost/factory"}`
+	config, err := LoadControlPlaneConfig(writeConfig(t, `{`+base+`}`))
+	if err != nil || config.Persistence.Backend != PersistenceBackendPostgres || config.WorkersEnabledValue() {
+		t.Fatalf("LoadControlPlaneConfig()=(%+v,%v), want PostgreSQL with workers disabled", config.Persistence, err)
+	}
+	for _, document := range []string{
+		strings.Replace(base, `"workers_enabled":false`, `"workers_enabled":true`, 1),
+		strings.Replace(base, `"persistence":{"backend":"postgres","dsn":"postgres://factory:secret@localhost/factory"}`, `"persistence":{"backend":"sqlite","path":"/var/lib/factory/jobs.db"}`, 1),
+	} {
+		if _, err := LoadControlPlaneConfig(writeConfig(t, `{`+document+`}`)); err == nil {
+			t.Errorf("LoadControlPlaneConfig accepted invalid control plane config %s", document)
 		}
 	}
 }
