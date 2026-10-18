@@ -55,6 +55,10 @@ type recoveryBundleManifestData struct {
 // child directory names. The manifest intentionally excludes request payloads
 // and host paths.
 func CreateRecoveryBundle(ctx context.Context, database, resultsRoot string, repositoryDirs map[string]string, destination string) error {
+	return createRecoveryBundle(ctx, database, resultsRoot, repositoryDirs, destination, nil)
+}
+
+func createRecoveryBundle(ctx context.Context, database, resultsRoot string, repositoryDirs map[string]string, destination string, afterPublish func(string)) error {
 	if ctx == nil || !filepath.IsAbs(database) || filepath.Clean(database) != database || !filepath.IsAbs(resultsRoot) || filepath.Clean(resultsRoot) != resultsRoot || !filepath.IsAbs(destination) || filepath.Clean(destination) != destination || len(repositoryDirs) == 0 {
 		return errors.New("invalid recovery bundle paths")
 	}
@@ -211,6 +215,9 @@ func CreateRecoveryBundle(ctx context.Context, database, resultsRoot string, rep
 	}
 	if err := os.Link(tmpPath, destination); err != nil {
 		return errors.New("publish recovery bundle atomically")
+	}
+	if afterPublish != nil {
+		afterPublish(destination)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
