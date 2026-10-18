@@ -200,22 +200,33 @@ func CreateRecoveryBundle(ctx context.Context, database, resultsRoot string, rep
 	if err := tmp.Close(); err != nil {
 		return errors.New("close recovery bundle")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := VerifyRecoveryBundle(tmpPath); err != nil {
+		return errors.New("recovery bundle failed validation")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.Link(tmpPath, destination); err != nil {
 		return errors.New("publish recovery bundle atomically")
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	parentDir, err := os.Open(parent)
 	if err != nil {
-		_ = os.Remove(destination)
+		// A concurrent writer may have created or changed the destination after
+		// publication; never remove it as rollback.
 		return errors.New("open recovery bundle directory")
 	}
 	syncErr := parentDir.Sync()
 	closeErr := parentDir.Close()
 	if syncErr != nil || closeErr != nil {
-		_ = os.Remove(destination)
 		return errors.New("sync recovery bundle directory")
 	}
 	if err := VerifyRecoveryBundle(destination); err != nil {
-		_ = os.Remove(destination)
 		return errors.New("published recovery bundle failed validation")
 	}
 	return nil
