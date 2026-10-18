@@ -44,6 +44,24 @@ func testWebHandler(t *testing.T) http.Handler {
 	return New(api, "admin")
 }
 
+func TestDashboardSelectedJobScrollRespectsReducedMotionPreference(t *testing.T) {
+	handler := testWebHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard JavaScript status=%d", response.Code)
+	}
+	for _, want := range []string{
+		`window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"`,
+		`panel.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" })`,
+	} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Errorf("dashboard JavaScript missing selected-job scroll behavior %q", want)
+		}
+	}
+}
+
 func TestDashboardAssetsAreEmbeddedAndHardened(t *testing.T) {
 	handler := testWebHandler(t)
 	for _, path := range []string{"/", "/ui/assets/dashboard.css", "/ui/assets/dashboard.js"} {
