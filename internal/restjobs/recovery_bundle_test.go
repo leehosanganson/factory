@@ -259,7 +259,7 @@ func TestRecoveryBundleRejectsSQLiteCorruptionAndDoesNotPublishPartialBundle(t *
 }
 
 func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
-	// Cancel only after os.Link publishes, then verify a replacement destination survives.
+	// Replace the published path before validation to exercise post-publication cleanup.
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -277,8 +277,7 @@ func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(root, "raced.tar.gz")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := context.Background()
 	published := false
 	if err := createRecoveryBundle(ctx, database, results, map[string]string{"a": recoveryAliasDirectory("a")}, destination, func(publishedPath string) {
 		if publishedPath != destination {
@@ -291,7 +290,6 @@ func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
 		if err := os.WriteFile(destination, []byte("created by another process"), 0o600); err != nil {
 			t.Fatalf("write concurrent destination: %v", err)
 		}
-		cancel()
 	}); err == nil {
 		t.Fatal("creation unexpectedly succeeded after post-publication destination replacement")
 	}
