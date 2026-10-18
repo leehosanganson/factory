@@ -12,11 +12,11 @@
 
 ## Positive feedback loop
 
-Use Factory to build Factory: make regular, focused usability audits with a local development build, not only in response to user reports. Run `make build`, then exercise `./bin/factory` through realistic workflows. Record reproducible product friction in [usability issues](docs/issues/usability-issues.md), separating user reports from verified observations and capturing reproduction steps, impact, evidence, and current status. Store each finding in its own file under `docs/issues/usability/`; store each session's observations in a new dated file under `docs/issues/usability/session-observations/`. Do not append to shared issue lists or the historical archive. Propose one bounded issue at a time with a desired outcome and acceptance criteria; get explicit user approval via `factory implement --gate <task>` before fixing it. If already in an active Factory run, do not nest another workflow. After approval, inspect the diff, run relevant Make targets, rebuild and validate with `./bin/factory`, then update the individual issue file. Keep audits focused; do not treat `./bin/factory` as a versioned artifact.
+Use Factory to build Factory: make regular, focused usability audits with a local development build, not only in response to user reports. Run `make build`, then exercise `./bin/factory` through realistic workflows. Record reproducible product friction as a focused [GitHub issue](https://github.com/leehosanganson/factory/issues), separating user reports from verified observations and capturing reproduction steps, impact, evidence, and current status. Reuse existing issues where appropriate; do not create one issue per observation or duplicate completed work. Propose one bounded issue at a time with a desired outcome and acceptance criteria; get explicit user approval via `factory implement --gate <task>` before fixing it. If already in an active Factory run, do not nest another workflow. After approval, inspect the diff, run relevant Make targets, rebuild and validate with `./bin/factory`, then update the relevant GitHub issue. Keep audits focused; do not treat `./bin/factory` as a versioned artifact.
 
-At the end of each task, record concise session feedback about using Factory in a new, dated file under `docs/issues/usability/session-observations/` and keep them as part of the PR. Note what worked or caused friction, including bad surprises, and concrete ideas for improvement. Keep observations factual, distinguish them from user-reported findings, and do not infer causes without evidence.
+At the end of each task, record concise session feedback in the relevant PR or task notes. Note what worked or caused friction, including bad surprises, and concrete ideas for improvement. Keep observations factual, distinguish them from user-reported findings, and do not infer causes without evidence.
 
-Actionable code-review findings belong in `docs/to-fix.md` only when a code review is requested or produced and that workflow applies. Usability audits do not go there. See [issue documentation](docs/issues/README.md) for the distinction.
+Actionable code-review findings belong in `docs/to-fix.md` only when a code review is requested or produced and that workflow applies. Usability audits do not go there.
 
 ## Coding and verification standards
 
@@ -32,7 +32,7 @@ Actionable code-review findings belong in `docs/to-fix.md` only when a code revi
 - `internal/factory/prompts/` — embedded workflow prompts.
 - `.agents/skills/` — agent procedures and workflow guidance.
 - `docs/features/` — descriptions of capabilities implemented in the current CLI.
-- `docs/issues/` — usability findings, session observations, and issue-recording guidance.
+- GitHub Issues — categorized usability findings and actionable follow-up tracking.
 - `docs/roadmap/` — future direction and design notes; aspirational items are not claims of current behavior.
 - `.github/workflows/` — CI and release automation.
 

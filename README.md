@@ -19,9 +19,13 @@ The REST server supports volatile memory mode and optional SQLite or PostgreSQL 
 - [Factory operating skill](.agents/skills/factory/SKILL.md) — agent workflow guidance and intended product direction.
 - [Documentation skill](.agents/skills/documentation/SKILL.md) — documentation conventions.
 - [Contributing](CONTRIBUTING.md) — branch naming and pull request conventions.
-- [Issues and usability observations](docs/issues/README.md) — issue-recording guidance and usability findings.
+- [GitHub issues](https://github.com/leehosanganson/factory/issues) — categorized, actionable product follow-ups and tracked work.
 - [Roadmap](docs/roadmap/roadmap.md) — unified product direction and later possibilities.
 - [Issue context integration](docs/roadmap/rest-job-lifecycle.md) — broader issue-intake direction beyond the implemented poller.
+
+## Issue tracking
+
+Actionable product follow-ups and categorized usability findings are tracked in [GitHub Issues](https://github.com/leehosanganson/factory/issues). The former `docs/issues/` finding and session-observation archive was migrated to issue #292 and existing focused trackers; it is no longer maintained in this repository.
 
 ## First task
 

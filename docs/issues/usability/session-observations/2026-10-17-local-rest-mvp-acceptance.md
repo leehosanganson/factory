@@ -1,6 +1,0 @@
-# Session observation: local REST MVP acceptance
-
-- **Verified:** the acceptance work required examining several separate runtime/provider tests before the local lifecycle evidence could be summarized. A single operations-guide checklist now points to those tests and records which checks passed.
-- **Verified:** there was no process-level memory-restart test alongside the SQLite restart coverage. Added one that confirms an admitted memory-backed job and its idempotency key are lost after clean server restart.
-- **Verification:** the targeted checklist commands and `make test`, `make vet`, and `make build` passed on 2026-10-17. A separate real-process smoke run used a temporary Git checkout, SQLite server, synthetic successful agent, and configured check; it validated readiness, authenticated submission, terminal inspection/list/history, and passed check evidence. Temporary configuration, credentials, database, and harness were removed. This did not execute Pi or publish a PR. No production restore drill or live GitHub validation was performed.
-- **Session friction:** initial continuation verified test coverage but not a real API client/server smoke lifecycle; a synthetic local end-to-end run supplied that missing evidence without using an external provider or user checkout.
