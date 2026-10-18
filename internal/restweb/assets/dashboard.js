@@ -87,7 +87,7 @@
         }
         panel.append(actions);
       }
-      if (scroll) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (scroll) panel.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
       if (changedSelection && stream) { stream.close(); stream = null; }
       if (!stream && !["succeeded", "failed", "canceled"].includes(job.status)) {
         stream = new EventSource(`/ui/api/v1/jobs/${encodeURIComponent(id)}/events`);

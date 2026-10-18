@@ -6,11 +6,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestRecoveryBundleCreateVerifyRestore(t *testing.T) {
@@ -261,6 +259,7 @@ func TestRecoveryBundleRejectsSQLiteCorruptionAndDoesNotPublishPartialBundle(t *
 }
 
 func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
+	// Replace the published path before validation to exercise post-publication cleanup.
 	root := t.TempDir()
 	if err := os.Chmod(root, 0o700); err != nil {
 		t.Fatal(err)
@@ -278,41 +277,24 @@ func TestRecoveryBundleFailureNeverRemovesConcurrentDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	destination := filepath.Join(root, "raced.tar.gz")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	ready := make(chan error, 1)
-	go func() {
-		deadline := time.NewTimer(5 * time.Second)
-		defer deadline.Stop()
-		ticker := time.NewTicker(time.Millisecond)
-		defer ticker.Stop()
-		for {
-			matches, _ := filepath.Glob(filepath.Join(root, ".factory-recovery-*.partial"))
-			if len(matches) != 0 {
-				if err := os.WriteFile(destination, []byte("created by another process"), 0o600); err != nil {
-					ready <- err
-					return
-				}
-				cancel()
-				ready <- nil
-				return
-			}
-			select {
-			case <-ctx.Done():
-				ready <- ctx.Err()
-				return
-			case <-deadline.C:
-				ready <- errors.New("timed out waiting for temporary recovery archive")
-				return
-			case <-ticker.C:
-			}
+	ctx := context.Background()
+	published := false
+	if err := createRecoveryBundle(ctx, database, results, map[string]string{"a": recoveryAliasDirectory("a")}, destination, func(publishedPath string) {
+		if publishedPath != destination {
+			t.Fatalf("published path = %q, want %q", publishedPath, destination)
 		}
-	}()
-	if err := CreateRecoveryBundle(ctx, database, results, map[string]string{"a": recoveryAliasDirectory("a")}, destination); err == nil {
-		t.Fatal("creation unexpectedly succeeded after cancellation")
+		published = true
+		if err := os.Remove(destination); err != nil {
+			t.Fatalf("remove published destination: %v", err)
+		}
+		if err := os.WriteFile(destination, []byte("created by another process"), 0o600); err != nil {
+			t.Fatalf("write concurrent destination: %v", err)
+		}
+	}); err == nil {
+		t.Fatal("creation unexpectedly succeeded after post-publication destination replacement")
 	}
-	if err := <-ready; err != nil {
-		t.Fatalf("concurrent destination setup: %v", err)
+	if !published {
+		t.Fatal("test did not reach post-publication hook")
 	}
 	got, err := os.ReadFile(destination)
 	if err != nil || string(got) != "created by another process" {
