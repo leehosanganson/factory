@@ -41,6 +41,25 @@ This file describes strict server JSON for the implemented `factory server` comm
     "enabled": true,
     "operator_id": "factory-operator"
   },
+  "worker_listener": {
+    "listen_address": "127.0.0.1:8081",
+    "server_cert_file": "/run/secrets/factory-worker-api.crt",
+    "server_key_file": "/run/secrets/factory-worker-api.key",
+    "client_ca_file": "/run/secrets/factory-worker-ca.crt",
+    "certificates": [
+      {
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "principal_id": "worker-1",
+        "enabled": true
+      }
+    ]
+  },
+  "github_webhook": {
+    "secret_file": "/run/secrets/factory-github-webhook",
+    "trigger_label": "factory:ready",
+    "sources": {"acme/issues": "widget"},
+    "owners": {"acme/issues": "factory-operator"}
+  },
   "provider": {
     "backend": "github",
     "token_file": "/run/secrets/github-token",
@@ -73,7 +92,7 @@ This file describes strict server JSON for the implemented `factory server` comm
 
 For `factory server`, `workers_enabled` defaults to `true`; set it to `false` only for a PostgreSQL-backed API control plane intended to share the database with separately launched workers. `factory worker` uses the same strict JSON schema but requires `persistence.backend: "postgres"`; its config may omit `api_key_file` and `principals` because the worker opens no HTTP API. Keep trusted repository, harness, limits, provider, and PostgreSQL settings consistent across processes. In particular, every process sharing the database must use the same `limits.workers` value, which is the database-wide execution cap. Worker deployments and limitations are detailed in [REST worker process](rest-worker.md).
 
-`web_ui` is optional and disabled by default. When enabled, `operator_id` must identify an enabled named operator; the UI is served on the same listener and uses only that named credential. HTTPS is required for its Secure session cookie. See [the embedded REST operator dashboard guide](rest-web-ui.md) for the narrow proxy routes, sessions, CSRF, and container image. `listen_address` defaults to `127.0.0.1:8080`; explicitly binding a non-loopback address exposes the API on that interface and requires suitable network controls. `repositories` maps a validated alias to an absolute checkout root; callers cannot supply paths. Before listening, the server verifies each configured path is an existing directory and the exact canonical Git working-tree root. Subdirectories, bare repositories, and symlink/path-indirected roots are rejected; linked worktree roots are accepted. Git must be installed. Validation errors identify the alias without echoing configured paths.
+`web_ui` is optional and disabled by default. When enabled, `operator_id` must identify an enabled named operator; the UI is served on the same listener and uses only that named credential. HTTPS is required for its Secure session cookie. See [the embedded REST operator dashboard guide](rest-web-ui.md) for the narrow proxy routes, sessions, CSRF, and container image. The optional `github_webhook` accepts only GitHub `issues.labeled` events at `POST /v1/webhooks/github/issues`. It requires durable SQLite or PostgreSQL storage, an absolute private secret file containing at least 32 bytes, an exact trigger label, and matching `sources` and `owners` maps. Each exact `owner/repository` source maps to an existing repository alias and an enabled named Factory principal; the event cannot select either. HMAC validation uses the exact raw request bytes. Delivery ID and body digest are persisted atomically with the canonical Thread and Job, while raw event body and signature are not retained. See [GitHub issue webhook](github-issue-webhook.md); do not configure both the webhook and issue poller for the same source/label unless duplicate work is acceptable. `listen_address` defaults to `127.0.0.1:8080`; explicitly binding a non-loopback address exposes the API on that interface and requires suitable network controls. The optional `worker_listener` is a separate TLS/mTLS listener and must use a different address from the job API listener. It requires configured SQLite or PostgreSQL persistence, absolute server certificate/key and client CA file paths, and a nonempty list of certificate mappings. Each lowercase 64-character `sha256` is compared against SHA-256 of the exact client leaf certificate DER; `principal_id` is stable configured identity, not a trusted certificate subject. Duplicate fingerprints are rejected; multiple distinct certificate fingerprints may temporarily map to the same principal to permit overlap rotation. At least one mapping must be enabled. The listener requires a verified client certificate chain and exposes only health/readiness, session registration, and explicit session retirement. Authentication diagnostics report only bounded success/failure outcomes; they omit principals, certificate data, request bodies, and credentials. A retired principal/boot ID pair cannot be registered again, while a different boot ID may register only after explicit retirement. It does not implement worker job protocol operations, automated credential reload/revocation, or session-token capabilities. `repositories` maps a validated alias to an absolute checkout root; callers cannot supply paths. Before listening, the server verifies each configured path is an existing directory and the exact canonical Git working-tree root. Subdirectories, bare repositories, and symlink/path-indirected roots are rejected; linked worktree roots are accepted. Git must be installed. Validation errors identify the alias without echoing configured paths.
 
 `harness` is a fixed executable and argv, never shell text. Arguments must contain `{task}` and `{system_prompt}` exactly once; other placeholders are rejected. `verification_checks` is an optional list of trusted operator-configured argv arrays invoked after workflow stages; callers cannot provide or change checks. Empty/omitted checks mean no external checks run. The strict schema bounds this list to 16 commands, 32 nonempty argv elements per command, and 16 KiB total argv bytes per command. Only `mode: local_process` is accepted.
 

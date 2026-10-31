@@ -24,6 +24,11 @@ func CheckLocalPrerequisites(config Config) []string {
 			}
 		}
 	}
+	if config.GitHubWebhook.Enabled() {
+		if _, err := LoadWebhookSecret(config.GitHubWebhook.SecretFile); err != nil {
+			issues = append(issues, "github_webhook.secret_file: unavailable or invalid")
+		}
+	}
 	if config.Persistence.Backend == PersistenceBackendSQLite {
 		if err := checkSQLitePathMetadata(config.Persistence.Path); err != nil {
 			issues = append(issues, "persistence.path: unavailable or unsafe")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -36,6 +38,7 @@ const (
 // runtimeOptions contains injectable seams for runtime lifecycle tests.
 type runtimeOptions struct {
 	Listen          func(string, string) (net.Listener, error)
+	ListenWorker    func(string, string, *tls.Config) (net.Listener, error)
 	OpenStore       func(restserver.Config) (restjobs.Store, error)
 	Executor        restworker.Executor
 	Publisher       restprovider.Publisher
@@ -263,11 +266,57 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if config.WebUI.Enabled {
 		dashboardOperatorID = config.WebUI.OperatorID
 	}
+	var webhook restapi.GitHubWebhookConfig
+	if config.GitHubWebhook.Enabled() {
+		if _, ok := store.(restjobs.GitHubIssueWebhookStore); !ok {
+			closeStore()
+			return errors.New("configured job store does not support GitHub webhook admission")
+		}
+		secret, secretErr := restserver.LoadWebhookSecret(config.GitHubWebhook.SecretFile)
+		if secretErr != nil {
+			closeStore()
+			return errors.New("configured GitHub webhook secret is unavailable")
+		}
+		webhook = restapi.GitHubWebhookConfig{
+			Secret: secret.Value(), TriggerLabel: config.GitHubWebhook.TriggerLabel,
+			Sources: cloneStringMap(config.GitHubWebhook.Sources), Owners: cloneStringMap(config.GitHubWebhook.Owners),
+		}
+	}
+	var workerHandler http.Handler
+	var workerTLS *tls.Config
+	if config.WorkerListener != nil {
+		sessionStore, ok := store.(restjobs.WorkerSessionStore)
+		if !ok {
+			closeStore()
+			return errors.New("configured SQL store does not support worker sessions")
+		}
+		workerHandler, err = restserver.NewWorkerListenerHandler(*config.WorkerListener, sessionStore, func() bool {
+			if !ready.Load() {
+				return false
+			}
+			if readyCheck == nil {
+				return true
+			}
+			probeCtx, cancelProbe := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancelProbe()
+			return readyCheck(probeCtx) == nil
+		}, logger)
+		if err != nil {
+			closeStore()
+			return err
+		}
+		workerTLS, err = restserver.NewWorkerListenerTLS(*config.WorkerListener)
+		if err != nil {
+			closeStore()
+			return err
+		}
+	}
 	apiHandler, err := restapi.New(manager, key, restapi.Config{
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
 		DashboardOperatorID: dashboardOperatorID,
+		GitHubWebhook:       webhook,
 		CancelJob: func(requestCtx context.Context, id string) (restjobs.Snapshot, error) {
 			if err := requestCtx.Err(); err != nil {
 				return restjobs.Snapshot{}, restjobs.ErrInvalidTransition
@@ -374,8 +423,39 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		}
 		return errors.New("listen for REST server")
 	}
-	serveDone := make(chan error, 1)
+	var workerListener net.Listener
+	var workerServer *http.Server
+	if workerHandler != nil {
+		listenWorker := options.ListenWorker
+		if listenWorker == nil {
+			listenWorker = func(network, address string, tlsConfig *tls.Config) (net.Listener, error) {
+				listener, err := net.Listen(network, address)
+				if err != nil {
+					return nil, err
+				}
+				return tls.NewListener(listener, tlsConfig), nil
+			}
+		}
+		workerListener, err = listenWorker("tcp", config.WorkerListener.ListenAddress, workerTLS)
+		if err != nil {
+			_ = listener.Close()
+			cancelSweep()
+			shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
+			defer cancel()
+			_ = waitForSweep(shutdownCtx, sweepDone)
+			if coordinator != nil {
+				_ = coordinator.Shutdown(shutdownCtx)
+			}
+			closeStore()
+			return errors.New("listen for worker identity API")
+		}
+		workerServer = &http.Server{Handler: workerHandler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: maxHeaderBytes}
+	}
+	serveDone := make(chan error, 2)
 	go func() { serveDone <- server.Serve(listener) }()
+	if workerServer != nil {
+		go func() { serveDone <- workerServer.Serve(workerListener) }()
+	}
 	ready.Store(true)
 	logger.Printf("REST server ready; persistence backend: %s", config.Persistence.Backend)
 
@@ -384,7 +464,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	case <-ctx.Done():
 	case err := <-serveDone:
 		if !errors.Is(err, http.ErrServerClosed) {
-			serveErr = fmt.Errorf("serve REST API: %w", err)
+			serveErr = errors.New("serve REST listener")
 		}
 	}
 	shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
@@ -395,9 +475,18 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	cancelSweep()
 	sweepErr := waitForSweep(shutdownCtx, sweepDone)
-	shutdownErr := server.Shutdown(shutdownCtx)
-	if shutdownErr != nil {
-		_ = server.Close()
+	var httpServers []*http.Server
+	httpServers = append(httpServers, server)
+	if workerServer != nil {
+		httpServers = append(httpServers, workerServer)
+	}
+	httpShutdownErrors := shutdownHTTPServers(shutdownCtx, httpServers...)
+	var shutdownErr, workerShutdownErr error
+	if len(httpShutdownErrors) > 0 {
+		shutdownErr = httpShutdownErrors[0]
+	}
+	if len(httpShutdownErrors) > 1 {
+		workerShutdownErr = httpShutdownErrors[1]
 	}
 	var workerErr error
 	if coordinator != nil {
@@ -410,6 +499,9 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if shutdownErr != nil {
 		return fmt.Errorf("shut down REST HTTP server: %w", shutdownErr)
 	}
+	if workerShutdownErr != nil {
+		return fmt.Errorf("shut down worker identity API: %w", workerShutdownErr)
+	}
 	if workerErr != nil {
 		return fmt.Errorf("shut down REST workers: %w", workerErr)
 	}
@@ -417,6 +509,14 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		return fmt.Errorf("stop REST workspace sweeper: %w", sweepErr)
 	}
 	return nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func processBootID() string {
@@ -437,6 +537,23 @@ func principalsConfigured(config restserver.Config) bool {
 		}
 	}
 	return false
+}
+
+func shutdownHTTPServers(ctx context.Context, servers ...*http.Server) []error {
+	errorsByServer := make([]error, len(servers))
+	var wg sync.WaitGroup
+	for i, server := range servers {
+		wg.Add(1)
+		go func(i int, server *http.Server) {
+			defer wg.Done()
+			errorsByServer[i] = server.Shutdown(ctx)
+			if errorsByServer[i] != nil {
+				_ = server.Close()
+			}
+		}(i, server)
+	}
+	wg.Wait()
+	return errorsByServer
 }
 
 func newShutdownContext(timeout time.Duration) (context.Context, context.CancelFunc) {

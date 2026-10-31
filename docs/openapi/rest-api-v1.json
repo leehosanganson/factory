@@ -2,10 +2,37 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.9.0",
+    "version": "1.10.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
+    "/v1/webhooks/github/issues": {
+      "post": {
+        "operationId": "receiveGitHubIssueWebhook",
+        "summary": "Admit a configured labeled GitHub issue",
+        "description": "Optional unauthenticated GitHub issues webhook at the REST control-plane admission boundary. The exact raw request body is authenticated using X-Hub-Signature-256 HMAC; event action, issue state, PR marker, repository, and exact configured trigger label are checked before admission. Only configured source-to-repository-alias and source-to-owner-principal mappings are trusted; the event cannot select an owner. Requires durable SQLite or PostgreSQL persistence. The stable X-GitHub-Delivery ID and body SHA-256 digest are committed atomically with one canonical Thread and queued Job. Exact same-body retries replay, and a changed-body reuse conflicts. No raw body or secret is retained. This adapter does not coordinate with issue-poller; configuring both for one source/label can duplicate work.",
+        "security": [],
+        "parameters": [
+          { "name": "X-GitHub-Delivery", "in": "header", "required": true, "schema": { "type": "string", "maxLength": 256 } },
+          { "name": "X-GitHub-Event", "in": "header", "required": true, "schema": { "type": "string", "enum": [ "issues" ] } },
+          { "name": "X-Hub-Signature-256", "in": "header", "required": true, "description": "sha256= followed by 64 hexadecimal characters encoding the HMAC-SHA256 of the exact raw request bytes. Hexadecimal letters are case-insensitive.", "schema": { "type": "string", "pattern": "^sha256=[0-9a-fA-F]{64}$" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "type": "object", "description": "GitHub issues.labeled webhook payload; bounded by server request-body configuration." } } }
+        },
+        "responses": {
+          "202": { "description": "Delivery was admitted into the existing Thread/Job lifecycle or safely ignored." },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "409": { "description": "Delivery ID was previously accepted with a different body.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "413": { "description": "Webhook body exceeds the configured limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only POST is supported." }
+        }
+      }
+    },
     "/healthz": {
       "get": {
         "operationId": "healthCheck",
@@ -523,8 +550,12 @@
         "description": "The request is malformed, invalid, or contains unsupported fields.",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
       },
+      "UnsupportedMediaType": {
+        "description": "The request Content-Type must be application/json.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+      },
       "Unauthenticated": {
-        "description": "A single valid bearer credential is required.",
+        "description": "A single valid bearer credential is required for authenticated API routes; the optional GitHub webhook instead requires its configured raw-byte HMAC signature.",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
       },
       "NotFound": {

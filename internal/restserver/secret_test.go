@@ -117,6 +117,28 @@ func TestProviderTokenLoadsPrivatelyAndAuthenticates(t *testing.T) {
 	}
 }
 
+func TestWebhookSecretRequiresPrivateBoundedFileAndIsRedacted(t *testing.T) {
+	secret := strings.Repeat("s", 32)
+	path := writeSecret(t, secret, 0o600)
+	loaded, err := LoadWebhookSecret(path)
+	if err != nil || string(loaded.Value()) != secret {
+		t.Fatalf("LoadWebhookSecret()=(%q,%v)", loaded.Value(), err)
+	}
+	if fmt.Sprint(loaded) != "[REDACTED]" || strings.Contains(fmt.Sprintf("%#v", loaded), secret) {
+		t.Fatal("webhook secret formatting disclosed value")
+	}
+	for name, data := range map[string]string{"short": "too-short", "newline": secret + "\n", "oversized": strings.Repeat("s", apiKeyFileLimit+1)} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := LoadWebhookSecret(writeSecret(t, data, 0o600)); err == nil {
+				t.Fatal("invalid webhook secret accepted")
+			}
+		})
+	}
+	if _, err := LoadWebhookSecret(writeSecret(t, secret, 0o640)); err == nil {
+		t.Fatal("group-readable webhook secret accepted")
+	}
+}
+
 func TestLoadProviderTokenRejectsOversizePrivateFile(t *testing.T) {
 	path := writeSecret(t, strings.Repeat("a", apiKeyFileLimit+1), 0o600)
 	if _, err := LoadProviderToken(path); err == nil {

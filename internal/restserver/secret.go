@@ -147,6 +147,39 @@ func LoadProviderToken(path string) (ProviderToken, error) {
 	return ProviderToken{value: string(data)}, nil
 }
 
+// WebhookSecret holds an operator-configured GitHub webhook signing key without
+// including its value in ordinary formatting or JSON output.
+type WebhookSecret struct{ value []byte }
+
+func LoadWebhookSecret(path string) (WebhookSecret, error) {
+	if path == "" {
+		return WebhookSecret{}, errors.New("webhook secret file path must not be empty")
+	}
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return WebhookSecret{}, errors.New("webhook secret file is unavailable or invalid")
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return WebhookSecret{}, errors.New("webhook secret file is unavailable or invalid")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !info.Mode().IsRegular() || info.Mode().Perm()&^0o600 != 0 || info.Mode().Perm()&0o400 == 0 || !ok || stat.Uid != uint32(os.Geteuid()) || info.Size() < 32 || info.Size() > apiKeyFileLimit {
+		return WebhookSecret{}, errors.New("webhook secret file must be a private, owner-readable regular file with at least 32 bytes")
+	}
+	value, err := io.ReadAll(io.LimitReader(file, apiKeyFileLimit+1))
+	if err != nil || len(value) < 32 || len(value) > apiKeyFileLimit || !utf8.Valid(value) || bytes.IndexAny(value, "\x00\r\n") >= 0 {
+		return WebhookSecret{}, errors.New("webhook secret file must contain one nonempty secret of at most 4096 bytes")
+	}
+	return WebhookSecret{value: bytes.Clone(value)}, nil
+}
+
+func (secret WebhookSecret) Value() []byte { return bytes.Clone(secret.value) }
+func (WebhookSecret) String() string       { return "[REDACTED]" }
+func (WebhookSecret) GoString() string     { return "[REDACTED]" }
+
 func (token ProviderToken) Authenticate(value string) bool {
 	if token.value == "" || value == "" {
 		return false
