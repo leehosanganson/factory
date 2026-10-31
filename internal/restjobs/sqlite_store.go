@@ -45,6 +45,7 @@ type SQLiteStore struct {
 }
 
 var _ Store = (*SQLiteStore)(nil)
+var _ ThreadStore = (*SQLiteStore)(nil)
 
 // OpenSQLiteStore opens a file-backed SQLite database and applies embedded,
 // forward-only migrations. The database parent directory must already exist.
@@ -434,6 +435,193 @@ func (s *SQLiteStore) AdmitAs(key, principalID string, request Request) (Snapsho
 	return Snapshot{ID: id, Submitter: principalID, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}, false, nil
 }
 
+// AdmitThreadAs atomically persists a Thread and its initial queued Job. Thread
+// idempotency keys use their own principal-scoped namespace.
+func (s *SQLiteStore) AdmitThreadAs(idempotencyKey, principalID string, request Request) (ThreadSnapshot, bool, error) {
+	key, normalized, err := normalizeAdmission(idempotencyKey, request, s.config.MaxTaskBytes)
+	if err != nil {
+		return ThreadSnapshot{}, false, err
+	}
+	if normalized.Issue != nil || normalized.IssueProvenance != nil {
+		return ThreadSnapshot{}, false, ErrInvalidInput
+	}
+	principalID, err = normalizePrincipalID(principalID)
+	if err != nil {
+		return ThreadSnapshot{}, false, err
+	}
+	if err := s.checkAccepting(); err != nil {
+		return ThreadSnapshot{}, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ThreadSnapshot{}, false, errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+
+	var threadID, raw string
+	err = tx.QueryRowContext(ctx, `SELECT thread_id,request_json FROM factory_thread_idempotency WHERE principal_id=? AND key=?`, principalID, key).Scan(&threadID, &raw)
+	if err == nil {
+		var existing Request
+		if json.Unmarshal([]byte(raw), &existing) != nil {
+			return ThreadSnapshot{}, false, errors.New("SQLite Thread record is invalid")
+		}
+		if !sameRequest(existing, normalized) {
+			return ThreadSnapshot{}, false, ErrIdempotencyConflict
+		}
+		snapshot, err := s.threadSnapshotTx(ctx, tx, threadID, "")
+		if err != nil {
+			return ThreadSnapshot{}, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return ThreadSnapshot{}, false, errors.New("finish SQLite Thread idempotency lookup")
+		}
+		return snapshot, true, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return ThreadSnapshot{}, false, errors.New("read SQLite Thread idempotency record")
+	}
+
+	var retained int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs`).Scan(&retained); err != nil {
+		return ThreadSnapshot{}, false, errors.New("check SQLite retained-record capacity")
+	}
+	if retained >= s.config.MaxRecords {
+		return ThreadSnapshot{}, false, ErrRegistryFull
+	}
+	var active int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs WHERE status IN ('queued','running')`).Scan(&active); err != nil {
+		return ThreadSnapshot{}, false, errors.New("check SQLite job capacity")
+	}
+	if active >= s.config.QueueCapacity+s.config.MaxConcurrentJobs {
+		return ThreadSnapshot{}, false, ErrQueueFull
+	}
+
+	threadID, err = newJobID()
+	if err != nil {
+		return ThreadSnapshot{}, false, errors.New("create SQLite Thread identifier")
+	}
+	jobID, err := newJobID()
+	if err != nil {
+		return ThreadSnapshot{}, false, errors.New("create SQLite job identifier")
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(queue_sequence),0)+1 FROM factory_jobs`).Scan(&sequence); err != nil {
+		return ThreadSnapshot{}, false, errors.New("allocate SQLite queue position")
+	}
+	now := time.Now().UTC()
+	stamp := now.Format(time.RFC3339Nano)
+	requestJSON, err := json.Marshal(normalized)
+	if err != nil {
+		return ThreadSnapshot{}, false, ErrInvalidInput
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,history_truncated,submitter) VALUES(?,?,?,?,?,?,0,?)`, jobID, string(requestJSON), StatusQueued, stamp, stamp, sequence, principalID); err != nil {
+		return ThreadSnapshot{}, false, errors.New("persist SQLite Thread job")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_threads(id,submitter,created_at,initial_job_id) VALUES(?,?,?,?)`, threadID, principalID, stamp, jobID); err != nil {
+		return ThreadSnapshot{}, false, errors.New("persist SQLite Thread")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_thread_jobs(thread_id,job_id,position,created_at) VALUES(?,?,1,?)`, threadID, jobID, stamp); err != nil {
+		return ThreadSnapshot{}, false, errors.New("persist initial SQLite Thread membership")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_thread_idempotency(principal_id,key,thread_id,request_json) VALUES(?,?,?,?)`, principalID, key, threadID, string(requestJSON)); err != nil {
+		return ThreadSnapshot{}, false, errors.New("persist SQLite Thread idempotency key")
+	}
+	if err := insertEvent(ctx, tx, jobID, "queued", "Job admitted", now, s.config.MaxEventsPerJob); err != nil {
+		return ThreadSnapshot{}, false, errors.New("persist SQLite Thread admission history")
+	}
+	if err := tx.Commit(); err != nil {
+		return ThreadSnapshot{}, false, errors.New("commit SQLite Thread admission")
+	}
+	return ThreadSnapshot{
+		Thread: Thread{ID: threadID, Submitter: principalID, CreatedAt: now, UpdatedAt: now, JobIDs: []string{jobID}, Status: ThreadStatusInProgress},
+		Jobs:   []Snapshot{{ID: jobID, Submitter: principalID, Request: normalized, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}},
+	}, false, nil
+}
+
+// GetThread returns a defensive snapshot of a retained SQLite Thread.
+func (s *SQLiteStore) GetThread(id string) (ThreadSnapshot, error) {
+	return s.getThread(id, "")
+}
+
+// GetThreadForPrincipal hides missing and differently attributed Threads behind
+// the same not-found result.
+func (s *SQLiteStore) GetThreadForPrincipal(id, principalID string) (ThreadSnapshot, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return ThreadSnapshot{}, err
+	}
+	return s.getThread(id, principalID)
+}
+
+func (s *SQLiteStore) getThread(id, principalID string) (ThreadSnapshot, error) {
+	if err := s.checkOpen(); err != nil {
+		return ThreadSnapshot{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ThreadSnapshot{}, errors.New("read SQLite Thread")
+	}
+	defer tx.Rollback()
+	snapshot, err := s.threadSnapshotTx(ctx, tx, id, principalID)
+	if err != nil {
+		return ThreadSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return ThreadSnapshot{}, errors.New("finish SQLite Thread read")
+	}
+	return snapshot, nil
+}
+
+// Legacy single-member Thread reader retained temporarily for historical migration diagnostics.
+func (s *SQLiteStore) threadSnapshotTxLegacy(ctx context.Context, tx *sql.Tx, id, principalID string) (ThreadSnapshot, error) {
+	query := `SELECT id,submitter,created_at,initial_job_id FROM factory_threads WHERE id=?`
+	args := []any{id}
+	if principalID != "" {
+		query += ` AND submitter=?`
+		args = append(args, principalID)
+	}
+	var thread Thread
+	var createdAt string
+	var jobID string
+	if err := tx.QueryRowContext(ctx, query, args...).Scan(&thread.ID, &thread.Submitter, &createdAt, &jobID); errors.Is(err, sql.ErrNoRows) {
+		return ThreadSnapshot{}, ErrNotFound
+	} else if err != nil {
+		return ThreadSnapshot{}, errors.New("read SQLite Thread record")
+	}
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return ThreadSnapshot{}, errors.New("decode SQLite Thread timestamp")
+	}
+	thread.CreatedAt = created
+	job, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, jobID))
+	if err != nil {
+		return ThreadSnapshot{}, errors.New("read SQLite Thread job")
+	}
+	var workerID, bootID sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT worker_id,boot_id FROM factory_worker_ownership WHERE job_id=?`, jobID).Scan(&workerID, &bootID); err == nil && workerID.Valid && bootID.Valid {
+		job.Worker = &WorkerSummary{WorkerID: workerID.String, BootID: bootID.String}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return ThreadSnapshot{}, errors.New("read SQLite Thread worker identity")
+	}
+	var stage, state sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT stage,state FROM factory_job_progress WHERE job_id=?`, jobID).Scan(&stage, &state); err == nil && stage.Valid && state.Valid {
+		job.Progress = &ProgressSummary{Stage: stage.String, State: state.String}
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return ThreadSnapshot{}, errors.New("read SQLite Thread progress")
+	}
+	thread.JobIDs = []string{jobID}
+	thread.UpdatedAt = thread.CreatedAt
+	if job.UpdatedAt.After(thread.UpdatedAt) {
+		thread.UpdatedAt = job.UpdatedAt
+	}
+	thread.Status = DeriveThreadStatus([]Snapshot{job}, s.RecoveryNeeded)
+	return ThreadSnapshot{Thread: thread, Jobs: []Snapshot{job}}, nil
+}
+
 // ClaimNext is an unfenced single-process/admin compatibility claim. It does
 // not create worker ownership state and must never be used by distributed
 // workers. Use ClaimNextAttempt for worker execution.
@@ -622,11 +810,20 @@ func (s *SQLiteStore) Close() {
 		_ = rows.Close()
 		for _, id := range queued {
 			now := time.Now().UTC()
+			threadID, wasDone, transitionErr := sqliteThreadDoneTransition(ctx, tx, id)
+			if transitionErr != nil {
+				_ = tx.Rollback()
+				return
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='canceled', updated_at=? WHERE id=? AND status='queued'`, now.Format(time.RFC3339Nano), id); err != nil {
 				_ = tx.Rollback()
 				return
 			}
 			if err := insertEvent(ctx, tx, id, string(StatusCanceled), "Manager closed before job started", now, s.config.MaxEventsPerJob); err != nil {
+				_ = tx.Rollback()
+				return
+			}
+			if transitionErr := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); transitionErr != nil {
 				_ = tx.Rollback()
 				return
 			}
@@ -922,10 +1119,14 @@ func (s *SQLiteStore) FinishAttempt(handle AttemptHandle, status Status) error {
 	}
 	defer cancel()
 	defer tx.Rollback()
+	threadID, wasDone, err := sqliteThreadDoneTransition(ctx, tx, handle.JobID)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,cancellation_requested=0,updated_at=? WHERE id=? AND status='running' AND EXISTS(SELECT 1 FROM factory_worker_ownership WHERE job_id=? AND generation=? AND owner_token=?)`, status, now.Format(time.RFC3339Nano), handle.JobID, handle.JobID, handle.Generation, handle.OwnerToken)
 	if err != nil {
-		return errors.New("finish SQLite job")
+		return fmt.Errorf("finish SQLite job: %w", err)
 	}
 	if changed, _ := result.RowsAffected(); changed != 1 {
 		return ErrStaleAttempt
@@ -935,6 +1136,9 @@ func (s *SQLiteStore) FinishAttempt(handle AttemptHandle, status Status) error {
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE factory_worker_ownership SET lease_until=? WHERE job_id=? AND generation=? AND owner_token=?`, now.Format(time.RFC3339Nano), handle.JobID, handle.Generation, handle.OwnerToken); err != nil {
 		return errors.New("release SQLite worker ownership")
+	}
+	if err := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -1150,6 +1354,10 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 			return errors.New("record SQLite provider outcome")
 		}
 	}
+	threadID, wasDone, err := sqliteThreadDoneTransition(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='succeeded',updated_at=? WHERE id=? AND status=?`, stamp, id, status)
 	if err != nil {
 		return errors.New("finish reconciled SQLite job")
@@ -1162,6 +1370,9 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 	}
 	if err := insertEvent(ctx, tx, id, "provider_reconciled", "Operator confirmed provider outcome", now, s.config.MaxEventsPerJob); err != nil {
 		return errors.New("record SQLite reconciliation history")
+	}
+	if err := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite provider reconciliation")
@@ -1570,6 +1781,10 @@ func (s *SQLiteStore) ResolveInterrupted(id string, disposition InterruptedDispo
 	if !requiresOperator {
 		return ErrInvalidTransition
 	}
+	threadID, wasDone, err := sqliteThreadDoneTransition(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	var providerRecord int
 	if err := tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM factory_job_provider_attempts WHERE job_id=?) + (SELECT COUNT(*) FROM factory_job_provider_outcomes WHERE job_id=?)`, id, id).Scan(&providerRecord); err != nil {
 		return errors.New("check SQLite provider side effects")
@@ -1591,6 +1806,9 @@ func (s *SQLiteStore) ResolveInterrupted(id string, disposition InterruptedDispo
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_operator_dispositions(job_id,disposition,updated_at) VALUES(?,?,?)`, id, string(disposition), stamp); err != nil {
 		return errors.New("persist SQLite interrupted disposition")
+	}
+	if err := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite interrupted disposition")
@@ -1621,11 +1839,18 @@ func (s *SQLiteStore) Cancel(id string) (Snapshot, error) {
 	stamp := now.Format(time.RFC3339Nano)
 	switch Status(status) {
 	case StatusQueued:
+		threadID, wasDone, transitionErr := sqliteThreadDoneTransition(ctx, tx, id)
+		if transitionErr != nil {
+			return Snapshot{}, transitionErr
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='canceled',updated_at=? WHERE id=? AND status='queued'`, stamp, id); err != nil {
 			return Snapshot{}, errors.New("cancel queued SQLite job")
 		}
 		if err := insertEvent(ctx, tx, id, string(StatusCanceled), "Job canceled before start", now, s.config.MaxEventsPerJob); err != nil {
 			return Snapshot{}, errors.New("record SQLite queued cancellation")
+		}
+		if err := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); err != nil {
+			return Snapshot{}, err
 		}
 	case StatusRunning:
 		s.recoveryMu.RLock()
@@ -1676,6 +1901,10 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	if owned {
 		return ErrStaleAttempt
 	}
+	threadID, wasDone, err := sqliteThreadDoneTransition(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=?,cancellation_requested=0,updated_at=? WHERE id=? AND status='running'`, status, now.Format(time.RFC3339Nano), id)
 	if err != nil {
@@ -1698,6 +1927,9 @@ func (s *SQLiteStore) Finish(id string, status Status) error {
 	defer s.recoveryMu.Unlock()
 	if _, interrupted := s.recoveryNeeded[id]; interrupted {
 		return ErrInvalidTransition
+	}
+	if err := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return errors.New("commit SQLite job completion")

@@ -24,6 +24,311 @@ func privateSQLiteDir(t *testing.T) string {
 	return dir
 }
 
+func TestSQLiteThreadAddJobPreservesOrderReplayAndRestart(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "thread-membership.db")
+	config := Config{QueueCapacity: 4, MaxConcurrentJobs: 2, MaxRecords: 8, MaxEventsPerJob: 8}
+	firstStore, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _, err := firstStore.AdmitThreadAs("create", "alice", Request{Repository: "widget", Task: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := firstStore.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstStore.Finish(created.Jobs[0].ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	var migratedMembership int
+	if countErr := firstStore.db.QueryRow(`SELECT COUNT(*) FROM factory_thread_jobs WHERE thread_id=?`, created.Thread.ID).Scan(&migratedMembership); countErr != nil || migratedMembership != 1 {
+		t.Fatalf("migrated Thread membership count=%d err=%v, want one initial member", migratedMembership, countErr)
+	}
+	var joined int
+	if countErr := firstStore.db.QueryRow(`SELECT COUNT(*) FROM factory_thread_jobs m JOIN factory_jobs j ON j.id=m.job_id WHERE m.thread_id=?`, created.Thread.ID).Scan(&joined); countErr != nil || joined != 1 {
+		t.Fatalf("migrated member/job join=%d err=%v", joined, countErr)
+	}
+	standalone, _, err := firstStore.AdmitAs("standalone-between", "alice", Request{Repository: "widget", Task: "between Thread members"})
+	if err != nil {
+		t.Fatalf("admit standalone Job before follow-up: %v", err)
+	}
+	if _, err := firstStore.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstStore.Finish(standalone.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	updated, member, replay, err := firstStore.AdmitThreadJobAs(created.Thread.ID, "member", "alice", Request{Repository: "widget", Task: "second"})
+	if err != nil || replay || updated.Thread.Status != ThreadStatusInProgress || len(updated.Jobs) != 2 || updated.Thread.JobIDs[1] != member.ID {
+		t.Fatalf("add member=(%+v,%+v,%t,%v), want Done Thread reopened In Progress with stable second member", updated, member, replay, err)
+	}
+	standaloneSnapshot, err := firstStore.Get(standalone.ID)
+	if err != nil || standaloneSnapshot.Status != StatusSucceeded {
+		t.Fatalf("standalone Job after Thread member admission=(%+v,%v), want preserved terminal state without sequence collision", standaloneSnapshot, err)
+	}
+	replayed, memberReplay, replay, err := firstStore.AdmitThreadJobAs(created.Thread.ID, " member ", "alice", Request{Repository: " widget ", Task: "  second  "})
+	if err != nil || !replay || memberReplay.ID != member.ID || len(replayed.Jobs) != 2 {
+		t.Fatalf("member replay=(%+v,%+v,%t,%v), want same member without duplication", replayed, memberReplay, replay, err)
+	}
+	if err := firstStore.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	persisted, err := store.GetThread(created.Thread.ID)
+	if err != nil || len(persisted.Jobs) != 2 || persisted.Thread.JobIDs[0] != created.Jobs[0].ID || persisted.Thread.JobIDs[1] != member.ID {
+		t.Fatalf("reopened Thread=(%+v,%v), want durable stable two-member order", persisted, err)
+	}
+}
+
+func TestSQLiteThreadCompletionPersistsAndRejectsConcurrentStoreAdmission(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "thread-completion.db")
+	config := Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 8}
+	first, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, _, err := first.AdmitThreadAs("thread", "alice", Request{Repository: "widget", Task: "complete without changing job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := first.ClaimNext()
+	if err != nil || claimed.ID != created.Jobs[0].ID {
+		t.Fatalf("claim initial Thread Job=(%+v,%v)", claimed, err)
+	}
+	if err := first.Finish(claimed.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	type raceResult struct {
+		completed ThreadSnapshot
+		added     Snapshot
+		err       error
+	}
+	completeResult := make(chan raceResult, 1)
+	addResult := make(chan raceResult, 1)
+	go func() {
+		<-start
+		snapshot, err := first.CompleteThreadAs(created.Thread.ID, "alice")
+		completeResult <- raceResult{completed: snapshot, err: err}
+	}()
+	go func() {
+		<-start
+		_, added, _, err := second.AdmitThreadJobAs(created.Thread.ID, "race-member", "alice", Request{Repository: "widget", Task: "racing admission"})
+		addResult <- raceResult{added: added, err: err}
+	}()
+	close(start)
+	initialClose, appended := <-completeResult, <-addResult
+	if initialClose.err != nil || initialClose.completed.Thread.CompletedAt == nil || initialClose.completed.Jobs[0].Status != StatusSucceeded {
+		t.Fatalf("concurrent completion=(%+v,%v), want successful close", initialClose.completed.Thread, initialClose.err)
+	}
+	if appended.err != nil && !errors.Is(appended.err, ErrThreadClosed) {
+		t.Fatalf("concurrent append error=%v, want success or ErrThreadClosed", appended.err)
+	}
+	if appended.err == nil {
+		if _, err := second.Get(appended.added.ID); err != nil {
+			t.Fatalf("append-first member missing after completion: %v", err)
+		}
+	} else if _, _, _, err := second.AdmitThreadJobAs(created.Thread.ID, "late", "alice", Request{Repository: "widget", Task: "must reject"}); !errors.Is(err, ErrThreadClosed) {
+		t.Fatalf("append after completion=%v, want ErrThreadClosed", err)
+	}
+	expectedMembers := 1
+	if appended.err == nil {
+		expectedMembers++
+	}
+	completed, err := first.CompleteThreadAs(created.Thread.ID, "alice")
+	if err != nil || completed.Thread.CompletedAt == nil || len(completed.Jobs) != expectedMembers || completed.Jobs[0].Status != StatusSucceeded {
+		t.Fatalf("final Thread=(%+v,%v), want completed with exactly the admitted members", completed, err)
+	}
+	repeated, err := second.CompleteThreadAs(created.Thread.ID, "alice")
+	if err != nil || repeated.Thread.CompletedAt == nil || !repeated.Thread.CompletedAt.Equal(*completed.Thread.CompletedAt) {
+		t.Fatalf("cross-connection completion replay=(%+v,%v), want same timestamp", repeated, err)
+	}
+	if _, _, _, err := second.AdmitThreadJobAs(created.Thread.ID, "late", "alice", Request{Repository: "widget", Task: "must reject"}); !errors.Is(err, ErrThreadClosed) {
+		t.Fatalf("cross-connection append after completion=%v, want ErrThreadClosed", err)
+	}
+	if appended.err == nil {
+		if _, _, replayed, err := second.AdmitThreadJobAs(created.Thread.ID, "race-member", "alice", Request{Repository: "widget", Task: "racing admission"}); err != nil || !replayed {
+			t.Fatalf("exact member replay after completion=(%t,%v), want successful replay", replayed, err)
+		}
+	}
+	if err := first.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	persisted, err := reopened.GetThread(created.Thread.ID)
+	if err != nil || persisted.Thread.CompletedAt == nil || persisted.Thread.CompletedBy != "alice" || persisted.Jobs[0].ID != created.Jobs[0].ID || persisted.Jobs[0].Status != StatusSucceeded {
+		t.Fatalf("restarted Thread=(%+v,%v), want durable completion and same member Job", persisted, err)
+	}
+}
+
+func TestSQLiteThreadStoreAdmissionReplayOwnershipAndRetention(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "threads.db")
+	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 4}
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Repository: " widget ", Task: "  persist thread  "}
+	first, replay, err := store.AdmitThreadAs("thread-key", "alice", request)
+	if err != nil || replay {
+		t.Fatalf("first Thread admission=(%+v,%t,%v), want new record", first, replay, err)
+	}
+	if len(first.Jobs) != 1 || first.Thread.JobIDs[0] != first.Jobs[0].ID || first.Thread.Status != ThreadStatusInProgress {
+		t.Fatalf("initial Thread snapshot=%+v, want one queued member", first)
+	}
+	if _, _, err := store.Admit("thread-key", request); err != nil {
+		t.Fatalf("separate Job idempotency namespace collided: %v", err)
+	}
+	if _, _, err := store.AdmitThreadAs("thread-key", "alice", Request{Repository: "widget", Task: "different"}); !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("changed Thread replay error=%v, want conflict", err)
+	}
+	if _, err := store.GetThreadForPrincipal(first.Thread.ID, "bob"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign Thread read error=%v, want not found", err)
+	}
+	first.Thread.JobIDs[0] = "caller mutation"
+	first.Jobs[0].Request.Task = "caller mutation"
+	_ = store.CloseStore()
+
+	store, err = OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	reopened, replay, err := store.AdmitThreadAs(" thread-key ", " alice ", Request{Repository: "widget", Task: "persist thread"})
+	if err != nil || !replay || reopened.Thread.ID != first.Thread.ID || reopened.Thread.JobIDs[0] != reopened.Jobs[0].ID || reopened.Jobs[0].Request.Task != "persist thread" {
+		t.Fatalf("durable normalized replay=(%+v,%t,%v)", reopened, replay, err)
+	}
+	if _, _, err := store.AdmitThreadAs("thread-key", "bob", request); err != nil {
+		t.Fatalf("same key under another principal should create an independent Thread: %v", err)
+	}
+}
+
+func TestSQLiteThreadStatusAndCascadeRetention(t *testing.T) {
+	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4}
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "threads.db"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	created, _, err := store.AdmitThreadAs("thread", "alice", Request{Repository: "widget", Task: "finish"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.ClaimNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(job.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := store.GetThread(created.Thread.ID)
+	if err != nil || finished.Thread.Status != ThreadStatusDone || finished.Jobs[0].Status != StatusFailed || !finished.Thread.UpdatedAt.After(created.Thread.CreatedAt) {
+		t.Fatalf("terminal Thread=(%+v,%v), want done projection", finished, err)
+	}
+	ordinary, _, err := store.Admit("replacement", Request{Repository: "widget", Task: "replacement"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNext()
+	if err != nil || claim.ID != ordinary.ID {
+		t.Fatalf("replacement claim=(%+v,%v)", claim, err)
+	}
+	if err := store.Finish(ordinary.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	// Existing SQLite retention rejects capacity rather than deleting history;
+	// remove its non-cascading event rows to verify Thread-owned retention links.
+	if _, err := store.db.Exec(`DELETE FROM factory_job_events WHERE job_id=?`, job.ID); err != nil {
+		t.Fatalf("remove Job history for cascade fixture: %v", err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_jobs WHERE id=?`, job.ID); err != nil {
+		t.Fatalf("delete retained Job: %v", err)
+	}
+	if _, err := store.GetThread(created.Thread.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Thread survived cascaded Job eviction: %v", err)
+	}
+	if _, _, err := store.AdmitThreadAs("thread", "alice", Request{Repository: "widget", Task: "new after eviction"}); err != nil {
+		t.Fatalf("idempotency mapping survived Job eviction: %v", err)
+	}
+}
+
+func TestSQLiteThreadConcurrentConnectionsAdmitOneThreadAndJob(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "threads.db")
+	config := Config{QueueCapacity: 16, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 4}
+	stores := make([]*SQLiteStore, 2)
+	for i := range stores {
+		store, err := OpenSQLiteStore(path, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = store
+		defer store.CloseStore()
+	}
+	const callers = 12
+	start := make(chan struct{})
+	type result struct {
+		snapshot ThreadSnapshot
+		replay   bool
+		err      error
+	}
+	results := make(chan result, callers)
+	for i := range callers {
+		go func(i int) {
+			<-start
+			snapshot, replay, err := stores[i%len(stores)].AdmitThreadAs("same-thread", "alice", Request{Repository: "widget", Task: "same"})
+			results <- result{snapshot: snapshot, replay: replay, err: err}
+		}(i)
+	}
+	close(start)
+	var first ThreadSnapshot
+	created := 0
+	for range callers {
+		got := <-results
+		if got.err != nil {
+			t.Errorf("concurrent Thread admission: %v", got.err)
+			continue
+		}
+		if first.Thread.ID == "" {
+			first = got.snapshot
+		}
+		if got.snapshot.Thread.ID != first.Thread.ID || got.snapshot.Thread.JobIDs[0] != first.Thread.JobIDs[0] {
+			t.Errorf("concurrent admissions returned different Thread/Job pair")
+		}
+		if !got.replay {
+			created++
+		}
+	}
+	var jobs, threads, keys int
+	if err := stores[0].db.QueryRow(`SELECT COUNT(*) FROM factory_jobs`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].db.QueryRow(`SELECT COUNT(*) FROM factory_threads`).Scan(&threads); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores[0].db.QueryRow(`SELECT COUNT(*) FROM factory_thread_idempotency`).Scan(&keys); err != nil {
+		t.Fatal(err)
+	}
+	if created != 1 || jobs != 1 || threads != 1 || keys != 1 {
+		t.Fatalf("created=%d jobs=%d threads=%d keys=%d; want one atomic admission", created, jobs, threads, keys)
+	}
+}
+
 func TestSQLiteStoreSatisfiesSharedContract(t *testing.T) {
 	runStoreContract(t, func(t *testing.T) Store {
 		t.Helper()
@@ -609,6 +914,10 @@ func TestSQLiteStoreCloseCancelsQueuedButPreservesRunningForRecovery(t *testing.
 	job, err = reopened.Get(queued.ID)
 	if err != nil || job.Status != StatusCanceled {
 		t.Fatalf("queued job after shutdown = (%+v,%v)", job, err)
+	}
+	history, err := reopened.History(queued.ID)
+	if err != nil || len(history.Events) != 2 || history.Events[1].Type != string(StatusCanceled) {
+		t.Fatalf("queued job shutdown history=(%+v,%v), want cancellation event", history, err)
 	}
 }
 

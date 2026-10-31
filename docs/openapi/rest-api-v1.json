@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.5.0",
-    "description": "Authenticated API for submitting and inspecting bounded Factory jobs. A successful agent process or PR publication is not an independent correctness verdict."
+    "version": "1.9.0",
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
     "/healthz": {
@@ -130,6 +130,109 @@
             "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "POST" ] } } },
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
           }
+        }
+      }
+    },
+    "/v1/threads": {
+      "post": {
+        "operationId": "createThread",
+        "summary": "Create a Thread and its initial Job",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter" ],
+        "description": "Creates one direct-request Thread and its initial Job atomically in the existing Job queue. Scheduled or standalone Jobs continue to use POST /v1/jobs and are not assigned to Threads. The body accepts only repository and task; issue metadata and other fields are rejected. The Idempotency-Key is scoped to the authenticated principal and a Thread-specific namespace: a retained retry with the same normalized request returns the same Thread and Job, changed content conflicts, and a distinct key creates a distinct Thread. Operators can inspect any Thread; submitters can inspect only their own. Thread status is derived from member Job state; terminal succeeded, failed, and canceled Jobs are Done, while durable recovery-needed Jobs require attention. Status projection does not close a Thread; closure is explicit through POST /v1/threads/{id}/complete.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/IdempotencyKey" } ],
+        "requestBody": {
+          "required": true,
+          "description": "JSON body limit and task size are operator-configurable. Repository must be an operator-configured alias.",
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateThreadRequest" } } }
+        },
+        "responses": {
+          "202": { "description": "The Thread and initial Job were admitted, or an identical retained retry was replayed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateThreadResponse" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "409": { "description": "The principal-scoped Thread idempotency key conflicts with a different request.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "413": { "description": "The request body exceeds the configured byte limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "415": { "description": "The request Content-Type is not application/json.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "503": { "description": "The service is not ready, shutting down, or has reached queue/registry capacity, or the selected Store does not yet support Threads.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "enum": [ "POST" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      }
+    },
+    "/v1/notifications": {
+      "get": {
+        "operationId": "listNotifications",
+        "summary": "List Thread Done notifications",
+        "description": "Read-only authenticated inbox filtered to the principal attributed as Thread submitter. Each notification records committed availability in Factory's in-product inbox; no external sender or read-ack state exists. A notification is committed atomically with the Job transition that first makes an unclosed aggregate Thread Done. Reads never create notifications or mutate Jobs. A later Done transition after adding a member creates a new notification. Responses expose only notification ID, Thread ID, fixed status, and timestamp; request/task text and secrets are omitted. Pages are bounded to 1–100 items (default 50), newest first; use before with next_cursor for continuation. Missing and foreign owners both receive an empty filtered page.",
+        "x-allowed-roles": [ "legacy-shared operator (own submitted Threads only)", "named operator (own submitted Threads only)", "submitter (own Threads only)" ],
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "before", "in": "query", "required": false, "description": "Exclusive notification ID cursor; pass next_cursor from the prior response.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } }
+        ],
+        "responses": {
+          "200": { "description": "A bounded page containing only notifications owned by the authenticated principal.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ThreadNotificationPage" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "enum": [ "GET" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      }
+    },
+    "/v1/threads/{id}": {
+      "get": {
+        "operationId": "getThread",
+        "summary": "Get a Thread and its Jobs",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own Threads only)" ],
+        "description": "Returns a Thread with its stable ordered member Job snapshots. Submitters see only Threads attributed to their principal; missing and differently attributed Threads both return 404. Thread status and updated_at are derived from retained Job lifecycle/recovery state. This route does not close a Thread or mutate Jobs.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/ThreadId" } ],
+        "responses": {
+          "200": { "description": "Thread and its member Jobs.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ThreadSnapshot" } } } },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "description": "The Thread does not exist or is not visible to this principal.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "enum": [ "GET" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      }
+    },
+    "/v1/threads/{id}/complete": {
+      "post": {
+        "operationId": "completeThread",
+        "summary": "Explicitly complete an owned Thread",
+        "x-allowed-roles": [ "legacy-shared operator (Threads they own)", "named operator (Threads they own)", "submitter (own Threads only)" ],
+        "description": "Bodyless authenticated owner action that explicitly closes a Thread independently of its derived aggregate status; in particular, a Thread becoming Done does not close it. Submitters and operators may complete only Threads attributed to their authenticated principal; operators' inspect-any policy does not grant cross-owner completion. Missing and differently attributed IDs both return 404. Completion is idempotent: repeated calls return the same completed_at/completed_by metadata and do not mutate member Jobs. Completion and new member admission serialize against the same Thread record across durable Store connections. If admission commits first, completion can then close the Thread; if completion commits first, later new member admissions return 409. An identical retry for a previously admitted member remains a replay. Scheduled and standalone Jobs are unaffected.",
+        "parameters": [ { "$ref": "#/components/parameters/ThreadId" } ],
+        "responses": {
+          "200": { "description": "The completed Thread and unchanged member Job snapshots.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ThreadSnapshot" } } } },
+          "400": { "description": "The request must be bodyless.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "401": { "description": "Authentication is required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "404": { "description": "The Thread does not exist or is not owned by this principal.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "405": { "description": "Method not allowed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "503": { "description": "Thread operations are unavailable or the service is shutting down.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      }
+    },
+    "/v1/threads/{id}/jobs": {
+      "post": {
+        "operationId": "addThreadJob",
+        "summary": "Add a Job to a Thread",
+        "x-allowed-roles": [ "legacy-shared operator (Threads they own)", "named operator (Threads they own)", "submitter (own Threads only)" ],
+        "description": "Atomically admits a new direct-request Job as the next ordered member of a Thread owned by the authenticated principal. Operators may inspect any Thread but may append only to Threads attributed to their principal. The body accepts only repository and task. Idempotency-Key is scoped to the authenticated principal and Thread; a retained retry with the same normalized body returns the same Job without duplicating membership, while changed content conflicts. Adding a Job to an open Done Thread reopens its derived status as In Progress. New Jobs cannot be added after explicit completion; exact retained retries remain idempotent. Scheduled and standalone Jobs remain outside Threads.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/ThreadId" }, { "$ref": "#/components/parameters/IdempotencyKey" } ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateThreadRequest" } } } },
+        "responses": {
+          "202": { "description": "The Job was added to the Thread, or an identical retained retry was replayed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AddThreadJobResponse" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "description": "The Thread does not exist or is not visible to this principal.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "409": { "description": "The Thread is completed, or the member idempotency key conflicts with a different request.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "413": { "description": "The request body exceeds the configured byte limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "415": { "description": "The request Content-Type is not application/json.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only POST is supported.", "headers": { "Allow": { "schema": { "type": "string", "enum": [ "POST" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
         }
       }
     },
@@ -406,6 +509,13 @@
         "required": true,
         "description": "Opaque job identifier returned at admission.",
         "schema": { "type": "string", "minLength": 1 }
+      },
+      "ThreadId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Opaque Thread identifier returned at admission.",
+        "schema": { "type": "string", "minLength": 1 }
       }
     },
     "responses": {
@@ -431,6 +541,80 @@
       }
     },
     "schemas": {
+      "CreateThreadRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "repository", "task" ],
+        "properties": {
+          "repository": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Operator-configured repository alias; not a URL or filesystem path." },
+          "task": { "type": "string", "minLength": 1, "maxLength": 262144, "description": "UTF-8 task text, at most 256 KiB by byte length; operator configuration may impose a smaller limit." }
+        }
+      },
+      "CreateThreadResponse": {
+        "type": "object",
+        "required": [ "thread", "job", "replayed", "links" ],
+        "properties": {
+          "thread": { "$ref": "#/components/schemas/Thread" },
+          "job": { "$ref": "#/components/schemas/JobSnapshot" },
+          "replayed": { "type": "boolean" },
+          "links": {
+            "type": "object",
+            "required": [ "self", "job" ],
+            "properties": { "self": { "type": "string" }, "job": { "type": "string" } }
+          }
+        }
+      },
+      "AddThreadJobResponse": {
+        "type": "object",
+        "required": [ "thread", "job", "replayed" ],
+        "properties": {
+          "thread": { "$ref": "#/components/schemas/Thread" },
+          "job": { "$ref": "#/components/schemas/JobSnapshot" },
+          "replayed": { "type": "boolean" }
+        }
+      },
+      "ThreadSnapshot": {
+        "type": "object",
+        "required": [ "thread", "jobs" ],
+        "properties": {
+          "thread": { "$ref": "#/components/schemas/Thread" },
+          "jobs": { "type": "array", "minItems": 1, "items": { "$ref": "#/components/schemas/JobSnapshot" } }
+        }
+      },
+      "ThreadNotificationPage": {
+        "type": "object",
+        "required": [ "notifications", "has_more" ],
+        "properties": {
+          "notifications": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/ThreadNotification" } },
+          "has_more": { "type": "boolean" },
+          "next_cursor": { "type": "integer", "format": "int64", "minimum": 1, "description": "Exclusive before cursor, present only when has_more is true." }
+        }
+      },
+      "ThreadNotification": {
+        "type": "object",
+        "required": [ "id", "thread_id", "status", "created_at" ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "integer", "format": "int64", "minimum": 1 },
+          "thread_id": { "type": "string" },
+          "status": { "type": "string", "enum": [ "done" ] },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Thread": {
+        "type": "object",
+        "required": [ "id", "submitted_by", "created_at", "updated_at", "job_ids", "status" ],
+        "properties": {
+          "id": { "type": "string" },
+          "submitted_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "job_ids": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "status": { "type": "string", "enum": [ "need_attention", "in_progress", "done" ], "description": "Aggregate projection from member Jobs; does not close the Thread." },
+          "completed_at": { "type": "string", "format": "date-time", "description": "Present only after an explicit authenticated owner completion action." },
+          "completed_by": { "type": "string", "description": "Authenticated principal that explicitly completed the Thread." }
+        }
+      },
       "CreateJobRequest": {
         "type": "object",
         "additionalProperties": false,

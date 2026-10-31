@@ -43,8 +43,8 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.5.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.5.0", document.Info.Version)
+	if document.Info.Version != "1.9.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.9.0", document.Info.Version)
 	}
 }
 
@@ -70,6 +70,76 @@ func TestOpenAPIDocumentationNavigationAndVersionPolicy(t *testing.T) {
 				t.Errorf("feature documentation %s must state API version policy: %s", path, policy)
 			}
 		})
+	}
+}
+
+func TestThreadOpenAPIContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Info struct {
+			Version string `json:"version"`
+		} `json:"info"`
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			Schemas map[string]map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Info.Version != "1.9.0" {
+		t.Fatalf("version=%q want 1.9.0", document.Info.Version)
+	}
+	for path, method := range map[string]string{"/v1/threads": "post", "/v1/threads/{id}": "get", "/v1/threads/{id}/jobs": "post", "/v1/threads/{id}/complete": "post", "/v1/notifications": "get"} {
+		var operation map[string]json.RawMessage
+		if raw, ok := document.Paths[path][method]; !ok || json.Unmarshal(raw, &operation) != nil {
+			t.Errorf("OpenAPI missing %s %s operation", method, path)
+		}
+	}
+	var inboxOperation struct {
+		Description string                       `json:"description"`
+		Security    []map[string]json.RawMessage `json:"security"`
+	}
+	if err := json.Unmarshal(document.Paths["/v1/notifications"]["get"], &inboxOperation); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"filtered to the principal attributed as Thread submitter", "atomic", "Reads never create notifications", "no external sender or read-ack state"} {
+		if !strings.Contains(inboxOperation.Description, required) {
+			t.Errorf("notification OpenAPI description must include %q", required)
+		}
+	}
+	if len(inboxOperation.Security) == 0 {
+		t.Error("notification inbox must require bearer authentication")
+	}
+	var addMemberOperation struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(document.Paths["/v1/threads/{id}/jobs"]["post"], &addMemberOperation); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"owned by the authenticated principal", "Operators may inspect any Thread but may append only to Threads attributed to their principal"} {
+		if !strings.Contains(addMemberOperation.Description, required) {
+			t.Errorf("member-add OpenAPI description must include %q", required)
+		}
+	}
+	var completionOperation struct {
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(document.Paths["/v1/threads/{id}/complete"]["post"], &completionOperation); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"Bodyless", "independently of its derived aggregate status", "idempotent", "serialize", "Missing and differently attributed IDs both return 404"} {
+		if !strings.Contains(completionOperation.Description, required) {
+			t.Errorf("completion OpenAPI description must include %q", required)
+		}
+	}
+	for _, schema := range []string{"CreateThreadRequest", "CreateThreadResponse", "AddThreadJobResponse", "ThreadSnapshot", "Thread", "ThreadNotification", "ThreadNotificationPage"} {
+		if document.Components.Schemas[schema] == nil {
+			t.Errorf("OpenAPI missing %s schema", schema)
+		}
 	}
 }
 
@@ -196,8 +266,8 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.5.0" {
-		t.Errorf("OpenAPI version = %q, want 1.5.0", document.Info.Version)
+	if document.Info.Version != "1.9.0" {
+		t.Errorf("OpenAPI version = %q, want 1.9.0", document.Info.Version)
 	}
 	provenanceRoute, ok := document.Paths["/v1/jobs/{id}/issue-provenance"]
 	if !ok {
@@ -321,6 +391,11 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"GET /readyz":                             "readinessCheck",
 		"GET /v1/jobs":                            "listJobs",
 		"POST /v1/jobs":                           "createJob",
+		"POST /v1/threads":                        "createThread",
+		"GET /v1/threads/{id}":                    "getThread",
+		"GET /v1/notifications":                   "listNotifications",
+		"POST /v1/threads/{id}/jobs":              "addThreadJob",
+		"POST /v1/threads/{id}/complete":          "completeThread",
 		"GET /v1/jobs/{id}":                       "getJob",
 		"GET /v1/jobs/{id}/issue-provenance":      "getJobIssueProvenance",
 		"GET /v1/jobs/{id}/history":               "getJobHistory",

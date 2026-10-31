@@ -93,7 +93,7 @@ func newPrincipalTestHandler(t *testing.T, manager restjobs.Manager, principals 
 func principalRequest(handler http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer "+token)
-	if method == http.MethodPost && path == "/v1/jobs" {
+	if method == http.MethodPost && (path == "/v1/jobs" || path == "/v1/threads") {
 		r.Header.Set("Idempotency-Key", "handler-principal-test-key")
 	}
 	if body != "" {
@@ -142,6 +142,336 @@ func request(handler http.Handler, method, path, body string, authenticated bool
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, r)
 	return recorder
+}
+
+func TestCreateAndInspectThreadEnforcesAuthOwnershipAndIdempotency(t *testing.T) {
+	manager := newTestManager(t, managerConfig(16, 32, 8))
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+	)
+
+	create := func(token, key, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/threads", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", key)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	first := create(namedPrincipalToken("alice"), "thread-key", `{"repository":"widget","task":"inspect this work"}`)
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("create Thread status=%d body=%s", first.Code, first.Body.String())
+	}
+	var admitted struct {
+		Thread restjobs.Thread   `json:"thread"`
+		Job    restjobs.Snapshot `json:"job"`
+		Replay bool              `json:"replayed"`
+		Links  threadLinksDTO    `json:"links"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &admitted); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Thread.ID == "" || admitted.Job.ID == "" || admitted.Thread.Submitter != "alice" || admitted.Thread.JobIDs[0] != admitted.Job.ID || admitted.Replay || admitted.Links.Self != "/v1/threads/"+admitted.Thread.ID || admitted.Links.Job != "/v1/jobs/"+admitted.Job.ID {
+		t.Fatalf("create Thread response=%+v", admitted)
+	}
+	replayed := create(namedPrincipalToken("alice"), "thread-key", `{"repository":"widget","task":"inspect this work"}`)
+	if replayed.Code != http.StatusAccepted {
+		t.Fatalf("Thread retry status=%d body=%s", replayed.Code, replayed.Body.String())
+	}
+	var replayResponse struct {
+		Thread restjobs.Thread   `json:"thread"`
+		Job    restjobs.Snapshot `json:"job"`
+		Replay bool              `json:"replayed"`
+	}
+	if err := json.Unmarshal(replayed.Body.Bytes(), &replayResponse); err != nil {
+		t.Fatal(err)
+	}
+	if !replayResponse.Replay || replayResponse.Thread.ID != admitted.Thread.ID || replayResponse.Job.ID != admitted.Job.ID {
+		t.Fatalf("Thread retry response=%+v, want same Thread/Job pair marked replay", replayResponse)
+	}
+	if conflict := create(namedPrincipalToken("alice"), "thread-key", `{"repository":"widget","task":"different"}`); conflict.Code != http.StatusConflict {
+		t.Fatalf("changed idempotency payload status=%d body=%s, want conflict", conflict.Code, conflict.Body.String())
+	}
+	if separate := create(namedPrincipalToken("alice"), "thread-key-2", `{"repository":"widget","task":"inspect this work"}`); separate.Code != http.StatusAccepted {
+		t.Fatalf("distinct Thread key status=%d body=%s", separate.Code, separate.Body.String())
+	}
+	if foreign := create(namedPrincipalToken("bob"), "thread-key", `{"repository":"widget","task":"inspect this work"}`); foreign.Code != http.StatusAccepted {
+		t.Fatalf("different principal Thread key status=%d body=%s", foreign.Code, foreign.Body.String())
+	}
+
+	own := principalRequest(handler, http.MethodGet, "/v1/threads/"+admitted.Thread.ID, "", namedPrincipalToken("alice"))
+	if own.Code != http.StatusOK || !strings.Contains(own.Body.String(), admitted.Job.ID) {
+		t.Fatalf("own Thread inspection status=%d body=%s", own.Code, own.Body.String())
+	}
+	for _, id := range []string{admitted.Thread.ID, "missing-thread"} {
+		foreign := principalRequest(handler, http.MethodGet, "/v1/threads/"+id, "", namedPrincipalToken("bob"))
+		if foreign.Code != http.StatusNotFound {
+			t.Errorf("submitter inspection of %q status=%d body=%s, want indistinguishable 404", id, foreign.Code, foreign.Body.String())
+		}
+	}
+	operator := principalRequest(handler, http.MethodGet, "/v1/threads/"+admitted.Thread.ID, "", namedPrincipalToken("admin"))
+	legacy := request(handler, http.MethodGet, "/v1/threads/"+admitted.Thread.ID, "", true)
+	if operator.Code != http.StatusOK || legacy.Code != http.StatusOK {
+		t.Errorf("operator/legacy inspection status=(%d,%d), want 200", operator.Code, legacy.Code)
+	}
+	unauthenticated := request(handler, http.MethodGet, "/v1/threads/"+admitted.Thread.ID, "", false)
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Errorf("unauthenticated inspection status=%d, want 401", unauthenticated.Code)
+	}
+
+	standalone := principalRequest(handler, http.MethodPost, "/v1/jobs", `{"repository":"widget","task":"ordinary scheduled work"}`, namedPrincipalToken("alice"))
+	if standalone.Code != http.StatusAccepted {
+		t.Fatalf("standalone Job admission status=%d body=%s", standalone.Code, standalone.Body.String())
+	}
+	var standaloneResponse struct {
+		Job restjobs.Snapshot `json:"job"`
+	}
+	if err := json.Unmarshal(standalone.Body.Bytes(), &standaloneResponse); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.GetThread(standaloneResponse.Job.ID); !errors.Is(err, restjobs.ErrNotFound) {
+		t.Errorf("ordinary /v1/jobs admission unexpectedly created Thread membership: %v", err)
+	}
+	followRequest := httptest.NewRequest(http.MethodPost, "/v1/threads/"+admitted.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"follow up"}`))
+	followRequest.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	followRequest.Header.Set("Idempotency-Key", "member-one")
+	followRequest.Header.Set("Content-Type", "application/json")
+	follow := httptest.NewRecorder()
+	handler.ServeHTTP(follow, followRequest)
+	if follow.Code != http.StatusAccepted {
+		t.Fatalf("add Thread Job status=%d body=%s", follow.Code, follow.Body.String())
+	}
+	var added struct {
+		Thread restjobs.Thread   `json:"thread"`
+		Job    restjobs.Snapshot `json:"job"`
+		Replay bool              `json:"replayed"`
+	}
+	if err := json.Unmarshal(follow.Body.Bytes(), &added); err != nil {
+		t.Fatal(err)
+	}
+	if added.Replay || len(added.Thread.JobIDs) != 2 || added.Thread.JobIDs[0] != admitted.Job.ID || added.Thread.JobIDs[1] != added.Job.ID {
+		t.Fatalf("added Thread Job response=%+v, want initial and follow-up in order", added)
+	}
+	replayRequest := httptest.NewRequest(http.MethodPost, "/v1/threads/"+admitted.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"follow up"}`))
+	replayRequest.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	replayRequest.Header.Set("Idempotency-Key", "member-one")
+	replayRequest.Header.Set("Content-Type", "application/json")
+	replay := httptest.NewRecorder()
+	handler.ServeHTTP(replay, replayRequest)
+	var replayedMember struct {
+		Job      restjobs.Snapshot `json:"job"`
+		Replayed bool              `json:"replayed"`
+	}
+	if replay.Code != http.StatusAccepted || json.Unmarshal(replay.Body.Bytes(), &replayedMember) != nil || !replayedMember.Replayed || replayedMember.Job.ID != added.Job.ID {
+		t.Fatalf("Thread member replay status=%d body=%s, want original Job marked replayed", replay.Code, replay.Body.String())
+	}
+	foreignRequest := httptest.NewRequest(http.MethodPost, "/v1/threads/"+admitted.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"foreign"}`))
+	foreignRequest.Header.Set("Authorization", "Bearer "+namedPrincipalToken("bob"))
+	foreignRequest.Header.Set("Idempotency-Key", "foreign-member")
+	foreignRequest.Header.Set("Content-Type", "application/json")
+	foreignAdd := httptest.NewRecorder()
+	handler.ServeHTTP(foreignAdd, foreignRequest)
+	if foreignAdd.Code != http.StatusNotFound {
+		t.Fatalf("foreign submitter member admission status=%d body=%s, want 404", foreignAdd.Code, foreignAdd.Body.String())
+	}
+}
+
+func TestCompleteThreadRequiresOwnershipAndIsBodylessIdempotent(t *testing.T) {
+	manager := newTestManager(t, managerConfig(16, 32, 8))
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "operator", Role: "operator", Enabled: true},
+	)
+	created, _, err := manager.AdmitThreadAs("completion", "alice", restjobs.Request{Repository: "widget", Task: "still running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1/threads/" + created.Thread.ID + "/complete"
+	doneThread, _, err := manager.AdmitThreadAs("already-done", "alice", restjobs.Request{Repository: "widget", Task: "finish before explicit action"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := manager.ClaimNext()
+	if err != nil || claimed.ID != created.Jobs[0].ID {
+		t.Fatalf("claim first Job=(%+v,%v)", claimed, err)
+	}
+	if err := manager.Finish(claimed.ID, restjobs.StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = manager.ClaimNext()
+	if err != nil || claimed.ID != doneThread.Jobs[0].ID {
+		t.Fatalf("claim second Job=(%+v,%v)", claimed, err)
+	}
+	if err := manager.Finish(claimed.ID, restjobs.StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	inspectDone := principalRequest(handler, http.MethodGet, "/v1/threads/"+doneThread.Thread.ID, "", namedPrincipalToken("alice"))
+	var doneSnapshot restjobs.ThreadSnapshot
+	if inspectDone.Code != http.StatusOK || json.Unmarshal(inspectDone.Body.Bytes(), &doneSnapshot) != nil || doneSnapshot.Thread.Status != restjobs.ThreadStatusDone || doneSnapshot.Thread.CompletedAt != nil {
+		t.Fatalf("Done Thread inspection status=%d body=%s, want Done but open before explicit action", inspectDone.Code, inspectDone.Body.String())
+	}
+	if closed := principalRequest(handler, http.MethodPost, "/v1/threads/"+doneThread.Thread.ID+"/complete", "", namedPrincipalToken("alice")); closed.Code != http.StatusOK {
+		t.Fatalf("explicit completion of Done Thread status=%d body=%s, want 200", closed.Code, closed.Body.String())
+	}
+	if got := request(handler, http.MethodPost, path, "", false); got.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated completion status=%d body=%s, want 401", got.Code, got.Body.String())
+	}
+	for _, token := range []string{namedPrincipalToken("bob"), namedPrincipalToken("operator")} {
+		got := principalRequest(handler, http.MethodPost, path, "", token)
+		if got.Code != http.StatusNotFound {
+			t.Fatalf("non-owner completion status=%d body=%s, want non-disclosing 404", got.Code, got.Body.String())
+		}
+	}
+	operatorOwned, _, err := manager.AdmitThreadAs("operator-owned", "operator", restjobs.Request{Repository: "widget", Task: "operator's own Thread"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := principalRequest(handler, http.MethodPost, "/v1/threads/"+operatorOwned.Thread.ID+"/complete", "", namedPrincipalToken("operator")); got.Code != http.StatusOK {
+		t.Fatalf("operator completion of own Thread status=%d body=%s, want 200", got.Code, got.Body.String())
+	}
+	missing := principalRequest(handler, http.MethodPost, "/v1/threads/missing-thread/complete", "", namedPrincipalToken("alice"))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing Thread completion status=%d body=%s, want non-disclosing 404", missing.Code, missing.Body.String())
+	}
+	if body := principalRequest(handler, http.MethodPost, path, `{"completed":true}`, namedPrincipalToken("alice")); body.Code != http.StatusBadRequest {
+		t.Fatalf("completion with body status=%d body=%s, want 400", body.Code, body.Body.String())
+	}
+	jobBefore, err := manager.Get(created.Jobs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	complete := principalRequest(handler, http.MethodPost, path, "", namedPrincipalToken("alice"))
+	if complete.Code != http.StatusOK {
+		t.Fatalf("owner completion status=%d body=%s, want 200", complete.Code, complete.Body.String())
+	}
+	var first restjobs.ThreadSnapshot
+	if err := json.Unmarshal(complete.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Thread.CompletedAt == nil || first.Thread.CompletedBy != "alice" || first.Jobs[0].ID != jobBefore.ID || first.Jobs[0].Status != jobBefore.Status || !first.Jobs[0].UpdatedAt.Equal(jobBefore.UpdatedAt) {
+		t.Fatalf("completion response=%+v, want explicit completion without Job mutation", first)
+	}
+	retry := principalRequest(handler, http.MethodPost, path, "", namedPrincipalToken("alice"))
+	var repeated restjobs.ThreadSnapshot
+	if retry.Code != http.StatusOK || json.Unmarshal(retry.Body.Bytes(), &repeated) != nil || repeated.Thread.CompletedAt == nil || !repeated.Thread.CompletedAt.Equal(*first.Thread.CompletedAt) {
+		t.Fatalf("repeated completion status=%d body=%s, want idempotent same completion", retry.Code, retry.Body.String())
+	}
+	if got := principalRequest(handler, http.MethodPost, path+"/jobs", `{"repository":"widget","task":"not a valid route"}`, namedPrincipalToken("alice")); got.Code != http.StatusNotFound {
+		t.Fatalf("invalid nested route status=%d", got.Code)
+	}
+	add := httptest.NewRequest(http.MethodPost, "/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"after close"}`))
+	add.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	add.Header.Set("Content-Type", "application/json")
+	add.Header.Set("Idempotency-Key", "after-close")
+	addResponse := httptest.NewRecorder()
+	handler.ServeHTTP(addResponse, add)
+	if addResponse.Code != http.StatusConflict || !strings.Contains(addResponse.Body.String(), "thread_closed") {
+		t.Fatalf("append after completion status=%d body=%s, want sanitized 409", addResponse.Code, addResponse.Body.String())
+	}
+}
+
+func TestThreadDoneNotificationsAreOwnerFilteredAndSafe(t *testing.T) {
+	manager := newTestManager(t, managerConfig(16, 32, 8))
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+	)
+	created, _, err := manager.AdmitThreadAs("notify", "alice", restjobs.Request{Repository: "widget", Task: "private request secret text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(created.Jobs[0].ID, restjobs.StatusCanceled); err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1/notifications"
+	own := principalRequest(handler, http.MethodGet, path, "", namedPrincipalToken("alice"))
+	if own.Code != http.StatusOK || strings.Contains(own.Body.String(), "private request secret text") || !strings.Contains(own.Body.String(), created.Thread.ID) {
+		t.Fatalf("owner notification response=%d %s", own.Code, own.Body.String())
+	}
+	for _, token := range []string{namedPrincipalToken("bob"), namedPrincipalToken("admin"), testAPIKey} {
+		response := principalRequest(handler, http.MethodGet, path, "", token)
+		if response.Code != http.StatusOK || strings.Contains(response.Body.String(), created.Thread.ID) {
+			t.Errorf("non-owner inbox response=%d %s, expected no foreign Thread", response.Code, response.Body.String())
+		}
+	}
+	if response := request(handler, http.MethodGet, path, "", false); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated inbox status=%d body=%s", response.Code, response.Body.String())
+	}
+	for _, query := range []string{"?limit=0", "?limit=101", "?before=0", "?unexpected=1", "?limit=1&limit=2"} {
+		if response := principalRequest(handler, http.MethodGet, path+query, "", namedPrincipalToken("alice")); response.Code != http.StatusBadRequest {
+			t.Errorf("invalid query %q status=%d body=%s", query, response.Code, response.Body.String())
+		}
+	}
+	if response := principalRequest(handler, http.MethodGet, path+"?limit=1", "", namedPrincipalToken("alice")); response.Code != http.StatusOK {
+		t.Fatalf("bounded inbox status=%d body=%s", response.Code, response.Body.String())
+	} else {
+		var page restjobs.NotificationPage
+		if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil || len(page.Notifications) != 1 || page.HasMore || page.NextCursor != 0 {
+			t.Fatalf("bounded inbox page=(%+v,%v)", page, err)
+		}
+	}
+	if response := principalRequest(handler, http.MethodGet, path, "", namedPrincipalToken("alice")); response.Code != http.StatusOK {
+		t.Fatalf("repeated read status=%d body=%s", response.Code, response.Body.String())
+	}
+	if page, err := manager.ListNotificationsForPrincipal(context.Background(), "alice", 0, 10); err != nil || len(page.Notifications) != 1 {
+		t.Fatalf("repeated API read changed inbox=(%+v,%v)", page, err)
+	}
+}
+
+func TestThreadRouteValidationAndUnsupportedStore(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 8, 8))
+	handler := newTestHandler(t, manager, func() bool { return true })
+	unsupported, err := New(struct{ restjobs.Manager }{Manager: manager}, handler.key, Config{MaxRequestBodyBytes: 256, MaxTaskBytes: 128, RepositoryAliases: map[string]struct{}{"widget": {}}, Ready: func() bool { return true }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqUnsupported := httptest.NewRequest(http.MethodPost, "/v1/threads", strings.NewReader(`{"repository":"widget","task":"x"}`))
+	reqUnsupported.Header.Set("Authorization", "Bearer "+testAPIKey)
+	reqUnsupported.Header.Set("Content-Type", "application/json")
+	reqUnsupported.Header.Set("Idempotency-Key", "unsupported-store")
+	unsupportedResponse := httptest.NewRecorder()
+	unsupported.ServeHTTP(unsupportedResponse, reqUnsupported)
+	if unsupportedResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unsupported Store status=%d body=%s, want 503", unsupportedResponse.Code, unsupportedResponse.Body.String())
+	}
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{name: "issue field rejected", body: `{"repository":"widget","task":"x","issue":1}`, want: http.StatusBadRequest},
+		{name: "unknown field rejected", body: `{"repository":"widget","task":"x","extra":true}`, want: http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/threads", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+testAPIKey)
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", "validation-"+tc.name)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != tc.want {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), tc.want)
+			}
+		})
+	}
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{{http.MethodGet, "/v1/threads", http.StatusMethodNotAllowed}, {http.MethodPost, "/v1/threads/id", http.StatusMethodNotAllowed}, {http.MethodGet, "/v1/threads/id/nested", http.StatusNotFound}} {
+		response := request(handler, tc.method, tc.path, "", true)
+		if response.Code != tc.want {
+			t.Errorf("%s %s status=%d body=%s, want %d", tc.method, tc.path, response.Code, response.Body.String(), tc.want)
+		}
+	}
 }
 
 func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T) {

@@ -77,27 +77,44 @@ func (f *fakeProvider) RemoveLabel(_ context.Context, repository string, number 
 }
 
 type fakeStore struct {
-	admitted       bool
-	failure        error
-	labelAuditErr  error
-	finishErr      bool
-	quarantineErr  error
-	request        restjobs.Request
-	key            string
-	labels         []string
-	outcomes       map[string]string
-	reasons        map[string]string
-	finishAttempts map[string]int
-	pending        []restjobs.IssuePollerOutcome
-	cursors        map[string]int
-	admissions     int
-	admittedIssues []int
-	onAdmit        func()
+	admitted         bool
+	threadAdmissions int
+	badThread        bool
+	failure          error
+	labelAuditErr    error
+	finishErr        bool
+	quarantineErr    error
+	request          restjobs.Request
+	key              string
+	labels           []string
+	outcomes         map[string]string
+	reasons          map[string]string
+	finishAttempts   map[string]int
+	pending          []restjobs.IssuePollerOutcome
+	cursors          map[string]int
+	admissions       int
+	admittedIssues   []int
+	onAdmit          func()
 }
 
-func (s *fakeStore) AdmitIssuePoller(_ context.Context, key, _ string, request restjobs.Request, label string) (restjobs.Snapshot, bool, error) {
+func (s *fakeStore) AdmitIssuePollerThread(_ context.Context, key, principal string, request restjobs.Request, label string) (restjobs.ThreadSnapshot, bool, error) {
+	s.threadAdmissions++
+	job, replay, err := s.admitIssuePoller(key, request)
+	if err != nil {
+		return restjobs.ThreadSnapshot{}, false, err
+	}
+	thread := restjobs.Thread{ID: "thread-1", Submitter: principal, JobIDs: []string{job.ID}, Status: restjobs.ThreadStatusInProgress}
+	if s.badThread {
+		thread.JobIDs = nil
+	}
+	return restjobs.ThreadSnapshot{Thread: thread, Jobs: []restjobs.Snapshot{job}}, replay, nil
+}
+func (s *fakeStore) admitIssuePoller(key string, request restjobs.Request) (restjobs.Snapshot, bool, error) {
 	s.key = key
 	s.request = request
+	if s.labelAuditErr != nil {
+		return restjobs.Snapshot{}, false, s.labelAuditErr
+	}
 	if s.failure != nil {
 		return restjobs.Snapshot{}, false, s.failure
 	}
@@ -109,7 +126,7 @@ func (s *fakeStore) AdmitIssuePoller(_ context.Context, key, _ string, request r
 	if s.onAdmit != nil {
 		s.onAdmit()
 	}
-	return restjobs.Snapshot{ID: "job-1", Status: restjobs.StatusQueued, Request: request}, false, nil
+	return restjobs.Snapshot{ID: "job-1", Submitter: principalID, Status: restjobs.StatusQueued, Request: request}, false, nil
 }
 func (s *fakeStore) ListIssuePollerPending(context.Context) ([]restjobs.IssuePollerOutcome, error) {
 	var result []restjobs.IssuePollerOutcome
@@ -184,11 +201,22 @@ func TestPollerExactAllowlistAndTriggerDispatch(t *testing.T) {
 	if err := (Poller{Config: config, Provider: provider, Store: store}).PollOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !store.admitted || store.request.Repository != "destination" || store.request.IssueProvenance.SourceRepository != "source/repo" || store.request.Task == "" {
+	if !store.admitted || store.threadAdmissions != 1 || store.request.Repository != "destination" || store.request.IssueProvenance.SourceRepository != "source/repo" || store.request.Task == "" {
 		t.Fatalf("admission=%+v", store)
 	}
 	if store.outcomes["source/repo"+strings.Repeat("a", 64)] != "label_removed" || provider.removals != 1 {
 		t.Fatalf("label result=%v removals=%d", store.outcomes, provider.removals)
+	}
+}
+
+func TestPollerRejectsAdmissionWithoutOneCanonicalThreadMember(t *testing.T) {
+	config, provider, store := fixture()
+	store.badThread = true
+	if err := (Poller{Config: config, Provider: provider, Store: store}).PollOnce(context.Background()); err == nil {
+		t.Fatal("poller accepted admission without a verifiable one-job Thread")
+	}
+	if provider.removals != 0 || !containsExact(provider.labels, "ready") {
+		t.Fatal("trigger label changed before Thread ownership was verified")
 	}
 }
 
