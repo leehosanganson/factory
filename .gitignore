@@ -11,6 +11,9 @@
 *.out
 coverage.txt
 
+# Local Compose credentials and generated configuration
+/.local/
+
 # Dependency and workspace artifacts
 /vendor/
 go.work
