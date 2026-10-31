@@ -8,6 +8,6 @@ Sessions are held in process memory, capped at 1,000 live sessions, and expire a
 
 ## Control-plane container
 
-The root `Dockerfile` builds a static, non-root image intended for a PostgreSQL-backed API control plane. It compiles a binary that accepts only `factory server` (and version output), and server startup requires PostgreSQL persistence with local workers explicitly disabled. Configure the server JSON at `/etc/factory/server.json` and mount credentials/configuration securely; the image has no repository execution tools or harness bundled. The image uses the same service listener (port 8080) and includes the embedded dashboard assets. This container is not a sandbox or fleet manager.
+The root `Dockerfile` builds `factory-controller:local` (also tagged `factory-web:local`) and `factory-worker:local` from one shared build-stage executable. The Controller target remains static and non-root, includes the embedded dashboard assets, and defaults to `/factory server --config /etc/factory/server.json`. It requires PostgreSQL persistence with local workers disabled and contains no Git or harness. The Worker target is non-root, includes Git, and defaults to `/factory worker --config /etc/factory/worker.json`. Both role checks are operational guardrails only, not security boundaries. Running the executable without an image role retains normal CLI behavior and the all-in-one server's default local worker setting. The Controller serves the API on the usual listener (port 8080); neither image is a sandbox or fleet manager.
 
-Build locally with `make container-build` when Docker is available.
+Build both images locally with `make container-build` when Docker is available.

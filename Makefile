@@ -5,7 +5,20 @@ build:
 	go build -o bin/factory ./cmd/factory
 
 container-build:
-	docker build --build-arg VERSION=$$(git describe --tags --always --dirty 2>/dev/null || echo dev) -t factory-web:local .
+	version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev); \
+	printf '%s\n' \
+	  'target "controller" {' \
+	  '  context = "."' \
+	  '  dockerfile = "Dockerfile"' \
+	  '  target = "controller"' \
+	  '  tags = ["factory-controller:local", "factory-web:local"]' \
+	  '}' \
+	  'target "worker" {' \
+	  '  context = "."' \
+	  '  dockerfile = "Dockerfile"' \
+	  '  target = "worker"' \
+	  '  tags = ["factory-worker:local"]' \
+	  '}' | VERSION=$$version docker buildx bake --load --set "*.args.VERSION=$$version" -f - controller worker
 
 test:
 	go test ./...
@@ -37,7 +50,7 @@ clean:
 help:
 	@printf '%-8s %s\n' \
 		build 'Compile the Factory CLI' \
-		container-build 'Build the REST control-plane image' \
+		container-build 'Build the REST controller and worker images' \
 		test 'Run all Go tests' \
 		test-compose-local 'Build and smoke test the local Compose API control plane' \
 		fmt 'Format Go source files' \

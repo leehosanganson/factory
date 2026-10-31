@@ -22,12 +22,77 @@ services:
     image: busybox:1.37
     user: "0:0"
     entrypoint: ["/bin/sh", "/provision/provision-compose-config.sh"]
+    command: ["default"]
     volumes:
-      - ./.local/factory-compose:/source:ro
+      - ${FACTORY_COMPOSE_CONFIG_DIR:-./.local/factory-compose}:/source:ro
       - ./scripts/provision-compose-config.sh:/provision/provision-compose-config.sh:ro
       - factory-config:/target/factory-config
       - postgres-secrets:/target/postgres-secrets
     restart: "no"
+
+  provision-worker-config:
+    image: busybox:1.37
+    profiles: [worker]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/provision/provision-compose-config.sh"]
+    command: ["worker"]
+    depends_on:
+      provision-config:
+        condition: service_completed_successfully
+    volumes:
+      - ${FACTORY_COMPOSE_CONFIG_DIR:-./.local/factory-compose}:/source:ro
+      - ./scripts/provision-compose-config.sh:/provision/provision-compose-config.sh:ro
+      - factory-worker-config:/target/worker-config
+    restart: "no"
+
+  worker-init:
+    image: factory-worker:local
+    profiles: [worker]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown 65532:65532 /checkout /state
+        git config --global --add safe.directory /checkout
+        if ! git -C /checkout rev-parse --verify HEAD >/dev/null 2>&1; then
+          git -C /checkout init -q -b main
+          git -C /checkout config user.name 'Factory Compose fixture'
+          git -C /checkout config user.email 'factory-compose@example.invalid'
+          printf '%s\n' 'Disposable local Compose worker checkout.' > /checkout/README.md
+          git -C /checkout add README.md
+          git -C /checkout commit -q -m 'Initialize local Compose worker checkout'
+        fi
+        test "$(git -C /checkout rev-parse --show-toplevel)" = /checkout
+        test -z "$(git -C /checkout status --porcelain)"
+        chown -R 65532:65532 /checkout /state
+    volumes:
+      - worker-checkout:/checkout
+      - worker-state:/state
+    restart: "no"
+
+  worker:
+    image: factory-worker:local
+    profiles: [worker]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      provision-worker-config:
+        condition: service_completed_successfully
+      worker-init:
+        condition: service_completed_successfully
+    environment:
+      XDG_STATE_HOME: /var/lib/factory/state
+    volumes:
+      - factory-worker-config:/etc/factory:ro
+      - worker-checkout:/var/lib/factory/checkouts/local
+      - worker-state:/var/lib/factory/state
+      - type: bind
+        source: ${FACTORY_COMPOSE_HARNESS_DIR:-./.local/factory-compose/harness}
+        target: /opt/factory
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
 
   api:
     image: factory-web:local
@@ -53,4 +118,7 @@ services:
 volumes:
   postgres-data:
   factory-config:
+  factory-worker-config:
   postgres-secrets:
+  worker-checkout:
+  worker-state:

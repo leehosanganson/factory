@@ -1,6 +1,6 @@
 # REST worker process
 
-`factory worker --config /absolute/path/to/worker.json` starts a worker-only process for a PostgreSQL-backed REST job service. The process connects to the configured shared job store, claims jobs through fenced PostgreSQL leases, constructs trusted workspaces and the configured Factory workflow, and runs without an HTTP listener. It does not load `api_key_file` or named caller `principals`.
+`factory worker --config /absolute/path/to/worker.json` starts a worker-only process for a PostgreSQL-backed REST job service. The process connects to the configured shared job store, claims jobs through fenced PostgreSQL leases, constructs trusted workspaces and the configured Factory workflow, and runs without an HTTP listener. It does not load `api_key_file` or named caller `principals`. The optional `factory-worker:local` container image is built alongside `factory-controller:local` from the same executable; it runs as a non-root user, includes Git, and defaults to `/factory worker --config /etc/factory/worker.json`. Its image-role guard is an operational guardrail, not a security boundary. The local Compose setup uses a workers-disabled API by default, so jobs remain queued in that mode. The opt-in `worker` profile starts this image against the same PostgreSQL store and can execute admitted jobs.
 
 A worker config is the same strict server JSON configuration used by `factory server`, with these distinctions:
 
