@@ -27,6 +27,7 @@ var (
 	ErrRegistryFull        = errors.New("job registry is full")
 	ErrNotFound            = errors.New("job not found")
 	ErrInvalidTransition   = errors.New("invalid job status transition")
+	ErrThreadClosed        = errors.New("Thread is completed")
 	ErrNoQueuedJobs        = errors.New("no queued jobs")
 	ErrNoWorkerSlots       = errors.New("no worker slots available")
 	ErrManagerClosed       = errors.New("job manager is closed")
@@ -342,6 +343,12 @@ type Manager interface {
 	Store
 }
 
+// RecoveryClassifier reports whether a retained Job requires operator recovery
+// before it can be treated as ordinary in-progress work.
+type RecoveryClassifier interface {
+	RecoveryNeeded(id string) bool
+}
+
 // InterruptedDisposition is the bounded non-success outcome an operator may
 // record for SQLite work found running at startup, only when no provider side
 // effect was recorded.
@@ -391,6 +398,7 @@ type idempotencyIdentity struct {
 
 type job struct {
 	snapshot        Snapshot
+	threadID        string
 	providerAttempt *ProviderAttempt
 	generation      int64
 	ownerToken      string
@@ -406,17 +414,22 @@ const legacySharedPrincipalID = "legacy-shared"
 
 // LocalManager is an in-memory bounded registry and pending queue.
 type LocalManager struct {
-	mu            sync.Mutex
-	config        Config
-	jobs          map[string]*job
-	idempotency   map[idempotencyIdentity]string
-	provenance    map[issueProvenanceKey]string
-	queue         []string
-	running       int
-	nextSequence  uint64
-	registryBytes uint64
-	notify        chan struct{}
-	closed        bool
+	mu                 sync.Mutex
+	config             Config
+	jobs               map[string]*job
+	idempotency        map[idempotencyIdentity]string
+	provenance         map[issueProvenanceKey]string
+	threads            map[string]*threadRecord
+	threadIdempotency  map[idempotencyIdentity]string
+	threadJobKeys      map[threadJobIdentity]string
+	notifications      []memoryNotification
+	nextNotificationID int64
+	queue              []string
+	running            int
+	nextSequence       uint64
+	registryBytes      uint64
+	notify             chan struct{}
+	closed             bool
 }
 
 var _ Manager = (*LocalManager)(nil)
@@ -446,11 +459,14 @@ func NewManager(config Config) (*LocalManager, error) {
 		return nil, fmt.Errorf("%w: capacity bounds are outside supported limits", ErrInvalidInput)
 	}
 	return &LocalManager{
-		config:      config,
-		jobs:        make(map[string]*job),
-		idempotency: make(map[idempotencyIdentity]string),
-		provenance:  make(map[issueProvenanceKey]string),
-		notify:      make(chan struct{}),
+		config:            config,
+		jobs:              make(map[string]*job),
+		idempotency:       make(map[idempotencyIdentity]string),
+		provenance:        make(map[issueProvenanceKey]string),
+		threads:           make(map[string]*threadRecord),
+		threadIdempotency: make(map[idempotencyIdentity]string),
+		threadJobKeys:     make(map[threadJobIdentity]string),
+		notify:            make(chan struct{}),
 	}, nil
 }
 
@@ -641,8 +657,7 @@ func (m *LocalManager) Close() {
 		if !m.appendEventLocked(entry, string(StatusCanceled), "Manager closed before job started") {
 			entry.truncated = true
 		}
-		entry.snapshot.Status = StatusCanceled
-		entry.snapshot.UpdatedAt = now
+		m.finishThreadTransitionLocked(entry, StatusCanceled, now)
 	}
 	m.queue = nil
 	m.signalLocked()
@@ -1223,11 +1238,11 @@ func (m *LocalManager) Cancel(id string) (Snapshot, error) {
 	}
 	switch entry.snapshot.Status {
 	case StatusQueued:
+		now := time.Now().UTC()
 		if !m.appendEventLocked(entry, string(StatusCanceled), "Job canceled before start") {
 			entry.truncated = true
 		}
-		entry.snapshot.Status = StatusCanceled
-		entry.snapshot.UpdatedAt = time.Now().UTC()
+		m.finishThreadTransitionLocked(entry, StatusCanceled, now)
 		for index, queuedID := range m.queue {
 			if queuedID == id {
 				m.queue = append(m.queue[:index], m.queue[index+1:]...)
@@ -1265,9 +1280,7 @@ func (m *LocalManager) FinishAttempt(attempt AttemptHandle, terminalStatus Statu
 	if !m.appendEventLocked(entry, string(terminalStatus), "Job finished") {
 		entry.truncated = true
 	}
-	entry.snapshot.Status = terminalStatus
-	entry.snapshot.CancellationRequested = false
-	entry.snapshot.UpdatedAt = time.Now().UTC()
+	m.finishThreadTransitionLocked(entry, terminalStatus, time.Now().UTC())
 	m.running--
 	m.signalLocked()
 	return nil
@@ -1292,9 +1305,7 @@ func (m *LocalManager) Finish(id string, terminalStatus Status) error {
 	if !m.appendEventLocked(entry, string(terminalStatus), "Job finished") {
 		entry.truncated = true
 	}
-	entry.snapshot.Status = terminalStatus
-	entry.snapshot.CancellationRequested = false
-	entry.snapshot.UpdatedAt = time.Now().UTC()
+	m.finishThreadTransitionLocked(entry, terminalStatus, time.Now().UTC())
 	m.running--
 	m.signalLocked()
 	return nil
@@ -1402,9 +1413,51 @@ func (m *LocalManager) oldestTerminalLocked(excluded *job) *job {
 	return oldest
 }
 
+func (m *LocalManager) removeThreadForJobLocked(entry *job) {
+	if entry.threadID == "" {
+		return
+	}
+	thread := m.threads[entry.threadID]
+	if thread == nil {
+		return
+	}
+	wasInitial := thread.initialJobID == entry.snapshot.ID
+	for i, id := range thread.jobIDs {
+		if id == entry.snapshot.ID {
+			thread.jobIDs = append(thread.jobIDs[:i], thread.jobIDs[i+1:]...)
+			break
+		}
+	}
+	for identity, id := range m.threadJobKeys {
+		if id == entry.snapshot.ID {
+			delete(m.threadJobKeys, identity)
+		}
+	}
+
+	if wasInitial || len(thread.jobIDs) == 0 {
+		delete(m.threads, entry.threadID)
+		for identity, threadID := range m.threadIdempotency {
+			if threadID == entry.threadID {
+				delete(m.threadIdempotency, identity)
+			}
+		}
+		for _, remainingID := range thread.jobIDs {
+			if remaining := m.jobs[remainingID]; remaining != nil {
+				remaining.threadID = ""
+				for identity, jobID := range m.threadJobKeys {
+					if identity.threadID == entry.threadID && jobID == remainingID {
+						delete(m.threadJobKeys, identity)
+					}
+				}
+			}
+		}
+	}
+}
+
 func (m *LocalManager) removeJobLocked(entry *job) {
 	m.registryBytes -= entry.accountedBytes
 	delete(m.jobs, entry.snapshot.ID)
+	m.removeThreadForJobLocked(entry)
 	if entry.snapshot.Request.IssueProvenance != nil {
 		delete(m.provenance, keyForIssueProvenance(*entry.snapshot.Request.IssueProvenance))
 	}
@@ -1500,6 +1553,7 @@ func (m *LocalManager) evictOldestTerminalExceptLocked(protected *job) bool {
 	}
 	m.registryBytes -= oldest.accountedBytes
 	delete(m.jobs, oldestID)
+	m.removeThreadForJobLocked(oldest)
 	if oldest.snapshot.Request.IssueProvenance != nil {
 		delete(m.provenance, keyForIssueProvenance(*oldest.snapshot.Request.IssueProvenance))
 	}

@@ -40,6 +40,7 @@ type PostgresStore struct {
 }
 
 var _ Store = (*PostgresStore)(nil)
+var _ ThreadStore = (*PostgresStore)(nil)
 
 // OpenPostgresStore opens a PostgreSQL connection pool and applies migrations.
 func OpenPostgresStore(dsn string, config Config) (*PostgresStore, error) {
@@ -631,10 +632,17 @@ func (s *PostgresStore) Close() {
 		}
 		_ = rows.Close()
 		for _, id := range ids {
+			threadID, wasDone, transitionErr := postgresThreadDoneTransition(ctx, tx, id)
+			if transitionErr != nil {
+				return
+			}
 			if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='canceled',updated_at=clock_timestamp() WHERE id=$1 AND status='queued'`, id); err != nil {
 				return
 			}
 			if err := insertPostgresEvent(ctx, tx, id, "canceled", "Manager closed before job started", s.config.MaxEventsPerJob); err != nil {
+				return
+			}
+			if transitionErr := recordPostgresDoneTransition(ctx, tx, threadID, wasDone); transitionErr != nil {
 				return
 			}
 		}
@@ -1239,6 +1247,10 @@ func (s *PostgresStore) finish(id string, a *AttemptHandle, status Status) error
 		return err
 	}
 	defer tx.Rollback()
+	threadID, wasDone, err := postgresThreadDoneTransition(ctx, tx, id)
+	if err != nil {
+		return err
+	}
 	if a == nil {
 		var exists int
 		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM factory_jobs WHERE id=$1`, id).Scan(&exists); err != nil {
@@ -1279,6 +1291,9 @@ func (s *PostgresStore) finish(id string, a *AttemptHandle, status Status) error
 			return errors.New("release PostgreSQL worker ownership")
 		}
 	}
+	if err := recordPostgresDoneTransition(ctx, tx, threadID, wasDone); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -1304,11 +1319,18 @@ func (s *PostgresStore) Cancel(id string) (Snapshot, error) {
 	}
 	switch Status(status) {
 	case StatusQueued:
+		threadID, wasDone, transitionErr := postgresThreadDoneTransition(ctx, tx, id)
+		if transitionErr != nil {
+			return Snapshot{}, transitionErr
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE factory_jobs SET status='canceled',updated_at=clock_timestamp() WHERE id=$1`, id); err != nil {
 			return Snapshot{}, errors.New("cancel PostgreSQL queued job")
 		}
 		if err = insertPostgresEvent(ctx, tx, id, "canceled", "Job canceled before start", s.config.MaxEventsPerJob); err != nil {
 			return Snapshot{}, errors.New("record PostgreSQL cancellation")
+		}
+		if err := recordPostgresDoneTransition(ctx, tx, threadID, wasDone); err != nil {
+			return Snapshot{}, err
 		}
 	case StatusRunning:
 		s.recoveryMu.Lock()
@@ -1398,6 +1420,10 @@ func (s *PostgresStore) ResolveInterrupted(id string, d InterruptedDisposition) 
 	if status != string(StatusRunning) || !needed {
 		return ErrInvalidTransition
 	}
+	threadID, wasDone, transitionErr := postgresThreadDoneTransition(ctx, tx, id)
+	if transitionErr != nil {
+		return transitionErr
+	}
 	var sideEffects int
 	if err = tx.QueryRowContext(ctx, `SELECT (SELECT COUNT(*) FROM factory_job_provider_attempts WHERE job_id=$1)+(SELECT COUNT(*) FROM factory_job_provider_outcomes WHERE job_id=$1)`, id).Scan(&sideEffects); err != nil {
 		return errors.New("check PostgreSQL provider side effects")
@@ -1413,6 +1439,9 @@ func (s *PostgresStore) ResolveInterrupted(id string, d InterruptedDisposition) 
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO factory_job_operator_dispositions(job_id,disposition,updated_at) VALUES($1,$2,clock_timestamp())`, id, d); err != nil {
 		return errors.New("persist PostgreSQL disposition")
+	}
+	if err := recordPostgresDoneTransition(ctx, tx, threadID, wasDone); err != nil {
+		return err
 	}
 	if err = tx.Commit(); err != nil {
 		return errors.New("commit PostgreSQL disposition")

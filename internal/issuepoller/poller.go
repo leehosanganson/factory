@@ -32,7 +32,7 @@ type Provider interface {
 }
 
 type Store interface {
-	AdmitIssuePoller(context.Context, string, string, restjobs.Request, string) (restjobs.Snapshot, bool, error)
+	AdmitIssuePollerThread(context.Context, string, string, restjobs.Request, string) (restjobs.ThreadSnapshot, bool, error)
 	ListIssuePollerPending(context.Context) ([]restjobs.IssuePollerOutcome, error)
 	IssuePollerCursor(context.Context, string) (int, error)
 	AdvanceIssuePollerCursor(context.Context, string, int, int) error
@@ -210,7 +210,7 @@ func (p Poller) dispatch(ctx context.Context, destination string, snapshot facto
 		Tracker: "github", SourceRepository: snapshot.Repository, IssueNumber: snapshot.Number,
 		Version: snapshot.Version, URL: snapshot.URL, Title: EscapeIssueContent(snapshot.Title),
 	}}
-	admitted, _, err := p.Store.AdmitIssuePoller(ctx, idempotencyKey(destination, snapshot.Repository, snapshot.Number, snapshot.Version), principalID, request, p.Config.Trigger)
+	thread, _, err := p.Store.AdmitIssuePollerThread(ctx, idempotencyKey(destination, snapshot.Repository, snapshot.Number, snapshot.Version), principalID, request, p.Config.Trigger)
 	if errors.Is(err, restjobs.ErrProvenanceConflict) {
 		if quarantineErr := p.Store.RecordIssuePollerQuarantine(ctx, snapshot.Repository, snapshot.Number, snapshot.Version, "provenance_conflict"); quarantineErr != nil {
 			return false, errors.New("issue provenance conflict quarantine was not durably confirmed; trigger label retained")
@@ -220,11 +220,12 @@ func (p Poller) dispatch(ctx context.Context, destination string, snapshot facto
 	if err != nil {
 		return false, errors.New("durable issue admission was not confirmed; trigger label retained")
 	}
-	if admitted.ID == "" || admitted.Request.Repository != destination || admitted.Request.Task != task || admitted.Request.Issue == nil || *admitted.Request.Issue != snapshot.Number || admitted.Request.IssueProvenance == nil || *admitted.Request.IssueProvenance != *request.IssueProvenance || (admitted.Status != restjobs.StatusQueued && admitted.Status != restjobs.StatusRunning && !admitted.Status.Terminal()) {
-		return false, errors.New("durable issue admission could not be verified; trigger label retained")
+	if len(thread.Jobs) != 1 || len(thread.Thread.JobIDs) != 1 || thread.Thread.ID == "" || thread.Thread.Submitter != principalID || thread.Thread.JobIDs[0] != thread.Jobs[0].ID {
+		return false, errors.New("durable issue Thread admission could not be verified; trigger label retained")
 	}
-	if err := p.Store.RecordIssuePollerLabel(ctx, snapshot.Repository, snapshot.Number, snapshot.Version, p.Config.Trigger); err != nil {
-		return false, errors.New("durable issue admission audit is uncertain; trigger label retained")
+	admitted := thread.Jobs[0]
+	if admitted.ID == "" || admitted.Request.Repository != destination || admitted.Request.Task != task || admitted.Request.Issue == nil || *admitted.Request.Issue != snapshot.Number || admitted.Request.IssueProvenance == nil || *admitted.Request.IssueProvenance != *request.IssueProvenance || admitted.Submitter != principalID || (admitted.Status != restjobs.StatusQueued && admitted.Status != restjobs.StatusRunning && !admitted.Status.Terminal()) {
+		return false, errors.New("durable issue Thread admission could not be verified; trigger label retained")
 	}
 	return true, p.finishLabel(ctx, snapshot.Repository, snapshot.Number, snapshot.Version, p.Config.Trigger)
 }

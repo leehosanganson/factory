@@ -20,7 +20,7 @@ test-postgres-up:
 	docker compose -f docker-compose.postgres-test.yml up -d --wait
 
 test-postgres: test-postgres-up
-	FACTORY_TEST_POSTGRES_URL='postgres://factory:factory@127.0.0.1:55432/factory_test?sslmode=disable' FACTORY_REQUIRE_POSTGRES_TEST=1 go test ./internal/restjobs ./internal/restserver/runtime ./internal/issuepoller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan)$$' -count=1 -v
+	FACTORY_TEST_POSTGRES_URL='postgres://factory:factory@127.0.0.1:55432/factory_test?sslmode=disable' FACTORY_REQUIRE_POSTGRES_TEST=1 go test ./internal/restjobs ./internal/restserver/runtime ./internal/issuepoller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically)$$' -count=1 -v
 
 test-postgres-down:
 	docker compose -f docker-compose.postgres-test.yml down --volumes

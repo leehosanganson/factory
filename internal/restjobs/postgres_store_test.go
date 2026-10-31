@@ -31,6 +31,220 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		t.Fatalf("PostgreSQL server_version_num=%d, integration coverage requires PostgreSQL 18", version)
 	}
 
+	t.Run("Thread persistence, ownership, and recovery projection", func(t *testing.T) {
+		db1 := scopedPostgresDB(t, admin, dsn)
+		schema := currentTestSchema(t, db1)
+		db2 := postgresDBForSchema(t, dsn, schema)
+		first, err := NewPostgresStore(db1, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		second, err := NewPostgresStore(db2, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = first.CloseStore(); _ = second.CloseStore() })
+
+		request := Request{Repository: " widget ", Task: "  persist Thread  "}
+		created, replay, err := first.AdmitThreadAs("thread-key", " alice ", request)
+		if err != nil || replay {
+			t.Fatalf("initial Thread admission=(%+v,%t,%v), want new pair", created, replay, err)
+		}
+		if len(created.Thread.JobIDs) != 1 || len(created.Jobs) != 1 || created.Thread.JobIDs[0] != created.Jobs[0].ID || created.Thread.Status != ThreadStatusInProgress {
+			t.Fatalf("initial Thread snapshot=%+v, want one queued member", created)
+		}
+		memberSnapshot, secondJob, memberReplay, err := first.AdmitThreadJobAs(created.Thread.ID, "member-key", "alice", Request{Repository: "widget", Task: "follow-up"})
+		if err != nil || memberReplay || len(memberSnapshot.Jobs) != 2 || memberSnapshot.Thread.JobIDs[1] != secondJob.ID {
+			t.Fatalf("Thread member admission=(%+v,%+v,%t,%v), want ordered second Job", memberSnapshot, secondJob, memberReplay, err)
+		}
+		if memberSnapshot.Thread.Status != ThreadStatusInProgress {
+			t.Fatalf("Thread after member admission status=%s, want in_progress", memberSnapshot.Thread.Status)
+		}
+		memberSnapshot, replayedMember, memberReplay, err := second.AdmitThreadJobAs(created.Thread.ID, " member-key ", "alice", Request{Repository: " widget ", Task: " follow-up "})
+		if err != nil || !memberReplay || replayedMember.ID != secondJob.ID || len(memberSnapshot.Jobs) != 2 || memberSnapshot.Thread.JobIDs[1] != secondJob.ID {
+			t.Fatalf("cross-store Thread member replay=(%+v,%+v,%t,%v)", memberSnapshot, replayedMember, memberReplay, err)
+		}
+		if _, _, _, err := second.AdmitThreadJobAs(created.Thread.ID, "foreign-member", "bob", Request{Repository: "widget", Task: "foreign"}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("foreign Thread member admission error=%v, want not found", err)
+		}
+		completed, err := first.CompleteThreadAs(created.Thread.ID, "alice")
+		if err != nil || completed.Thread.CompletedAt == nil || completed.Thread.Status != ThreadStatusInProgress {
+			t.Fatalf("explicit completion=(%+v,%v), want completed metadata independent of aggregate status", completed.Thread, err)
+		}
+		repeatedCompletion, err := second.CompleteThreadAs(created.Thread.ID, "alice")
+		if err != nil || repeatedCompletion.Thread.CompletedAt == nil || !repeatedCompletion.Thread.CompletedAt.Equal(*completed.Thread.CompletedAt) {
+			t.Fatalf("cross-connection completion replay=(%+v,%v), want same timestamp", repeatedCompletion.Thread, err)
+		}
+		if _, _, _, err := second.AdmitThreadJobAs(created.Thread.ID, "post-completion", "alice", Request{Repository: "widget", Task: "must reject"}); !errors.Is(err, ErrThreadClosed) {
+			t.Fatalf("append after completion=%v, want ErrThreadClosed", err)
+		}
+		if _, _, _, err := second.AdmitThreadJobAs(created.Thread.ID, "member-key", "alice", Request{Repository: "widget", Task: "follow-up"}); err != nil {
+			t.Fatalf("replay admitted member after completion=%v, want idempotent replay", err)
+		}
+		raceThread, _, err := first.AdmitThreadAs("completion-race", "alice", Request{Repository: "widget", Task: "race initial"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		startRace := make(chan struct{})
+		type raceResult struct {
+			thread ThreadSnapshot
+			job    Snapshot
+			err    error
+		}
+		completeResult := make(chan raceResult, 1)
+		addResult := make(chan raceResult, 1)
+		go func() {
+			<-startRace
+			snapshot, err := first.CompleteThreadAs(raceThread.Thread.ID, "alice")
+			completeResult <- raceResult{thread: snapshot, err: err}
+		}()
+		go func() {
+			<-startRace
+			_, job, _, err := second.AdmitThreadJobAs(raceThread.Thread.ID, "completion-race-member", "alice", Request{Repository: "widget", Task: "race member"})
+			addResult <- raceResult{job: job, err: err}
+		}()
+		close(startRace)
+		closed, appended := <-completeResult, <-addResult
+		if closed.err != nil || closed.thread.Thread.CompletedAt == nil {
+			t.Fatalf("concurrent PostgreSQL completion=(%+v,%v), want successful close", closed.thread.Thread, closed.err)
+		}
+		if appended.err != nil && !errors.Is(appended.err, ErrThreadClosed) {
+			t.Fatalf("concurrent PostgreSQL append error=%v, want success or ErrThreadClosed", appended.err)
+		}
+		finalRace, err := second.GetThread(raceThread.Thread.ID)
+		expectedJobs := 1
+		if appended.err == nil {
+			expectedJobs++
+		}
+		if err != nil || finalRace.Thread.CompletedAt == nil || len(finalRace.Jobs) != expectedJobs {
+			t.Fatalf("PostgreSQL concurrent final state=(%+v,%v), want close plus either admitted member or rejection", finalRace, err)
+		}
+		replayed, replay, err := second.AdmitThreadAs(" thread-key ", "alice", Request{Repository: "widget", Task: "persist Thread"})
+		if err != nil || !replay || replayed.Thread.ID != created.Thread.ID || replayed.Jobs[0].ID != created.Jobs[0].ID {
+			t.Fatalf("cross-store normalized replay=(%+v,%t,%v)", replayed, replay, err)
+		}
+		if _, _, err := first.AdmitThreadAs("thread-key", "alice", Request{Repository: "widget", Task: "changed"}); !errors.Is(err, ErrIdempotencyConflict) {
+			t.Fatalf("changed payload error=%v, want idempotency conflict", err)
+		}
+		otherPrincipal, replay, err := second.AdmitThreadAs("thread-key", "bob", request)
+		if err != nil || replay || otherPrincipal.Thread.ID == created.Thread.ID || otherPrincipal.Jobs[0].ID == created.Jobs[0].ID {
+			t.Fatalf("principal-scoped key admission=(%+v,%t,%v), want distinct pair", otherPrincipal, replay, err)
+		}
+		otherKey, replay, err := first.AdmitThreadAs("another-key", "alice", request)
+		if err != nil || replay || otherKey.Thread.ID == created.Thread.ID || otherKey.Jobs[0].ID == created.Jobs[0].ID {
+			t.Fatalf("distinct key admission=(%+v,%t,%v), want distinct pair", otherKey, replay, err)
+		}
+		if _, _, err := first.Admit("thread-key", request); err != nil {
+			t.Fatalf("Thread key collided with ordinary Job namespace: %v", err)
+		}
+		if _, err := first.CompleteThreadAs(created.Thread.ID, "bob"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("foreign owner completion error=%v, want non-disclosing not found", err)
+		}
+		const callers = 8
+		start := make(chan struct{})
+		type concurrentResult struct {
+			snapshot ThreadSnapshot
+			replay   bool
+			err      error
+		}
+		results := make(chan concurrentResult, callers)
+		for i := 0; i < callers; i++ {
+			store := first
+			if i%2 == 1 {
+				store = second
+			}
+			go func(store *PostgresStore) {
+				<-start
+				snapshot, replay, err := store.AdmitThreadAs("concurrent-thread", "alice", Request{Repository: "widget", Task: "concurrent"})
+				results <- concurrentResult{snapshot: snapshot, replay: replay, err: err}
+			}(store)
+		}
+		close(start)
+		var concurrentID, concurrentJobID string
+		createdCount := 0
+		for i := 0; i < callers; i++ {
+			got := <-results
+			if got.err != nil {
+				t.Fatalf("concurrent Thread admission: %v", got.err)
+			}
+			if concurrentID == "" {
+				concurrentID, concurrentJobID = got.snapshot.Thread.ID, got.snapshot.Jobs[0].ID
+			}
+			if got.snapshot.Thread.ID != concurrentID || got.snapshot.Jobs[0].ID != concurrentJobID {
+				t.Fatalf("concurrent admission returned different Thread/Job pairs")
+			}
+			if !got.replay {
+				createdCount++
+			}
+		}
+		if createdCount != 1 {
+			t.Fatalf("concurrent new admissions=%d, want exactly one", createdCount)
+		}
+		if _, err := first.GetThreadForPrincipal(created.Thread.ID, "bob"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("foreign owner read error=%v, want not found", err)
+		}
+		if _, err := second.CompleteThreadAs(created.Thread.ID, "bob"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("foreign completion error=%v, want non-disclosing not found", err)
+		}
+		issueNumber := 7
+		for label, invalid := range map[string]Request{
+			"issue":      {Repository: "widget", Task: "task", Issue: &issueNumber},
+			"provenance": provenanceRequest("task"),
+		} {
+			if _, _, err := first.AdmitThreadAs("invalid-"+label, "alice", invalid); !errors.Is(err, ErrInvalidInput) {
+				t.Errorf("issue metadata %s error=%v, want invalid input", label, err)
+			}
+		}
+
+		if _, err := first.Cancel(secondJob.ID); err != nil {
+			t.Fatalf("cancel follow-up Thread Job: %v", err)
+		}
+		claim, err := first.ClaimNextAttempt()
+		if err != nil || claim.Job.ID != created.Jobs[0].ID {
+			t.Fatalf("claim initial Thread Job=(%+v,%v)", claim, err)
+		}
+		live, err := second.GetThread(created.Thread.ID)
+		if err != nil || live.Thread.Status != ThreadStatusInProgress {
+			t.Fatalf("live shared-worker Thread=(%+v,%v), want in_progress", live, err)
+		}
+		if _, err := db1.Exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1`, claim.Job.ID); err != nil {
+			t.Fatal(err)
+		}
+		interrupted, err := second.GetThread(created.Thread.ID)
+		if err != nil || interrupted.Thread.Status != ThreadStatusNeedAttention {
+			t.Fatalf("expired shared-worker Thread=(%+v,%v), want need_attention", interrupted, err)
+		}
+		if _, err := db1.Exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()+interval '1 hour' WHERE job_id=$1`, claim.Job.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.FinishAttempt(claim.Attempt, StatusFailed); err != nil {
+			t.Fatal(err)
+		}
+		finished, err := second.GetThread(created.Thread.ID)
+		if err != nil || finished.Thread.Status != ThreadStatusDone || finished.Jobs[0].Status != StatusFailed {
+			t.Fatalf("terminal shared-worker Thread=(%+v,%v), want done", finished, err)
+		}
+
+		// The canonical Job may be evicted by retention; its Thread and key
+		// namespace record must disappear with it.
+		if _, err := db1.Exec(`DELETE FROM factory_job_events WHERE job_id=$1`, otherKey.Jobs[0].ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db1.Exec(`DELETE FROM factory_jobs WHERE id=$1`, otherKey.Jobs[0].ID); err != nil {
+			t.Fatal(err)
+		}
+		var threads, keys int
+		if err := db1.QueryRow(`SELECT COUNT(*) FROM factory_threads WHERE id=$1`, otherKey.Thread.ID).Scan(&threads); err != nil {
+			t.Fatal(err)
+		}
+		if err := db1.QueryRow(`SELECT COUNT(*) FROM factory_thread_idempotency WHERE principal_id='alice' AND key='another-key'`).Scan(&keys); err != nil {
+			t.Fatal(err)
+		}
+		if threads != 0 || keys != 0 {
+			t.Fatalf("Job delete left Thread rows=%d idempotency rows=%d, want cascaded deletion", threads, keys)
+		}
+	})
+
 	t.Run("shared Store contract", func(t *testing.T) {
 		runStoreContract(t, func(t *testing.T) Store {
 			db := scopedPostgresDB(t, admin, dsn)
@@ -389,6 +603,120 @@ func TestPostgresStoreIntegration(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL 18 notification integration tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db1 := scopedPostgresDB(t, admin, dsn)
+	schema := currentTestSchema(t, db1)
+	db2 := postgresDBForSchema(t, dsn, schema)
+	first, err := NewPostgresStore(db1, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewPostgresStore(db2, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.CloseStore()
+	defer second.CloseStore()
+	created, _, err := first.AdmitThreadAs("notify", "alice", Request{Repository: "widget", Task: "not in notification"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	follow, job, _, err := first.AdmitThreadJobAs(created.Thread.ID, "follow", "alice", Request{Repository: "widget", Task: "follow-up"})
+	if err != nil || len(follow.Jobs) != 2 {
+		t.Fatalf("member admission=(%+v,%v)", follow, err)
+	}
+	for range 2 {
+		if _, err := first.ClaimNext(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db1.Exec(`CREATE FUNCTION reject_thread_notification() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected notification failure'; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db1.Exec(`CREATE TRIGGER reject_thread_notification BEFORE INSERT ON factory_thread_notifications FOR EACH ROW EXECUTE FUNCTION reject_thread_notification()`); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, item := range []struct {
+		store *PostgresStore
+		id    string
+	}{{first, created.Jobs[0].ID}, {second, job.ID}} {
+		wg.Add(1)
+		go func(s *PostgresStore, id string) { defer wg.Done(); errs <- s.Finish(id, StatusFailed) }(item.store, item.id)
+	}
+	wg.Wait()
+	close(errs)
+	failedWrites := 0
+	for err := range errs {
+		if err == nil {
+			continue
+		} // A non-final member may commit without creating a notification.
+		failedWrites++
+		if errors.Is(err, ErrInvalidTransition) {
+			t.Errorf("final transition failed before notification persistence: %v", err)
+		}
+	}
+	if failedWrites != 1 {
+		t.Fatalf("notification failure count=%d, want only final aggregate transition aborted", failedWrites)
+	}
+	for _, statement := range []string{`DROP TRIGGER reject_thread_notification ON factory_thread_notifications`, `DROP FUNCTION reject_thread_notification()`} {
+		if _, err := db1.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, item := range []struct {
+		store *PostgresStore
+		id    string
+	}{{first, created.Jobs[0].ID}, {second, job.ID}} {
+		if err := item.store.Finish(item.id, StatusFailed); err != nil && !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("retry after notification failure: %v", err)
+		}
+	}
+	page, err := second.ListNotificationsForPrincipal(context.Background(), "alice", 0, 10)
+	if err != nil || len(page.Notifications) != 1 {
+		t.Fatalf("PostgreSQL inbox=(%+v,%v), want one Done cycle", page, err)
+	}
+	restartedDB := postgresDBForSchema(t, dsn, schema)
+	first, err = NewPostgresStore(restartedDB, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.CloseStore()
+	page, err = first.ListNotificationsForPrincipal(context.Background(), "alice", 0, 10)
+	if err != nil || len(page.Notifications) != 1 {
+		t.Fatalf("restarted PostgreSQL inbox=(%+v,%v)", page, err)
+	}
+	if foreign, err := first.ListNotificationsForPrincipal(context.Background(), "bob", 0, 10); err != nil || len(foreign.Notifications) != 0 {
+		t.Fatalf("foreign inbox=(%+v,%v)", foreign, err)
+	}
+	_, reopenedJob, _, err := first.AdmitThreadJobAs(created.Thread.ID, "reopen", "alice", Request{Repository: "widget", Task: "reopen"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Finish(reopenedJob.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	page, err = first.ListNotificationsForPrincipal(context.Background(), "alice", 0, 10)
+	if err != nil || len(page.Notifications) != 2 {
+		t.Fatalf("reopened Done inbox=(%+v,%v), want two cycles", page, err)
+	}
 }
 
 func TestPostgresWorkerIdentityAndSafeProgressIntegration(t *testing.T) {

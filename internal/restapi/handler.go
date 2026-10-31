@@ -181,7 +181,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		return
 	}
 
-	if !isJobsPath(r.URL.Path) && r.URL.Path != "/v1/operations" {
+	if !isJobsPath(r.URL.Path) && !isThreadsPath(r.URL.Path) && r.URL.Path != "/v1/operations" && r.URL.Path != "/v1/notifications" {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -207,12 +207,52 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		return
 	}
 	switch {
+	case path == "/v1/notifications":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.listNotifications(w, r, caller.ID)
 	case path == "/v1/operations":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
 		h.getOperations(w, r)
+	case path == "/v1/threads":
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w, http.MethodPost)
+			return
+		}
+		h.createThread(w, r, caller)
+	case strings.HasPrefix(path, "/v1/threads/"):
+		tail := strings.TrimPrefix(path, "/v1/threads/")
+		parts := strings.Split(tail, "/")
+		if len(parts) == 1 && parts[0] != "" {
+			if r.Method != http.MethodGet {
+				methodNotAllowed(w, http.MethodGet)
+				return
+			}
+			h.getThread(w, parts[0], caller)
+			return
+		}
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "jobs" {
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w, http.MethodPost)
+				return
+			}
+			h.addThreadJob(w, r, parts[0], caller)
+			return
+		}
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "complete" {
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w, http.MethodPost)
+				return
+			}
+			h.completeThread(w, r, parts[0], caller)
+			return
+		}
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	case path == "/v1/jobs":
 		if r.Method == http.MethodGet {
 			if caller.Role == "submitter" {
@@ -309,6 +349,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 }
 
 func submitterRoute(path, method string) bool {
+	if path == "/v1/notifications" {
+		return method == http.MethodGet
+	}
+	if path == "/v1/threads" {
+		return method == http.MethodPost
+	}
+	if strings.HasPrefix(path, "/v1/threads/") {
+		tail := strings.TrimPrefix(path, "/v1/threads/")
+		parts := strings.Split(tail, "/")
+		return method == http.MethodGet && len(parts) == 1 && parts[0] != "" || method == http.MethodPost && len(parts) == 2 && parts[0] != "" && (parts[1] == "jobs" || parts[1] == "complete")
+	}
 	if path == "/v1/jobs" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
@@ -495,6 +546,10 @@ func isJobsPath(path string) bool {
 	return path == "/v1/jobs" || strings.HasPrefix(path, "/v1/jobs/")
 }
 
+func isThreadsPath(path string) bool {
+	return path == "/v1/threads" || strings.HasPrefix(path, "/v1/threads/")
+}
+
 func (h *Handler) AuthenticateDashboardOperator(token string) bool {
 	principal, ok := h.key.Resolve(token)
 	return h.config.DashboardOperatorID != "" && ok && principal.ID == h.config.DashboardOperatorID && principal.Role == "operator"
@@ -511,6 +566,113 @@ func (h *Handler) authenticate(r *http.Request) (restserver.Principal, bool) {
 	}
 	resolved, ok := h.key.Resolve(fields[1])
 	return resolved, ok
+}
+
+func (h *Handler) createThread(w http.ResponseWriter, r *http.Request, caller restserver.Principal) {
+	threadStore, ok := h.manager.(restjobs.ThreadStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "thread_unavailable", "Thread operations are unavailable.")
+		return
+	}
+	keyValues := r.Header.Values("Idempotency-Key")
+	if len(keyValues) != 1 || strings.TrimSpace(keyValues[0]) == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	contentTypes := r.Header.Values("Content-Type")
+	mediaType := ""
+	var err error
+	if len(contentTypes) == 1 {
+		mediaType, _, err = mime.ParseMediaType(contentTypes[0])
+	} else {
+		err = errors.New("invalid Content-Type")
+	}
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json.")
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(h.config.MaxRequestBodyBytes)))
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "Request body is too large.")
+		} else {
+			writeError(w, http.StatusBadRequest, "malformed_json", "Request body is invalid.")
+		}
+		return
+	}
+	if !utf8.Valid(body) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	if err := validateJSONShape(body); err != nil {
+		writeError(w, http.StatusBadRequest, "malformed_json", "Request body is invalid.")
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
+		writeError(w, http.StatusBadRequest, "malformed_json", "Request body is invalid.")
+		return
+	}
+	for name := range fields {
+		if name != "repository" && name != "task" {
+			writeError(w, http.StatusBadRequest, "unknown_field", "Request contains an unsupported field.")
+			return
+		}
+	}
+	var request restjobs.Request
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	request.Repository = strings.TrimSpace(request.Repository)
+	if len(request.Task) > h.config.MaxTaskBytes {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	if _, ok := h.config.RepositoryAliases[request.Repository]; !ok {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	snapshot, replayed, err := threadStore.AdmitThreadAs(keyValues[0], caller.ID, request)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	id := snapshot.Thread.ID
+	writeJSON(w, http.StatusAccepted, struct {
+		Thread   restjobs.Thread   `json:"thread"`
+		Job      restjobs.Snapshot `json:"job"`
+		Replayed bool              `json:"replayed"`
+		Links    threadLinksDTO    `json:"links"`
+	}{snapshot.Thread, snapshot.Jobs[0], replayed, threadLinksDTO{Self: "/v1/threads/" + id, Job: "/v1/jobs/" + snapshot.Jobs[0].ID}})
+}
+
+type threadLinksDTO struct {
+	Self string `json:"self"`
+	Job  string `json:"job"`
+}
+
+func (h *Handler) getThread(w http.ResponseWriter, id string, caller restserver.Principal) {
+	threadStore, ok := h.manager.(restjobs.ThreadStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "thread_unavailable", "Thread operations are unavailable.")
+		return
+	}
+	var snapshot restjobs.ThreadSnapshot
+	var err error
+	if caller.Role == "submitter" {
+		snapshot, err = threadStore.GetThreadForPrincipal(id, caller.ID)
+	} else {
+		snapshot, err = threadStore.GetThread(id)
+	}
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snapshot)
 }
 
 func (h *Handler) createJob(w http.ResponseWriter, r *http.Request, caller restserver.Principal) {
@@ -1126,6 +1288,8 @@ func (h *Handler) writeManagerError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "The server is shutting down.")
 	case errors.Is(err, restjobs.ErrInvalidTransition):
 		writeError(w, http.StatusConflict, "reconciliation_not_allowed", "Job is not eligible for provider reconciliation.")
+	case errors.Is(err, restjobs.ErrThreadClosed):
+		writeError(w, http.StatusConflict, "thread_closed", "Thread is already completed.")
 	case errors.Is(err, restjobs.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	default:
