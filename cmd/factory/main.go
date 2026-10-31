@@ -23,7 +23,6 @@ import (
 )
 
 var version = "dev"
-var imageControlPlaneOnly = "false"
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
@@ -33,8 +32,8 @@ func main() {
 }
 
 func run(args []string, in io.Reader, out, errOut io.Writer) error {
-	if imageControlPlaneOnly == "true" && (len(args) == 0 || args[0] != "server" && args[0] != "probe" && args[0] != "version") {
-		return errors.New("this Factory image only supports the REST control plane")
+	if err := validateImageRoleArgs(os.Getenv("FACTORY_IMAGE_ROLE"), args); err != nil {
+		return err
 	}
 	if len(args) > 0 {
 		if err := rejectRemovedAlias(args); err != nil {
@@ -106,9 +105,6 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			defer stop()
 			return issuepoller.Run(ctx, config)
 		case "server":
-			if imageControlPlaneOnly == "true" && len(args) > 1 && (args[1] == "doctor" || args[1] == "bundle" || args[1] == "backup") {
-				return errors.New("this Factory image only supports the REST control plane")
-			}
 			if len(args) > 1 && args[1] == "doctor" {
 				configPath, err := parseServerDoctorOptions(args[2:])
 				if err != nil {
@@ -144,7 +140,7 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 				return err
 			}
 			var config restserver.Config
-			if imageControlPlaneOnly == "true" {
+			if os.Getenv("FACTORY_IMAGE_ROLE") == "controller" {
 				config, err = restserver.LoadControlPlaneConfig(configPath)
 			} else {
 				config, err = restserver.LoadConfig(configPath)
@@ -256,6 +252,37 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 	ctx, stop := foregroundContext()
 	defer stop()
 	return runPipelineContext(ctx, nil, false, in, out)
+}
+
+func validateImageRoleArgs(role string, args []string) error {
+	if role == "" {
+		return nil
+	}
+	if role == "controller" {
+		if len(args) == 1 && args[0] == "version" || len(args) > 0 && args[0] == "probe" {
+			return nil
+		}
+		if len(args) != 3 || args[0] != "server" || args[1] != "--config" {
+			return errors.New("controller image only supports the REST control plane")
+		}
+		if args[2] != "/etc/factory/server.json" {
+			return errors.New("controller image requires config /etc/factory/server.json")
+		}
+		return nil
+	}
+	if role == "worker" {
+		if len(args) == 1 && args[0] == "version" {
+			return nil
+		}
+		if len(args) != 3 || args[0] != "worker" || args[1] != "--config" {
+			return errors.New("worker image only supports the PostgreSQL job worker")
+		}
+		if args[2] != "/etc/factory/worker.json" {
+			return errors.New("worker image requires config /etc/factory/worker.json")
+		}
+		return nil
+	}
+	return fmt.Errorf("unknown Factory image role %q", role)
 }
 
 func validateNestedCommand(args []string) error {

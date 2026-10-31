@@ -24,22 +24,56 @@ import (
 	"github.com/leehosanganson/factory/internal/restserver"
 )
 
-func TestControlPlaneImageModeRejectsNonServerCommandsAndUnsafeServerModes(t *testing.T) {
-	original := imageControlPlaneOnly
-	imageControlPlaneOnly = "true"
-	t.Cleanup(func() { imageControlPlaneOnly = original })
-	for _, args := range [][]string{{}, {"rest", "help"}, {"worker", "--config", "/tmp/config.json"}, {"server", "doctor", "--config", "/tmp/config.json"}, {"server", "bundle", "verify", "--source", "/tmp/bundle"}} {
-		if err := run(args, strings.NewReader(""), io.Discard, io.Discard); err == nil {
-			t.Errorf("control-plane image accepted %v", args)
-		}
+func TestImageRoleCommandAndConfigRestrictions(t *testing.T) {
+	tests := []struct {
+		name string
+		role string
+		args []string
+		want string
+	}{
+		{name: "controller allows server with designated config", role: "controller", args: []string{"server", "--config", "/etc/factory/server.json"}},
+		{name: "controller rejects worker", role: "controller", args: []string{"worker", "--config", "/etc/factory/worker.json"}, want: "controller image only supports the REST control plane"},
+		{name: "controller rejects alternate config", role: "controller", args: []string{"server", "--config", "/tmp/server.json"}, want: "controller image requires config /etc/factory/server.json"},
+		{name: "controller rejects server utilities", role: "controller", args: []string{"server", "backup", "--config", "/etc/factory/server.json", "--destination", "/tmp/backup"}, want: "controller image only supports the REST control plane"},
+		{name: "controller allows probe", role: "controller", args: []string{"probe", "--url", "http://localhost/readyz"}},
+		{name: "worker allows worker with designated config", role: "worker", args: []string{"worker", "--config", "/etc/factory/worker.json"}},
+		{name: "worker rejects server", role: "worker", args: []string{"server", "--config", "/etc/factory/server.json"}, want: "worker image only supports the PostgreSQL job worker"},
+		{name: "worker rejects alternate config", role: "worker", args: []string{"worker", "--config", "/tmp/worker.json"}, want: "worker image requires config /etc/factory/worker.json"},
 	}
-	configPath := filepath.Join(t.TempDir(), "server.json")
-	config := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"admin","role":"operator","token_file":"/run/admin","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://factory:password@database/factory"},"workers_enabled":true}`
-	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
-		t.Fatal(err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateImageRoleArgs(tc.role, tc.args); tc.want == "" && err != nil {
+				t.Fatalf("validateImageRoleArgs(%q, %v): %v", tc.role, tc.args, err)
+			} else if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("validateImageRoleArgs(%q, %v) error = %v, want containing %q", tc.role, tc.args, err, tc.want)
+			}
+		})
 	}
-	if err := run([]string{"server", "--config", configPath}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "workers_enabled: false") {
-		t.Fatalf("control-plane image accepted worker-enabled config: %v", err)
+}
+
+func TestImageRoleGuardAndUnrestrictedCLI(t *testing.T) {
+	t.Setenv("FACTORY_IMAGE_ROLE", "controller")
+	if err := run([]string{"worker", "--config", "/etc/factory/worker.json"}, strings.NewReader(""), io.Discard, io.Discard); err == nil {
+		t.Fatal("controller role accepted worker command")
+	}
+	if err := run([]string{"server", "--config", "/tmp/server.json"}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "/etc/factory/server.json") {
+		t.Fatalf("controller role accepted alternate server config path: %v", err)
+	}
+
+	t.Setenv("FACTORY_IMAGE_ROLE", "worker")
+	if err := run([]string{"server", "--config", "/etc/factory/server.json"}, strings.NewReader(""), io.Discard, io.Discard); err == nil {
+		t.Fatal("worker role accepted server command")
+	}
+	if err := run([]string{"worker", "--config", "/tmp/worker.json"}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "/etc/factory/worker.json") {
+		t.Fatalf("worker role accepted alternate worker config path: %v", err)
+	}
+
+	t.Setenv("FACTORY_IMAGE_ROLE", "")
+	if err := run([]string{"version"}, strings.NewReader(""), io.Discard, io.Discard); err != nil {
+		t.Fatalf("unroled CLI version: %v", err)
+	}
+	if err := run([]string{"worker", "--config", "/tmp/config.json"}, strings.NewReader(""), io.Discard, io.Discard); err == nil || strings.Contains(err.Error(), "image") {
+		t.Fatalf("unroled CLI unexpectedly applied an image role restriction: %v", err)
 	}
 }
 

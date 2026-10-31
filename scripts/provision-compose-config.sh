@@ -3,20 +3,26 @@ set -eu
 umask 077
 
 config_volume=/target/factory-config
+worker_config_volume=/target/worker-config
 secrets_volume=/target/postgres-secrets
-names='server.json api-key operator-verifier.json postgres-password'
+config_names='server.json api-key operator-verifier.json'
+worker_config_names='worker.json'
+secret_names='postgres-password'
 config_stage_dir=
+worker_config_stage_dir=
 secrets_stage_dir=
+mode=${1:-default}
 
 config_source() {
   case "$1" in
-    server.json|api-key|operator-verifier.json) printf '/source/%s' "$1" ;;
+    server.json|worker.json|api-key|operator-verifier.json) printf '/source/%s' "$1" ;;
     postgres-password) printf '/source/postgres-password' ;;
     *) return 1 ;;
   esac
 }
 config_target() {
   case "$1" in
+    worker.json) printf '%s/%s' "$worker_config_volume" "$1" ;;
     server.json|api-key|operator-verifier.json) printf '%s/%s' "$config_volume" "$1" ;;
     postgres-password) printf '%s/postgres-password' "$secrets_volume" ;;
     *) return 1 ;;
@@ -24,6 +30,7 @@ config_target() {
 }
 stage_dir() {
   case "$1" in
+    worker.json) printf '%s' "$worker_config_stage_dir" ;;
     server.json|api-key|operator-verifier.json) printf '%s' "$config_stage_dir" ;;
     postgres-password) printf '%s' "$secrets_stage_dir" ;;
     *) return 1 ;;
@@ -36,17 +43,28 @@ fail() {
 cleanup() {
   # These mode-0700 directories were uniquely created by this PID; never touch a final path.
   [ -z "$config_stage_dir" ] || rm -rf "$config_stage_dir"
+  [ -z "$worker_config_stage_dir" ] || rm -rf "$worker_config_stage_dir"
   [ -z "$secrets_stage_dir" ] || rm -rf "$secrets_stage_dir"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-[ -f /source/postgres-password ] && [ ! -L /source/postgres-password ] && [ "$(stat -c %h /source/postgres-password)" = 1 ] && [ -s /source/postgres-password ] && [ "$(stat -c %a /source/postgres-password)" = 600 ] || fail 'invalid source credentials'
+[ "$#" -le 1 ] && { [ "$mode" = default ] || [ "$mode" = worker ]; } || fail 'usage: provision-compose-config.sh [default|worker]'
 [ -d /source ] && [ ! -L /source ] && [ "$(stat -c %a /source)" = 700 ] || fail 'invalid source directory'
-for name in server.json api-key operator-verifier.json; do
+if [ "$mode" = default ]; then
+  for name in $config_names; do
+    source=$(config_source "$name")
+    [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid source configuration'
+  done
+  for name in $secret_names; do
+    source=$(config_source "$name")
+    [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid source credentials'
+  done
+else
+  name=worker.json
   source=$(config_source "$name")
-  [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid source configuration'
-done
+  [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid worker source configuration'
+fi
 
 validate_target() {
   name=$1
@@ -62,9 +80,16 @@ validate_target() {
   [ "$(stat -c %h "$target")" = 1 ] && [ "$expected_digest" = "$(sha256sum "$target" | cut -d ' ' -f 1)" ]
 }
 
-config_stage_dir=$(mktemp -d "$config_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private config staging directory'
-secrets_stage_dir=$(mktemp -d "$secrets_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private secret staging directory'
-chmod 0700 "$config_stage_dir" "$secrets_stage_dir"
+if [ "$mode" = default ]; then
+  config_stage_dir=$(mktemp -d "$config_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private config staging directory'
+  secrets_stage_dir=$(mktemp -d "$secrets_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private secret staging directory'
+  chmod 0700 "$config_stage_dir" "$secrets_stage_dir"
+  names="$config_names $secret_names"
+else
+  worker_config_stage_dir=$(mktemp -d "$worker_config_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private worker config staging directory'
+  chmod 0700 "$worker_config_stage_dir"
+  names=$worker_config_names
+fi
 
 for name in $names; do
   source=$(config_source "$name")
