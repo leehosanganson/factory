@@ -81,6 +81,25 @@ func TestCheckLocalPrerequisitesSkipsWorkerRequirementsOnlyWhenWorkersDisabled(t
 	}
 }
 
+func TestCheckLocalPrerequisitesValidatesWebhookSecretWithoutLeakingPath(t *testing.T) {
+	root := t.TempDir()
+	secretPath := filepath.Join(root, "webhook-secret")
+	config := validConfig()
+	config.GitHubWebhook = GitHubWebhookConfig{SecretFile: secretPath, TriggerLabel: "ready", Sources: map[string]string{"acme/issues": "widget"}, Owners: map[string]string{}}
+	issues := CheckLocalPrerequisites(config)
+	joined := strings.Join(issues, "\\n")
+	if !strings.Contains(joined, "github_webhook.secret_file: unavailable or invalid") || strings.Contains(joined, secretPath) {
+		t.Fatalf("missing webhook secret preflight issues=%v", issues)
+	}
+	if err := os.WriteFile(secretPath, []byte(strings.Repeat("s", 32)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	issues = CheckLocalPrerequisites(config)
+	if strings.Contains(strings.Join(issues, "\\n"), "github_webhook.secret_file:") {
+		t.Fatalf("valid webhook secret preflight issues=%v", issues)
+	}
+}
+
 func TestCheckLocalPrerequisitesValidatesEnabledPrincipalVerifierWithoutLeakingData(t *testing.T) {
 	const token = "private-preflight-token"
 	digest := sha256.Sum256([]byte(token))

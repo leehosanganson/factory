@@ -69,6 +69,8 @@ type Config struct {
 	Persistence        PersistenceConfig       `json:"persistence"`
 	Provider           ProviderConfig          `json:"provider"`
 	WebUI              WebUIConfig             `json:"web_ui,omitempty"`
+	WorkerListener     *WorkerListenerConfig   `json:"worker_listener,omitempty"`
+	GitHubWebhook      GitHubWebhookConfig     `json:"github_webhook,omitempty"`
 	WorkersEnabled     *bool                   `json:"workers_enabled,omitempty"`
 	WorkerID           string                  `json:"worker_id,omitempty"`
 	Limits             Limits                  `json:"limits"`
@@ -124,6 +126,34 @@ type PrincipalConfig struct {
 type WebUIConfig struct {
 	Enabled    bool   `json:"enabled"`
 	OperatorID string `json:"operator_id,omitempty"`
+}
+
+// GitHubWebhookConfig enables one authenticated issues.labeled delivery route.
+type GitHubWebhookConfig struct {
+	SecretFile   string            `json:"secret_file"`
+	TriggerLabel string            `json:"trigger_label"`
+	Sources      map[string]string `json:"sources,omitempty"`
+	Owners       map[string]string `json:"owners,omitempty"`
+}
+
+func (c GitHubWebhookConfig) Enabled() bool {
+	return c.SecretFile != "" || c.TriggerLabel != "" || len(c.Sources) != 0 || len(c.Owners) != 0
+}
+
+// WorkerListenerConfig enables the isolated authenticated worker identity API.
+type WorkerListenerConfig struct {
+	ListenAddress  string                       `json:"listen_address"`
+	ServerCertFile string                       `json:"server_cert_file"`
+	ServerKeyFile  string                       `json:"server_key_file"`
+	ClientCAFile   string                       `json:"client_ca_file"`
+	Certificates   []WorkerCertificatePrincipal `json:"certificates"`
+}
+
+// WorkerCertificatePrincipal maps an exact client certificate DER fingerprint to an identity.
+type WorkerCertificatePrincipal struct {
+	SHA256      string `json:"sha256"`
+	PrincipalID string `json:"principal_id"`
+	Enabled     bool   `json:"enabled"`
 }
 
 type ProviderConfig struct {
@@ -316,6 +346,82 @@ func (c Config) Validate() error {
 	if err := validateListenAddress(c.ListenAddress); err != nil {
 		return err
 	}
+	if c.WorkerListener != nil {
+		if c.Persistence.Backend == PersistenceBackendMemory {
+			return errors.New("worker_listener requires SQLite or PostgreSQL persistence")
+		}
+		listener := c.WorkerListener
+		if err := validateListenAddress(listener.ListenAddress); err != nil {
+			return fmt.Errorf("worker_listener.%w", err)
+		}
+		if listener.ListenAddress == c.ListenAddress {
+			return errors.New("worker_listener.listen_address must be distinct from listen_address")
+		}
+		for _, path := range []struct{ name, value string }{{"server_cert_file", listener.ServerCertFile}, {"server_key_file", listener.ServerKeyFile}, {"client_ca_file", listener.ClientCAFile}} {
+			if !filepath.IsAbs(path.value) || strings.TrimSpace(path.value) == "" || strings.ContainsRune(path.value, 0) {
+				return fmt.Errorf("worker_listener.%s must be an absolute path", path.name)
+			}
+		}
+		if len(listener.Certificates) == 0 {
+			return errors.New("worker_listener.certificates must not be empty")
+		}
+		fingerprints := make(map[string]struct{}, len(listener.Certificates))
+		hasEnabledCertificate := false
+		for index, certificate := range listener.Certificates {
+			if !principalIDPattern.MatchString(certificate.PrincipalID) || certificate.PrincipalID == "legacy-shared" {
+				return fmt.Errorf("worker_listener.certificates[%d].principal_id is invalid", index)
+			}
+			if !workerCertificateFingerprintPattern.MatchString(certificate.SHA256) {
+				return fmt.Errorf("worker_listener.certificates[%d] requires a lowercase SHA-256 fingerprint", index)
+			}
+			if _, ok := fingerprints[certificate.SHA256]; ok {
+				return errors.New("worker_listener contains duplicate certificate fingerprints")
+			}
+			fingerprints[certificate.SHA256] = struct{}{}
+			hasEnabledCertificate = hasEnabledCertificate || certificate.Enabled
+		}
+		if !hasEnabledCertificate {
+			return errors.New("worker_listener requires at least one enabled certificate mapping")
+		}
+	}
+	if c.GitHubWebhook.Enabled() {
+		if c.Persistence.Backend == PersistenceBackendMemory {
+			return errors.New("github_webhook requires SQLite or PostgreSQL persistence")
+		}
+		if !filepath.IsAbs(c.GitHubWebhook.SecretFile) || strings.TrimSpace(c.GitHubWebhook.SecretFile) == "" || strings.ContainsRune(c.GitHubWebhook.SecretFile, 0) {
+			return errors.New("github_webhook.secret_file must be an absolute path")
+		}
+		if len(c.GitHubWebhook.TriggerLabel) == 0 || len(c.GitHubWebhook.TriggerLabel) > 100 || strings.TrimSpace(c.GitHubWebhook.TriggerLabel) != c.GitHubWebhook.TriggerLabel || strings.ContainsAny(c.GitHubWebhook.TriggerLabel, "\r\n") || strings.IndexFunc(c.GitHubWebhook.TriggerLabel, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return errors.New("github_webhook.trigger_label must be a nonempty exact GitHub label name of at most 100 bytes")
+		}
+		if len(c.GitHubWebhook.Sources) == 0 || len(c.GitHubWebhook.Sources) != len(c.GitHubWebhook.Owners) {
+			return errors.New("github_webhook.sources and owners must map the same configured sources")
+		}
+		principalIDs := make(map[string]PrincipalConfig, len(c.Principals))
+		for _, principal := range c.Principals {
+			if principal.Enabled {
+				principalIDs[principal.ID] = principal
+			}
+		}
+		for source, alias := range c.GitHubWebhook.Sources {
+			parts := strings.Split(source, "/")
+			if len(parts) != 2 || !validGitHubRepository(source) || parts[0] == "." || parts[0] == ".." || parts[1] == "." || parts[1] == ".." {
+				return errors.New("github_webhook.sources must use exact owner/repository names")
+			}
+			if _, ok := c.Repositories[alias]; !ok {
+				return errors.New("github_webhook.sources must map to configured repository aliases")
+			}
+			owner, ok := principalIDs[c.GitHubWebhook.Owners[source]]
+			if !ok || !principalIDPattern.MatchString(c.GitHubWebhook.Owners[source]) || owner.ID == "" {
+				return errors.New("github_webhook.owners must map each source to an enabled Factory principal")
+			}
+		}
+		for source := range c.GitHubWebhook.Owners {
+			if _, ok := c.GitHubWebhook.Sources[source]; !ok {
+				return errors.New("github_webhook.owners must map each source to an enabled Factory principal")
+			}
+		}
+	}
 	if len(c.Repositories) == 0 {
 		return errors.New("repositories must contain at least one alias")
 	}
@@ -415,6 +521,7 @@ func validateListenAddress(address string) error {
 }
 
 var postgresWorkerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+var workerCertificateFingerprintPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func boolPointer(value bool) *bool { return &value }
 
@@ -580,7 +687,7 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "worker_listener": {}, "github_webhook": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
 	case "execution":
 		fields = map[string]struct{}{"mode": {}}
 	case "harness":
@@ -593,6 +700,14 @@ func configFieldAllowed(parent, key string) bool {
 		fields = map[string]struct{}{"backend": {}, "path": {}, "dsn": {}}
 	case "web_ui":
 		fields = map[string]struct{}{"enabled": {}, "operator_id": {}}
+	case "worker_listener":
+		fields = map[string]struct{}{"listen_address": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "certificates": {}}
+	case "github_webhook":
+		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}}
+	case "github_webhook_sources", "github_webhook_owners":
+		return validGitHubRepository(key)
+	case "certificates":
+		fields = map[string]struct{}{"sha256": {}, "principal_id": {}, "enabled": {}}
 	case "provider":
 		if key == "backend" || key == "token_file" || key == "base_branch" {
 			return true
@@ -687,13 +802,39 @@ func validateRequiredConfigFields(data []byte) error {
 			}
 		}
 	}
+	if raw, exists := fields["worker_listener"]; exists {
+		var listener map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &listener); err != nil {
+			return errors.New("worker_listener must be an object")
+		}
+		for _, field := range []string{"listen_address", "server_cert_file", "server_key_file", "client_ca_file", "certificates"} {
+			if _, ok := listener[field]; !ok {
+				return fmt.Errorf("required worker_listener field %q is missing", field)
+			}
+		}
+		var certificates []map[string]json.RawMessage
+		if err := json.Unmarshal(listener["certificates"], &certificates); err != nil {
+			return errors.New("worker_listener.certificates must be an array")
+		}
+		for index, certificate := range certificates {
+			for _, field := range []string{"sha256", "principal_id", "enabled"} {
+				if _, ok := certificate[field]; !ok {
+					return fmt.Errorf("required worker_listener certificate %d field %q is missing", index, field)
+				}
+			}
+		}
+	}
 	return nil
 }
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "repositories", "verification_checks", "execution":
+	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "worker_listener", "github_webhook", "certificates", "repositories", "verification_checks", "execution":
 		return key
+	case "sources":
+		return "github_webhook_sources"
+	case "owners":
+		return "github_webhook_owners"
 	default:
 		return ""
 	}

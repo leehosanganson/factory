@@ -14,6 +14,7 @@ This section describes implemented behavior, distinct from the remaining target 
 - [REST worker process](rest-worker.md) — separate PostgreSQL worker and workers-disabled API control-plane operation.
 - [Embedded REST operator dashboard](rest-web-ui.md) — optional same-listener browser UI and control-plane container image.
 - [Autonomous GitHub issue poller](issue-poller.md) — dedicated PostgreSQL-backed admission into the shared REST job queue.
+- [GitHub issue webhook](github-issue-webhook.md) — optional durable admission of authenticated `issues.labeled` deliveries into the same Thread/Job lifecycle.
 - [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, SQLite backup and portable recovery bundles, restart recovery classification, limits, and trusted-network operations.
 - [REST job client](rest-client.md) — separate protected client configuration and CLI commands for remote submit, inspect, watch, cooperative cancellation, read-only aggregate operations, and explicit SQLite interrupted-job recovery actions.
 - [Supervised systemd deployment](rest-server-systemd.md) — dedicated service account, private paths, installed binary unit, lifecycle, and single-host operations.

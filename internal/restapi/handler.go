@@ -50,9 +50,18 @@ type Config struct {
 	ResolveInterrupted  func(context.Context, string, restjobs.InterruptedDisposition) error
 	CancelJob           func(context.Context, string) (restjobs.Snapshot, error)
 	DashboardOperatorID string
+	GitHubWebhook       GitHubWebhookConfig
 }
 
 // Handler serves the REST API using the supplied manager and immutable API key.
+// GitHubWebhookConfig is the runtime-validated issue webhook admission policy.
+type GitHubWebhookConfig struct {
+	Secret       []byte
+	TriggerLabel string
+	Sources      map[string]string
+	Owners       map[string]string
+}
+
 type Handler struct {
 	manager         restjobs.Manager
 	key             restserver.APIKey
@@ -181,6 +190,14 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		return
 	}
 
+	if r.URL.Path == githubIssueWebhookPath {
+		if r.URL.EscapedPath() != r.URL.Path {
+			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+			return
+		}
+		h.receiveGitHubIssueWebhook(w, r)
+		return
+	}
 	if !isJobsPath(r.URL.Path) && !isThreadsPath(r.URL.Path) && r.URL.Path != "/v1/operations" && r.URL.Path != "/v1/notifications" {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return

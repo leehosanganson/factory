@@ -333,6 +333,25 @@ func TestLoadConfigAcceptsGitHubProviderAndRejectsPartialProviderConfig(t *testi
 	}
 }
 
+func TestLoadConfigValidatesGitHubIssueWebhookPrincipalMappingAndDurability(t *testing.T) {
+	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"issue-owner","role":"submitter","token_file":"/run/owner-verifier","enabled":true},{"id":"admin","role":"operator","token_file":"/run/admin-verifier","enabled":true}],"persistence":{"backend":"sqlite","path":"/var/lib/factory/jobs.db"},"github_webhook":{"secret_file":"/run/secrets/github-webhook","trigger_label":"factory:ready","sources":{"acme/issues":"widget"},"owners":{"acme/issues":"issue-owner"}}}`
+	config, err := LoadConfig(writeConfig(t, base))
+	if err != nil || config.GitHubWebhook.Owners["acme/issues"] != "issue-owner" || config.GitHubWebhook.Sources["acme/issues"] != "widget" {
+		t.Fatalf("valid GitHub webhook config=(%+v,%v)", config.GitHubWebhook, err)
+	}
+	for _, invalid := range []string{
+		strings.Replace(base, `"backend":"sqlite"`, `"backend":"memory"`, 1),
+		strings.Replace(base, `"owners":{"acme/issues":"issue-owner"}`, `"owners":{"acme/issues":"missing"}`, 1),
+		strings.Replace(base, `"sources":{"acme/issues":"widget"}`, `"sources":{"acme/unknown":"widget"}`, 1),
+		strings.Replace(base, `"trigger_label":"factory:ready"`, `"trigger_label":" factory:ready"`, 1),
+		strings.Replace(base, `"github_webhook":{"secret_file"`, `"github_webhook":{"unknown":true,"secret_file"`, 1),
+	} {
+		if _, err := LoadConfig(writeConfig(t, invalid)); err == nil {
+			t.Errorf("invalid GitHub webhook config accepted: %s", invalid)
+		}
+	}
+}
+
 func TestLoadConfigParsesOperatorVerificationChecksWithoutShellParsing(t *testing.T) {
 	path := writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"verification_checks":[["go","test","./..."],["./scripts/check.sh","--strict mode"]],"api_key_file":"/run/secrets/key"}`)
 	config, err := LoadConfig(path)
@@ -501,6 +520,26 @@ func TestConfigValidateRejectsUnsupportedAuthorityAndUnsafeValues(t *testing.T) 
 				t.Fatal("invalid config was accepted")
 			}
 		})
+	}
+}
+
+func TestDisabledGitHubWebhookConfigRoundTripsThroughStrictParser(t *testing.T) {
+	config := validConfig()
+	encoded, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("strict parser rejected serialized config with disabled webhook: %v\n%s", err, encoded)
+	}
+	if loaded.GitHubWebhook.Enabled() {
+		t.Fatalf("round-tripped webhook unexpectedly enabled: %+v", loaded.GitHubWebhook)
 	}
 }
 

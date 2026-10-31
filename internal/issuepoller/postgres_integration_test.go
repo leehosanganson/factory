@@ -17,6 +17,9 @@ import (
 func TestPostgresProvenanceConflictQuarantinesAndAdvancesScan(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
 		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL issue-poller integration tests")
 	}
 	adminConfig, err := pgx.ParseConfig(dsn)

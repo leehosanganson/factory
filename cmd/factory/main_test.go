@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -3537,21 +3538,281 @@ func waitFailedImplementTestShutdown(store *factory.JobStore, target, id string,
 	return fmt.Errorf("detached worker %s did not reach terminal status and clear its worker record/target lock within %s", id, timeout)
 }
 
+func detachedTidyWorkerFromProcessLine(line, id, storeRoot string) (int, string, error) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0, "", nil
+	}
+	command := line[strings.Index(line, fields[1]):]
+	workerArg := strings.Index(command, "__job-worker")
+	if workerArg < 0 {
+		return 0, "", nil
+	}
+	workerCommand := strings.TrimLeft(command[workerArg+len("__job-worker"):], " \t")
+	jobIDEnd := strings.IndexAny(workerCommand, " \t")
+	if jobIDEnd < 0 {
+		return 0, "", nil
+	}
+	jobID := workerCommand[:jobIDEnd]
+	workerStoreRoot := strings.TrimSpace(workerCommand[jobIDEnd:])
+	if workerStoreRoot != storeRoot || (id != "" && jobID != id) {
+		return 0, "", nil
+	}
+	pid, err := strconv.Atoi(fields[0])
+	if err != nil || pid <= 0 {
+		return 0, "", fmt.Errorf("parse PID for tidy worker %s from %q", id, line)
+	}
+	return pid, jobID, nil
+}
+
+func TestDetachedTidyWorkerProcessLine(t *testing.T) {
+	const storeRoot = "/tmp/factory detached tidy test-123/factory/detached-jobs"
+	line := " 1234 /tmp/factory __job-worker job-567 " + storeRoot
+	pid, id, err := detachedTidyWorkerFromProcessLine(line, "job-567", storeRoot)
+	if err != nil || pid != 1234 || id != "job-567" {
+		t.Fatalf("parse worker process line = (%d, %q, %v), want (1234, job-567, nil)", pid, id, err)
+	}
+	if pid, _, err := detachedTidyWorkerFromProcessLine(line, "other-job", storeRoot); err != nil || pid != 0 {
+		t.Fatalf("parse mismatched worker process line = (%d, %v), want no match", pid, err)
+	}
+}
+
+func findDetachedTidyWorkerPID(id, storeRoot string) (int, string, error) {
+	output, err := exec.Command("ps", "-axo", "pid=,command=").CombinedOutput()
+	if err != nil {
+		return 0, "", fmt.Errorf("list processes while locating tidy worker %s: %w: %s", id, err, output)
+	}
+	for _, line := range strings.Split(string(output), "\n") {
+		pid, jobID, err := detachedTidyWorkerFromProcessLine(line, id, storeRoot)
+		if err != nil {
+			return 0, "", err
+		}
+		if pid > 0 {
+			return pid, jobID, nil
+		}
+	}
+	return 0, "", nil
+}
+
+func waitForDetachedTidyWorkerExit(store *factory.JobStore, target, id string, pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	if err := waitForTestProcessExit(pid, time.Until(deadline)); err != nil {
+		return err
+	}
+	for time.Now().Before(deadline) {
+		if id != "" {
+			if _, err := store.ReadWorker(id); !errors.Is(err, os.ErrNotExist) {
+				if err != nil {
+					return fmt.Errorf("read tidy worker record after PID %d exit: %w", pid, err)
+				}
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+		}
+		unlock, acquired, err := store.TryLockTarget(target)
+		if err != nil {
+			return fmt.Errorf("check tidy target lock after worker PID %d exit: %w", pid, err)
+		}
+		if acquired {
+			unlock()
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("worker PID %d, its record, and/or target lock did not quiesce within %s", pid, timeout)
+}
+
+func waitForDetachedTidyNoWorker(store *factory.JobStore, target, id, storeRoot string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	clearObservations := 0
+	for time.Now().Before(deadline) {
+		pid, _, err := findDetachedTidyWorkerPID(id, storeRoot)
+		if err != nil {
+			return err
+		}
+		if pid != 0 {
+			if err := stopDetachedTidyProcessGroup(pid, 2*time.Second); err != nil {
+				return fmt.Errorf("stop detached tidy worker process group %d: %w", pid, err)
+			}
+			continue
+		}
+		if id != "" {
+			if _, err := store.ReadWorker(id); !errors.Is(err, os.ErrNotExist) {
+				if err != nil {
+					return fmt.Errorf("read worker record for detached tidy job %s: %w", id, err)
+				}
+				clearObservations = 0
+				time.Sleep(20 * time.Millisecond)
+				continue
+			}
+		}
+		unlock, acquired, err := store.TryLockTarget(target)
+		if err != nil {
+			return fmt.Errorf("check detached tidy target lock: %w", err)
+		}
+		if !acquired {
+			clearObservations = 0
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		unlock()
+		clearObservations++
+		if clearObservations >= 2 {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("could not establish that detached tidy worker, worker record, and target lock are absent within %s", timeout)
+}
+
+func stopDetachedTidyProcessGroup(pid int, timeout time.Duration) error {
+	groupAlive := func() (bool, error) {
+		output, err := exec.Command("ps", "-axo", "pgid=,stat=").CombinedOutput()
+		if err != nil {
+			return false, fmt.Errorf("inspect detached tidy process group %d: %w: %s", pid, err, output)
+		}
+		for _, line := range strings.Split(string(output), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) == 2 && fields[0] == strconv.Itoa(pid) && !strings.HasPrefix(fields[1], "Z") {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	waitGone := func(timeout time.Duration) error {
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			alive, err := groupAlive()
+			if err != nil {
+				return err
+			}
+			if !alive {
+				return nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return fmt.Errorf("process group %d remained live after %s", pid, timeout)
+	}
+	alive, err := groupAlive()
+	if err != nil || !alive {
+		return err
+	}
+	if err := syscall.Kill(-pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("terminate process group %d: %w", pid, err)
+	}
+	if err := waitGone(timeout); err == nil {
+		return nil
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("kill process group %d: %w", pid, err)
+	}
+	return waitGone(timeout)
+}
+
 func TestDetachedTidyCLIUsesDefaultDescriptionAndNeverPublishes(t *testing.T) {
-	state := t.TempDir()
-	configHome := t.TempDir()
+	root, err := os.MkdirTemp("", "factory detached tidy test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	preserveRoot := false
+	var workerPID int
+	var workerJobID string
+	var storeRoot string
+	var store *factory.JobStore
+	var target, releaseWorker string
+	commandStarted := false
+	t.Cleanup(func() {
+		if releaseWorker != "" {
+			if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+				t.Errorf("release detached tidy worker during cleanup: %v", err)
+				preserveRoot = true
+			}
+		}
+		if store != nil {
+			captureUntil := time.Now().Add(5 * time.Second)
+			for workerPID == 0 && time.Now().Before(captureUntil) {
+				jobs, err := store.ListJobs()
+				if err == nil && len(jobs) == 1 {
+					workerJobID = jobs[0].ID
+					if worker, readErr := store.ReadWorker(workerJobID); readErr == nil {
+						workerPID = worker.PID
+						break
+					}
+					if pid, _, findErr := findDetachedTidyWorkerPID(workerJobID, storeRoot); findErr == nil && pid > 0 {
+						workerPID = pid
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			if workerPID == 0 {
+				if pid, id, findErr := findDetachedTidyWorkerPID("", storeRoot); findErr == nil && pid > 0 {
+					workerPID, workerJobID = pid, id
+				}
+			}
+		}
+		if store != nil && workerJobID == "" {
+			jobs, err := store.ListJobs()
+			if err != nil || len(jobs) != 0 || commandStarted {
+				t.Errorf("could not establish detached tidy worker identity; preserving temporary directory %s: jobs=%+v err=%v", root, jobs, err)
+				preserveRoot = true
+			}
+		}
+		if workerPID == 0 && commandStarted && store != nil {
+			if err := waitForDetachedTidyNoWorker(store, target, workerJobID, storeRoot, 5*time.Second); err != nil {
+				t.Errorf("could not prove detached tidy worker is absent; preserving temporary directory %s: %v", root, err)
+				preserveRoot = true
+			}
+		}
+		if workerJobID != "" && workerPID == 0 && !preserveRoot {
+			t.Errorf("could not capture detached tidy worker PID for job %s despite confirming no worker remains; preserving temporary directory %s", workerJobID, root)
+			preserveRoot = true
+		}
+		if workerPID > 0 && store != nil {
+			if err := waitForDetachedTidyWorkerExit(store, target, workerJobID, workerPID, 5*time.Second); err != nil {
+				_ = syscall.Kill(-workerPID, syscall.SIGTERM)
+				if killErr := waitForDetachedTidyWorkerExit(store, target, workerJobID, workerPID, 5*time.Second); killErr != nil {
+					_ = syscall.Kill(-workerPID, syscall.SIGKILL)
+					if killErr = waitForDetachedTidyWorkerExit(store, target, workerJobID, workerPID, 5*time.Second); killErr != nil {
+						t.Errorf("could not quiesce detached tidy worker; preserving temporary directory %s: %v (initial wait: %v)", root, killErr, err)
+						preserveRoot = true
+					}
+				}
+			}
+			if err := stopDetachedTidyProcessGroup(workerPID, 2*time.Second); err != nil {
+				t.Errorf("could not stop detached tidy process-group children; preserving temporary directory %s: %v", root, err)
+				preserveRoot = true
+			}
+		}
+		if preserveRoot {
+			t.Errorf("preserving detached tidy test artifacts: %s", root)
+			return
+		}
+		if err := os.RemoveAll(root); err != nil {
+			t.Errorf("remove detached tidy test directory: %v", err)
+		}
+	})
+
+	state := filepath.Join(root, "state")
+	if err := os.MkdirAll(state, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configHome := filepath.Join(root, "config")
 	factoryConfig := filepath.Join(configHome, "factory")
 	if err := os.MkdirAll(factoryConfig, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	agent := filepath.Join(t.TempDir(), "agent")
-	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'PASS\\n'\n"), 0o700); err != nil {
+	agent := filepath.Join(root, "agent")
+	workerStarted := filepath.Join(state, "worker-started")
+	releaseWorker = filepath.Join(state, "release-worker")
+	agentScript := "#!/bin/sh\n: > \"$FACTORY_TEST_WORKER_STARTED\"\nwhile [ ! -f \"$FACTORY_TEST_RELEASE_WORKER\" ]; do sleep 0.02; done\nprintf 'PASS\\n'\n"
+	if err := os.WriteFile(agent, []byte(agentScript), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, agent, state)), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(factoryConfig, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s"}`, agent, state)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	binary := filepath.Join(t.TempDir(), "factory")
+	binary := filepath.Join(root, "factory")
 	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -3562,7 +3823,10 @@ func TestDetachedTidyCLIUsesDefaultDescriptionAndNeverPublishes(t *testing.T) {
 		t.Fatalf("build factory: %v\n%s", err, output)
 	}
 
-	target := t.TempDir()
+	target = filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	git := func(args ...string) []byte {
 		t.Helper()
 		command := exec.Command("git", args...)
@@ -3585,40 +3849,98 @@ func TestDetachedTidyCLIUsesDefaultDescriptionAndNeverPublishes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(target, "preexisting.txt"), []byte("keep me\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	fakeBin := t.TempDir()
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(fakeBin, "make"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	storeRoot, err = factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err = factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	command := exec.Command(binary, "tidy", "--detach")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, binary, "tidy", "--detach")
 	command.Dir = target
-	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_WORKER_STARTED="+workerStarted, "FACTORY_TEST_RELEASE_WORKER="+releaseWorker, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	commandStarted = true
 	output, err := command.CombinedOutput()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("detached tidy CLI exceeded 10s and was killed/reaped: %v\n%s", err, output)
+	}
 	if err != nil {
 		t.Fatalf("detached tidy CLI: %v\n%s", err, output)
 	}
 	if !strings.Contains(string(output), "Started tidy job ") || !strings.Contains(string(output), "remain unpublished") {
 		t.Fatalf("CLI did not report tidy dispatch and nonpublishing mode: %q", output)
 	}
-	storeRoot, err := factory.JobStateRoot(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, err := factory.NewJobStore(storeRoot)
-	if err != nil {
-		t.Fatal(err)
+	if err := waitForTestFile(t, workerStarted, 10*time.Second); err != nil {
+		t.Fatalf("detached tidy agent did not reach its shutdown gate: %v", err)
 	}
 	var jobs []factory.JobRecord
 	waitUntil := time.Now().Add(10 * time.Second)
 	for time.Now().Before(waitUntil) {
 		jobs, err = store.ListJobs()
-		if err == nil && len(jobs) == 1 && jobs[0].Status == "complete" {
+		if err != nil {
 			break
+		}
+		if len(jobs) == 1 {
+			workerJobID = jobs[0].ID
+			worker, workerErr := store.ReadWorker(workerJobID)
+			if workerErr == nil {
+				workerPID = worker.PID
+				break
+			}
+			if !errors.Is(workerErr, os.ErrNotExist) {
+				err = workerErr
+				break
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if err != nil || len(jobs) != 1 || jobs[0].Type != "tidy" || jobs[0].Status != "complete" || jobs[0].TaskDescription != "Review, fix, document, and verify the target repository without publishing changes." {
+	if err != nil || workerPID <= 0 {
+		preserveRoot = true
+		t.Fatalf("detached tidy worker record = %+v PID=%d err=%v; preserving %s", jobs, workerPID, err, root)
+	}
+	if err := waitForTestProcessLive(workerPID, 2*time.Second); err != nil {
+		t.Fatalf("detached tidy worker was not live while its agent was gated: %v", err)
+	}
+	unlock, acquired, err := store.TryLockTarget(target)
+	if err != nil {
+		t.Fatalf("check target lock while detached tidy worker is gated: %v", err)
+	}
+	if acquired {
+		unlock()
+		t.Fatal("detached tidy worker did not hold its target lock while its agent was gated")
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release detached tidy worker: %v", err)
+	}
+	if err := waitForDetachedTidyWorkerExit(store, target, workerJobID, workerPID, 10*time.Second); err != nil {
+		t.Fatalf("detached tidy worker did not exit and release its target lock: %v", err)
+	}
+	lockUnlock, acquired, err := store.TryLockTarget(target)
+	if err != nil || !acquired {
+		t.Fatalf("acquire target lock to verify quiescence timeout handling: acquired=%t err=%v", acquired, err)
+	}
+	if err := waitForDetachedTidyWorkerExit(store, target, workerJobID, workerPID, 100*time.Millisecond); err == nil {
+		lockUnlock()
+		t.Fatal("quiescence check succeeded while the target lock was held")
+	}
+	lockUnlock()
+	jobs, err = store.ListJobs()
+	if err != nil || len(jobs) != 1 || jobs[0].ID != workerJobID || jobs[0].Type != "tidy" || jobs[0].Status != "complete" || jobs[0].TaskDescription != "Review, fix, document, and verify the target repository without publishing changes." {
 		t.Fatalf("detached tidy job record = %+v err=%v", jobs, err)
+	}
+	if _, err := store.ReadWorker(workerJobID); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("detached tidy worker record remains after PID %d exited: err=%v", workerPID, err)
 	}
 	if got := strings.TrimSpace(string(git("rev-parse", "HEAD"))); got != initialHead {
 		t.Fatalf("detached tidy published a commit: HEAD=%s want=%s", got, initialHead)
