@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: factory
+      POSTGRES_DB: factory
+      POSTGRES_PASSWORD_FILE: /run/factory-secrets/postgres-password
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - postgres-secrets:/run/factory-secrets:ro
+    depends_on:
+      provision-config:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U factory -d factory"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  provision-config:
+    image: busybox:1.37
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/provision/provision-compose-config.sh"]
+    volumes:
+      - ./.local/factory-compose:/source:ro
+      - ./scripts/provision-compose-config.sh:/provision/provision-compose-config.sh:ro
+      - factory-config:/target/factory-config
+      - postgres-secrets:/target/postgres-secrets
+    restart: "no"
+
+  api:
+    image: factory-web:local
+    build:
+      context: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      provision-config:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1::8080"
+    volumes:
+      - factory-config:/etc/factory:ro
+    healthcheck:
+      test: ["CMD", "/factory", "probe", "--url", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  factory-config:
+  postgres-secrets:

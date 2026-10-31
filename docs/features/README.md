@@ -13,6 +13,7 @@ This section describes implemented behavior, distinct from the remaining target 
 - [PostgreSQL Store](postgres-store.md) — PostgreSQL-backed REST persistence and shared-store behavior.
 - [REST worker process](rest-worker.md) — separate PostgreSQL worker and workers-disabled API control-plane operation.
 - [Embedded REST operator dashboard](rest-web-ui.md) — optional same-listener browser UI and control-plane container image.
+- [Local Compose API control plane](compose-local-control-plane.md) — isolated local PostgreSQL API setup with no worker service.
 - [Autonomous GitHub issue poller](issue-poller.md) — dedicated PostgreSQL-backed admission into the shared REST job queue.
 - [GitHub issue webhook](github-issue-webhook.md) — optional durable admission of authenticated `issues.labeled` deliveries into the same Thread/Job lifecycle.
 - [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, SQLite backup and portable recovery bundles, restart recovery classification, limits, and trusted-network operations.

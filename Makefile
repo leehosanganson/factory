@@ -1,4 +1,4 @@
-.PHONY: build container-build test fmt vet test-postgres-up test-postgres test-postgres-down clean help
+.PHONY: build container-build test test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
@@ -9,6 +9,9 @@ container-build:
 
 test:
 	go test ./...
+
+test-compose-local:
+	./scripts/test-compose-local.sh
 
 fmt:
 	gofmt -w $$(find . -name '*.go' -type f)
@@ -36,6 +39,7 @@ help:
 		build 'Compile the Factory CLI' \
 		container-build 'Build the REST control-plane image' \
 		test 'Run all Go tests' \
+		test-compose-local 'Build and smoke test the local Compose API control plane' \
 		fmt 'Format Go source files' \
 		vet 'Run go vet' \
 		test-postgres-up 'Start the disposable PostgreSQL 18 test service' \

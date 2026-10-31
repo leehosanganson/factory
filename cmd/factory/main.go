@@ -33,7 +33,7 @@ func main() {
 }
 
 func run(args []string, in io.Reader, out, errOut io.Writer) error {
-	if imageControlPlaneOnly == "true" && (len(args) == 0 || args[0] != "server" && args[0] != "version") {
+	if imageControlPlaneOnly == "true" && (len(args) == 0 || args[0] != "server" && args[0] != "probe" && args[0] != "version") {
 		return errors.New("this Factory image only supports the REST control plane")
 	}
 	if len(args) > 0 {
@@ -67,6 +67,8 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 		case "version":
 			fmt.Fprintln(out, version)
 			return nil
+		case "probe":
+			return runProbe(args[1:], out)
 		case "rest":
 			return runRESTClient(args[1:], out)
 		case "doctor":
@@ -317,7 +319,7 @@ func commandHelpRequested(args []string) bool {
 		return len(args) == 4 && args[1] == "bundle" && (args[2] == "create" || args[2] == "verify" || args[2] == "inspect" || args[2] == "restore") && (args[3] == "-h" || args[3] == "--help" || args[3] == "help")
 	}
 	switch args[0] {
-	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker", "issue-poller":
+	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker", "issue-poller", "probe":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -942,6 +944,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory issue-poller list|resolve --config <absolute-path>", "Inspect or resolve bounded issue-poller operator outcomes."},
 		{"factory rest <command>", "Submit and inspect jobs on a configured REST server."},
 		{"factory doctor", "Check local setup without starting work."},
+		{"factory probe --url <readyz-url>", "Check a readiness endpoint for container health checks."},
 		{"factory version", "Print the build version."},
 		{"factory help, -h, --help", "Show this concise help."},
 	}
