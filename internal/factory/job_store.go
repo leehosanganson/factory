@@ -109,6 +109,7 @@ type SessionEvent struct {
 // JobStore provides concurrency-safe persistence beneath a jobs state root.
 type JobStore struct {
 	root               string
+	writeJobRecord     func(string, JobRecord) error
 	writeSessionRecord func(string, SessionRecord) error
 	appendSessionLog   func(string, string, []byte) error
 }
@@ -469,43 +470,13 @@ func (s *JobStore) reconcileMonitorOrphan(job JobRecord) (bool, error) {
 		return false, nil
 	}
 
-	session, err := s.GetSession(current.ID, monitorSessionID)
-	if err != nil {
-		return false, fmt.Errorf("read monitor session: %w", err)
-	}
-	setLifecycleTimes(current.Status, "interrupted", &current.StartedAt, &current.EndedAt)
-	current.Status = "interrupted"
-	current.UpdatedAt = now.UTC()
-	for i := range current.Sessions {
-		if current.Sessions[i].ID == monitorSessionID {
-			setLifecycleTimes(session.Status, "interrupted", &session.StartedAt, &session.EndedAt)
-			session.Status = "interrupted"
-			session.UpdatedAt = current.UpdatedAt
-			current.Sessions[i] = sessionMetadata(session)
-			break
-		}
-	}
-	jobDir, err := s.jobDir(current.ID, false)
-	if err != nil {
-		return false, err
-	}
-	if err := writeJSONAtomic(jobDir, "job.json", current); err != nil {
-		return false, err
-	}
-	sessionDir, err := s.sessionDir(current.ID, monitorSessionID, false)
-	if err != nil {
-		return false, err
-	}
-	if err := writeJSONAtomic(sessionDir, "session.json", session); err != nil {
-		return false, err
-	}
 	if current.Monitor == nil {
 		return false, fmt.Errorf("monitor job is missing its canonical monitor state")
 	}
-	current.Monitor.Status = "interrupted"
-	current.Monitor.LastEvent = "Monitor worker was stale; reconciliation marked the job interrupted."
-	current.Monitor.UpdatedAt = current.UpdatedAt
-	if err := writeJSONAtomic(jobDir, "job.json", current); err != nil {
+	monitor := current.Monitor
+	monitor.Status = "interrupted"
+	monitor.LastEvent = "Monitor worker was stale; reconciliation marked the job interrupted."
+	if err := s.updateMonitorAggregateLocked(monitor, false, false, now.UTC()); err != nil {
 		return false, err
 	}
 	if err := s.clearWorkerLocked(current.ID); err != nil {
@@ -788,6 +759,9 @@ func (s *JobStore) reconcileJob(id string) (JobRecord, error) {
 	if err := s.reconcileTerminalSession(id); err != nil {
 		return JobRecord{}, err
 	}
+	if err := s.reconcileMonitorSession(id); err != nil {
+		return JobRecord{}, err
+	}
 	return s.GetJob(id)
 }
 
@@ -808,7 +782,7 @@ func (s *JobStore) reconcileTerminalSession(id string) error {
 	if (job.Type != implementationJobType && job.Type != tidyJobType) || !isTerminalStatus(job.Status) {
 		return nil
 	}
-	session, err := s.GetSession(id, "workflow")
+	session, err := s.getSessionLocked(id, "workflow")
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -1061,7 +1035,167 @@ func (s *JobStore) CreateSession(jobID, sessionID, status string) (SessionRecord
 }
 
 // GetSession reads a session record.
+// UpdateMonitorAggregate persists the monitor snapshot and all status projections
+// in job.json as one canonical write, then mirrors the session record.
+func (s *JobStore) UpdateMonitorAggregate(monitor *monitorJob, recordEvent bool) error {
+	if monitor == nil {
+		return fmt.Errorf("monitor state is required")
+	}
+	unlock, err := s.LockJob(monitor.ID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.updateMonitorAggregateLocked(monitor, recordEvent, false, time.Time{})
+}
+
+// updateMonitorAggregateLocked commits the canonical job snapshot before its session mirror.
+// The caller must hold the job lock so recovery and readers cannot observe mixed projections.
+func (s *JobStore) updateMonitorAggregateLocked(monitor *monitorJob, recordEvent, recordLog bool, at time.Time) error {
+	job, err := s.GetJob(monitor.ID)
+	if err != nil {
+		return err
+	}
+	if job.Type != monitorJobType || job.Monitor == nil {
+		return fmt.Errorf("invalid canonical monitor job record")
+	}
+	session, err := s.getSessionLocked(monitor.ID, monitorSessionID)
+	if err != nil {
+		return err
+	}
+
+	now := at
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	oldStatus := job.Status
+	setLifecycleTimesAt(oldStatus, monitor.Status, &job.StartedAt, &job.EndedAt, now)
+	job.Status = monitor.Status
+	job.UpdatedAt = now
+	copy := *monitor
+	copy.ID = job.ID
+	if copy.DeadlineAt.IsZero() {
+		copy.DeadlineAt = job.Monitor.DeadlineAt
+	}
+	copy.UpdatedAt = now
+	job.Monitor = &copy
+
+	session.Status = monitor.Status
+	session.StartedAt, session.EndedAt = job.StartedAt, job.EndedAt
+	session.UpdatedAt = now
+	metadata := sessionMetadata(session)
+	found := false
+	for i := range job.Sessions {
+		if job.Sessions[i].ID == monitorSessionID {
+			job.Sessions[i] = metadata
+			found = true
+			break
+		}
+	}
+	if !found {
+		job.Sessions = append(job.Sessions, metadata)
+	}
+	sessionDir, err := s.sessionDir(monitor.ID, monitorSessionID, false)
+	if err != nil {
+		return err
+	}
+	if recordEvent {
+		message := monitor.LastEvent
+		if message == "" {
+			message = "Monitor status changed to " + monitor.Status + "."
+		}
+		if err := appendLockedMonitorEvent(sessionDir, message, now); err != nil {
+			return err
+		}
+	}
+	if recordLog {
+		if err := appendLockedMonitorLog(sessionDir, monitor.LastEvent, now); err != nil {
+			return err
+		}
+	}
+	jobDir, err := s.jobDir(monitor.ID, false)
+	if err != nil {
+		return err
+	}
+	if s.writeJobRecord != nil {
+		err = s.writeJobRecord(jobDir, job)
+	} else {
+		err = writeJSONAtomic(jobDir, "job.json", job)
+	}
+	if err != nil {
+		return err
+	}
+	if s.writeSessionRecord != nil {
+		return s.writeSessionRecord(sessionDir, session)
+	}
+	return writeJSONAtomic(sessionDir, "session.json", session)
+}
+
+func (s *JobStore) reconcileMonitorSession(jobID string) error {
+	unlock, err := s.LockJob(jobID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	job, err := s.GetJob(jobID)
+	if err != nil {
+		return err
+	}
+	if job.Type != monitorJobType || job.Monitor == nil {
+		return nil
+	}
+	session, err := s.getSessionLocked(jobID, monitorSessionID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	metadata, ok := jobSessionMetadata(job, monitorSessionID)
+	if !ok {
+		return fmt.Errorf("monitor job is missing embedded session metadata")
+	}
+	if session.Status == metadata.Status && session.StartedAt.Equal(metadata.StartedAt) && session.EndedAt.Equal(metadata.EndedAt) {
+		return nil
+	}
+	session.Status, session.StartedAt, session.EndedAt = metadata.Status, metadata.StartedAt, metadata.EndedAt
+	session.UpdatedAt = job.UpdatedAt
+	dir, err := s.sessionDir(jobID, monitorSessionID, false)
+	if err != nil {
+		return err
+	}
+	if s.writeSessionRecord != nil {
+		return s.writeSessionRecord(dir, session)
+	}
+	return writeJSONAtomic(dir, "session.json", session)
+}
+
 func (s *JobStore) GetSession(jobID, sessionID string) (SessionRecord, error) {
+	unlock, err := s.LockJob(jobID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+	defer unlock()
+	session, err := s.getSessionLocked(jobID, sessionID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+	job, err := s.GetJob(jobID)
+	if err != nil {
+		return SessionRecord{}, err
+	}
+	if job.Type == monitorJobType {
+		if metadata, ok := jobSessionMetadata(job, sessionID); ok {
+			session.Status = metadata.Status
+			session.StartedAt = metadata.StartedAt
+			session.EndedAt = metadata.EndedAt
+		}
+	}
+	return session, nil
+}
+
+// getSessionLocked reads a session record while its job lock is already held.
+func (s *JobStore) getSessionLocked(jobID, sessionID string) (SessionRecord, error) {
 	var session SessionRecord
 	dir, err := s.sessionDir(jobID, sessionID, false)
 	if err != nil {
@@ -1083,7 +1217,7 @@ func (s *JobStore) UpdateSession(jobID, sessionID string, update func(*SessionRe
 		return SessionRecord{}, err
 	}
 	defer unlock()
-	session, err := s.GetSession(jobID, sessionID)
+	session, err := s.getSessionLocked(jobID, sessionID)
 	if err != nil {
 		return SessionRecord{}, err
 	}
@@ -1188,7 +1322,7 @@ func (s *JobStore) AppendSessionEventDetails(jobID, sessionID string, event Sess
 		return err
 	}
 	defer unlock()
-	session, err := s.GetSession(jobID, sessionID)
+	session, err := s.getSessionLocked(jobID, sessionID)
 	if err != nil {
 		return err
 	}
@@ -1504,7 +1638,10 @@ func (s *JobStore) sessionDir(jobID, sessionID string, create bool) (string, err
 }
 
 func setLifecycleTimes(oldStatus, newStatus string, startedAt, endedAt *time.Time) {
-	now := time.Now().UTC()
+	setLifecycleTimesAt(oldStatus, newStatus, startedAt, endedAt, time.Now().UTC())
+}
+
+func setLifecycleTimesAt(oldStatus, newStatus string, startedAt, endedAt *time.Time, now time.Time) {
 	if oldStatus != "running" && newStatus == "running" && startedAt.IsZero() {
 		*startedAt = now
 	}
@@ -1543,6 +1680,15 @@ func (s *JobStore) updateSessionMetadataLocked(jobID string, session SessionReco
 		return err
 	}
 	return writeJSONAtomic(dir, "job.json", job)
+}
+
+func jobSessionMetadata(job JobRecord, sessionID string) (SessionMetadata, bool) {
+	for _, session := range job.Sessions {
+		if session.ID == sessionID {
+			return session, true
+		}
+	}
+	return SessionMetadata{}, false
 }
 
 func sessionMetadata(session SessionRecord) SessionMetadata {
