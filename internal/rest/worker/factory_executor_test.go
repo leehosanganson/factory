@@ -726,10 +726,10 @@ func TestFactoryExecutorPassesOnlyAllowlistedEnvironmentToHarness(t *testing.T) 
 	t.Setenv("REST_TEST_SECRET", "must-not-leak")
 	agentScript := filepath.Join(t.TempDir(), "agent.sh")
 	envFile := filepath.Join(t.TempDir(), "agent-env")
-	if err := os.WriteFile(agentScript, []byte("#!/bin/sh\nprintf '%s|%s|%s|%s' \"$PATH\" \"$LANG\" \"$REST_SERVER_API_KEY\" \"$REST_TEST_SECRET\" > \""+envFile+"\"\nhead -c 5242880 /dev/zero | tr '\\000' x\n"), 0o700); err != nil {
+	if err := os.WriteFile(agentScript, []byte("#!/bin/sh\nprintf '%s|%s|%s|%s' \"$PATH\" \"$LANG\" \"$REST_SERVER_API_KEY\" \"$REST_TEST_SECRET\" > \""+envFile+"\"\nhead -c 131072 /dev/zero | tr '\\000' x\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	executor, manager, _ := newExecutorFixture(t, "5s", restJobOutputLimit, &executorTestAgent{})
+	executor, manager, _ := newExecutorFixture(t, "5s", 64<<10, &executorTestAgent{})
 	executor.server.Harness.Executable = agentScript
 	executor.env = allowlistedEnvironment(append(os.Environ(), "REST_SERVER_API_KEY=must-not-leak", "REST_TEST_SECRET=must-not-leak"))
 	executor.agent = func(config factory.Config, env []string, output io.Writer) factory.Agent {
@@ -753,7 +753,7 @@ func TestFactoryExecutorPassesOnlyAllowlistedEnvironmentToHarness(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(capture) > restJobOutputLimit || !strings.Contains(string(capture), "output truncated") {
+	if len(capture) > 64<<10 || !strings.Contains(string(capture), "output truncated") {
 		t.Fatalf("subprocess output capture length=%d, truncated=%v", len(capture), strings.Contains(string(capture), "output truncated"))
 	}
 }
