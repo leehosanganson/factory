@@ -20,8 +20,8 @@ import (
 	"time"
 
 	"github.com/leehosanganson/factory/internal/factory"
-	"github.com/leehosanganson/factory/internal/restjobs"
-	"github.com/leehosanganson/factory/internal/restserver"
+	"github.com/leehosanganson/factory/internal/rest/jobs"
+	"github.com/leehosanganson/factory/internal/rest/server"
 )
 
 func TestImageRoleCommandAndConfigRestrictions(t *testing.T) {

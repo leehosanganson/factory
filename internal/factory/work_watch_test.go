@@ -6,16 +6,18 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 type workWatchStore struct {
-	recorded map[string]IssueSnapshot
+	recorded map[string]issuepkg.IssueSnapshot
 	order    []string
 	calls    int
 	err      error
 }
 
-func (s *workWatchStore) Record(_ context.Context, _ string, snapshot IssueSnapshot) (bool, error) {
+func (s *workWatchStore) Record(_ context.Context, _ string, snapshot issuepkg.IssueSnapshot) (bool, error) {
 	s.calls++
 	if s.err != nil {
 		return false, s.err
@@ -78,13 +80,13 @@ func (s *workWatchStore) Reconcile(ctx context.Context, key string) (IssueLifecy
 
 func TestWorkWatchDoesNotFetchAfterPersistedClosedObservation(t *testing.T) {
 	item := WorkItem{Request: WorkRequest{DeduplicationKey: "test-request", Repository: "acme/widget", IssueID: "42"}}
-	store := &workWatchStore{recorded: map[string]IssueSnapshot{
+	store := &workWatchStore{recorded: map[string]issuepkg.IssueSnapshot{
 		"open-version":   testIssueSnapshot("open-version", "open", "Open", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)),
 		"closed-version": testIssueSnapshot("closed-version", "closed", "Done", time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)),
 	}, order: []string{"open-version", "closed-version"}}
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		t.Fatal("terminal watch fetched from provider")
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	var out strings.Builder
 	if err := watchIssue(context.Background(), item, tracker, store, time.Second, &out, func(context.Context, time.Duration) error {
@@ -105,9 +107,9 @@ func TestWorkWatchResumesPollingFromPersistedOpenBaseline(t *testing.T) {
 	item := WorkItem{Request: WorkRequest{DeduplicationKey: "test-request", Repository: "acme/widget", IssueID: "42"}}
 	baseline := testIssueSnapshot("open-version-1", "open", "Open", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC))
 	updated := testIssueSnapshot("open-version-2", "open", "Updated", time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC))
-	store := &workWatchStore{recorded: map[string]IssueSnapshot{baseline.Version: baseline}, order: []string{baseline.Version}}
+	store := &workWatchStore{recorded: map[string]issuepkg.IssueSnapshot{baseline.Version: baseline}, order: []string{baseline.Version}}
 	fetches := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		fetches++
 		return updated, nil
 	})
@@ -137,18 +139,18 @@ func TestWorkWatchRecordsUpdatesAndStopsAfterClosedObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := item
-	snapshots := []IssueSnapshot{
+	snapshots := []issuepkg.IssueSnapshot{
 		testIssueSnapshot("version-1", "open", "Initial", time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)),
 		testIssueSnapshot("version-2", "open", "Updated", time.Date(2025, 1, 2, 0, 0, 0, 0, time.UTC)),
 		testIssueSnapshot("version-3", "closed", "Done", time.Date(2025, 1, 3, 0, 0, 0, 0, time.UTC)),
 	}
 	fetches, waits := 0, 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		snapshot := snapshots[fetches]
 		fetches++
 		return snapshot, nil
 	})
-	store := &workWatchStore{recorded: make(map[string]IssueSnapshot)}
+	store := &workWatchStore{recorded: make(map[string]issuepkg.IssueSnapshot)}
 	var out strings.Builder
 	interval := 17 * time.Second
 	err = watchIssue(context.Background(), item, tracker, store, interval, &out, func(_ context.Context, got time.Duration) error {
@@ -183,11 +185,11 @@ func TestWorkWatchReportsDuplicateVersionsAndCancellationStopsNextFetch(t *testi
 	}
 	snapshot := testIssueSnapshot("same-version", "open", "Still open", time.Now().UTC())
 	fetches := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		fetches++
 		return snapshot, nil
 	})
-	store := &workWatchStore{recorded: make(map[string]IssueSnapshot)}
+	store := &workWatchStore{recorded: make(map[string]issuepkg.IssueSnapshot)}
 	ctx, cancel := context.WithCancel(context.Background())
 	var out strings.Builder
 	err = watchIssue(ctx, item, tracker, store, time.Second, &out, func(context.Context, time.Duration) error {
@@ -201,7 +203,7 @@ func TestWorkWatchReportsDuplicateVersionsAndCancellationStopsNextFetch(t *testi
 		t.Fatalf("canceled watch fetched=%d recorded=%d output=%s", fetches, store.calls, out.String())
 	}
 
-	store = &workWatchStore{recorded: map[string]IssueSnapshot{snapshot.Version: snapshot}}
+	store = &workWatchStore{recorded: map[string]issuepkg.IssueSnapshot{snapshot.Version: snapshot}}
 	ctx, cancel = context.WithCancel(context.Background())
 	defer cancel()
 	out.Reset()
@@ -217,17 +219,19 @@ func TestWorkWatchReportsDuplicateVersionsAndCancellationStopsNextFetch(t *testi
 func TestWorkWatchExitsOnProviderOrStoreFailure(t *testing.T) {
 	item := WorkItem{Request: WorkRequest{DeduplicationKey: "test-request", Repository: "acme/widget", IssueID: "42"}}
 	providerErr := errors.New("provider unavailable")
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) { return IssueSnapshot{}, providerErr })
-	store := &workWatchStore{recorded: make(map[string]IssueSnapshot)}
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
+		return issuepkg.IssueSnapshot{}, providerErr
+	})
+	store := &workWatchStore{recorded: make(map[string]issuepkg.IssueSnapshot)}
 	if err := watchIssue(context.Background(), item, tracker, store, time.Second, &strings.Builder{}, func(context.Context, time.Duration) error { t.Fatal("waited after provider failure"); return nil }); !errors.Is(err, providerErr) {
 		t.Fatalf("provider error = %v, want wrapped provider failure", err)
 	}
 
 	storeErr := errors.New("disk full")
-	tracker = issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker = issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		return testIssueSnapshot("version", "open", "Open", time.Now().UTC()), nil
 	})
-	store = &workWatchStore{err: storeErr, recorded: make(map[string]IssueSnapshot)}
+	store = &workWatchStore{err: storeErr, recorded: make(map[string]issuepkg.IssueSnapshot)}
 	if err := watchIssue(context.Background(), item, tracker, store, time.Second, &strings.Builder{}, func(context.Context, time.Duration) error { t.Fatal("waited after store failure"); return nil }); !errors.Is(err, storeErr) {
 		t.Fatalf("store error = %v, want wrapped store failure", err)
 	}
@@ -264,9 +268,9 @@ func TestWaitWorkWatchIntervalStopsOnContextCancellation(t *testing.T) {
 
 func TestWorkWatchPreflightRejectsMissingAndUnsupportedBeforeFetch(t *testing.T) {
 	calls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		calls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	for _, tc := range []struct {
 		name, provider, key string

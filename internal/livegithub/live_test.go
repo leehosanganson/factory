@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leehosanganson/factory/internal/restprovider"
+	"github.com/leehosanganson/factory/internal/rest/provider"
 )
 
 func TestLiveGitHubPublishReconcile(t *testing.T) {

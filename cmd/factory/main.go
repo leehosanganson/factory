@@ -16,10 +16,10 @@ import (
 	"unicode"
 
 	"github.com/leehosanganson/factory/internal/factory"
-	"github.com/leehosanganson/factory/internal/issuepoller"
-	"github.com/leehosanganson/factory/internal/restjobs"
-	"github.com/leehosanganson/factory/internal/restserver"
-	serverruntime "github.com/leehosanganson/factory/internal/restserver/runtime"
+	"github.com/leehosanganson/factory/internal/issue/poller"
+	"github.com/leehosanganson/factory/internal/rest/jobs"
+	"github.com/leehosanganson/factory/internal/rest/server"
+	serverruntime "github.com/leehosanganson/factory/internal/rest/server/runtime"
 )
 
 var version = "dev"
@@ -91,19 +91,19 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if len(args) > 1 && (args[1] == "list" || args[1] == "resolve") {
 				ctx, stop := foregroundContext()
 				defer stop()
-				return issuepoller.OperatorCommand(ctx, args[1:], out)
+				return poller.OperatorCommand(ctx, args[1:], out)
 			}
 			configPath, err := parseIssuePollerOptions(args[1:])
 			if err != nil {
 				return err
 			}
-			config, err := issuepoller.LoadConfig(configPath)
+			config, err := poller.LoadConfig(configPath)
 			if err != nil {
 				return err
 			}
 			ctx, stop := foregroundContext()
 			defer stop()
-			return issuepoller.Run(ctx, config)
+			return poller.Run(ctx, config)
 		case "server":
 			if len(args) > 1 && args[1] == "doctor" {
 				configPath, err := parseServerDoctorOptions(args[2:])

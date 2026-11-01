@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leehosanganson/factory/internal/restprovider"
+	"github.com/leehosanganson/factory/internal/rest/provider"
 )
 
 func TestCleanupRefusesMatchingBranchWithDifferentPRIdentity(t *testing.T) {

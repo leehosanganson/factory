@@ -288,8 +288,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 			return fmt.Errorf("create clean check log %s: %w", logName, err)
 		}
 		fmt.Fprintf(w.Out, "Running make %s\n", target)
-		var checkOutput bytes.Buffer
-		checkWriter := io.MultiWriter(w.Out, &checkOutput, logFile)
+		checkWriter := io.MultiWriter(w.Out, logFile)
 		var checkErr error
 		if w.Make != nil {
 			checkErr = w.Make(target)
