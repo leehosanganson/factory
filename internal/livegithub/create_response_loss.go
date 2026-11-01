@@ -8,7 +8,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/leehosanganson/factory/internal/restprovider"
+	"github.com/leehosanganson/factory/internal/rest/provider"
 )
 
 var errSecondCreateRefused = errors.New("live response-loss seam refused a second POST")

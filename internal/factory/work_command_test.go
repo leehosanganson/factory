@@ -8,19 +8,21 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
-type issueTrackerFunc func(context.Context, string, string) (IssueSnapshot, error)
+type issueTrackerFunc func(context.Context, string, string) (issuepkg.IssueSnapshot, error)
 
-func (f issueTrackerFunc) GetIssue(ctx context.Context, repository, issue string) (IssueSnapshot, error) {
+func (f issueTrackerFunc) GetIssue(ctx context.Context, repository, issue string) (issuepkg.IssueSnapshot, error) {
 	return f(ctx, repository, issue)
 }
 
 func TestWorkIssueRejectsMissingRequestBeforeFetching(t *testing.T) {
 	calls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		calls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	var out strings.Builder
 	err := WorkCommandWithIssueTracker(context.Background(), []string{"issue", "missing"}, Config{StateDir: t.TempDir()}, &out, tracker)
@@ -35,9 +37,9 @@ func TestWorkIssueRejectsMissingRequestBeforeFetching(t *testing.T) {
 func TestWorkIssueRejectsUnsupportedTrackerBeforeFetching(t *testing.T) {
 	cfg, key := enqueueTestWorkRequest(t, "azure-boards", "42")
 	calls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		calls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	var out strings.Builder
 	err := WorkCommandWithIssueTracker(context.Background(), []string{"issue", key}, cfg, &out, tracker)
@@ -68,12 +70,12 @@ func TestWorkIssueFetchesAndRendersOneSnapshotWithoutChangingQueuedItem(t *testi
 
 	updatedAt := time.Date(2025, 3, 4, 5, 6, 7, 123000000, time.FixedZone("offset", 2*60*60))
 	calls := 0
-	tracker := issueTrackerFunc(func(_ context.Context, repository, issue string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(_ context.Context, repository, issue string) (issuepkg.IssueSnapshot, error) {
 		calls++
 		if repository != "acme/widget" || issue != "42" {
 			t.Fatalf("IssueTracker.GetIssue(%q, %q), want queued repository and issue", repository, issue)
 		}
-		return IssueSnapshot{
+		return issuepkg.IssueSnapshot{
 			Repository: repository, Number: 42, Title: "Fix widget handling", State: "open",
 			UpdatedAt: updatedAt, Version: "snapshot-version", URL: "https://github.com/acme/widget/issues/42",
 		}, nil
@@ -115,8 +117,8 @@ func TestWorkIssueFetchesAndRendersOneSnapshotWithoutChangingQueuedItem(t *testi
 
 func TestWorkIssueSanitizesUntrustedTitleBeforeTerminalOutput(t *testing.T) {
 	cfg, key := enqueueTestWorkRequest(t, "github", "42")
-	tracker := issueTrackerFunc(func(_ context.Context, repository, issue string) (IssueSnapshot, error) {
-		return IssueSnapshot{
+	tracker := issueTrackerFunc(func(_ context.Context, repository, issue string) (issuepkg.IssueSnapshot, error) {
+		return issuepkg.IssueSnapshot{
 			Repository: repository, Number: 42, Title: "safe" + string([]byte{0x1b}) + "[31mRED" + string([]byte{0x1b}) + "[0m\nInjected: yes", State: "open",
 			UpdatedAt: time.Date(2025, 3, 4, 5, 6, 7, 0, time.UTC),
 			Version:   "snapshot-version", URL: "https://github.com/acme/widget/issues/42",
@@ -133,8 +135,8 @@ func TestWorkIssueSanitizesUntrustedTitleBeforeTerminalOutput(t *testing.T) {
 
 func TestWorkIssueReportsTrackerFailure(t *testing.T) {
 	cfg, key := enqueueTestWorkRequest(t, "github", "42")
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
-		return IssueSnapshot{}, errors.New("GitHub unavailable")
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
+		return issuepkg.IssueSnapshot{}, errors.New("GitHub unavailable")
 	})
 	var out strings.Builder
 	err := WorkCommandWithIssueTracker(context.Background(), []string{"issue", key}, cfg, &out, tracker)

@@ -2,7 +2,7 @@
 
 ## Status and current boundary
 
-**Future protocol only; authenticated remote workers are not implemented.** Factory's REST runtime currently uses in-process workers. The isolated PostgreSQL ownership protocol in `internal/restjobs/postgres_ownership.go` accepts `workerID` and `bootID` as caller-supplied labels and creates a random per-attempt `OwnerToken` for fencing. The labels are not authenticated identities; the owner token is a generation-scoped mutation secret, not a worker credential or proof of who claimed the job. PostgreSQL ownership remains test-only, is not a `Store` or runtime option, and provides no recovery or reassignment.
+**Future protocol only; authenticated remote workers are not implemented.** Factory's REST runtime currently uses in-process workers. The isolated PostgreSQL ownership protocol in `internal/rest/jobs/postgres_ownership.go` accepts `workerID` and `bootID` as caller-supplied labels and creates a random per-attempt `OwnerToken` for fencing. The labels are not authenticated identities; the owner token is a generation-scoped mutation secret, not a worker credential or proof of who claimed the job. PostgreSQL ownership remains test-only, is not a `Store` or runtime option, and provides no recovery or reassignment.
 
 This contract defines the identity boundary required before a future independent worker protocol. It does not add worker auth, expose a worker API, change the PostgreSQL schema, or authorize production deployment.
 

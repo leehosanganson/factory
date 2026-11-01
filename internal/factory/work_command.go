@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 // WorkCommand manages locally queued issue work requests. Issue snapshots are
@@ -340,7 +342,7 @@ func printWorkItem(out io.Writer, item WorkItem) {
 		request.DeduplicationKey, item.State, request.TrackerProvider, request.IssueID, request.CodeHostProvider, request.Repository)
 }
 
-func printIssueSnapshot(out io.Writer, snapshot IssueSnapshot) {
+func printIssueSnapshot(out io.Writer, snapshot issuepkg.IssueSnapshot) {
 	fmt.Fprintf(out, "Issue snapshot:\nTitle: %s\nState: %s\nUpdated: %s\nVersion: %s\nURL: %s\n",
 		sanitizeProgressLine(snapshot.Title), snapshot.State, snapshot.UpdatedAt.UTC().Format(time.RFC3339Nano), snapshot.Version, snapshot.URL)
 }

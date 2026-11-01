@@ -143,10 +143,7 @@ func monitorJobDir(root, id string) (string, error) {
 }
 
 func saveMonitorJob(dir string, job *monitorJob) error {
-	if err := writeMonitorJob(dir, job); err != nil {
-		return err
-	}
-	return syncMonitorJobStatus(dir, job)
+	return syncMonitorJob(dir, job, false)
 }
 
 func writeMonitorJob(dir string, monitor *monitorJob) error {
@@ -167,15 +164,7 @@ func writeMonitorJob(dir string, monitor *monitorJob) error {
 			return err
 		}
 	}
-	_, err = store.UpdateJob(monitor.ID, func(job *JobRecord) error {
-		copy := *monitor
-		if job.Monitor != nil && !job.Monitor.DeadlineAt.IsZero() {
-			copy.DeadlineAt = job.Monitor.DeadlineAt
-		}
-		job.Monitor = &copy
-		return nil
-	})
-	return err
+	return store.UpdateMonitorAggregate(monitor, false)
 }
 
 func readMonitorJob(dir string) (*monitorJob, error) {
@@ -218,9 +207,6 @@ func monitorEvent(dir string, job *monitorJob, message string) error {
 	}
 	now := time.Now().UTC()
 	recordMonitorRecentEvent(job, job.Phase, message, now)
-	if err := writeMonitorJob(dir, job); err != nil {
-		return err
-	}
 	return syncMonitorJobEvent(dir, job)
 }
 
@@ -302,7 +288,7 @@ func loadJobs(root string) ([]monitorJob, error) {
 	if err != nil {
 		return nil, err
 	}
-	records, err := store.ListJobs()
+	records, err := store.reconcileJobs()
 	if err != nil {
 		return nil, err
 	}

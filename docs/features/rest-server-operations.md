@@ -80,19 +80,19 @@ Use this checklist to verify the documented single-host job lifecycle after a cl
 - [ ] Verify volatile memory behavior across a real server-process restart. The job and idempotency record disappear; replaying the same key is a new admission:
 
   ```sh
-  go test ./internal/restserver/runtime -run '^TestRESTServerMemoryPersistenceLostOnProcessRestartE2E$' -count=1
+  go test ./internal/rest/server/runtime -run '^TestRESTServerMemoryPersistenceLostOnProcessRestartE2E$' -count=1
   ```
 
 - [ ] Verify durable SQLite behavior and its failure/recovery boundaries: queued work resumes, interrupted running work is retained without replay, unavailable configured storage fails before listening, and backup/restore preserves inspectable records. The process tests use temporary state and synthetic workspaces:
 
   ```sh
-  go test ./internal/restserver/runtime -run '^(TestRESTServerProcessRecoversQueuedAndRetainsInterruptedRunningSQLiteJobs|TestRESTServerProcessRejectsUnavailableSQLiteBeforeListening|TestRESTServerBackupRestoreProcessE2E|TestRESTServerProcessSQLiteWriteLockFailsReadinessAndAdmission)$' -count=1
+  go test ./internal/rest/server/runtime -run '^(TestRESTServerProcessRecoversQueuedAndRetainsInterruptedRunningSQLiteJobs|TestRESTServerProcessRejectsUnavailableSQLiteBeforeListening|TestRESTServerBackupRestoreProcessE2E|TestRESTServerProcessSQLiteWriteLockFailsReadinessAndAdmission)$' -count=1
   ```
 
 - [ ] Verify authenticated lifecycle inspection/cancellation, recorded verification evidence, and required provider outcome using the process-level fake-provider tests:
 
   ```sh
-  go test ./internal/restserver/runtime -run '^(TestRESTServerJobListingProcessE2E|TestRESTServerPerJobCancellationProcessE2E|TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider)$' -count=1
+  go test ./internal/rest/server/runtime -run '^(TestRESTServerJobListingProcessE2E|TestRESTServerPerJobCancellationProcessE2E|TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider)$' -count=1
   ```
 
 - [ ] Verify first-party client `watch` follows lifecycle events, falls back to status/history polling when event streaming is unavailable, reconnects without duplicate events at terminal transition, and does not cancel the remote job when the observer exits. These process tests use an in-process test server and fake executor:
@@ -104,7 +104,7 @@ Use this checklist to verify the documented single-host job lifecycle after a cl
 - [ ] Verify deterministic production GitHub adapter behavior against GitHub-shaped test endpoints, including a lost create response and read-only reconciliation without duplicate writes. These tests use no credentials and do not contact GitHub:
 
   ```sh
-  go test ./internal/restprovider -run '^(TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI|TestGitHubPublisherReconcileRejectsMismatchedGitHubResponsesReadOnly|TestGitHubPublisherReconcilesAfterForwardedCreateResponseIsLostWithoutRetry)$' -count=1
+  go test ./internal/rest/provider -run '^(TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI|TestGitHubPublisherReconcileRejectsMismatchedGitHubResponsesReadOnly|TestGitHubPublisherReconcilesAfterForwardedCreateResponseIsLostWithoutRetry)$' -count=1
   ```
 
 - [ ] Run the repository-required checks:
@@ -201,7 +201,7 @@ The backup file is written with owner-only permissions. Restore by placing a cop
 The process-level regression test exercises this command against a live temporary SQLite server using only synthetic requests and no provider configuration or credentials. It restores a copied backup under a separate private path and starts a second server; assertions cover terminal status, verification evidence, lifecycle history, idempotent replay, queued-job resumption, and non-replay of an interrupted running job. It also checks backup/restore file modes, CLI rejection of the live source and a non-private destination directory, and sanitized startup failure for corrupt SQLite content. Run the reproducible test with:
 
 ```sh
-go test ./internal/restserver/runtime -run '^TestRESTServerBackupRestoreProcessE2E$' -count=1
+go test ./internal/rest/server/runtime -run '^TestRESTServerBackupRestoreProcessE2E$' -count=1
 ```
 
 This is automated disposable test evidence, not a claim that a production or deployed-service restore drill has been performed.

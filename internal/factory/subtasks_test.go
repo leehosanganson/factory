@@ -626,7 +626,12 @@ func TestParallelImplementationPersistsCanceledWorkerWaveOutcomes(t *testing.T) 
 
 func TestParallelImplementationCancelsSiblingOnWorkerError(t *testing.T) {
 	dir := initTestGitRepo(t)
-	agent := &parallelWorkflowAgent{cancelSibling: true}
+	agent := &parallelWorkflowAgent{
+		cancelSibling:       true,
+		cancellationBarrier: true,
+		siblingStarted:      make(chan struct{}),
+		siblingCanceledCh:   make(chan struct{}),
+	}
 	workflow := Workflow{Agent: agent, Config: Config{StateDir: filepath.Join(t.TempDir(), "state"), ParallelImplementation: &ParallelImplementationConfig{Enabled: true, MaxConcurrency: 2}}, In: strings.NewReader(""), Out: ioDiscard{}, Workdir: dir, Stages: []string{"implement"}}
 	if err := workflow.Run("cancel sibling after first failure"); err == nil {
 		t.Fatal("worker failure unexpectedly succeeded")

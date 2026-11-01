@@ -55,56 +55,25 @@ func createMonitorJobRecord(cfg Config, monitor *monitorJob) error {
 	return nil
 }
 
-func syncMonitorJobStatus(dir string, monitor *monitorJob) error {
-	return syncMonitorJob(dir, monitor, false)
-}
-
 func syncMonitorJobEvent(dir string, monitor *monitorJob) error {
 	return syncMonitorJob(dir, monitor, true)
 }
 
 func syncMonitorJob(dir string, monitor *monitorJob, recordEvent bool) error {
 	store, exists, err := monitorJobStore(dir)
-	if err != nil || !exists {
-		return err
-	}
-	job, err := store.GetJob(monitor.ID)
 	if err != nil {
 		return err
 	}
-	status := monitor.Status
-	session, err := store.GetSession(monitor.ID, monitorSessionID)
-	if err != nil {
-		return err
-	}
-	statusChanged := job.Status != status || session.Status != status
-	if !recordEvent && !statusChanged {
-		return nil
-	}
-	message := monitor.LastEvent
-	if message == "" {
-		message = "Monitor status changed to " + status + "."
-	}
-	if recordEvent {
-		if err := store.AppendSessionEvent(monitor.ID, monitorSessionID, "monitor.status", message); err != nil {
+	if !exists {
+		copy := *monitor
+		if err := store.CreateJob(JobRecord{ID: monitor.ID, Type: monitorJobType, TaskDescription: monitor.Description, TargetPath: monitor.RepoRoot, Status: monitor.Status, Monitor: &copy}); err != nil {
+			return err
+		}
+		if _, err := store.CreateSession(monitor.ID, monitorSessionID, monitor.Status); err != nil {
 			return err
 		}
 	}
-	if job.Status != status {
-		if _, err := store.UpdateJob(monitor.ID, func(record *JobRecord) error {
-			record.Status = status
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	if session.Status != status {
-		_, err = store.UpdateSession(monitor.ID, monitorSessionID, func(session *SessionRecord) error {
-			session.Status = status
-			return nil
-		})
-	}
-	return err
+	return store.UpdateMonitorAggregate(monitor, recordEvent)
 }
 
 func storeMonitorSessionRunning(id, dir string) error {
@@ -112,20 +81,17 @@ func storeMonitorSessionRunning(id, dir string) error {
 	if err != nil || !exists {
 		return err
 	}
-	if _, err := store.UpdateJob(id, func(record *JobRecord) error {
-		record.Status = "running"
-		return nil
-	}); err != nil {
-		return err
+	job, err := store.GetJob(id)
+	if err != nil || job.Monitor == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("invalid canonical monitor job record")
 	}
-	_, err = store.UpdateSession(id, monitorSessionID, func(session *SessionRecord) error {
-		session.Status = "running"
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	return store.AppendSessionEvent(id, monitorSessionID, "monitor.started", "Detached PR monitor worker registered.")
+	monitor := job.Monitor
+	monitor.Status = "running"
+	monitor.LastEvent = "Detached PR monitor worker registered."
+	return store.UpdateMonitorAggregate(monitor, true)
 }
 
 func registerMonitorWorkerIfMissing(id, dir string, pid int) error {
@@ -167,6 +133,14 @@ func clearMonitorWorker(id, dir string) error {
 }
 
 func finishMonitorWorkerLockTimeout(root, id string) (bool, error) {
+	store, err := NewJobStore(root)
+	if err != nil {
+		return false, err
+	}
+	return finishMonitorWorkerLockTimeoutWithStore(root, id, store)
+}
+
+func finishMonitorWorkerLockTimeoutWithStore(root, id string, store *JobStore) (bool, error) {
 	dir, err := monitorJobDir(root, id)
 	if err != nil {
 		return false, err
@@ -177,10 +151,6 @@ func finishMonitorWorkerLockTimeout(root, id string) (bool, error) {
 	}
 	defer unlockWorker()
 
-	store, err := NewJobStore(root)
-	if err != nil {
-		return false, err
-	}
 	unlockJob, err := store.LockJob(id)
 	if err != nil {
 		return false, err
@@ -205,41 +175,10 @@ func finishMonitorWorkerLockTimeout(root, id string) (bool, error) {
 	// startup or active work. A live PID may refer to this timed-out worker.
 	message := "Monitor lifetime timeout reached; monitoring stopped."
 	now := time.Now().UTC()
-	setLifecycleTimes(job.Status, "stopped", &job.StartedAt, &job.EndedAt)
-	job.Status, job.UpdatedAt = "stopped", now
-	monitor.Status, monitor.Phase, monitor.UpdatedAt = "stopped", "stopped", now
+	monitor.Status, monitor.Phase = "stopped", "stopped"
+	monitor.LastEvent = message
 	recordMonitorRecentEvent(monitor, monitor.Phase, message, now)
-	session, err := store.GetSession(id, monitorSessionID)
-	if err != nil {
-		return false, err
-	}
-	setLifecycleTimes(session.Status, "stopped", &session.StartedAt, &session.EndedAt)
-	session.Status, session.UpdatedAt = "stopped", now
-	for i := range job.Sessions {
-		if job.Sessions[i].ID == monitorSessionID {
-			job.Sessions[i] = sessionMetadata(session)
-			break
-		}
-	}
-
-	sessionDir, err := store.sessionDir(id, monitorSessionID, false)
-	if err != nil {
-		return false, err
-	}
-	if err := appendLockedMonitorEvent(sessionDir, message, now); err != nil {
-		return false, err
-	}
-	if err := appendLockedMonitorLog(sessionDir, message, now); err != nil {
-		return false, err
-	}
-	if err := writeJSONAtomic(sessionDir, "session.json", session); err != nil {
-		return false, err
-	}
-	jobDir, err := store.jobDir(id, false)
-	if err != nil {
-		return false, err
-	}
-	if err := writeJSONAtomic(jobDir, "job.json", job); err != nil {
+	if err := store.updateMonitorAggregateLocked(monitor, true, true, now); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -341,23 +280,13 @@ func resetMonitorJobRecord(id, root string) error {
 	if err != nil {
 		return err
 	}
-	if job.Status != "recoverable_failure" {
+	if job.Status != "recoverable_failure" || job.Monitor == nil {
 		return nil
 	}
 	if err := store.ClearStopRequest(id); err != nil {
 		return err
 	}
-	if _, err := store.UpdateJob(id, func(record *JobRecord) error {
-		record.Status = "queued"
-		record.EndedAt = time.Time{}
-		return nil
-	}); err != nil {
-		return err
-	}
-	_, err = store.UpdateSession(id, monitorSessionID, func(session *SessionRecord) error {
-		session.Status = "queued"
-		session.EndedAt = time.Time{}
-		return nil
-	})
-	return err
+	monitor := *job.Monitor
+	monitor.Status = "queued"
+	return store.UpdateMonitorAggregate(&monitor, true)
 }

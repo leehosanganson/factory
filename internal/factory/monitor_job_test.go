@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -514,6 +516,182 @@ func TestMonitorHelpListsCanonicalCommandsOnly(t *testing.T) {
 	}
 }
 
+func TestMonitorStatusSyncKeepsCanonicalAggregateCoherentAndRepairsSession(t *testing.T) {
+	state := t.TempDir()
+	root, err := JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewJobStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "20260518T120011-0123456789ab"
+	target := t.TempDir()
+	monitor := &monitorJob{ID: id, RepoRoot: target, Status: "queued"}
+	if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, TargetPath: target, Status: "queued", Monitor: monitor}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateSession(id, monitorSessionID, "queued"); err != nil {
+		t.Fatal(err)
+	}
+
+	mirrorStarted := make(chan struct{})
+	releaseMirror := make(chan struct{})
+	var releaseOnce, mirrorStartedOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseMirror) }) }
+	done := make(chan error, 1)
+	finished := make(chan struct{})
+	t.Cleanup(func() {
+		release()
+		select {
+		case <-finished:
+		case <-time.After(5 * time.Second):
+			t.Error("monitor aggregate update did not finish after releasing session mirror")
+		}
+	})
+	store.writeSessionRecord = func(dir string, session SessionRecord) error {
+		if session.Status == "closed" {
+			mirrorStartedOnce.Do(func() { close(mirrorStarted) })
+			<-releaseMirror
+			return errors.New("injected monitor session mirror failure")
+		}
+		return writeJSONAtomic(dir, "session.json", session)
+	}
+	monitor.Status = "closed"
+	go func() {
+		defer close(finished)
+		done <- store.UpdateMonitorAggregate(monitor, false)
+	}()
+	select {
+	case <-mirrorStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for monitor session mirror hook")
+	}
+	job, err := store.GetJob(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Monitor == nil || job.Monitor.Status != "closed" || job.Status != "closed" || len(job.Sessions) != 1 || job.Sessions[0].Status != "closed" {
+		t.Fatalf("canonical job aggregate during session mirror = %+v; want monitor, job, and embedded session closed", job)
+	}
+	if !job.StartedAt.Equal(job.Sessions[0].StartedAt) || !job.EndedAt.Equal(job.Sessions[0].EndedAt) || !job.UpdatedAt.Equal(job.Monitor.UpdatedAt) {
+		t.Fatalf("canonical lifecycle timestamps diverged: job started/ended/updated=%v/%v/%v embedded=%v/%v monitor updated=%v", job.StartedAt, job.EndedAt, job.UpdatedAt, job.Sessions[0].StartedAt, job.Sessions[0].EndedAt, job.Monitor.UpdatedAt)
+	}
+	release()
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "injected monitor session mirror failure") {
+		t.Fatalf("status sync error = %v, want injected mirror failure", err)
+	}
+	staleSession, err := store.getSessionLocked(id, monitorSessionID)
+	if err != nil || staleSession.Status != "queued" {
+		t.Fatalf("stored session after mirror failure = %+v, err=%v; want stale queued mirror", staleSession, err)
+	}
+	projectedSession, err := store.GetSession(id, monitorSessionID)
+	if err != nil || projectedSession.Status != "closed" {
+		t.Fatalf("session read after mirror failure = %+v, err=%v; want canonical closed status", projectedSession, err)
+	}
+
+	store.writeSessionRecord = nil
+	if err := store.reconcileMonitorSession(id); err != nil {
+		t.Fatalf("repair monitor session from canonical aggregate: %v", err)
+	}
+	job, err = store.GetJob(id)
+	if err != nil || job.Monitor == nil || job.Monitor.Status != "closed" || job.Status != "closed" || job.Sessions[0].Status != "closed" {
+		t.Fatalf("canonical job aggregate after repair = %+v, err=%v", job, err)
+	}
+	session, err := store.getSessionLocked(id, monitorSessionID)
+	if err != nil || session.Status != "closed" || !session.StartedAt.Equal(job.StartedAt) || !session.EndedAt.Equal(job.EndedAt) {
+		t.Fatalf("repaired session = %+v, job = %+v, err=%v; want matching status and lifecycle timestamps", session, job, err)
+	}
+}
+
+func TestMonitorWorkerLockTimeoutUsesCanonicalAggregateCommit(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		failJobWrite    bool
+		failSessionCopy bool
+	}{
+		{name: "session mirror failure", failSessionCopy: true},
+		{name: "job write failure", failJobWrite: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			store, err := NewJobStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const id = "20260518T120012-2123456789ab"
+			monitor := &monitorJob{ID: id, Status: "queued", Phase: "queued", DeadlineAt: time.Now().UTC().Add(-time.Second)}
+			if err := store.CreateJob(JobRecord{ID: id, Type: monitorJobType, Status: "queued", Monitor: monitor}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.CreateSession(id, monitorSessionID, "queued"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.failJobWrite {
+				store.writeJobRecord = func(string, JobRecord) error { return errors.New("injected monitor job write failure") }
+			}
+			if tc.failSessionCopy {
+				store.writeSessionRecord = func(string, SessionRecord) error { return errors.New("injected monitor session mirror failure") }
+			}
+
+			finished, err := finishMonitorWorkerLockTimeoutWithStore(root, id, store)
+			if finished || err == nil {
+				t.Fatalf("timeout transition finished=%v err=%v; want failed persistence without completion", finished, err)
+			}
+			if tc.failJobWrite {
+				if !strings.Contains(err.Error(), "injected monitor job write failure") {
+					t.Fatalf("timeout error = %v; want injected canonical write failure", err)
+				}
+				job, readErr := store.GetJob(id)
+				if readErr != nil || job.Status != "queued" || job.Monitor.Status != "queued" || job.Sessions[0].Status != "queued" {
+					t.Fatalf("canonical aggregate after failed job write = %+v, err=%v; want unchanged queued aggregate", job, readErr)
+				}
+				session, readErr := store.getSessionLocked(id, monitorSessionID)
+				if readErr != nil || session.Status != "queued" {
+					t.Fatalf("session after failed job write = %+v, err=%v; want queued mirror", session, readErr)
+				}
+				events, readErr := store.SessionEvents(id, monitorSessionID)
+				if readErr != nil || len(events) != 1 || !strings.Contains(events[0].Message, "Monitor lifetime timeout reached") {
+					t.Fatalf("events after failed job write = %+v, err=%v; want append-first timeout event", events, readErr)
+				}
+				log, readErr := os.ReadFile(filepath.Join(root, id, "sessions", monitorSessionID, "session.log"))
+				if readErr != nil || !strings.Contains(string(log), "Monitor lifetime timeout reached") {
+					t.Fatalf("log after failed job write = %q, err=%v; want append-first timeout log entry", log, readErr)
+				}
+				return
+			}
+
+			if !strings.Contains(err.Error(), "injected monitor session mirror failure") {
+				t.Fatalf("timeout error = %v; want injected session mirror failure", err)
+			}
+			job, readErr := store.GetJob(id)
+			if readErr != nil || job.Status != "stopped" || job.Monitor.Status != "stopped" || job.Sessions[0].Status != "stopped" {
+				t.Fatalf("canonical aggregate after mirror failure = %+v, err=%v; want stopped aggregate", job, readErr)
+			}
+			if !job.StartedAt.Equal(job.Sessions[0].StartedAt) || !job.EndedAt.Equal(job.Sessions[0].EndedAt) || !job.UpdatedAt.Equal(job.Monitor.UpdatedAt) {
+				t.Fatalf("timeout lifecycle timestamps diverged: job=%+v monitor=%+v", job, job.Monitor)
+			}
+			events, readErr := store.SessionEvents(id, monitorSessionID)
+			if readErr != nil || len(events) != 1 || !events[0].At.Equal(job.UpdatedAt) || !strings.Contains(events[0].Message, "Monitor lifetime timeout reached") {
+				t.Fatalf("timeout lifecycle events = %+v, err=%v; want one event at the canonical lifecycle timestamp", events, readErr)
+			}
+			projected, readErr := store.GetSession(id, monitorSessionID)
+			if readErr != nil || projected.Status != "stopped" || !projected.EndedAt.Equal(job.EndedAt) {
+				t.Fatalf("GetSession after mirror failure = %+v, err=%v; want canonical stopped projection", projected, readErr)
+			}
+			store.writeSessionRecord = nil
+			if err := store.reconcileMonitorSession(id); err != nil {
+				t.Fatalf("reconcile session mirror from timeout aggregate: %v", err)
+			}
+			repaired, readErr := store.getSessionLocked(id, monitorSessionID)
+			if readErr != nil || repaired.Status != "stopped" || !repaired.EndedAt.Equal(job.EndedAt) {
+				t.Fatalf("reconciled timeout session = %+v, err=%v; want canonical stopped lifecycle", repaired, readErr)
+			}
+		})
+	}
+}
+
 func TestMonitorStatusSyncWritesCanonicalLifecycleStatusToJobAndSession(t *testing.T) {
 	state := t.TempDir()
 	root, err := JobStateRoot(state)
@@ -537,16 +715,19 @@ func TestMonitorStatusSyncWritesCanonicalLifecycleStatusToJobAndSession(t *testi
 	for _, status := range []string{"running", "recoverable_failure", "complete", "closed", "stopped", "failed", "interrupted"} {
 		t.Run(status, func(t *testing.T) {
 			monitor.Status = status
-			if err := syncMonitorJobStatus(dir, monitor); err != nil {
+			if err := syncMonitorJob(dir, monitor, false); err != nil {
 				t.Fatal(err)
 			}
 			job, err := store.GetJob(id)
 			if err != nil || job.Status != status {
 				t.Fatalf("job status = %q, err=%v; want exact monitor status %q", job.Status, err, status)
 			}
-			session, err := store.GetSession(id, monitorSessionID)
+			session, err := store.getSessionLocked(id, monitorSessionID)
 			if err != nil || session.Status != status {
 				t.Fatalf("session status = %q, err=%v; want exact monitor status %q", session.Status, err, status)
+			}
+			if !job.StartedAt.Equal(session.StartedAt) || !job.EndedAt.Equal(session.EndedAt) {
+				t.Fatalf("job lifecycle timestamps = %v/%v, session timestamps = %v/%v; want alignment for status %q", job.StartedAt, job.EndedAt, session.StartedAt, session.EndedAt, status)
 			}
 		})
 	}

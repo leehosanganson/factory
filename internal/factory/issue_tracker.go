@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 var (
@@ -28,21 +30,7 @@ var (
 // Repository is a provider-specific repository locator such as "owner/repo";
 // issue is the provider's issue reference. Implementations must not modify issues.
 type IssueTracker interface {
-	GetIssue(context.Context, string, string) (IssueSnapshot, error)
-}
-
-// IssueSnapshot is a provider-neutral view of issue content and state. Version
-// is a stable SHA-256 fingerprint of the normalized snapshot and changes when
-// any exposed issue field changes. UpdatedAt is the provider's last-update time.
-type IssueSnapshot struct {
-	Repository string    `json:"repository"`
-	Number     int       `json:"number"`
-	Title      string    `json:"title"`
-	Body       string    `json:"body"`
-	State      string    `json:"state"`
-	URL        string    `json:"url"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	Version    string    `json:"version"`
+	GetIssue(context.Context, string, string) (issuepkg.IssueSnapshot, error)
 }
 
 type githubIssueCommand func(context.Context, ...string) ([]byte, error)
@@ -65,28 +53,28 @@ func newGitHubIssueTracker(run githubIssueCommand) *GitHubIssueTracker {
 	return &GitHubIssueTracker{run: run}
 }
 
-func (t *GitHubIssueTracker) GetIssue(ctx context.Context, repository, issue string) (IssueSnapshot, error) {
+func (t *GitHubIssueTracker) GetIssue(ctx context.Context, repository, issue string) (issuepkg.IssueSnapshot, error) {
 	if ctx == nil {
-		return IssueSnapshot{}, errors.New("issue tracker context must not be nil")
+		return issuepkg.IssueSnapshot{}, errors.New("issue tracker context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
-		return IssueSnapshot{}, err
+		return issuepkg.IssueSnapshot{}, err
 	}
 	if err := validateGitHubRepository(repository); err != nil {
-		return IssueSnapshot{}, err
+		return issuepkg.IssueSnapshot{}, err
 	}
 	number, err := validateGitHubIssueNumber(issue)
 	if err != nil {
-		return IssueSnapshot{}, err
+		return issuepkg.IssueSnapshot{}, err
 	}
 	if t == nil || t.run == nil {
-		return IssueSnapshot{}, errors.New("GitHub issue tracker command is unavailable")
+		return issuepkg.IssueSnapshot{}, errors.New("GitHub issue tracker command is unavailable")
 	}
 
 	endpoint := "repos/" + repository + "/issues/" + issue
 	data, err := t.run(ctx, "api", "--method", "GET", endpoint)
 	if err != nil {
-		return IssueSnapshot{}, fmt.Errorf("read GitHub issue %s#%s: %w", repository, issue, err)
+		return issuepkg.IssueSnapshot{}, fmt.Errorf("read GitHub issue %s#%s: %w", repository, issue, err)
 	}
 	var response struct {
 		ID          int64           `json:"id"`
@@ -99,21 +87,21 @@ func (t *GitHubIssueTracker) GetIssue(ctx context.Context, repository, issue str
 		PullRequest json.RawMessage `json:"pull_request"`
 	}
 	if err := json.Unmarshal(data, &response); err != nil {
-		return IssueSnapshot{}, fmt.Errorf("invalid GitHub issue JSON: %w", err)
+		return issuepkg.IssueSnapshot{}, fmt.Errorf("invalid GitHub issue JSON: %w", err)
 	}
 	if len(response.PullRequest) != 0 && !bytes.Equal(bytes.TrimSpace(response.PullRequest), []byte("null")) {
-		return IssueSnapshot{}, fmt.Errorf("GitHub reference %s#%s: %w", repository, issue, ErrNotIssue)
+		return issuepkg.IssueSnapshot{}, fmt.Errorf("GitHub reference %s#%s: %w", repository, issue, ErrNotIssue)
 	}
 	state := strings.ToLower(response.State)
 	if response.ID <= 0 || response.Number != number || response.Title == "" || response.URL == "" || response.UpdatedAt.IsZero() || (state != "open" && state != "closed") {
-		return IssueSnapshot{}, errors.New("GitHub issue response is incomplete or has an unexpected identity")
+		return issuepkg.IssueSnapshot{}, errors.New("GitHub issue response is incomplete or has an unexpected identity")
 	}
 	parsedURL, err := url.Parse(response.URL)
 	wantPath := "/" + repository + "/issues/" + issue
 	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil || parsedURL.Path != wantPath || parsedURL.RawQuery != "" || parsedURL.Fragment != "" {
-		return IssueSnapshot{}, errors.New("GitHub issue response contains an invalid URL")
+		return issuepkg.IssueSnapshot{}, errors.New("GitHub issue response contains an invalid URL")
 	}
-	snapshot := IssueSnapshot{
+	snapshot := issuepkg.IssueSnapshot{
 		Repository: repository,
 		Number:     response.Number,
 		Title:      response.Title,
@@ -124,7 +112,7 @@ func (t *GitHubIssueTracker) GetIssue(ctx context.Context, repository, issue str
 	}
 	versionInput, err := json.Marshal(snapshot)
 	if err != nil {
-		return IssueSnapshot{}, fmt.Errorf("fingerprint GitHub issue: %w", err)
+		return issuepkg.IssueSnapshot{}, fmt.Errorf("fingerprint GitHub issue: %w", err)
 	}
 	fingerprint := sha256.Sum256(versionInput)
 	snapshot.Version = hex.EncodeToString(fingerprint[:])

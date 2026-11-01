@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 const (
@@ -25,9 +27,9 @@ const (
 
 // IssueObservation is one immutable, durable snapshot associated with a work request.
 type IssueObservation struct {
-	DeduplicationKey string        `json:"deduplication_key"`
-	Snapshot         IssueSnapshot `json:"snapshot"`
-	ObservedAt       time.Time     `json:"observed_at"`
+	DeduplicationKey string                 `json:"deduplication_key"`
+	Snapshot         issuepkg.IssueSnapshot `json:"snapshot"`
+	ObservedAt       time.Time              `json:"observed_at"`
 }
 
 // HumanDirection is an immutable instruction pinned to one issue snapshot version.
@@ -40,7 +42,7 @@ type HumanDirection struct {
 
 // IssueObservationStore persists issue observations, reconciled lifecycle, and version-pinned human directions.
 type IssueObservationStore interface {
-	Record(context.Context, string, IssueSnapshot) (bool, error)
+	Record(context.Context, string, issuepkg.IssueSnapshot) (bool, error)
 	List(context.Context, string) ([]IssueObservation, error)
 	Reconcile(context.Context, string) (IssueLifecycleState, error)
 	RecordDirection(context.Context, string, string, string) (HumanDirection, bool, error)
@@ -109,7 +111,7 @@ func NewLocalIssueObservationStore(root string) (*LocalIssueObservationStore, er
 	return &LocalIssueObservationStore{root: root}, nil
 }
 
-func (s *LocalIssueObservationStore) Record(ctx context.Context, deduplicationKey string, snapshot IssueSnapshot) (bool, error) {
+func (s *LocalIssueObservationStore) Record(ctx context.Context, deduplicationKey string, snapshot issuepkg.IssueSnapshot) (bool, error) {
 	if err := validateWorkDeduplicationKey(deduplicationKey); err != nil {
 		return false, err
 	}
@@ -572,7 +574,7 @@ func readIssueLifecycleRecord(path string) (issueLifecycleRecord, error) {
 	return record, nil
 }
 
-func sameIssueSnapshot(a, b IssueSnapshot) bool {
+func sameIssueSnapshot(a, b issuepkg.IssueSnapshot) bool {
 	return a.Repository == b.Repository && a.Number == b.Number && a.Title == b.Title && a.Body == b.Body &&
 		a.State == b.State && a.URL == b.URL && a.UpdatedAt.Equal(b.UpdatedAt) && a.Version == b.Version
 }

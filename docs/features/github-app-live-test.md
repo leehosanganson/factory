@@ -1,6 +1,6 @@
 # Manual GitHub App live-provider test
 
-This is an **opt-in validation harness**, not a production credential feature. It uses the existing `internal/restprovider.GitHubPublisher` against one disposable GitHub repository. Default CI does not invoke it, and there is no push, pull-request, or scheduled trigger. Live execution remains unverified until the dedicated installation and sandbox repository are provisioned through issue #134 and the manual workflow succeeds.
+This is an **opt-in validation harness**, not a production credential feature. It uses the existing `internal/rest/provider.GitHubPublisher` against one disposable GitHub repository. Default CI does not invoke it, and there is no push, pull-request, or scheduled trigger. Live execution remains unverified until the dedicated installation and sandbox repository are provisioned through issue #134 and the manual workflow succeeds.
 
 ## Provisioning gate
 

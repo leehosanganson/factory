@@ -1,6 +1,7 @@
 package factory
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -111,6 +112,56 @@ func TestDetachedJobCapacityIsAtomicAcrossCLIProcessesAndReleasedAtTerminal(t *t
 		}
 		return false
 	})
+
+	jobs, err = store.ListJobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstJob, secondJob JobRecord
+	for _, job := range jobs {
+		if job.TaskDescription == "capacity after terminal release" {
+			secondJob = job
+		} else {
+			firstJob = job
+		}
+	}
+	if firstJob.ID == "" || secondJob.ID == "" {
+		t.Fatalf("completed initial and follow-up jobs not found: %+v", jobs)
+	}
+	waitForDetachedJobWorkerCleanup(t, store, firstJob)
+	waitForDetachedJobWorkerCleanup(t, store, secondJob)
+}
+
+func waitForDetachedJobWorkerCleanup(t *testing.T, store *JobStore, job JobRecord) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	workerAbsent := false
+	lockAvailable := false
+	for time.Now().Before(deadline) {
+		_, err := store.ReadWorker(job.ID)
+		switch {
+		case err == nil:
+			workerAbsent = false
+		case errors.Is(err, os.ErrNotExist):
+			workerAbsent = true
+		default:
+			t.Fatalf("read worker record for job %s (target %q): %v", job.ID, job.TargetPath, err)
+		}
+
+		unlock, acquired, err := store.TryLockTarget(job.TargetPath)
+		if err != nil {
+			t.Fatalf("try target lock for job %s (target %q): %v", job.ID, job.TargetPath, err)
+		}
+		lockAvailable = acquired
+		if acquired {
+			unlock()
+		}
+		if workerAbsent && lockAvailable {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("worker cleanup timed out for job %s (target %q): worker_absent=%t target_lock_available=%t", job.ID, job.TargetPath, workerAbsent, lockAvailable)
 }
 
 func capacityTestTarget(t *testing.T) string {

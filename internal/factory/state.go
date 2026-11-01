@@ -1,7 +1,6 @@
 package factory
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -128,9 +127,5 @@ func createRun(root, workdir, task string) (string, *State, error) {
 
 func writeState(dir string, state *State) error {
 	state.UpdatedAt = time.Now().UTC()
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(dir, "state.json"), append(data, '\n'), 0o600)
+	return writeJSONAtomic(dir, "state.json", state)
 }
