@@ -47,6 +47,27 @@ func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		writeWorkerJSON(w, http.StatusNotFound, map[string]string{"code": "not_found"})
 		return
 	}
+	if r.URL.Path == "/v1/worker/session" && (r.Method == http.MethodGet || r.Method == http.MethodDelete) {
+		if r.URL.RawQuery != "" {
+			writeWorkerJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request"})
+			return
+		}
+		session, ok := h.requireCapability(w, r)
+		if !ok {
+			return
+		}
+		if r.Method == http.MethodGet {
+			writeWorkerJSON(w, http.StatusOK, session)
+			return
+		}
+		retired, err := h.store.RetireWorkerCapability(r.Context(), session.PrincipalID, bearerCapability(r))
+		if err != nil {
+			writeWorkerError(w, err)
+			return
+		}
+		writeWorkerJSON(w, http.StatusOK, retired)
+		return
+	}
 	if r.URL.Path == "/healthz" && r.Method == http.MethodGet {
 		writeWorkerJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
@@ -143,6 +164,32 @@ func (h *WorkerListenerHandler) logAuthentication(succeeded bool) {
 		outcome = "succeeded"
 	}
 	h.logger.Printf("worker identity authentication %s", outcome)
+}
+
+func bearerCapability(r *http.Request) string {
+	parts := strings.Split(r.Header.Get("Authorization"), " ")
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" || strings.TrimSpace(parts[1]) != parts[1] {
+		return ""
+	}
+	return parts[1]
+}
+
+func (h *WorkerListenerHandler) requireCapability(w http.ResponseWriter, r *http.Request) (restjobs.WorkerSession, bool) {
+	principal, ok := h.certificatePrincipal(r)
+	capability := bearerCapability(r)
+	if !ok || capability == "" {
+		h.logAuthentication(false)
+		writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
+		return restjobs.WorkerSession{}, false
+	}
+	session, err := h.store.AuthenticateWorkerCapability(r.Context(), principal, capability)
+	if err != nil {
+		h.logAuthentication(false)
+		writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
+		return restjobs.WorkerSession{}, false
+	}
+	h.logAuthentication(true)
+	return session, true
 }
 
 func (h *WorkerListenerHandler) certificatePrincipal(r *http.Request) (string, bool) {
