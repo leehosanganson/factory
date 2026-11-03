@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       run_full: ${{ steps.changes.outputs.run_full }}
+      run_macos: ${{ steps.changes.outputs.run_macos }}
     steps:
       - name: Check out repository history
         uses: actions/checkout@v4
@@ -40,15 +41,37 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: .github/workflows/check-commit-attribution.sh "$BASE_SHA" "$HEAD_SHA"
 
-  build:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  linux-build:
+    name: Linux build, test, and vet
+    runs-on: ubuntu-latest
     needs: [classify]
     if: always() && needs.classify.outputs.run_full != 'false'
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.3'
+
+      - name: Check Go formatting
+        run: test -z "$(find cmd internal -name '*.go' -type f -print0 | xargs -0 gofmt -l)"
+
+      - name: Build
+        run: make build
+
+      - name: Test
+        run: make test
+
+      - name: Vet
+        run: make vet
+
+  macos-build:
+    name: macOS build, test, and vet
+    runs-on: macos-latest
+    needs: [classify]
+    if: always() && needs.classify.outputs.run_macos != 'false'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -123,7 +146,8 @@ jobs:
     needs:
       - classify
       - commit-attribution
-      - build
+      - linux-build
+      - macos-build
       - container-image
       - postgres-store-integration
     steps:
@@ -131,19 +155,10 @@ jobs:
         env:
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           RUN_FULL: ${{ needs.classify.outputs.run_full }}
+          RUN_MACOS: ${{ needs.classify.outputs.run_macos }}
           ATTRIBUTION_RESULT: ${{ needs.commit-attribution.result }}
-          BUILD_RESULT: ${{ needs.build.result }}
+          BUILD_RESULT: ${{ needs.linux-build.result }}
+          MACOS_RESULT: ${{ needs.macos-build.result }}
           IMAGE_RESULT: ${{ needs.container-image.result }}
           POSTGRES_RESULT: ${{ needs.postgres-store-integration.result }}
-        run: |
-          test "$CLASSIFY_RESULT" = success
-          test "$ATTRIBUTION_RESULT" = success
-          if [ "$RUN_FULL" = false ]; then
-            test "$BUILD_RESULT" = skipped
-            test "$IMAGE_RESULT" = skipped
-            test "$POSTGRES_RESULT" = skipped
-          else
-            test "$BUILD_RESULT" = success
-            test "$IMAGE_RESULT" = success
-            test "$POSTGRES_RESULT" = success
-          fi
+        run: .github/workflows/validate-ci-results.sh
