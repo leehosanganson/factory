@@ -50,6 +50,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Test CI change classifier
+        run: .github/workflows/test-ci-change-classifier.sh
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:

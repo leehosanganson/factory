@@ -66,9 +66,52 @@ assert_path compose-only docker-compose.custom.yml true false
 assert_path go-source internal/factory/change.go true true
 assert_path go-test internal/factory/change_test.go true true
 assert_path module-change go.mod true true
-assert_path workflow-change .github/workflows/ci.yml true true
+assert_path workflow-change .github/workflows/ci.yml true false
+assert_path classifier-change .github/workflows/classify-ci-changes.sh true false
+assert_path classifier-test-change .github/workflows/test-ci-change-classifier.sh true false
+assert_path validator-change .github/workflows/validate-ci-results.sh true false
 assert_path makefile-change Makefile true true
 assert_path unknown-path new-tool-config true true
+
+new_repo all-ci-helpers
+for path in \
+  .github/workflows/ci.yml \
+  .github/workflows/classify-ci-changes.sh \
+  .github/workflows/test-ci-change-classifier.sh \
+  .github/workflows/validate-ci-results.sh; do
+  mkdir -p "$(dirname "$TEST_REPO/$path")"
+  printf 'change\n' > "$TEST_REPO/$path"
+done
+git -C "$TEST_REPO" add --all
+git -C "$TEST_REPO" commit -qm 'change approved CI helpers'
+classify true false
+
+new_repo ci-helper-plus-readme
+add_and_commit .github/workflows/ci.yml
+printf 'documentation change\n' >> "$TEST_REPO/README.md"
+git -C "$TEST_REPO" add README.md
+git -C "$TEST_REPO" commit -qm 'mix CI helper and README'
+classify true true
+
+new_repo ci-helper-plus-docs
+add_and_commit .github/workflows/ci.yml
+mkdir -p "$TEST_REPO/docs"
+printf 'documentation change\n' > "$TEST_REPO/docs/guide.md"
+git -C "$TEST_REPO" add docs/guide.md
+git -C "$TEST_REPO" commit -qm 'mix CI helper and docs'
+classify true true
+
+new_repo ci-helper-plus-go
+add_and_commit .github/workflows/ci.yml
+mkdir -p "$TEST_REPO/internal"
+printf 'code change\n' > "$TEST_REPO/internal/change.go"
+git -C "$TEST_REPO" add internal/change.go
+git -C "$TEST_REPO" commit -qm 'mix CI helper and Go'
+classify true true
+
+assert_path other-workflow .github/workflows/release.yml true true
+assert_path other-script .github/workflows/new-helper.sh true true
+assert_path ci-test-doc .github/workflows/README.md true true
 
 new_repo mixed-docker-and-go
 add_and_commit Dockerfile
@@ -183,6 +226,7 @@ for required in \
   "if: always() && needs.classify.outputs.run_full != 'false'" \
   "if: always() && needs.classify.outputs.run_macos != 'false'" \
   '  linux-build:' \
+  'run: .github/workflows/test-ci-change-classifier.sh' \
   '  macos-build:' \
   '  ci-result:' \
   '    name: CI result' \

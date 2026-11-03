@@ -36,6 +36,7 @@ fi
 has_changes=false
 all_docs_only=true
 all_docker_only=true
+all_ci_only=true
 while IFS= read -r -d '' path; do
   has_changes=true
   if [[ $path != README.md && $path != docs/* ]]; then
@@ -44,11 +45,21 @@ while IFS= read -r -d '' path; do
   if [[ $path == *$'\n'* || $path == *$'\t'* || ($path != Dockerfile && $path != docker-compose*.yml) ]]; then
     all_docker_only=false
   fi
+  case $path in
+    .github/workflows/ci.yml|\
+    .github/workflows/classify-ci-changes.sh|\
+    .github/workflows/test-ci-change-classifier.sh|\
+    .github/workflows/validate-ci-results.sh)
+      ;;
+    *)
+      all_ci_only=false
+      ;;
+  esac
 done < "$changed_paths"
 
 # An empty diff is not evidence that either platform's checks can be skipped.
 if [[ $has_changes == true && $all_docs_only == true ]]; then
   printf 'run_full=false\nrun_macos=false\n' >> "$output"
-elif [[ $has_changes == true && $all_docker_only == true ]]; then
+elif [[ $has_changes == true && ( $all_docker_only == true || $all_ci_only == true ) ]]; then
   printf 'run_macos=false\n' >> "$output"
 fi
