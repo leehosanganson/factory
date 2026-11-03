@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/leehosanganson/factory/internal/workflow"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,11 +18,11 @@ import (
 // WorkCommand manages locally queued issue work requests. Issue snapshots are
 // fetched only by explicit issue, refresh, and foreground watch subcommands; no command starts engineering.
 func WorkCommand(ctx context.Context, args []string, cfg Config, out io.Writer) error {
-	return WorkCommandWithIssueTracker(ctx, args, cfg, out, NewGitHubIssueTracker())
+	return WorkCommandWithIssueTracker(ctx, args, cfg, out, issuepkg.NewGitHubIssueTracker())
 }
 
 // WorkCommandWithIssueTracker makes the read-only issue lookup dependency explicit.
-func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config, out io.Writer, tracker IssueTracker) (result error) {
+func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config, out io.Writer, tracker issuepkg.IssueTracker) (result error) {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: factory work submit --tracker <provider> --issue <issue-ref> --code-host <provider> --repository <repo> [--dedup-key <key>] | list | get <dedup-key> | issue <dedup-key> | refresh <dedup-key> | history <dedup-key> | watch <dedup-key> [--interval <duration>] | respond <dedup-key> --version <issue-version> --instruction <text> | directions <dedup-key>")
 	}
@@ -108,7 +109,7 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 		} else {
 			fmt.Fprintln(out, "Direction: already recorded")
 		}
-		fmt.Fprintf(out, "Issue version: %s\nInstruction: %s\n", sanitizeProgressLine(direction.IssueVersion), sanitizeHumanDirection(direction.Instruction))
+		fmt.Fprintf(out, "Issue version: %s\nInstruction: %s\n", workflow.SanitizeProgressLine(direction.IssueVersion), workflow.SanitizeHumanDirection(direction.Instruction))
 		fmt.Fprintln(out, "No lifecycle, queue, or engineering action was taken.")
 		return nil
 	case "directions":
@@ -135,7 +136,7 @@ func WorkCommandWithIssueTracker(ctx context.Context, args []string, cfg Config,
 			return nil
 		}
 		for _, direction := range directions {
-			fmt.Fprintf(out, "Issue version: %s\nRecorded: %s\nInstruction: %s\n", sanitizeProgressLine(direction.IssueVersion), direction.RecordedAt.UTC().Format(time.RFC3339Nano), sanitizeHumanDirection(direction.Instruction))
+			fmt.Fprintf(out, "Issue version: %s\nRecorded: %s\nInstruction: %s\n", workflow.SanitizeProgressLine(direction.IssueVersion), direction.RecordedAt.UTC().Format(time.RFC3339Nano), workflow.SanitizeHumanDirection(direction.Instruction))
 		}
 		return nil
 	case "get", "issue", "refresh", "history", "watch":
@@ -344,5 +345,5 @@ func printWorkItem(out io.Writer, item WorkItem) {
 
 func printIssueSnapshot(out io.Writer, snapshot issuepkg.IssueSnapshot) {
 	fmt.Fprintf(out, "Issue snapshot:\nTitle: %s\nState: %s\nUpdated: %s\nVersion: %s\nURL: %s\n",
-		sanitizeProgressLine(snapshot.Title), snapshot.State, snapshot.UpdatedAt.UTC().Format(time.RFC3339Nano), snapshot.Version, snapshot.URL)
+		workflow.SanitizeProgressLine(snapshot.Title), snapshot.State, snapshot.UpdatedAt.UTC().Format(time.RFC3339Nano), snapshot.Version, snapshot.URL)
 }

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	restjobs "github.com/leehosanganson/factory/internal/rest/jobs"
+	restjobs "github.com/leehosanganson/factory/internal/jobs"
 )
 
 func TestOperatorCommandRejectsMalformedOrUnboundedOptionsBeforeStoreAccess(t *testing.T) {

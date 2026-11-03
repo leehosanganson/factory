@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/leehosanganson/factory/internal/issue"
 )
 
 // CodeRepository reads pull request state from a repository provider. It is
@@ -66,7 +68,7 @@ func (h *GitHubCodeRepository) GetPullRequest(ctx context.Context, repository st
 	if err := ctx.Err(); err != nil {
 		return PullRequestSnapshot{}, err
 	}
-	if err := validateGitHubRepository(repository); err != nil {
+	if err := issue.ValidateGitHubRepository(repository); err != nil {
 		return PullRequestSnapshot{}, err
 	}
 	if number <= 0 {

@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/leehosanganson/factory/internal/workflow"
 )
 
 const (
@@ -147,7 +149,7 @@ func (o JobSessionObserver) ObserveWorkflowEvent(event WorkflowEvent) error {
 		if event.Type == "status.completed" && len(fields) > 1 {
 			record.Outcome = strings.TrimPrefix(fields[1], "outcome=")
 			if record.Outcome == "success" {
-				record.Summary = sanitizeSecondaryStatus(strings.TrimPrefix(strings.Join(fields[2:], " "), "summary="))
+				record.Summary = workflow.SanitizeSecondaryStatus(strings.TrimPrefix(strings.Join(fields[2:], " "), "summary="))
 			}
 		}
 	}

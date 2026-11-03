@@ -1,8 +1,6 @@
 package factory
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -113,40 +111,5 @@ func (o statusJobObserver) ObserveWorkflowEvent(event WorkflowEvent) error {
 	if strings.HasPrefix(event.Type, "agent.") {
 		return nil
 	}
-	if strings.HasPrefix(event.Type, "status.") {
-		fields := strings.Fields(event.Message)
-		if len(fields) > 0 && strings.HasPrefix(fields[0], "stage=") {
-			fields = fields[1:]
-		}
-		record := SessionEvent{Type: event.Type, Message: event.Message, Outcome: event.Outcome}
-		if event.Type == "status.started" {
-			record.Invocation = strings.TrimPrefix(event.Message, "stage=")
-			if len(fields) > 0 {
-				record.Invocation = fields[len(fields)-1]
-			}
-		} else if len(fields) > 0 {
-			record.Invocation = fields[0]
-		}
-		if event.Type == "status.completed" && len(fields) > 1 {
-			record.Outcome = strings.TrimPrefix(fields[1], "outcome=")
-			if record.Outcome == "success" {
-				record.Summary = sanitizeSecondaryStatus(strings.TrimPrefix(strings.Join(fields[2:], " "), "summary="))
-			}
-		}
-		return o.store.AppendSessionEventDetails(o.jobID, o.sessionID, record)
-	}
 	return o.JobSessionObserver.ObserveWorkflowEvent(event)
-}
-
-func classifyStatusOutcome(ctx context.Context, err error) string {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "timeout"
-	}
-	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-		return "canceled"
-	}
-	if err != nil {
-		return "error"
-	}
-	return "success"
 }

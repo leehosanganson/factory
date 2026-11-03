@@ -15,9 +15,9 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/leehosanganson/factory/internal/rest/api"
-	"github.com/leehosanganson/factory/internal/rest/jobs"
-	"github.com/leehosanganson/factory/internal/rest/server"
+	"github.com/leehosanganson/factory/internal/api"
+	"github.com/leehosanganson/factory/internal/jobs"
+	"github.com/leehosanganson/factory/internal/server"
 )
 
 func TestRESTUnknownCommandIsDiagnosedBeforeOptionParsing(t *testing.T) {

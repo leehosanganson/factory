@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leehosanganson/factory/internal/rest/api"
-	"github.com/leehosanganson/factory/internal/rest/client"
-	"github.com/leehosanganson/factory/internal/rest/jobs"
-	"github.com/leehosanganson/factory/internal/rest/server"
+	"github.com/leehosanganson/factory/internal/api"
+	"github.com/leehosanganson/factory/internal/client"
+	"github.com/leehosanganson/factory/internal/jobs"
+	"github.com/leehosanganson/factory/internal/server"
 
 	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )

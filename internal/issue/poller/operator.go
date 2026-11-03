@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/leehosanganson/factory/internal/rest/jobs"
+	"github.com/leehosanganson/factory/internal/jobs"
 )
 
 func parseOperatorListLimit(value string) (int, error) {

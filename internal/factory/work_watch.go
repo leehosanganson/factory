@@ -6,6 +6,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"github.com/leehosanganson/factory/internal/issue"
 )
 
 const defaultWorkWatchInterval = time.Minute
@@ -31,7 +33,7 @@ func parseWorkWatch(args []string) (string, time.Duration, error) {
 	return key, parsed, nil
 }
 
-func watchIssue(ctx context.Context, item WorkItem, tracker IssueTracker, store IssueObservationStore, interval time.Duration, out io.Writer, wait workWatchWait) error {
+func watchIssue(ctx context.Context, item WorkItem, tracker issue.IssueTracker, store IssueObservationStore, interval time.Duration, out io.Writer, wait workWatchWait) error {
 	if tracker == nil {
 		return fmt.Errorf("watch issue: issue tracker is unavailable")
 	}

@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/leehosanganson/factory/internal/workflow"
 )
 
 type workflowActivityEvent struct {
@@ -47,7 +49,7 @@ func readWorkflowActivityEvents(path string) []workflowActivityEvent {
 		return nil
 	}
 	for scanner.Scan() {
-		var event workflowEventRecord
+		var event workflow.WorkflowEventRecord
 		if err := json.Unmarshal(scanner.Bytes(), &event); err == nil {
 			events = append(events, workflowActivityEvent{Type: event.Type, Stage: event.Stage, Message: event.Message})
 		}
@@ -87,14 +89,7 @@ func stageProgressFallback(stage string) string {
 	return "Workflow in progress"
 }
 
-func validWorkflowStage(stage string) bool {
-	for _, candidate := range workflowStages {
-		if stage == candidate {
-			return true
-		}
-	}
-	return false
-}
+func validWorkflowStage(stage string) bool { return workflow.IsWorkflowStage(stage) }
 
 func workflowStatusSummary(message string) string {
 	fields := strings.Fields(message)

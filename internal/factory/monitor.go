@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/leehosanganson/factory/internal/workflow"
 	"io"
 	"net/url"
 	"os"
@@ -543,7 +544,7 @@ func workerFresh(job monitorJob) bool {
 }
 
 func monitorID() (string, error) {
-	return newUUIDv4()
+	return workflow.NewUUIDv4()
 }
 
 type lockOwner struct {
@@ -1065,7 +1066,7 @@ func runMonitorWorker(id, root string, cfg Config) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
-	monitorTimeout, err := cfg.monitorTimeout()
+	monitorTimeout, err := cfg.MonitorTimeoutDuration()
 	if err != nil {
 		return err
 	}
@@ -1630,7 +1631,7 @@ func processMonitorEventContext(ctx context.Context, dir string, job *monitorJob
 		return err
 	}
 	logPath := filepath.Join(dir, "agent.log")
-	agentTimeout, err := cfg.agentTimeout()
+	agentTimeout, err := cfg.AgentTimeoutDuration()
 	if err != nil {
 		return err
 	}

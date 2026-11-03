@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leehosanganson/factory/internal/rest/api"
-	"github.com/leehosanganson/factory/internal/rest/jobs"
-	"github.com/leehosanganson/factory/internal/rest/server"
-	"github.com/leehosanganson/factory/internal/rest/worker"
+	"github.com/leehosanganson/factory/internal/api"
+	"github.com/leehosanganson/factory/internal/jobs"
+	"github.com/leehosanganson/factory/internal/server"
+	"github.com/leehosanganson/factory/internal/worker"
 )
 
 const watchPrivateTask = "WATCH_PRIVATE_TASK /private/watch/task"

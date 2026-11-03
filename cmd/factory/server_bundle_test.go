@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leehosanganson/factory/internal/rest/jobs"
-	"github.com/leehosanganson/factory/internal/rest/server"
+	"github.com/leehosanganson/factory/internal/jobs"
+	"github.com/leehosanganson/factory/internal/server"
 )
 
 func TestRecoveryBundleProcessCreateMoveVerifyRestoreInspect(t *testing.T) {

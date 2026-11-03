@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/leehosanganson/factory/internal/rest/provider"
+	"github.com/leehosanganson/factory/internal/provider"
 )
 
 func TestCreateResponseLossTransportRecoversThroughProductionPublisherWithoutRetry(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/leehosanganson/factory/internal/workflow"
 	"io"
 	"os"
 	"os/exec"
@@ -830,7 +831,7 @@ func cleanHasTransition(runDir, runID, status string) bool {
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		var event workflowEventRecord
+		var event workflow.WorkflowEventRecord
 		if json.Unmarshal(scanner.Bytes(), &event) != nil {
 			return false
 		}

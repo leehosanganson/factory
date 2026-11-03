@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leehosanganson/factory/internal/rest/jobs"
+	"github.com/leehosanganson/factory/internal/jobs"
 
 	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )

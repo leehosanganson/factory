@@ -5,7 +5,7 @@ import (
 	"errors"
 	"os"
 
-	"github.com/leehosanganson/factory/internal/rest/jobs"
+	"github.com/leehosanganson/factory/internal/jobs"
 )
 
 func Run(ctx context.Context, config Config) error {
