@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 func TestIssueLifecycleReconcilesObservationHistoryAndRemainsTerminal(t *testing.T) {
@@ -87,7 +89,7 @@ func TestIssueLifecycleRecoversFromMissingStateAndHistoricalRefreshChronology(t 
 	ctx := context.Background()
 	key := "recovery-request"
 	// Provider UpdatedAt order intentionally differs from persistence chronology.
-	for _, snapshot := range []IssueSnapshot{
+	for _, snapshot := range []issuepkg.IssueSnapshot{
 		testIssueSnapshot("older-provider-time", "open", "first observed", time.Date(2025, 2, 2, 0, 0, 0, 0, time.UTC)),
 		testIssueSnapshot("newer-provider-time", "open", "second observed", time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)),
 	} {

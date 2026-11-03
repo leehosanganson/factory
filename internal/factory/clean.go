@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/leehosanganson/factory/internal/workflow"
 	"io"
 	"os"
 	"os/exec"
@@ -288,8 +289,7 @@ func (w CleanWorkflow) RunContext(ctx context.Context, task string) (runErr erro
 			return fmt.Errorf("create clean check log %s: %w", logName, err)
 		}
 		fmt.Fprintf(w.Out, "Running make %s\n", target)
-		var checkOutput bytes.Buffer
-		checkWriter := io.MultiWriter(w.Out, &checkOutput, logFile)
+		checkWriter := io.MultiWriter(w.Out, logFile)
 		var checkErr error
 		if w.Make != nil {
 			checkErr = w.Make(target)
@@ -831,7 +831,7 @@ func cleanHasTransition(runDir, runID, status string) bool {
 	defer file.Close()
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
-		var event workflowEventRecord
+		var event workflow.WorkflowEventRecord
 		if json.Unmarshal(scanner.Bytes(), &event) != nil {
 			return false
 		}

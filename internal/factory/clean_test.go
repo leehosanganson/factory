@@ -1795,6 +1795,9 @@ func TestCleanPersistsCompleteCheckLogsAndStaysRunningThroughPublication(t *test
 			t.Errorf("make %s log length/content = %d bytes, want full transcript over %d bytes", check.Command[len(check.Command)-1], len(data), evaluatorOutputLimit)
 		}
 	}
+	if !strings.Contains(output.String(), "large-check-transcript") {
+		t.Fatal("check output was not streamed to the terminal writer")
+	}
 }
 
 func TestCleanCheckOpenFailurePersistsFailureLifecycle(t *testing.T) {

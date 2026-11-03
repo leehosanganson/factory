@@ -1,0 +1,201 @@
+package workflow
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+const maxDetachedJobConcurrency = 64
+
+const defaultWorktreeParent = "../{repo}.worktrees"
+
+// Config describes the agent process and prompt overrides used for each run.
+type Config struct {
+	Command                   string                        `json:"command"`
+	Args                      []string                      `json:"args"`
+	PipelineChecks            [][]string                    `json:"pipeline_checks,omitempty"`
+	ParallelImplementation    *ParallelImplementationConfig `json:"parallel_implementation,omitempty"`
+	DetachedJobMaxConcurrency *int                          `json:"detached_job_max_concurrency,omitempty"`
+	PromptDir                 string                        `json:"prompt_dir,omitempty"`
+	StateDir                  string                        `json:"state_dir,omitempty"`
+	WorktreeParent            string                        `json:"worktree_parent,omitempty"`
+	AutoPublish               bool                          `json:"auto_publish"`
+	AgentTimeout              string                        `json:"agent_timeout,omitempty"`
+	MonitorTimeout            string                        `json:"monitor_timeout,omitempty"`
+}
+
+// DefaultConfig returns a copy of the built-in pi command adapter.
+func DefaultConfig() Config {
+	return Config{
+		Command:        "pi",
+		Args:           []string{"-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"},
+		AgentTimeout:   "60m",
+		WorktreeParent: defaultWorktreeParent,
+		AutoPublish:    true,
+	}
+}
+
+// ConfigPath returns the XDG config path, defaulting to ~/.config when unset.
+func ConfigPath() (string, error) {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("find home directory: %w", err)
+		}
+		base = filepath.Join(home, ".config")
+	}
+	if !filepath.IsAbs(base) {
+		return "", fmt.Errorf("XDG_CONFIG_HOME must be absolute")
+	}
+	return filepath.Join(base, "factory", "config.json"), nil
+}
+
+// LoadConfig reads and validates the factory config, falling back to defaults if absent.
+func LoadConfig(path string) (Config, error) {
+	if path == "" {
+		var err error
+		path, err = ConfigPath()
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		cfg := DefaultConfig()
+		return cfg, nil
+	}
+	if err != nil {
+		return Config{}, fmt.Errorf("read config %s: %w", path, err)
+	}
+	var cfg Config
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&cfg); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return Config{}, fmt.Errorf("parse config %s: expected one JSON value", path)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return Config{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	if _, configured := fields["auto_publish"]; !configured {
+		cfg.AutoPublish = true
+	}
+	if value, configured := fields["detached_job_max_concurrency"]; configured && bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return Config{}, fmt.Errorf("invalid config %s: detached_job_max_concurrency must be an integer when set", path)
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("invalid config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Validate checks config fields before they can influence a child process or file path.
+func (c Config) Validate() error {
+	if _, err := c.AgentTimeoutDuration(); err != nil {
+		return err
+	}
+	if _, err := c.MonitorTimeoutDuration(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(c.Command) == "" {
+		return fmt.Errorf("command must not be empty")
+	}
+	if strings.ContainsRune(c.Command, 0) {
+		return fmt.Errorf("command contains NUL")
+	}
+	var taskCount, systemPromptCount int
+	for i, arg := range c.Args {
+		if strings.ContainsRune(arg, 0) {
+			return fmt.Errorf("argument %d contains NUL", i)
+		}
+		taskCount += strings.Count(arg, "{task}")
+		systemPromptCount += strings.Count(arg, "{system_prompt}")
+	}
+	taskCount += strings.Count(c.Command, "{task}")
+	systemPromptCount += strings.Count(c.Command, "{system_prompt}")
+	if taskCount != 1 {
+		return fmt.Errorf("command and arguments must contain {task} exactly once (found %d)", taskCount)
+	}
+	if systemPromptCount != 1 {
+		return fmt.Errorf("command and arguments must contain {system_prompt} exactly once (found %d)", systemPromptCount)
+	}
+	if err := ValidatePipelineChecks(c.PipelineChecks); err != nil {
+		return err
+	}
+	if c.DetachedJobMaxConcurrency != nil && (*c.DetachedJobMaxConcurrency < 1 || *c.DetachedJobMaxConcurrency > maxDetachedJobConcurrency) {
+		return fmt.Errorf("detached_job_max_concurrency must be between 1 and %d when set", maxDetachedJobConcurrency)
+	}
+	if c.ParallelImplementation != nil {
+		if c.ParallelImplementation.MaxConcurrency < 0 || c.ParallelImplementation.MaxConcurrency > maxParallelSubtasks {
+			return fmt.Errorf("parallel_implementation.max_concurrency must be between 0 and %d", maxParallelSubtasks)
+		}
+	}
+	if c.PromptDir != "" && strings.ContainsRune(c.PromptDir, 0) {
+		return fmt.Errorf("prompt_dir contains NUL")
+	}
+	if c.StateDir != "" && !filepath.IsAbs(c.StateDir) {
+		return fmt.Errorf("state_dir must be absolute")
+	}
+	if strings.ContainsRune(c.WorktreeParent, 0) {
+		return fmt.Errorf("worktree_parent contains NUL")
+	}
+	if c.WorktreeParent != "" && strings.TrimSpace(c.WorktreeParent) == "" {
+		return fmt.Errorf("worktree_parent must not be empty or whitespace")
+	}
+	return nil
+}
+
+func ValidatePipelineChecks(checks [][]string) error {
+	for i, check := range checks {
+		if len(check) == 0 {
+			return fmt.Errorf("pipeline check %d must not be empty", i)
+		}
+		if strings.TrimSpace(check[0]) == "" {
+			return fmt.Errorf("pipeline check %d executable must not be empty", i)
+		}
+		for j, arg := range check {
+			if strings.ContainsRune(arg, 0) {
+				return fmt.Errorf("pipeline check %d argument %d contains NUL", i, j)
+			}
+		}
+	}
+	return nil
+}
+
+func (c Config) MonitorTimeoutDuration() (time.Duration, error) {
+	if c.MonitorTimeout == "" {
+		return 0, nil
+	}
+	duration, err := time.ParseDuration(c.MonitorTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("monitor_timeout must be a valid duration: %w", err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("monitor_timeout must be positive")
+	}
+	return duration, nil
+}
+
+func (c Config) AgentTimeoutDuration() (time.Duration, error) {
+	if c.AgentTimeout == "" {
+		return 60 * time.Minute, nil
+	}
+	duration, err := time.ParseDuration(c.AgentTimeout)
+	if err != nil {
+		return 0, fmt.Errorf("agent_timeout must be a valid duration: %w", err)
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("agent_timeout must be positive")
+	}
+	return duration, nil
+}

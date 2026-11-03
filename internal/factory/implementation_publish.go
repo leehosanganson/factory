@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/leehosanganson/factory/internal/workflow"
 	"io"
 	"os"
 	"os/exec"
@@ -67,7 +68,7 @@ func requireCleanCheckout(ctx context.Context, target string) error {
 	return nil
 }
 
-func RunAutomaticImplementation(ctx context.Context, cfg Config, target, task string, in io.Reader, out io.Writer, terminal, gate bool) error {
+func runAutomaticImplementation(ctx context.Context, cfg Config, target, task string, in io.Reader, out io.Writer, terminal, gate bool) error {
 	if err := requireCleanCheckout(ctx, target); err != nil {
 		return err
 	}
@@ -81,7 +82,7 @@ func RunAutomaticImplementation(ctx context.Context, cfg Config, target, task st
 		return fmt.Errorf("automatic PR publication requires a checkout on a named branch")
 	}
 	targetBranch = strings.TrimSpace(targetBranch)
-	id, err := newJobID()
+	id, err := workflow.NewUUIDv4()
 	if err != nil {
 		return err
 	}
@@ -96,19 +97,19 @@ func RunAutomaticImplementation(ctx context.Context, cfg Config, target, task st
 		return fmt.Errorf("create isolated implementation worktree: %w", err)
 	}
 	var runDir string
-	workflow := Workflow{
+	runWorkflow := Workflow{
 		Agent: Runner{Config: cfg}, Config: cfg, In: in, Out: out, Workdir: worktree, Terminal: terminal, Gate: gate,
 		RequireComplete: gate && cfg.AutoPublish, DeferCompletion: cfg.AutoPublish, Managed: gate,
 		RunCreated: func(dir, _ string) { runDir = dir },
 	}
-	runErr := workflow.RunContext(ctx, task)
+	runErr := runWorkflow.RunContext(ctx, task)
 	if runErr == nil && cfg.AutoPublish {
 		state, stateErr := readManagedState(runDir)
 		if stateErr != nil {
 			runErr = stateErr
 		} else {
 			observe := func(event WorkflowEvent) error { return persistWorkflowEvent(runDir, event) }
-			runErr = runPipelineChecks(ctx, cfg.PipelineChecks, worktree, runDir, &state, observe, processPipelineCheckRunner{})
+			runErr = workflow.RunPipelineChecks(ctx, cfg.PipelineChecks, worktree, runDir, &state, observe, workflow.ProcessPipelineCheckRunner{})
 			if runErr != nil {
 				status := "failed"
 				if ctx.Err() != nil || errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {

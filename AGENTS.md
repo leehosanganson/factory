@@ -28,8 +28,10 @@ Actionable code-review findings belong in `docs/to-fix.md` only when a code revi
 ## Repository structure
 
 - `cmd/factory/` — CLI entry point and terminal-specific helpers.
-- `internal/factory/` — workflow, job, monitor, configuration, agent execution, state, and safety logic.
-- `internal/factory/prompts/` — embedded workflow prompts.
+- `internal/factory/` — CLI orchestration, detached local jobs, monitor, CLI-local issue work, and related local state.
+- `internal/workflow/` — shared workflow implementation, configuration, execution/state, and embedded prompts.
+- `internal/issue/` — provider-neutral issue snapshots and issue-tracker integrations; `internal/issue/poller/` admits issues to REST jobs.
+- `internal/{api,client,jobs,provider,server,web,worker,workspace}/` — current REST service responsibilities, split by package.
 - `.agents/skills/` — agent procedures and workflow guidance.
 - `docs/features/` — descriptions of capabilities implemented in the current CLI.
 - GitHub Issues — categorized usability findings and actionable follow-up tracking.

@@ -122,9 +122,9 @@ func TestStatusLifecyclePersistsFailureTimeoutAndCancellationWithoutFailingPrima
 	workflow := Workflow{
 		Agent:  &blockingStatusTestAgent{started: startedPrimary, release: make(chan struct{})},
 		Config: Config{StateDir: filepath.Join(base, "state")}, Out: io.Discard, Workdir: t.TempDir(),
-		Stages: []string{"implement"}, statusInterval: time.Millisecond,
+		Stages: []string{"implement"}, StatusInterval: time.Millisecond,
 		Observer: statusJobObserver{JobSessionObserver: JobSessionObserver{Store: store, JobID: "status-outcomes", SessionID: "workflow"}, store: store, jobID: "status-outcomes", sessionID: "workflow"},
-		statusCall: func(ctx context.Context, _, _, _, _ string) (string, error) {
+		StatusCall: func(ctx context.Context, _, _, _, _ string) (string, error) {
 			calls++
 			switch calls {
 			case 1:

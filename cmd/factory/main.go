@@ -16,10 +16,11 @@ import (
 	"unicode"
 
 	"github.com/leehosanganson/factory/internal/factory"
-	"github.com/leehosanganson/factory/internal/issuepoller"
-	"github.com/leehosanganson/factory/internal/restjobs"
-	"github.com/leehosanganson/factory/internal/restserver"
-	serverruntime "github.com/leehosanganson/factory/internal/restserver/runtime"
+	"github.com/leehosanganson/factory/internal/issue/poller"
+	"github.com/leehosanganson/factory/internal/jobs"
+	"github.com/leehosanganson/factory/internal/server"
+	serverruntime "github.com/leehosanganson/factory/internal/server/runtime"
+	"github.com/leehosanganson/factory/internal/workflow"
 )
 
 var version = "dev"
@@ -91,19 +92,19 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			if len(args) > 1 && (args[1] == "list" || args[1] == "resolve") {
 				ctx, stop := foregroundContext()
 				defer stop()
-				return issuepoller.OperatorCommand(ctx, args[1:], out)
+				return poller.OperatorCommand(ctx, args[1:], out)
 			}
 			configPath, err := parseIssuePollerOptions(args[1:])
 			if err != nil {
 				return err
 			}
-			config, err := issuepoller.LoadConfig(configPath)
+			config, err := poller.LoadConfig(configPath)
 			if err != nil {
 				return err
 			}
 			ctx, stop := foregroundContext()
 			defer stop()
-			return issuepoller.Run(ctx, config)
+			return poller.Run(ctx, config)
 		case "server":
 			if len(args) > 1 && args[1] == "doctor" {
 				configPath, err := parseServerDoctorOptions(args[2:])
@@ -720,7 +721,7 @@ func runPipelineContextWithTerminalCheck(ctx context.Context, args []string, gat
 			if err := factory.ValidateImplementationCheckout(filepath.Clean(workdir)); err != nil {
 				return err
 			}
-			workflow := factory.Workflow{Agent: factory.Runner{Config: cfg}, Config: cfg, In: workflowIn, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: true, Managed: true}
+			workflow := workflow.Workflow{Agent: workflow.Runner{Config: cfg}, Config: cfg, In: workflowIn, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: true, Managed: true}
 			return workflow.RunContext(ctx, task)
 		}
 		id, err := factory.StartImplementationJob(cfg, workdir, task)
@@ -801,12 +802,12 @@ func runCleanContext(ctx context.Context, gate bool, in io.Reader, out, errOut i
 	if gate && !terminal {
 		return fmt.Errorf("factory tidy --gate requires an interactive terminal for approvals")
 	}
-	return (factory.CleanWorkflow{Agent: foregroundAgent{ctx: ctx, agent: factory.Runner{Config: cfg}}, Config: cfg, In: in, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: gate}).RunContext(ctx, "")
+	return (factory.CleanWorkflow{Agent: foregroundAgent{ctx: ctx, agent: workflow.Runner{Config: cfg}}, Config: cfg, In: in, Out: out, Workdir: filepath.Clean(workdir), Terminal: terminal, Gate: gate}).RunContext(ctx, "")
 }
 
 type foregroundAgent struct {
 	ctx   context.Context
-	agent factory.Agent
+	agent workflow.Agent
 }
 
 func (a foregroundAgent) Run(stage, prompt, task, workdir, logPath string) error {

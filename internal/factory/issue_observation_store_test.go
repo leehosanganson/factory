@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 func TestLocalIssueObservationStoreReopensAndPreservesVersionHistory(t *testing.T) {
@@ -215,8 +217,8 @@ func TestLocalIssueObservationStoreIsolatesRequestKeys(t *testing.T) {
 	}
 }
 
-func testIssueSnapshot(version, state, title string, updated time.Time) IssueSnapshot {
-	return IssueSnapshot{
+func testIssueSnapshot(version, state, title string, updated time.Time) issuepkg.IssueSnapshot {
+	return issuepkg.IssueSnapshot{
 		Repository: "acme/widget", Number: 42, Title: title, Body: "details", State: state,
 		URL: "https://github.com/acme/widget/issues/42", UpdatedAt: updated, Version: version,
 	}

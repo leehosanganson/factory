@@ -6,13 +6,15 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 func TestWorkRefreshRejectsMissingAndUnsupportedBeforeFetching(t *testing.T) {
 	calls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		calls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	for _, tc := range []struct {
 		name, provider, key, want string
@@ -51,7 +53,7 @@ func TestWorkRefreshRecordsThenReportsDuplicateWithoutChangingQueue(t *testing.T
 	_ = queue.Close()
 	snapshot := testIssueSnapshot("version-1", "open", "Initial title", time.Date(2025, 2, 3, 4, 5, 6, 0, time.UTC))
 	calls := 0
-	tracker := issueTrackerFunc(func(_ context.Context, repository, issue string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(_ context.Context, repository, issue string) (issuepkg.IssueSnapshot, error) {
 		calls++
 		if repository != "acme/widget" || issue != "42" {
 			t.Fatalf("tracker request = %q#%q; want queued identity", repository, issue)
@@ -93,8 +95,8 @@ func TestWorkRefreshRecordsThenReportsDuplicateWithoutChangingQueue(t *testing.T
 
 func TestWorkRefreshFetchFailureDoesNotPersist(t *testing.T) {
 	cfg, key := enqueueTestWorkRequest(t, "github", "42")
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
-		return IssueSnapshot{}, errors.New("GitHub unavailable")
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
+		return issuepkg.IssueSnapshot{}, errors.New("GitHub unavailable")
 	})
 	var out strings.Builder
 	err := WorkCommandWithIssueTracker(context.Background(), []string{"refresh", key}, cfg, &out, tracker)
@@ -126,7 +128,7 @@ func TestWorkHistoryListsSnapshotsWithoutFetchingOrChangingQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, snapshot := range []IssueSnapshot{
+	for _, snapshot := range []issuepkg.IssueSnapshot{
 		testIssueSnapshot("version-1", "open", "Earlier title", time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)),
 		testIssueSnapshot("version-2", "closed", "Latest title", time.Date(2025, 2, 2, 0, 0, 0, 0, time.UTC)),
 	} {
@@ -135,9 +137,9 @@ func TestWorkHistoryListsSnapshotsWithoutFetchingOrChangingQueue(t *testing.T) {
 		}
 	}
 	calls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		calls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	var out strings.Builder
 	if err := WorkCommandWithIssueTracker(context.Background(), []string{"history", key}, cfg, &out, tracker); err != nil {

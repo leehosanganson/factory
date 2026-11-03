@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/leehosanganson/factory/internal/restjobs"
-	"github.com/leehosanganson/factory/internal/restserver"
+	"github.com/leehosanganson/factory/internal/jobs"
+	"github.com/leehosanganson/factory/internal/server"
 )
 
 func runServerBundle(args []string, out io.Writer) error {

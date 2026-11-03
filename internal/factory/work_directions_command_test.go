@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
 
 func TestWorkRespondAndDirectionsAreLocalAndLeaveQueueAndLifecycleUnchanged(t *testing.T) {
@@ -35,9 +37,9 @@ func TestWorkRespondAndDirectionsAreLocalAndLeaveQueueAndLifecycleUnchanged(t *t
 	}
 
 	trackerCalls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		trackerCalls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	var output strings.Builder
 	if err := WorkCommandWithIssueTracker(context.Background(), []string{"respond", key, "--version", "changed", "--instruction", "Keep existing behavior; do not remove compatibility."}, cfg, &output, tracker); err != nil {
@@ -96,9 +98,9 @@ func TestWorkRespondRejectsWithoutChangingRecordsOrCallingProvider(t *testing.T)
 		t.Fatal(err)
 	}
 	calls := 0
-	tracker := issueTrackerFunc(func(context.Context, string, string) (IssueSnapshot, error) {
+	tracker := issueTrackerFunc(func(context.Context, string, string) (issuepkg.IssueSnapshot, error) {
 		calls++
-		return IssueSnapshot{}, nil
+		return issuepkg.IssueSnapshot{}, nil
 	})
 	for _, args := range [][]string{
 		{"respond", key, "--version", "baseline", "--instruction", "not waiting"},

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/leehosanganson/factory/internal/workflow"
 	"io"
 	"os"
 	"path/filepath"
@@ -924,7 +925,7 @@ func finishJob(store *JobStore, id, status string) error {
 }
 
 func newJobID() (string, error) {
-	return newUUIDv4()
+	return workflow.NewUUIDv4()
 }
 
 func ensureCancelFile(path string) error {
