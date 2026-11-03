@@ -6,6 +6,25 @@ on:
     branches: [main]
 
 jobs:
+  classify:
+    name: Classify changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      run_full: ${{ steps.changes.outputs.run_full }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify pull request changes
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: .github/workflows/classify-ci-changes.sh "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA"
+
   commit-attribution:
     name: Commit attribution
     runs-on: ubuntu-latest
@@ -24,6 +43,8 @@ jobs:
   build:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    needs: [classify]
+    if: always() && needs.classify.outputs.run_full != 'false'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -52,6 +73,8 @@ jobs:
   container-image:
     name: REST controller and worker images
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: always() && needs.classify.outputs.run_full != 'false'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -62,6 +85,8 @@ jobs:
   postgres-store-integration:
     name: PostgreSQL 18 Store and separate worker integration
     runs-on: ubuntu-latest
+    needs: [classify]
+    if: always() && needs.classify.outputs.run_full != 'false'
     services:
       postgres:
         image: postgres:18
@@ -90,3 +115,35 @@ jobs:
 
       - name: Run PostgreSQL ownership, Store, runtime, and issue-poller integration tests
         run: go test ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically)$' -count=1 -v
+
+  ci-result:
+    name: CI result
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - classify
+      - commit-attribution
+      - build
+      - container-image
+      - postgres-store-integration
+    steps:
+      - name: Require attribution and the expected validation result
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify.result }}
+          RUN_FULL: ${{ needs.classify.outputs.run_full }}
+          ATTRIBUTION_RESULT: ${{ needs.commit-attribution.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          IMAGE_RESULT: ${{ needs.container-image.result }}
+          POSTGRES_RESULT: ${{ needs.postgres-store-integration.result }}
+        run: |
+          test "$CLASSIFY_RESULT" = success
+          test "$ATTRIBUTION_RESULT" = success
+          if [ "$RUN_FULL" = false ]; then
+            test "$BUILD_RESULT" = skipped
+            test "$IMAGE_RESULT" = skipped
+            test "$POSTGRES_RESULT" = skipped
+          else
+            test "$BUILD_RESULT" = success
+            test "$IMAGE_RESULT" = success
+            test "$POSTGRES_RESULT" = success
+          fi
