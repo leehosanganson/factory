@@ -218,6 +218,11 @@ if RUN_FULL=false RUN_MACOS=false CLASSIFY_RESULT=success ATTRIBUTION_RESULT=fai
   fail 'aggregate accepted attribution failure'
 fi
 
+git ls-files --error-unmatch .github/workflows/validate-ci-results.sh >/dev/null || fail 'aggregate validator is not tracked'
+if ! awk '/^  ci-result:/{in_ci_result=1} in_ci_result && /uses: actions\/checkout@v4/{found=1} END{exit !found}' "$workflow"; then
+  fail 'aggregate validation job must check out the repository'
+fi
+
 for required in \
   '  pull_request:' \
   '    branches: [main]' \
