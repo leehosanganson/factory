@@ -26,7 +26,8 @@ var errExecutionFailed = errors.New("REST job execution failed")
 // WorkspaceManager is the per-repository workspace lifecycle used by an executor.
 type WorkspaceManager interface {
 	RepositoryRoot() string
-	CreateContext(context.Context, string) (restworkspace.Workspace, error)
+	CaptureContext(context.Context) (restworkspace.SourceRevision, error)
+	CreateRevisionContext(context.Context, string, restworkspace.SourceRevision) (restworkspace.Workspace, error)
 	VerifyResultDirectory(string) error
 	MarkSucceeded(string) error
 }
@@ -285,8 +286,12 @@ func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job rest
 	if err := jobCtx.Err(); err != nil {
 		return nil, errExecutionFailed
 	}
-	workspace, err := workspaceManager.CreateContext(jobCtx, job.ID)
-	if err != nil || jobCtx.Err() != nil || validateWorkspace(workspaceManager, job.ID, workspace) != nil {
+	revision, err := workspaceManager.CaptureContext(jobCtx)
+	if err != nil || jobCtx.Err() != nil {
+		return nil, errExecutionFailed
+	}
+	workspace, err := workspaceManager.CreateRevisionContext(jobCtx, job.ID, revision)
+	if err != nil || jobCtx.Err() != nil || workspace.SourceRevision != revision || validateWorkspace(workspaceManager, job.ID, workspace) != nil {
 		return nil, errExecutionFailed
 	}
 	outputFile, err := os.OpenFile(filepath.Join(workspace.OutputPath, "workflow.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
