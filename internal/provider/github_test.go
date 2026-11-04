@@ -119,24 +119,88 @@ func TestGitHubPublisherRedactsProviderToken(t *testing.T) {
 	}
 }
 
-func TestGitHubPublisherMarksProviderCreateFailureUncertain(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			_, _ = w.Write([]byte(`[]`))
-			return
-		}
-		http.Error(w, "failure", http.StatusInternalServerError)
-	}))
-	defer server.Close()
-	publisher := newGitHubPublisher("secret", server.Client(), server.URL, func(context.Context, string, string, string) error { return nil })
-	_, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "sha", Title: "title", BaseBranch: "main"})
-	if !errors.Is(err, ErrUncertain) {
-		t.Fatalf("create error = %v, want uncertain", err)
+func TestGitHubPublisherDoesNotInspectOrRetryAfterFailedCreateOrUpdate(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		failure    string
+		wantStatus int
+	}{
+		{name: "create transport failure", method: http.MethodPost, failure: "transport"},
+		{name: "create interrupted", method: http.MethodPost, failure: "interrupted"},
+		{name: "create non-2xx", method: http.MethodPost, failure: "status", wantStatus: http.StatusInternalServerError},
+		{name: "create malformed response", method: http.MethodPost, failure: "malformed", wantStatus: http.StatusCreated},
+		{name: "create identity mismatch", method: http.MethodPost, failure: "mismatch", wantStatus: http.StatusCreated},
+		{name: "update transport failure", method: http.MethodPatch, failure: "transport"},
+		{name: "update interrupted", method: http.MethodPatch, failure: "interrupted"},
+		{name: "update non-2xx", method: http.MethodPatch, failure: "status", wantStatus: http.StatusInternalServerError},
+		{name: "update malformed response", method: http.MethodPatch, failure: "malformed", wantStatus: http.StatusOK},
+		{name: "update identity mismatch", method: http.MethodPatch, failure: "mismatch", wantStatus: http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gets, writes := 0, 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					gets++
+					if tc.method == http.MethodPost {
+						_, _ = w.Write([]byte(`[]`))
+					} else {
+						_, _ = w.Write([]byte(`[{"number":19,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/19","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}]`))
+					}
+					return
+				}
+				writes++
+				if r.Method != tc.method {
+					t.Errorf("write method=%s, want %s", r.Method, tc.method)
+				}
+				if tc.failure == "status" {
+					http.Error(w, "write failed", tc.wantStatus)
+					return
+				}
+				w.WriteHeader(tc.wantStatus)
+				switch tc.failure {
+				case "malformed":
+					_, _ = w.Write([]byte(`{`))
+				case "mismatch":
+					_, _ = w.Write([]byte(`{"number":19,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/19","head":{"ref":"factory/job/` + testJobID + `","sha":"wrong-commit"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}`))
+				}
+			}))
+			defer server.Close()
+
+			var cancel context.CancelFunc
+			ctx := context.Background()
+			if tc.failure == "interrupted" {
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+			}
+			transport := providerRoundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				if request.Method != tc.method {
+					return http.DefaultTransport.RoundTrip(request)
+				}
+				if tc.failure == "transport" {
+					writes++
+					return nil, errors.New("simulated transport failure")
+				}
+				if tc.failure == "interrupted" {
+					writes++
+					cancel()
+					return nil, context.Canceled
+				}
+				return http.DefaultTransport.RoundTrip(request)
+			})
+			publisher := newGitHubPublisher("secret", &http.Client{Transport: transport}, server.URL, func(context.Context, string, string, string) error { return nil })
+			_, err := publisher.Publish(ctx, PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "title", BaseBranch: "main"})
+			if !errors.Is(err, ErrUncertain) {
+				t.Fatalf("Publish() error=%v, want ErrUncertain", err)
+			}
+			if gets != 1 || writes != 1 {
+				t.Fatalf("provider calls: GET=%d writes=%d; want only the pre-write lookup and one write", gets, writes)
+			}
+		})
 	}
 }
 
-func TestGitHubPublisherUpdatesExistingJobPR(t *testing.T) {
-	patched := false
+func TestGitHubPublisherUpdatesExistingJobPROnce(t *testing.T) {
 	patches := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -149,10 +213,6 @@ func TestGitHubPublisherUpdatesExistingJobPR(t *testing.T) {
 			return
 		}
 		patches++
-		if patches == 1 {
-			http.Error(w, "lost response", http.StatusInternalServerError)
-			return
-		}
 		var payload map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Fatal(err)
@@ -160,14 +220,14 @@ func TestGitHubPublisherUpdatesExistingJobPR(t *testing.T) {
 		if payload["title"] != "Updated title" || payload["body"] != "" {
 			t.Errorf("update payload=%v", payload)
 		}
-		patched = true
+		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"number":19,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/19","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}`))
 	}))
 	defer server.Close()
 	publisher := newGitHubPublisher("secret", server.Client(), server.URL, func(context.Context, string, string, string) error { return nil })
 	out, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "Updated title", Summary: "Updated summary", BaseBranch: "main"})
-	if err != nil || out.Number != 19 || !patched || patches != 2 {
-		t.Fatalf("out=%+v err=%v patched=%v attempts=%d", out, err, patched, patches)
+	if err != nil || out.Number != 19 || patches != 1 {
+		t.Fatalf("out=%+v err=%v attempts=%d", out, err, patches)
 	}
 }
 
@@ -196,7 +256,7 @@ func runTestGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI(t *testing.T) {
+func TestGitHubPublisherLeavesLostCreateResponseUncertainForExplicitReconciliation(t *testing.T) {
 	const token = "provider-test-secret"
 	var gets, posts, writes int
 	var created PullRequest
@@ -217,9 +277,9 @@ func TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI(t *testing.
 				_, _ = w.Write([]byte(`[]`))
 				return
 			}
-			if gets == 2 || gets == 3 {
-				// The create was accepted, but both automatic and operator lookups
-				// initially fail. The response body deliberately contains the token.
+			if gets == 2 {
+				// The create was accepted, but the first explicit lookup fails.
+				// The response body deliberately contains the token.
 				http.Error(w, "temporary provider outage containing "+token, http.StatusServiceUnavailable)
 				return
 			}
@@ -261,12 +321,15 @@ func TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI(t *testing.
 	publisher := newGitHubPublisher(token, server.Client(), server.URL, func(context.Context, string, string, string) error { return nil })
 	request := PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/private/worktree", Commit: "0123456789abcdef", Title: "Implement safely", Summary: "Verified outcome", BaseBranch: "main"}
 	if _, err := publisher.Publish(context.Background(), request); !errors.Is(err, ErrUncertain) {
-		t.Fatalf("Publish() error=%v, want uncertain after accepted create and failed lookup", err)
+		t.Fatalf("Publish() error=%v, want uncertain after accepted create and lost response", err)
 	} else if strings.Contains(err.Error(), token) {
 		t.Fatalf("uncertain create error leaked provider token: %v", err)
 	}
+	if gets != 1 || posts != 1 {
+		t.Fatalf("after uncertain Publish(): GET=%d POST=%d; want only initial lookup and one create", gets, posts)
+	}
 	if _, err := publisher.Reconcile(context.Background(), request); err == nil || strings.Contains(err.Error(), token) {
-		t.Fatalf("unresolved read-only Reconcile() error=%v, want a sanitized failure", err)
+		t.Fatalf("explicit read-only Reconcile() error=%v, want a sanitized failure", err)
 	}
 	outcome, err := publisher.Reconcile(context.Background(), request)
 	if err != nil {
@@ -276,8 +339,8 @@ func TestGitHubPublisherReconcilesLostCreateResponseThroughGitHubAPI(t *testing.
 	if outcome != want {
 		t.Fatalf("Reconcile() outcome=%+v, want %+v", outcome, want)
 	}
-	if gets != 4 || posts != 1 || writes != 0 {
-		t.Fatalf("GitHub API calls: GET=%d POST=%d other writes=%d; want 4, 1, 0", gets, posts, writes)
+	if gets != 3 || posts != 1 || writes != 0 {
+		t.Fatalf("GitHub API calls: GET=%d POST=%d other writes=%d; want 3, 1, 0", gets, posts, writes)
 	}
 }
 
@@ -327,16 +390,12 @@ func TestGitHubPublisherReconcileRejectsMismatchedGitHubResponsesReadOnly(t *tes
 	}
 }
 
-func TestGitHubPublisherReconcilesAfterAmbiguousCreate(t *testing.T) {
+func TestGitHubPublisherDoesNotLookupAfterAmbiguousCreate(t *testing.T) {
 	gets, posts := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			gets++
-			if gets == 1 {
-				_, _ = w.Write([]byte(`[]`))
-				return
-			}
-			_, _ = w.Write([]byte(`[{"number":19,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/19","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}]`))
+			_, _ = w.Write([]byte(`[]`))
 			return
 		}
 		posts++
@@ -344,9 +403,9 @@ func TestGitHubPublisherReconcilesAfterAmbiguousCreate(t *testing.T) {
 	}))
 	defer server.Close()
 	publisher := newGitHubPublisher("secret", server.Client(), server.URL, func(context.Context, string, string, string) error { return nil })
-	out, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "task", BaseBranch: "main"})
-	if err != nil || out.Number != 19 || posts != 1 || gets != 2 {
-		t.Fatalf("out=%+v err=%v GET=%d POST=%d", out, err, gets, posts)
+	_, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "task", BaseBranch: "main"})
+	if !errors.Is(err, ErrUncertain) || posts != 1 || gets != 1 {
+		t.Fatalf("err=%v GET=%d POST=%d; want uncertain, one pre-write lookup, and one write", err, gets, posts)
 	}
 }
 
@@ -356,16 +415,12 @@ func (f providerRoundTripperFunc) RoundTrip(request *http.Request) (*http.Respon
 	return f(request)
 }
 
-func TestGitHubPublisherReconcilesAfterForwardedCreateResponseIsLostWithoutRetry(t *testing.T) {
+func TestGitHubPublisherDoesNotLookupOrRetryAfterForwardedCreateResponseIsLost(t *testing.T) {
 	gets, posts := 0, 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			gets++
-			if gets == 1 {
-				_, _ = w.Write([]byte(`[]`))
-				return
-			}
-			_, _ = w.Write([]byte(`[{"number":29,"state":"open","body":"<!-- factory-job:` + testJobID + ` -->","html_url":"https://github.com/acme/widget/pull/29","head":{"ref":"factory/job/` + testJobID + `","sha":"commit-sha"},"base":{"ref":"main","repo":{"full_name":"acme/widget"}}}]`))
+			_, _ = w.Write([]byte(`[]`))
 			return
 		}
 		posts++
@@ -383,8 +438,8 @@ func TestGitHubPublisherReconcilesAfterForwardedCreateResponseIsLostWithoutRetry
 	})
 	client := &http.Client{Transport: transport}
 	publisher := newGitHubPublisher("secret", client, server.URL, func(context.Context, string, string, string) error { return nil })
-	out, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "task", BaseBranch: "main"})
-	if err != nil || out.Number != 29 || posts != 1 || gets != 2 {
-		t.Fatalf("out=%+v err=%v GET=%d POST=%d; expected one forwarded create and exact read-only reconciliation", out, err, gets, posts)
+	_, err := publisher.Publish(context.Background(), PublishRequest{JobID: testJobID, Repository: "acme/widget", Worktree: "/tmp/worktree", Commit: "commit-sha", Title: "task", BaseBranch: "main"})
+	if !errors.Is(err, ErrUncertain) || posts != 1 || gets != 1 {
+		t.Fatalf("err=%v GET=%d POST=%d; want uncertain with one pre-write lookup and one forwarded create", err, gets, posts)
 	}
 }
