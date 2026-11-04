@@ -876,12 +876,11 @@ func (h *Handler) reconcileProvider(w http.ResponseWriter, r *http.Request, id s
 		h.writeManagerError(w, err)
 		return
 	}
-	snapshot, err := h.manager.Get(id)
-	if err != nil {
+	if _, err := h.manager.Get(id); err != nil {
 		h.writeManagerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, snapshot)
+	writeError(w, http.StatusConflict, "reconciliation_not_allowed", "Provider outcome remains unresolved after read-only lookup.")
 }
 
 func bodyless(r *http.Request) bool {
@@ -1264,7 +1263,7 @@ func clearStreamWriteDeadline(controller *http.ResponseController) error {
 
 func safeEventType(value string) bool {
 	switch value {
-	case "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition", "stage_progress":
+	case "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_observed", "operator_disposition", "stage_progress":
 		return true
 	default:
 		return false
@@ -1272,7 +1271,7 @@ func safeEventType(value string) bool {
 }
 
 func safeEventMessage(eventType, message string) bool {
-	return message == "" || (eventType == "queued" && message == "Job admitted") || (eventType == "running" && message == "Job started") || (eventType == "cancel_requested" && message == "Cancellation requested") || (eventType == "canceled" && message == "Job canceled before start") || (eventType == "provider_reconciled" && message == "Operator confirmed provider outcome") || (eventType == "operator_disposition" && (message == "failed" || message == "canceled")) || ((eventType == "succeeded" || eventType == "failed" || eventType == "canceled") && message == "Job finished")
+	return message == "" || (eventType == "queued" && message == "Job admitted") || (eventType == "running" && message == "Job started") || (eventType == "cancel_requested" && message == "Cancellation requested") || (eventType == "canceled" && message == "Job canceled before start") || (eventType == "provider_observed" && message == "Matching pull request observed; outcome unresolved") || (eventType == "operator_disposition" && (message == "failed" || message == "canceled")) || ((eventType == "succeeded" || eventType == "failed" || eventType == "canceled") && message == "Job finished")
 }
 
 func validProvenanceShape(raw json.RawMessage) bool {

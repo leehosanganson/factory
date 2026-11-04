@@ -2368,18 +2368,43 @@ func TestRESTServerProcessReconcilesConfirmedProviderWriteAfterOutcomePersistenc
 		body, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, string(body)
 	}
-	if code, body := reconcile(); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
-		t.Fatalf("confirmed-attempt reconcile status=%d body=%s", code, body)
+	if code, body := reconcile(); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
+		t.Fatalf("confirmed provider observation status=%d body=%s", code, body)
 	}
-	if code, body := reconcile(); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
-		t.Fatalf("repeated confirmed-attempt reconcile status=%d body=%s", code, body)
+	if code, body := reconcile(); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
+		t.Fatalf("repeated provider observation status=%d body=%s", code, body)
 	}
-	reconciled := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
-	if reconciled.Status != restjobs.StatusSucceeded || reconciled.Provider == nil || reconciled.Provider.Number != 72 {
-		t.Fatalf("reconciled confirmed provider result=%+v", reconciled)
+	observedJob := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
+	if observedJob.Status != restjobs.StatusFailed || observedJob.Provider != nil {
+		t.Fatalf("provider observation resolved failed job=%+v", observedJob)
 	}
 	if _, err := os.Stat(outcomesPath + ".read-only-lookup"); err != nil {
 		t.Fatalf("provider was not confirmed by read-only reconciliation: %v", err)
+	}
+	observationManager, err := restworker.NewLocalJobManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observationStore, ok := observationManager.(*restjobs.SQLiteStore)
+	if !ok {
+		t.Fatalf("persisted store type=%T, want SQLiteStore", observationManager)
+	}
+	observation, err := observationStore.ProviderObservation(admitted.ID)
+	if err != nil || observation.Outcome.Number != 72 {
+		t.Fatalf("matching provider observation not retained=(%+v,%v)", observation, err)
+	}
+	if err := observationStore.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	reconciledHistory := getProcessHistory(t, client, baseURL, admitted.ID, apiKey)
+	observedEvents := 0
+	for _, event := range reconciledHistory.Events {
+		if event.Type == "provider_observed" {
+			observedEvents++
+		}
+	}
+	if observedEvents != 1 {
+		t.Fatalf("provider observation audit count=%d history=%+v", observedEvents, reconciledHistory)
 	}
 	providerRecord, err := os.ReadFile(outcomesPath + ".confirmed.json")
 	if err != nil {
@@ -2696,25 +2721,39 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	if err := os.Remove(outcomesPath + ".reconcile-mode"); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
-	if code, body := operatorReconcile(apiKey); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
-		t.Fatalf("authenticated reconcile status=%d body=%s", code, body)
+	if code, body := operatorReconcile(apiKey); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
+		t.Fatalf("authenticated provider observation status=%d body=%s", code, body)
 	}
-	if code, body := operatorReconcile(apiKey); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
-		t.Fatalf("repeated reconcile status=%d body=%s", code, body)
+	if code, body := operatorReconcile(apiKey); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
+		t.Fatalf("repeated provider observation status=%d body=%s", code, body)
 	}
-	reconciled := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
-	if reconciled.Status != restjobs.StatusSucceeded || reconciled.Provider == nil || reconciled.Provider.Number != record.Outcome.Number {
-		t.Fatalf("reconciled job=%+v", reconciled)
+	observedJob := getProcessJob(t, client, restartedURL, admitted.ID, apiKey)
+	if observedJob.Status != restjobs.StatusFailed || observedJob.Provider != nil {
+		t.Fatalf("provider observation resolved failed job=%+v", observedJob)
+	}
+	observationStore, err := restjobs.OpenSQLiteStore(config.Persistence.Path, restjobs.Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 100, MaxEventsPerJob: 64, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := observationStore.ProviderObservation(admitted.ID)
+	if err != nil || observation.Outcome.Number != record.Outcome.Number {
+		t.Fatalf("provider observation not persisted=(%+v,%v)", observation, err)
+	}
+	if err := observationStore.CloseStore(); err != nil {
+		t.Fatal(err)
 	}
 	reconciledHistory := getProcessHistory(t, client, restartedURL, admitted.ID, apiKey)
-	reconciledEvents := 0
+	observedEvents := 0
 	for _, event := range reconciledHistory.Events {
-		if event.Type == "provider_reconciled" {
-			reconciledEvents++
+		if event.Type == "provider_observed" {
+			observedEvents++
+		}
+		if event.Type == "provider_reconciled" || event.Type == string(restjobs.StatusSucceeded) {
+			t.Fatalf("provider observation created success history: %+v", reconciledHistory.Events)
 		}
 	}
-	if reconciledEvents != 1 {
-		t.Fatalf("reconciliation audit count=%d history=%+v", reconciledEvents, reconciledHistory)
+	if observedEvents != 1 {
+		t.Fatalf("provider observation audit count=%d history=%+v", observedEvents, reconciledHistory)
 	}
 	recordData, err = os.ReadFile(recordPath)
 	if err != nil || json.Unmarshal(recordData, &record) != nil || record.Creates != 1 || record.Attempts != 1 {
@@ -2906,11 +2945,11 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "worktree")); err != nil {
 		t.Fatalf("SQLite lock removed retained workspace: %v", err)
 	}
-	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
-		t.Fatalf("interrupted provider reconcile status=%d body=%s", code, body)
+	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
+		t.Fatalf("interrupted provider observation status=%d body=%s", code, body)
 	}
-	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusOK || !strings.Contains(body, `"status":"succeeded"`) {
-		t.Fatalf("repeated interrupted provider reconcile status=%d body=%s", code, body)
+	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
+		t.Fatalf("repeated interrupted provider observation status=%d body=%s", code, body)
 	}
 	if code, _ := action(noAttemptJob.ID, "/disposition/failed", "wrong-key", ""); code != http.StatusUnauthorized {
 		t.Fatalf("wrong-auth disposition status=%d", code)
@@ -2928,8 +2967,19 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 		t.Fatalf("failed disposition removed retained workspace: %v", err)
 	}
 	providerHistory := getProcessHistory(t, client, baseURL, providerJob.ID, apiKey)
-	if len(providerHistory.Events) != 4 || providerHistory.Events[2].Type != "succeeded" || providerHistory.Events[3].Type != "provider_reconciled" || providerHistory.Events[3].Message != "Operator confirmed provider outcome" {
-		t.Fatalf("provider recovery history=%+v", providerHistory)
+	if len(providerHistory.Events) != 3 || providerHistory.Events[2].Type != "provider_observed" || providerHistory.Events[2].Message != "Matching pull request observed; outcome unresolved" {
+		t.Fatalf("provider observation history=%+v", providerHistory)
+	}
+	observationStore, err := restjobs.OpenSQLiteStore(config.Persistence.Path, restjobs.Config{QueueCapacity: 2, MaxConcurrentJobs: 2, MaxRecords: 100, MaxEventsPerJob: 64, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := observationStore.ProviderObservation(providerJob.ID)
+	if err != nil || observation.Outcome.Number != 71 {
+		t.Fatalf("matching provider observation not retained=(%+v,%v)", observation, err)
+	}
+	if err := observationStore.CloseStore(); err != nil {
+		t.Fatal(err)
 	}
 	noAttemptHistory := getProcessHistory(t, client, baseURL, noAttemptJob.ID, apiKey)
 	foundDisposition := false
@@ -2967,8 +3017,8 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 	child, childDone, baseURL = startServer("final-listener")
 	finalProvider := getProcessJob(t, client, baseURL, providerJob.ID, apiKey)
 	finalNoAttempt := getProcessJob(t, client, baseURL, noAttemptJob.ID, apiKey)
-	if finalProvider.Status != restjobs.StatusSucceeded || finalProvider.Provider == nil || finalNoAttempt.Status != restjobs.StatusFailed {
-		t.Fatalf("recovery not durable across restart: provider=%+v noAttempt=%+v", finalProvider, finalNoAttempt)
+	if finalProvider.Status != restjobs.StatusRunning || finalProvider.Provider != nil || finalNoAttempt.Status != restjobs.StatusFailed {
+		t.Fatalf("unresolved provider observation changed across restart: provider=%+v noAttempt=%+v", finalProvider, finalNoAttempt)
 	}
 	if got := getProcessHistory(t, client, baseURL, providerJob.ID, apiKey); !reflect.DeepEqual(got, providerHistory) {
 		t.Fatalf("provider audit changed after restart: before=%+v after=%+v", providerHistory, got)

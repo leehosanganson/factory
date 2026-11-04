@@ -54,7 +54,8 @@ type runtimeOptions struct {
 type providerReconciliationStore interface {
 	Get(string) (restjobs.Snapshot, error)
 	ProviderAttempt(string) (restjobs.ProviderAttempt, error)
-	ReconcileProviderOutcome(string, restjobs.ProviderOutcome) error
+	ProviderObservation(string) (restjobs.ProviderObservation, error)
+	ObserveProviderOutcome(string, restjobs.ProviderOutcome) error
 	RecoveryNeeded(string) bool
 }
 
@@ -247,17 +248,25 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			if attemptErr != nil {
 				return attemptErr
 			}
-			if job.Status == restjobs.StatusSucceeded && job.Provider != nil && job.Provider.Provider == attempt.Provider && job.Provider.Repository == attempt.Repository && job.Provider.Branch == attempt.Branch && job.Provider.Commit == attempt.Commit {
+			if observation, observationErr := recoveryStore.ProviderObservation(id); observationErr == nil {
+				if observation.Outcome.Provider != attempt.Provider || observation.Outcome.Repository != attempt.Repository || observation.Outcome.Branch != attempt.Branch || observation.Outcome.Commit != attempt.Commit {
+					return restjobs.ErrInvalidTransition
+				}
 				return nil
+			} else if !errors.Is(observationErr, restjobs.ErrInvalidTransition) {
+				return observationErr
 			}
 			if job.Status != restjobs.StatusFailed && (job.Status != restjobs.StatusRunning || !recoveryStore.RecoveryNeeded(id)) {
+				return restjobs.ErrInvalidTransition
+			}
+			if job.Status == restjobs.StatusFailed && job.Provider != nil {
 				return restjobs.ErrInvalidTransition
 			}
 			outcome, reconcileErr := factoryExecutor.ReconcileInterruptedProvider(requestCtx, job, attempt, reconciler)
 			if reconcileErr != nil {
 				return restjobs.ErrInvalidTransition
 			}
-			if err := recoveryStore.ReconcileProviderOutcome(id, outcome); err != nil {
+			if err := recoveryStore.ObserveProviderOutcome(id, outcome); err != nil {
 				return restjobs.ErrInvalidTransition
 			}
 			return nil

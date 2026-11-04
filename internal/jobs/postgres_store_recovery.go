@@ -262,17 +262,40 @@ func (s *PostgresStore) ProviderAttempt(id string) (ProviderAttempt, error) {
 	return attempt, nil
 }
 
-// ReconcileProviderOutcome atomically records an operator-confirmed read-only
-// provider result. The caller performs live-provider confirmation; this method
-// enforces identity and recovery eligibility before changing the shared status.
-func (s *PostgresStore) ReconcileProviderOutcome(id string, outcome ProviderOutcome) error {
+// ProviderObservation returns the durable read-only provider observation for a job.
+func (s *PostgresStore) ProviderObservation(id string) (ProviderObservation, error) {
+	if err := s.checkOpen(); err != nil {
+		return ProviderObservation{}, err
+	}
+	var encoded string
+	if err := s.db.QueryRow(`SELECT observation_json FROM factory_job_provider_observations WHERE job_id=$1`, id).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
+		var exists bool
+		if queryErr := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM factory_jobs WHERE id=$1)`, id).Scan(&exists); queryErr != nil {
+			return ProviderObservation{}, errors.New("read PostgreSQL provider observation")
+		}
+		if !exists {
+			return ProviderObservation{}, ErrNotFound
+		}
+		return ProviderObservation{}, ErrInvalidTransition
+	} else if err != nil {
+		return ProviderObservation{}, errors.New("read PostgreSQL provider observation")
+	}
+	var observation ProviderObservation
+	if json.Unmarshal([]byte(encoded), &observation) != nil || validateProviderOutcome(observation.Outcome) != nil || observation.ObservedAt.IsZero() {
+		return ProviderObservation{}, errors.New("PostgreSQL provider observation is invalid")
+	}
+	return observation, nil
+}
+
+// ObserveProviderOutcome atomically stores a read-only observation and its audit
+// event without changing job status or provider outcome.
+func (s *PostgresStore) ObserveProviderOutcome(id string, outcome ProviderOutcome) error {
 	if validateProviderOutcome(outcome) != nil {
 		return ErrInvalidInput
 	}
 	if err := s.checkOpen(); err != nil {
 		return err
 	}
-	encoded, _ := json.Marshal(outcome)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -288,75 +311,53 @@ func (s *PostgresStore) ReconcileProviderOutcome(id string, outcome ProviderOutc
 	} else if err != nil {
 		return errors.New("read PostgreSQL job state")
 	}
-	threadID, wasDone, err := postgresThreadDoneTransition(ctx, tx, id)
-	if err != nil {
-		return err
-	}
-	if status == string(StatusSucceeded) {
-		var prior string
-		if err := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=$1`, id).Scan(&prior); err != nil || prior != string(encoded) {
-			return ErrInvalidTransition
-		}
-		return tx.Commit()
-	}
 	_, interrupted := s.recoveryNeeded[id]
 	if status != string(StatusFailed) && (status != string(StatusRunning) || !interrupted) {
 		return ErrInvalidTransition
 	}
 	var attemptJSON string
-	attemptErr := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=$1`, id).Scan(&attemptJSON)
-	var attempt ProviderAttempt
-	if attemptErr == nil {
-		if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
-			return ErrInvalidInput
-		}
-	} else if !errors.Is(attemptErr, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=$1`, id).Scan(&attemptJSON); errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidTransition
+	} else if err != nil {
 		return errors.New("read PostgreSQL provider attempt")
-	} else {
-		var prior string
-		if err := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=$1`, id).Scan(&prior); err != nil {
-			return ErrInvalidTransition
-		}
-		var persisted ProviderOutcome
-		if json.Unmarshal([]byte(prior), &persisted) != nil || validateProviderOutcome(persisted) != nil {
-			return errors.New("PostgreSQL provider outcome is invalid")
-		}
-		if persisted != outcome {
-			return ErrInvalidInput
-		}
-		attempt = ProviderAttempt{Provider: persisted.Provider, Repository: persisted.Repository, Branch: persisted.Branch, Commit: persisted.Commit}
+	}
+	var attempt ProviderAttempt
+	if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
+		return ErrInvalidInput
 	}
 	if outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
 		return ErrInvalidInput
 	}
-	var previous string
-	previousErr := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=$1`, id).Scan(&previous)
-	if previousErr == nil && previous != string(encoded) {
-		return ErrInvalidTransition
-	}
-	if previousErr != nil && !errors.Is(previousErr, sql.ErrNoRows) {
-		return errors.New("read PostgreSQL provider outcome")
-	}
-	if previousErr != nil {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) VALUES($1,$2,clock_timestamp())`, id, string(encoded)); err != nil {
-			return errors.New("record PostgreSQL provider outcome")
+	var existingJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT observation_json FROM factory_job_provider_observations WHERE job_id=$1`, id).Scan(&existingJSON); err == nil {
+		var existing ProviderObservation
+		if json.Unmarshal([]byte(existingJSON), &existing) != nil || validateProviderOutcome(existing.Outcome) != nil || existing.ObservedAt.IsZero() {
+			return errors.New("PostgreSQL provider observation is invalid")
 		}
+		if existing.Outcome != outcome {
+			return ErrInvalidTransition
+		}
+		return tx.Commit()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("read PostgreSQL provider observation")
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='succeeded',cancellation_requested=false,updated_at=clock_timestamp() WHERE id=$1 AND status=$2`, id, status); err != nil {
-		return errors.New("finish reconciled PostgreSQL job")
+	now := time.Now().UTC()
+	observation := ProviderObservation{Outcome: outcome, ObservedAt: now}
+	encoded, err := json.Marshal(observation)
+	if err != nil {
+		return ErrInvalidInput
 	}
-	if err := insertPostgresEvent(ctx, tx, id, string(StatusSucceeded), "Job finished", s.config.MaxEventsPerJob); err != nil {
-		return errors.New("record PostgreSQL reconciliation completion")
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_observations(job_id,observation_json) VALUES($1,$2)`, id, string(encoded)); err != nil {
+		return errors.New("record PostgreSQL provider observation")
 	}
-	if err := insertPostgresEvent(ctx, tx, id, "provider_reconciled", "Operator confirmed provider outcome", s.config.MaxEventsPerJob); err != nil {
-		return errors.New("record PostgreSQL reconciliation history")
+	if err := insertPostgresEvent(ctx, tx, id, "provider_observed", "Matching pull request observed; outcome unresolved", s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record PostgreSQL provider observation audit event")
 	}
-	if err := recordPostgresDoneTransition(ctx, tx, threadID, wasDone); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return errors.New("commit PostgreSQL provider reconciliation")
-	}
-	delete(s.recoveryNeeded, id)
-	return nil
+	return tx.Commit()
+}
+
+// ReconcileProviderOutcome remains for source compatibility. A read-only lookup
+// does not prove that an earlier provider write is quiescent.
+func (s *PostgresStore) ReconcileProviderOutcome(string, ProviderOutcome) error {
+	return ErrInvalidTransition
 }

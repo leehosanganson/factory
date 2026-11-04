@@ -129,6 +129,13 @@ type ProviderAttempt struct {
 	Uncertain  bool   `json:"uncertain"`
 }
 
+// ProviderObservation is a read-only provider result that does not establish
+// whether an earlier write is complete or permanently stopped.
+type ProviderObservation struct {
+	Outcome    ProviderOutcome `json:"outcome"`
+	ObservedAt time.Time       `json:"observed_at"`
+}
+
 // ProviderOutcome is a validated provider-side PR result.
 type ProviderOutcome struct {
 	Provider   string `json:"provider"`
@@ -299,9 +306,8 @@ type RecoveryReport struct {
 	Terminal      []Snapshot
 }
 
-// Store is the persistence contract shared by the local in-memory store and
-// future durable stores. Implementations must make Admit atomic with respect
-// to idempotency, preserve lifecycle/history consistency, and honor cancellation
+// Store is the persistence contract shared by all store implementations. Implementations must make Admit atomic with respect to
+// idempotency, preserve lifecycle/history consistency, and honor cancellation
 // for context-bearing operations.
 //
 // ClaimNext and WaitClaim are unfenced single-process/admin compatibility APIs;

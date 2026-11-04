@@ -34,7 +34,7 @@ func TestLocalManagerRecordsProviderOutcomeBeforeTerminalSuccess(t *testing.T) {
 	}
 }
 
-func TestSQLiteExplicitReconciliationIsAtomicAndIdempotent(t *testing.T) {
+func TestSQLiteProviderObservationIsAtomicAndIdempotent(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())
 	if err != nil {
@@ -71,15 +71,19 @@ func TestSQLiteExplicitReconciliationIsAtomicAndIdempotent(t *testing.T) {
 		t.Fatalf("persisted attempt = %+v, %v", got, err)
 	}
 	outcome := ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 71, URL: "https://github.com/acme/widget/pull/71", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("reconcile confirmed outcome: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("record provider observation: %v", err)
 	}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("repeat reconciliation: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("repeat provider observation: %v", err)
 	}
 	got, err := store.Get(job.ID)
-	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
-		t.Fatalf("reconciled job = %+v, %v", got, err)
+	if err != nil || got.Status != StatusFailed || got.Provider != nil {
+		t.Fatalf("provider observation resolved job = %+v, %v", got, err)
+	}
+	observation, err := store.ProviderObservation(job.ID)
+	if err != nil || observation.Outcome != outcome || observation.ObservedAt.IsZero() {
+		t.Fatalf("persisted provider observation = (%+v,%v)", observation, err)
 	}
 	history, err := store.History(job.ID)
 	if err != nil {
@@ -87,16 +91,16 @@ func TestSQLiteExplicitReconciliationIsAtomicAndIdempotent(t *testing.T) {
 	}
 	count := 0
 	for _, event := range history.Events {
-		if event.Type == "provider_reconciled" {
+		if event.Type == "provider_observed" {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Fatalf("provider reconciliation audit events=%d history=%+v", count, history.Events)
+		t.Fatalf("provider observation audit events=%d history=%+v", count, history.Events)
 	}
 }
 
-func TestSQLiteReconciliationCompletesInterruptedRunningJobOnlyAfterProviderConfirmation(t *testing.T) {
+func TestSQLiteProviderObservationRetainsInterruptedRunningClassification(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	seed, err := OpenSQLiteStore(path, testConfig())
 	if err != nil {
@@ -127,19 +131,23 @@ func TestSQLiteReconciliationCompletesInterruptedRunningJobOnlyAfterProviderConf
 	}
 	defer store.CloseStore()
 	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 72, URL: "https://github.com/acme/widget/pull/72", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("reconcile interrupted job: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("record provider observation: %v", err)
 	}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("repeat confirmed reconciliation: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("repeat provider observation: %v", err)
 	}
 	got, err := store.Get(job.ID)
-	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome || got.Verification == nil {
-		t.Fatalf("reconciled interrupted job = %+v, %v", got, err)
+	if err != nil || got.Status != StatusRunning || got.Provider != nil || got.Verification == nil {
+		t.Fatalf("provider observation changed interrupted job = %+v, %v", got, err)
 	}
 	report, err := store.Recover(t.Context())
-	if err != nil || len(report.NeedsOperator) != 0 || len(report.Terminal) != 1 {
-		t.Fatalf("recovery after confirmation = (%+v, %v)", report, err)
+	if err != nil || len(report.NeedsOperator) != 1 || len(report.Terminal) != 0 {
+		t.Fatalf("recovery after observation = (%+v, %v)", report, err)
+	}
+	observation, err := store.ProviderObservation(job.ID)
+	if err != nil || observation.Outcome != outcome || observation.ObservedAt.IsZero() {
+		t.Fatalf("persisted provider observation = (%+v,%v)", observation, err)
 	}
 	history, err := store.History(job.ID)
 	if err != nil {
@@ -147,16 +155,16 @@ func TestSQLiteReconciliationCompletesInterruptedRunningJobOnlyAfterProviderConf
 	}
 	count := 0
 	for _, event := range history.Events {
-		if event.Type == "provider_reconciled" {
+		if event.Type == "provider_observed" {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Fatalf("provider reconciliation audit events=%d history=%+v", count, history.Events)
+		t.Fatalf("provider observation audit events=%d history=%+v", count, history.Events)
 	}
 }
 
-func TestSQLiteReconciliationAcceptsOnlyPersistedInterruptedProviderOutcome(t *testing.T) {
+func TestSQLiteProviderObservationRejectsExistingProviderOutcome(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	seed, err := OpenSQLiteStore(path, testConfig())
 	if err != nil {
@@ -182,16 +190,16 @@ func TestSQLiteReconciliationAcceptsOnlyPersistedInterruptedProviderOutcome(t *t
 		t.Fatal(err)
 	}
 	defer store.CloseStore()
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("confirm already-persisted provider outcome: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("persisted provider outcome is not an unresolved attempt: %v", err)
 	}
 	got, err := store.Get(job.ID)
-	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
-		t.Fatalf("persisted-outcome reconciliation=(%+v,%v)", got, err)
+	if err != nil || got.Status != StatusRunning || got.Provider == nil || *got.Provider != outcome {
+		t.Fatalf("provider observation changed the already-persisted provider outcome=(%+v,%v)", got, err)
 	}
 }
 
-func TestSQLiteConcurrentInterruptedProviderReconciliationIsIdempotent(t *testing.T) {
+func TestSQLiteConcurrentInterruptedProviderObservationIsIdempotent(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	first, err := OpenSQLiteStore(path, testConfig())
 	if err != nil {
@@ -227,7 +235,7 @@ func TestSQLiteConcurrentInterruptedProviderReconciliationIsIdempotent(t *testin
 	for _, store := range []*SQLiteStore{first, second} {
 		go func(store *SQLiteStore) {
 			<-start
-			results <- store.ReconcileProviderOutcome(job.ID, outcome)
+			results <- store.ObserveProviderOutcome(job.ID, outcome)
 		}(store)
 	}
 	close(start)
@@ -237,25 +245,29 @@ func TestSQLiteConcurrentInterruptedProviderReconciliationIsIdempotent(t *testin
 		}
 	}
 	got, err := first.Get(job.ID)
-	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
-		t.Fatalf("concurrent reconciliation result=(%+v,%v)", got, err)
+	if err != nil || got.Status != StatusRunning || got.Provider != nil {
+		t.Fatalf("concurrent provider observations changed job=(%+v,%v)", got, err)
+	}
+	observation, err := first.ProviderObservation(job.ID)
+	if err != nil || observation.Outcome != outcome {
+		t.Fatalf("concurrent provider observation=(%+v,%v)", observation, err)
 	}
 	history, err := first.History(job.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reconciled := 0
+	observed := 0
 	for _, event := range history.Events {
-		if event.Type == "provider_reconciled" {
-			reconciled++
+		if event.Type == "provider_observed" {
+			observed++
 		}
 	}
-	if reconciled != 1 {
-		t.Fatalf("concurrent reconciliation audit events=%d history=%+v", reconciled, history)
+	if observed != 1 {
+		t.Fatalf("concurrent observation audit events=%d history=%+v", observed, history)
 	}
 }
 
-func TestSQLiteInterruptedReconciliationIsAtomicAndConflictsWithDisposition(t *testing.T) {
+func TestSQLiteInterruptedProviderObservationIsAtomicAndConflictsWithDisposition(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	seed, err := OpenSQLiteStore(path, testConfig())
 	if err != nil {
@@ -285,12 +297,12 @@ func TestSQLiteInterruptedReconciliationIsAtomicAndConflictsWithDisposition(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`CREATE TRIGGER reject_provider_reconcile BEFORE INSERT ON factory_job_events WHEN NEW.type='provider_reconciled' BEGIN SELECT RAISE(ABORT,'injected audit failure'); END`); err != nil {
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_provider_reconcile BEFORE INSERT ON factory_job_events WHEN NEW.type='provider_observed' BEGIN SELECT RAISE(ABORT,'injected audit failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 72, URL: "https://github.com/acme/widget/pull/72", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err == nil {
-		t.Fatal("interrupted reconciliation committed after audit-write failure")
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err == nil {
+		t.Fatal("provider observation committed after audit-write failure")
 	}
 	got, err := store.Get(job.ID)
 	if err != nil || got.Status != StatusRunning || got.Provider != nil {
@@ -307,22 +319,26 @@ func TestSQLiteInterruptedReconciliationIsAtomicAndConflictsWithDisposition(t *t
 	if _, err := store.db.Exec(`DROP TRIGGER reject_provider_reconcile`); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("reconcile after removing audit fault: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("record observation after removing audit fault: %v", err)
 	}
 	conflicting := outcome
 	conflicting.Number++
 	conflicting.URL = "https://github.com/acme/widget/pull/73"
-	if err := store.ReconcileProviderOutcome(job.ID, conflicting); !errors.Is(err, ErrInvalidTransition) {
-		t.Fatalf("stale provider reconciliation with different identity=%v; want invalid transition", err)
+	if err := store.ObserveProviderOutcome(job.ID, conflicting); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("conflicting provider observation=%v; want invalid transition", err)
 	}
 	got, err = store.Get(job.ID)
-	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
-		t.Fatalf("stale provider reconciliation changed success: (%+v, %v)", got, err)
+	if err != nil || got.Status != StatusRunning || got.Provider != nil {
+		t.Fatalf("provider observation resolved job: (%+v, %v)", got, err)
+	}
+	observation, err := store.ProviderObservation(job.ID)
+	if err != nil || observation.Outcome != outcome {
+		t.Fatalf("observation did not survive successful retry=(%+v,%v)", observation, err)
 	}
 }
 
-func TestSQLiteExplicitReconciliationAcceptsConfirmedAttemptAndRejectsMissingAttempt(t *testing.T) {
+func TestSQLiteProviderObservationRequiresAttemptAndRetainsFailedState(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -341,28 +357,32 @@ func TestSQLiteExplicitReconciliationAcceptsConfirmedAttemptAndRejectsMissingAtt
 		t.Fatal(err)
 	}
 	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 71, URL: "https://github.com/acme/widget/pull/71", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("reconcile matching recorded attempt: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("record matching provider observation: %v", err)
 	}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); err != nil {
-		t.Fatalf("repeat reconciliation: %v", err)
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("repeat provider observation: %v", err)
 	}
 	got, err := store.Get(job.ID)
-	if err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
-		t.Fatalf("reconciled confirmed-attempt job = %+v, %v", got, err)
+	if err != nil || got.Status != StatusFailed || got.Provider != nil {
+		t.Fatalf("provider observation resolved failed job = %+v, %v", got, err)
+	}
+	observation, err := store.ProviderObservation(job.ID)
+	if err != nil || observation.Outcome != outcome {
+		t.Fatalf("observation was not retained = (%+v,%v)", observation, err)
 	}
 	history, err := store.History(job.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reconciledEvents := 0
+	observedEvents := 0
 	for _, event := range history.Events {
-		if event.Type == "provider_reconciled" {
-			reconciledEvents++
+		if event.Type == "provider_observed" {
+			observedEvents++
 		}
 	}
-	if reconciledEvents != 1 {
-		t.Fatalf("reconciliation audit events=%d history=%+v", reconciledEvents, history.Events)
+	if observedEvents != 1 {
+		t.Fatalf("provider observation audit events=%d history=%+v", observedEvents, history.Events)
 	}
 
 	withoutAttempt, _, err := store.Admit("missing-attempt", Request{Repository: "widget", Task: "task"})
@@ -377,7 +397,7 @@ func TestSQLiteExplicitReconciliationAcceptsConfirmedAttemptAndRejectsMissingAtt
 	}
 	missingOutcome := outcome
 	missingOutcome.Branch = "factory/job/" + withoutAttempt.ID
-	if err := store.ReconcileProviderOutcome(withoutAttempt.ID, missingOutcome); !errors.Is(err, ErrInvalidTransition) {
+	if err := store.ObserveProviderOutcome(withoutAttempt.ID, missingOutcome); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("missing-attempt reconciliation error=%v, want ErrInvalidTransition", err)
 	}
 	unchanged, err := store.Get(withoutAttempt.ID)
@@ -386,7 +406,7 @@ func TestSQLiteExplicitReconciliationAcceptsConfirmedAttemptAndRejectsMissingAtt
 	}
 }
 
-func TestSQLiteExplicitReconciliationFailsClosedOnIdentityMismatch(t *testing.T) {
+func TestSQLiteProviderObservationFailsClosedOnIdentityMismatch(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -408,12 +428,100 @@ func TestSQLiteExplicitReconciliationFailsClosedOnIdentityMismatch(t *testing.T)
 		t.Fatal(err)
 	}
 	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 71, URL: "https://github.com/acme/widget/pull/71", Branch: attempt.Branch, Commit: "different", State: "open"}
-	if err := store.ReconcileProviderOutcome(job.ID, outcome); !errors.Is(err, ErrInvalidInput) {
+	if err := store.ObserveProviderOutcome(job.ID, outcome); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("mismatched commit error=%v, want invalid input", err)
 	}
 	got, err := store.Get(job.ID)
 	if err != nil || got.Status != StatusFailed || got.Provider != nil {
 		t.Fatalf("mismatch changed job state: %+v %v", got, err)
+	}
+}
+
+func TestSQLiteProviderObservationIsSeparateAtomicAndIdempotent(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "jobs.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("observation-storage", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	attempt := ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	if err := store.RecordProviderAttempt(job.ID, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(job.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 71, URL: "https://github.com/acme/widget/pull/71", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
+	if _, err := store.ProviderObservation(job.ID); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("observation before lookup=(%+v,%v), want absent", ProviderObservation{}, err)
+	}
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("record provider observation: %v", err)
+	}
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatalf("repeat identical observation: %v", err)
+	}
+	observed, err := store.ProviderObservation(job.ID)
+	if err != nil || observed.Outcome != outcome || observed.ObservedAt.IsZero() {
+		t.Fatalf("persisted provider observation=(%+v,%v)", observed, err)
+	}
+	got, err := store.Get(job.ID)
+	if err != nil || got.Status != StatusFailed || got.Provider != nil {
+		t.Fatalf("provider observation changed job outcome=(%+v,%v)", got, err)
+	}
+	history, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observations := 0
+	for _, event := range history.Events {
+		if event.Type == "provider_observed" {
+			observations++
+		}
+		if event.Type == string(StatusSucceeded) || event.Type == "provider_reconciled" {
+			t.Fatalf("provider observation created success history: %+v", history.Events)
+		}
+	}
+	if observations != 1 {
+		t.Fatalf("provider observation audit events=%d history=%+v", observations, history.Events)
+	}
+
+	conflict := outcome
+	conflict.Number++
+	conflict.URL = "https://github.com/acme/widget/pull/72"
+	if err := store.ObserveProviderOutcome(job.ID, conflict); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("conflicting observation error=%v, want ErrInvalidTransition", err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_provider_observation BEFORE INSERT ON factory_job_events WHEN NEW.type='provider_observed' BEGIN SELECT RAISE(ABORT,'injected audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := store.Admit("observation-atomicity", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	otherAttempt := ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + other.ID, Commit: "abc1234"}
+	if err := store.RecordProviderAttempt(other.ID, otherAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Finish(other.ID, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	otherOutcome := outcome
+	otherOutcome.Branch = otherAttempt.Branch
+	if err := store.ObserveProviderOutcome(other.ID, otherOutcome); err == nil {
+		t.Fatal("observation committed when audit insertion failed")
+	}
+	if _, err := store.ProviderObservation(other.ID); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("observation survived audit failure=(%+v,%v)", ProviderObservation{}, err)
 	}
 }
 

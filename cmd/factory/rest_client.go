@@ -32,8 +32,8 @@ func restClientHelp() []helpCommand {
 		{"factory rest watch [--poll-interval <duration>] [--json] <job-id>", "Follow one job; poll status/history safely."},
 		{"factory rest cancel [--json] <job-id>", "Request cooperative cancellation of one remote job."},
 		{"factory rest operations [--json]", "Show an authenticated aggregate operations snapshot."},
-		{"factory rest disposition --confirm [--json] <failed|canceled> <job-id>", "Explicitly disposition an eligible interrupted SQLite job."},
-		{"factory rest reconcile [--json] <job-id>", "Confirm an eligible SQLite provider outcome using read-only reconciliation."},
+		{"factory rest disposition --confirm [--json] <failed|canceled> <job-id>", "Explicitly disposition an eligible interrupted SQLite or PostgreSQL job."},
+		{"factory rest reconcile [--json] <job-id>", "Request a read-only provider lookup for an eligible SQLite or PostgreSQL job."},
 	}
 }
 
@@ -197,7 +197,7 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker is
 		if err != nil {
 			return err
 		}
-		return writeRESTResult(out, *jsonOutput, "job", result, fmt.Sprintf("Remote job %s reconciled from read-only provider confirmation (%s).", result.ID, result.Status))
+		return writeRESTResult(out, *jsonOutput, "job", result, fmt.Sprintf("Provider lookup recorded for remote job %s; its status remains %s.", result.ID, result.Status))
 	case "watch":
 		if flags.NArg() != 1 {
 			return errors.New("usage: factory rest watch [--poll-interval <duration>] [--json] <job-id>")
