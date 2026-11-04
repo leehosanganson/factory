@@ -14,7 +14,7 @@ import (
 	"github.com/leehosanganson/factory/internal/provider"
 )
 
-func TestCreateResponseLossTransportRecoversThroughProductionPublisherWithoutRetry(t *testing.T) {
+func TestCreateResponseLossTransportLeavesProductionPublishUncertainForExplicitReconciliation(t *testing.T) {
 	jobID, err := workflowJobID("987653", "1")
 	if err != nil {
 		t.Fatal(err)
@@ -55,13 +55,15 @@ func TestCreateResponseLossTransportRecoversThroughProductionPublisherWithoutRet
 		}
 		return nil
 	})
-	outcome, err := publisher.Publish(context.Background(), request)
-	if err != nil || outcome.Number != 72 || outcome.Repository != sandboxRepo || outcome.Branch != restprovider.JobBranch(jobID) || outcome.Commit != request.Commit {
-		t.Fatalf("production publish outcome=(%+v,%v)", outcome, err)
+	if _, err := publisher.Publish(context.Background(), request); !errors.Is(err, restprovider.ErrUncertain) {
+		t.Fatalf("production Publish() error=%v, want uncertain after lost create response", err)
+	}
+	if posts != 1 || gets != 1 || seam.forwarded != 1 {
+		t.Fatalf("after uncertain Publish(): POST=%d GET=%d forwarded=%d; want one initial lookup and exactly one create", posts, gets, seam.forwarded)
 	}
 	confirmed, err := publisher.Reconcile(context.Background(), request)
-	if err != nil || confirmed != outcome || posts != 1 || gets < 3 || seam.forwarded != 1 {
-		t.Fatalf("production reconcile=(%+v,%v), POST=%d GET=%d forwarded=%d; want same outcome and exactly one create", confirmed, err, posts, gets, seam.forwarded)
+	if err != nil || confirmed.Number != 72 || confirmed.Repository != sandboxRepo || confirmed.Branch != restprovider.JobBranch(jobID) || confirmed.Commit != request.Commit || posts != 1 || gets != 2 || seam.forwarded != 1 {
+		t.Fatalf("explicit production reconcile=(%+v,%v), POST=%d GET=%d forwarded=%d; want matching outcome and exactly one create", confirmed, err, posts, gets, seam.forwarded)
 	}
 }
 

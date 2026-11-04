@@ -119,44 +119,19 @@ func (g *GitHubPublisher) Publish(ctx context.Context, request PublishRequest) (
 		if err != nil {
 			return Outcome{}, errors.New("GitHub PR endpoint is invalid")
 		}
-		for attempt := 0; attempt < 2; attempt++ {
-			if err := g.doJSON(ctx, http.MethodPatch, updateEndpoint, updatePayload, &updated); err == nil {
-				if !validPullRequest(updated, request, branch) {
-					return Outcome{}, fmt.Errorf("%w: GitHub pull request update identity mismatch", ErrUncertain)
-				}
-				return outcomeFor(updated, request, branch), nil
-			}
-			if ctx.Err() != nil {
-				return Outcome{}, fmt.Errorf("%w: GitHub pull request update was interrupted", ErrUncertain)
-			}
-			var reconciled []PullRequest
-			if err := g.doJSON(ctx, http.MethodGet, endpoint+"?"+url.Values{"head": {strings.Split(request.Repository, "/")[0] + ":" + branch}, "state": {"all"}, "per_page": {"100"}}.Encode(), nil, &reconciled); err != nil {
-				return Outcome{}, fmt.Errorf("%w: reconcile GitHub pull request update", ErrUncertain)
-			}
-			found := false
-			for _, current := range reconciled {
-				if current.Number == outcome.Number && current.Head.Ref == branch && current.Head.SHA == request.Commit && current.Base.Ref == request.BaseBranch && current.Base.Repo.FullName == request.Repository && current.State == "open" {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return Outcome{}, fmt.Errorf("%w: matching pull request could not be confirmed after update", ErrUncertain)
-			}
+		if err := g.doJSON(ctx, http.MethodPatch, updateEndpoint, updatePayload, &updated); err != nil {
+			return Outcome{}, fmt.Errorf("%w: update GitHub pull request", ErrUncertain)
 		}
-		return Outcome{}, fmt.Errorf("%w: GitHub pull request update remains unresolved", ErrUncertain)
+		if !validPullRequest(updated, request, branch) {
+			return Outcome{}, fmt.Errorf("%w: GitHub pull request update identity mismatch", ErrUncertain)
+		}
+		return outcomeFor(updated, request, branch), nil
 	}
 	var created PullRequest
 	if err := g.doJSON(ctx, http.MethodPost, endpoint, payload, &created); err != nil {
-		if outcome, found, lookupErr := g.findJobPR(ctx, endpoint, request); lookupErr == nil && found {
-			return outcome, nil
-		}
-		return Outcome{}, fmt.Errorf("%w: create or reconcile GitHub pull request", ErrUncertain)
+		return Outcome{}, fmt.Errorf("%w: create GitHub pull request", ErrUncertain)
 	}
 	if !validPullRequest(created, request, branch) {
-		if outcome, found, lookupErr := g.findJobPR(ctx, endpoint, request); lookupErr == nil && found {
-			return outcome, nil
-		}
 		return Outcome{}, fmt.Errorf("%w: GitHub pull request response identity mismatch", ErrUncertain)
 	}
 	return outcomeFor(created, request, branch), nil
