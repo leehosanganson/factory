@@ -321,8 +321,13 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 				closeStore()
 				return errors.New("worker mapping file is invalid or unavailable")
 			}
+			mappingLookup, ok := store.(restserver.WorkerMappingLookup)
+			if !ok {
+				closeStore()
+				return errors.New("configured SQL store does not support worker mapping lookup")
+			}
 			if handler, ok := workerHandler.(*restserver.WorkerListenerHandler); ok {
-				handler.SetMappingRegistry(workerMappings)
+				handler.SetMappingLookup(mappingLookup)
 			}
 		}
 		workerTLS, err = restserver.NewWorkerListenerTLS(*config.WorkerListener)

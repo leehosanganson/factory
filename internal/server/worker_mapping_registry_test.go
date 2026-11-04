@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	restjobs "github.com/leehosanganson/factory/internal/jobs"
 )
@@ -152,6 +154,62 @@ func TestWorkerMappingAuditFailureRetainsLastKnownGoodPublication(t *testing.T) 
 	}
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_mapping_audit WHERE fingerprint=?`, fingerprint).Scan(&auditRows); err != nil || auditRows != 1 {
 		t.Fatalf("audit rows after failed change=%d, err=%v; want only initial accepted event", auditRows, err)
+	}
+}
+
+type blockingMappingStore struct {
+	inner   *memoryMappingStore
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingMappingStore) ReconcileWorkerMappings(ctx context.Context, candidate map[string]string) (restjobs.WorkerMappingState, error) {
+	s.once.Do(func() {
+		close(s.entered)
+		<-s.release
+	})
+	return s.inner.ReconcileWorkerMappings(ctx, candidate)
+}
+
+func TestWorkerMappingConcurrentReloadsPublishInSerializedOrder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mappings.json")
+	fingerprint := strings.Repeat("e", 64)
+	write := func(principal string) {
+		t.Helper()
+		contents := `{"version":1,"mappings":[{"sha256":"` + fingerprint + `","principal_id":"` + principal + `"}]}`
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("worker-first")
+	store := &blockingMappingStore{inner: &memoryMappingStore{active: map[string]string{}, revoked: map[string]string{}}, entered: make(chan struct{}), release: make(chan struct{})}
+	registry, err := NewWorkerMappingRegistry(path, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- registry.Reload(context.Background()) }()
+	<-store.entered
+	write("worker-second")
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- registry.Reload(context.Background()) }()
+	close(store.release)
+	for name, done := range map[string]<-chan error{"first": firstDone, "second": secondDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s reload failed: %v", name, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s reload did not complete", name)
+		}
+	}
+	if principal, ok := registry.Principal(fingerprint); !ok || principal != "worker-second" {
+		t.Fatalf("final published mapping=(%q,%v), want latest serialized mapping", principal, ok)
+	}
+	if status := registry.Status(); status.Result != "accepted" {
+		t.Fatalf("final reload status=%+v, want successful final reload", status)
 	}
 }
 

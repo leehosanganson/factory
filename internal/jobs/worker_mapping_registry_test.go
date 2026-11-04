@@ -9,6 +9,41 @@ import (
 	"testing"
 )
 
+func TestSQLiteWorkerMappingLookupReflectsCommittedState(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "worker-mapping-lookup.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	ctx := context.Background()
+	fingerprint := strings.Repeat("b", 64)
+	if _, err := store.ReconcileWorkerMappings(ctx, map[string]string{fingerprint: "worker-before"}); err != nil {
+		t.Fatal(err)
+	}
+	if principal, found, err := store.LookupWorkerMapping(ctx, fingerprint); err != nil || !found || principal != "worker-before" {
+		t.Fatalf("initial lookup=(%q,%v,%v)", principal, found, err)
+	}
+	var auditRows int
+	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_mapping_audit`).Scan(&auditRows); err != nil || auditRows != 1 {
+		t.Fatalf("authentication lookup changed mapping audit rows=%d err=%v; want only registration event", auditRows, err)
+	}
+	if _, err := store.ReconcileWorkerMappings(ctx, map[string]string{fingerprint: "worker-after"}); err != nil {
+		t.Fatal(err)
+	}
+	if principal, found, err := store.LookupWorkerMapping(ctx, fingerprint); err != nil || !found || principal != "worker-after" {
+		t.Fatalf("changed lookup=(%q,%v,%v)", principal, found, err)
+	}
+	if _, err := store.ReconcileWorkerMappings(ctx, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if principal, found, err := store.LookupWorkerMapping(ctx, fingerprint); err != nil || found || principal != "" {
+		t.Fatalf("revoked lookup=(%q,%v,%v), want absent", principal, found, err)
+	}
+	if _, _, err := store.LookupWorkerMapping(nil, fingerprint); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("nil context lookup error=%v, want invalid input", err)
+	}
+}
+
 func TestSQLiteWorkerMappingAuditFailureRollsBackRegistryState(t *testing.T) {
 	dbPath := filepath.Join(privateSQLiteDir(t), "worker-mapping-audit-failure.db")
 	store, err := OpenSQLiteStore(dbPath, testConfig())
@@ -38,6 +73,49 @@ func TestSQLiteWorkerMappingAuditFailureRollsBackRegistryState(t *testing.T) {
 	var auditRows int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_mapping_audit WHERE fingerprint=?`, fingerprint).Scan(&auditRows); err != nil || auditRows != 1 {
 		t.Fatalf("audit rows after failed change=%d, err=%v; want only initial accepted event", auditRows, err)
+	}
+}
+
+func TestPostgresWorkerMappingLookupUsesCurrentCommittedRegistry(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL worker mapping integration tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.CloseStore() })
+	ctx := context.Background()
+	fingerprint := strings.Repeat("a", 64)
+	if _, err := store.ReconcileWorkerMappings(ctx, map[string]string{fingerprint: "worker-before"}); err != nil {
+		t.Fatal(err)
+	}
+	principal, found, err := store.LookupWorkerMapping(ctx, fingerprint)
+	if err != nil || !found || principal != "worker-before" {
+		t.Fatalf("initial lookup=(%q,%v,%v)", principal, found, err)
+	}
+	if _, err := store.ReconcileWorkerMappings(ctx, map[string]string{fingerprint: "worker-after"}); err != nil {
+		t.Fatal(err)
+	}
+	principal, found, err = store.LookupWorkerMapping(ctx, fingerprint)
+	if err != nil || !found || principal != "worker-after" {
+		t.Fatalf("changed lookup=(%q,%v,%v)", principal, found, err)
+	}
+	if _, err := store.ReconcileWorkerMappings(ctx, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if principal, found, err := store.LookupWorkerMapping(ctx, fingerprint); err != nil || found || principal != "" {
+		t.Fatalf("revoked lookup=(%q,%v,%v), want absent", principal, found, err)
 	}
 }
 

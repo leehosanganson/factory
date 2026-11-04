@@ -346,6 +346,110 @@ func TestWorkerCapabilitySessionEndpointsUseOnlyAuthenticatedOwnSession(t *testi
 	}
 }
 
+type workerMappingLookupFunc func(context.Context, string) (string, bool, error)
+
+func (f workerMappingLookupFunc) LookupWorkerMapping(ctx context.Context, fingerprint string) (string, bool, error) {
+	return f(ctx, fingerprint)
+}
+
+func TestWorkerCapabilityUsesLiveMappingBeforeBearerAuthentication(t *testing.T) {
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-live-mapping.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	clientCert := workerTestCertificate(t, "live-mapping", true)
+	fingerprint := sha256.Sum256(clientCert.Certificate[0])
+	key := hex.EncodeToString(fingerprint[:])
+	if _, err := store.ReconcileWorkerMappings(context.Background(), map[string]string{key: "worker-before"}); err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := store.RegisterWorkerSession(context.Background(), "worker-before", "boot-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MappingFile: "configured"}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.SetMappingLookup(store)
+	request := httptest.NewRequest(http.MethodGet, "/v1/worker/session", nil)
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.Header.Set("Authorization", "Bearer "+session.Capability)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("current mapping status=%d, want 200", response.Code)
+	}
+	if _, err := store.ReconcileWorkerMappings(context.Background(), map[string]string{key: "worker-after"}); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"code":"unauthenticated"`) {
+		t.Fatalf("remapped certificate response=%d %s, want generic unauthenticated", response.Code, response.Body.String())
+	}
+	if _, err := store.ReconcileWorkerMappings(context.Background(), map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"code":"unauthenticated"`) {
+		t.Fatalf("removed certificate response=%d %s, want generic unauthenticated", response.Code, response.Body.String())
+	}
+}
+
+func TestWorkerMappingLookupFailureFailsClosedWithSanitized503(t *testing.T) {
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-mapping-outage.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	clientCert := workerTestCertificate(t, "mapping-outage", true)
+	fingerprint := sha256.Sum256(clientCert.Certificate[0])
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MappingFile: "configured"}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler.SetMappingLookup(workerMappingLookupFunc(func(context.Context, string) (string, bool, error) {
+		return "", false, errors.New("private database credential and host")
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-outage"}`))
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.Header.Set("Authorization", "Bearer unused")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"service_unavailable"`) {
+		t.Fatalf("lookup outage response=%d %s, want sanitized 503", response.Code, response.Body.String())
+	}
+	for _, private := range []string{"private database", hex.EncodeToString(fingerprint[:])} {
+		if strings.Contains(response.Body.String(), private) {
+			t.Errorf("lookup failure exposed %q in %s", private, response.Body.String())
+		}
+	}
+}
+
+func TestWorkerListenerInlineCertificateMappingRemainsProcessConfigured(t *testing.T) {
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-inline-mapping.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	clientCert := workerTestCertificate(t, "inline-mapping", true)
+	digest := sha256.Sum256(clientCert.Certificate[0])
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(digest[:]), PrincipalID: "worker-inline", Enabled: true}}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-inline"}`))
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"principal_id":"worker-inline"`) {
+		t.Fatalf("inline certificate mapping registration=%d %s, want configured principal", response.Code, response.Body.String())
+	}
+}
+
 func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-capability-auth.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
 	if err != nil {
