@@ -53,6 +53,197 @@ func gitTest(t *testing.T, root string, args ...string) {
 	}
 }
 
+func TestCreateRevisionMaterializesCapturedTreeInPrivateRepository(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, _ := testManager(t, &now, nil)
+	if err := os.WriteFile(filepath.Join(repo, "history.txt"), []byte("reachable source history"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", "history.txt")
+	gitTest(t, repo, "commit", "-qm", "reachable source history")
+	gitTest(t, repo, "branch", "extra-branch")
+	gitTest(t, repo, "tag", "extra-tag")
+	revision, err := manager.CaptureContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "original.txt"), []byte("changed after capture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", "original.txt")
+	gitTest(t, repo, "commit", "-qm", "later source")
+
+	workspace, err := manager.CreateRevisionContext(context.Background(), testJobID, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := gitText(t, workspace.WorktreePath, "rev-parse", "HEAD"); got != revision.Commit {
+		t.Fatalf("materialized commit = %s, want captured %s", got, revision.Commit)
+	}
+	if got := gitText(t, workspace.WorktreePath, "rev-parse", "HEAD^{tree}"); got != revision.Tree {
+		t.Fatalf("materialized tree = %s, want captured %s", got, revision.Tree)
+	}
+	if got, err := os.ReadFile(filepath.Join(workspace.WorktreePath, "original.txt")); err != nil || string(got) != "original" {
+		t.Fatalf("materialized source = %q, err=%v; want captured bytes", got, err)
+	}
+	if got := gitText(t, workspace.WorktreePath, "for-each-ref", "--format=%(refname)"); got != "" {
+		t.Fatalf("private repository copied source refs: %q", got)
+	}
+	if got := gitText(t, repo, "rev-list", "--count", revision.Commit); got != "2" {
+		t.Fatalf("fixture lacks reachable source history: count=%q", got)
+	}
+	if got := gitText(t, workspace.WorktreePath, "rev-list", "--count", "HEAD"); got != "1" {
+		t.Fatalf("private repository retained unrelated source history: count=%q", got)
+	}
+	gitDir, err := os.Lstat(filepath.Join(workspace.WorktreePath, ".git"))
+	if err != nil || !gitDir.IsDir() {
+		t.Fatalf("workspace is not a private Git repository: info=%v err=%v", gitDir, err)
+	}
+	if err := manager.MarkSucceeded(testJobID); err != nil {
+		t.Fatalf("MarkSucceeded() for private repository: %v", err)
+	}
+}
+
+func TestCaptureRejectsUnsupportedGitSourceFeatures(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{name: "checkout filter", setup: func(t *testing.T, repo string) {
+			if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("*.txt filter=custom\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, repo, "add", ".gitattributes")
+			gitTest(t, repo, "commit", "-qm", "filter")
+		}},
+		{name: "global checkout filter", setup: func(t *testing.T, repo string) {
+			t.Setenv("HOME", t.TempDir())
+			globalAttributes := filepath.Join(filepath.Dir(repo), "global-attributes")
+			if err := os.WriteFile(globalAttributes, []byte("*.txt filter=global\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, repo, "config", "--global", "core.attributesFile", globalAttributes)
+			if err := os.WriteFile(filepath.Join(repo, "filtered.txt"), []byte("filtered"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, repo, "add", "filtered.txt")
+			gitTest(t, repo, "commit", "-qm", "global filter")
+		}},
+		{name: "git lfs pointer without filter attributes", setup: func(t *testing.T, repo string) {
+			if err := os.WriteFile(filepath.Join(repo, "large.bin"), []byte("version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, repo, "add", ".")
+			gitTest(t, repo, "commit", "-qm", "lfs")
+		}},
+		{name: "git lfs filter attributes", setup: func(t *testing.T, repo string) {
+			if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("*.bin filter=lfs diff=lfs merge=lfs -text\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repo, "large.bin"), []byte("version https://git-lfs.github.com/spec/v1\noid sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\nsize 1\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, repo, "add", ".")
+			gitTest(t, repo, "commit", "-qm", "lfs")
+		}},
+		{name: "submodule", setup: func(t *testing.T, repo string) {
+			child := filepath.Join(filepath.Dir(repo), "child")
+			if err := os.Mkdir(child, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, child, "init", "-q")
+			gitTest(t, child, "config", "user.email", "test@example.com")
+			gitTest(t, child, "config", "user.name", "Workspace Test")
+			if err := os.WriteFile(filepath.Join(child, "child.txt"), []byte("child"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			gitTest(t, child, "add", ".")
+			gitTest(t, child, "commit", "-qm", "child")
+			gitTest(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", child, "nested")
+			gitTest(t, repo, "commit", "-qam", "submodule")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			manager, repo, _ := testManager(t, &now, nil)
+			test.setup(t, repo)
+			if test.name == "git lfs pointer without filter attributes" {
+				if err := os.Remove(filepath.Join(repo, "large.bin")); err != nil {
+					t.Fatal(err)
+				}
+				commit := gitText(t, repo, "rev-parse", "HEAD")
+				pointer, err := exec.Command("git", "-C", repo, "cat-file", "blob", commit+":large.bin").Output()
+				if err != nil || !isGitLFSPointer(pointer) {
+					t.Fatalf("captured tree does not contain the exact LFS pointer fixture: pointer=%q err=%v", pointer, err)
+				}
+				oldOrder := exec.Command("git", "-C", repo, "grep", "--no-textconv", "-I", "-l", "-F", "-z", "--", "version https://git-lfs.github.com/spec/v1", commit)
+				output, err := oldOrder.Output()
+				if err != nil || len(output) == 0 {
+					t.Fatalf("old argument order did not find the captured pointer: output=%q err=%v", output, err)
+				}
+			}
+			if _, err := manager.CaptureContext(context.Background()); err == nil {
+				t.Fatal("CaptureContext() accepted unsupported source features")
+			}
+		})
+	}
+}
+
+func TestCreateRevisionPreservesRawTreeBytesWithAmbientGitConfiguration(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	now := time.Now().UTC()
+	manager, repo, _ := testManager(t, &now, nil)
+	lineEndings := []byte("first\r\nsecond\n")
+	if err := os.WriteFile(filepath.Join(repo, "line-endings.txt"), lineEndings, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "add", "line-endings.txt")
+	gitTest(t, repo, "commit", "-qm", "raw line endings")
+	revision, err := manager.CaptureContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, repo, "config", "--global", "core.autocrlf", "true")
+	gitTest(t, repo, "config", "--global", "core.attributesFile", filepath.Join(t.TempDir(), "ambient-attributes"))
+	if err := os.WriteFile(filepath.Join(t.TempDir(), "ambient-attributes"), []byte("*.txt filter=ambient\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workspace, err := manager.CreateRevisionContext(context.Background(), testJobID, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(workspace.WorktreePath, "line-endings.txt"))
+	if err != nil || string(got) != string(lineEndings) {
+		t.Fatalf("materialized raw tree bytes = %q, err=%v; want %q", got, err, lineEndings)
+	}
+}
+
+func TestRetainedWorkspaceAcceptsLegacyLinkedWorktreeForReconciliation(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, _ := testManager(t, &now, nil)
+	jobDir := filepath.Join(manager.root, testJobID)
+	if err := os.Mkdir(jobDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"state", "output"} {
+		if err := os.Mkdir(filepath.Join(jobDir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyWorktree := filepath.Join(jobDir, "worktree")
+	gitTest(t, repo, "worktree", "add", "--detach", legacyWorktree, "HEAD")
+	workspace, err := manager.RetainedWorkspace(testJobID)
+	if err != nil {
+		t.Fatalf("RetainedWorkspace() rejected legacy linked worktree: %v", err)
+	}
+	if workspace.WorktreePath != legacyWorktree || workspace.JobID != testJobID {
+		t.Fatalf("RetainedWorkspace() = %+v, want legacy path %q", workspace, legacyWorktree)
+	}
+	if got, err := os.ReadFile(filepath.Join(workspace.WorktreePath, "original.txt")); err != nil || string(got) != "original" {
+		t.Fatalf("legacy linked worktree content = %q, err=%v", got, err)
+	}
+}
+
 func TestCreateMakesDetachedIsolatedWorktree(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	manager, repo, _ := testManager(t, &now, nil)
@@ -118,7 +309,7 @@ func TestCreateContextCancellationDuringGitRetainsPartialWorktree(t *testing.T) 
 	var calls int
 	runner := func(runCtx context.Context, root string, args ...string) error {
 		calls++
-		if len(args) < 2 || args[0] != "worktree" || args[1] != "add" {
+		if len(args) == 0 || args[0] != "init" {
 			return errors.New("unexpected Git command")
 		}
 		if err := runGit(runCtx, root, args...); err != nil {
@@ -133,7 +324,7 @@ func TestCreateContextCancellationDuringGitRetainsPartialWorktree(t *testing.T) 
 		t.Fatalf("CreateContext() error = %v, want context.Canceled", err)
 	}
 	if calls != 1 {
-		t.Fatalf("Git runner called %d times, want one worktree add", calls)
+		t.Fatalf("Git runner called %d times, want one repository initialization", calls)
 	}
 	jobDir := filepath.Join(manager.root, testJobID)
 	if _, err := os.Lstat(filepath.Join(jobDir, "worktree")); err != nil {
@@ -238,7 +429,7 @@ func TestCreateRetainsWorktreeIfRepositoryChangesDuringGitAdd(t *testing.T) {
 		if err := runGit(ctx, root, args...); err != nil {
 			return err
 		}
-		if len(args) >= 2 && args[0] == "worktree" && args[1] == "add" {
+		if len(args) > 0 && args[0] == "init" {
 			repoBackup = swapConfiguredCheckout(t, repo, replacement)
 			swapped = true
 		}
@@ -254,17 +445,17 @@ func TestCreateRetainsWorktreeIfRepositoryChangesDuringGitAdd(t *testing.T) {
 
 	workspace, err := manager.Create(testJobID)
 	if err == nil {
-		t.Fatal("accepted repository identity changed during git worktree add")
+		t.Fatal("accepted repository identity changed during private repository initialization")
 	}
 	if !swapped {
-		t.Fatal("git worktree add did not execute")
+		t.Fatal("private repository initialization did not execute")
 	}
 	if _, err := os.Lstat(workspace.WorktreePath); err == nil {
 		t.Fatal("expected failed Create to return an empty workspace")
 	}
 	worktree := filepath.Join(manager.root, testJobID, "worktree")
 	if _, err := os.Lstat(worktree); err != nil {
-		t.Fatalf("did not retain just-created worktree after identity change: %v", err)
+		t.Fatalf("did not retain just-created private repository after identity change: %v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(manager.root, testJobID, markerName)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("created completion marker after identity change: %v", err)
@@ -329,12 +520,13 @@ func TestSweepContextReturnsWhenManagerLockIsHeld(t *testing.T) {
 	}
 }
 
-func TestSweepContextCancelsBlockedGitAndRetainsWorkspace(t *testing.T) {
+func TestSweepContextCancelsBlockedPrivateRepositoryGitAndRetainsWorkspace(t *testing.T) {
 	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
 	enteredGit := make(chan struct{})
 	releaseGit := make(chan struct{})
+	var manager *Manager
 	runner := func(ctx context.Context, root string, args ...string) error {
-		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+		if len(args) > 0 && args[0] == "rev-parse" && root != manager.repoRoot {
 			close(enteredGit)
 			select {
 			case <-ctx.Done():
@@ -345,7 +537,7 @@ func TestSweepContextCancelsBlockedGitAndRetainsWorkspace(t *testing.T) {
 		}
 		return runGit(ctx, root, args...)
 	}
-	manager, _, _ := testManager(t, &now, runner)
+	manager, _, _ = testManager(t, &now, runner)
 	if _, err := manager.Create(testJobID); err != nil {
 		t.Fatal(err)
 	}
@@ -360,20 +552,40 @@ func TestSweepContextCancelsBlockedGitAndRetainsWorkspace(t *testing.T) {
 	select {
 	case <-enteredGit:
 	case <-time.After(5 * time.Second):
-		t.Fatal("sweep did not reach blocked Git cleanup")
+		t.Fatal("sweep did not reach blocked private repository Git operation")
 	}
 	cancel()
 	select {
 	case report := <-done:
 		if report.Removed != 0 || report.Retained != 1 {
-			t.Fatalf("canceled sweep report = %+v; expired workspace must be retained", report)
+			t.Fatalf("canceled sweep report = %+v", report)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("SweepContext did not return after its Git context was canceled")
+		t.Fatal("SweepContext did not return after Git cancellation")
 	}
 	close(releaseGit)
 	if _, err := os.Stat(filepath.Join(manager.root, testJobID)); err != nil {
 		t.Fatalf("canceled cleanup removed workspace: %v", err)
+	}
+}
+
+func TestSweepRemovesExpiredPrivateRepository(t *testing.T) {
+	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
+	manager, _, _ := testManager(t, &now, nil)
+	workspace, err := manager.Create(testJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.MarkSucceeded(testJobID); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Hour)
+	report := manager.Sweep()
+	if report.Removed != 1 || report.Retained != 0 || len(report.Errors) != 0 {
+		t.Fatalf("expired private repository sweep = %+v", report)
+	}
+	if _, err := os.Lstat(workspace.WorktreePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired private repository remains: %v", err)
 	}
 }
 
@@ -496,53 +708,39 @@ func TestSweepRetainsTamperedMarkerIdentityAndSymlink(t *testing.T) {
 	}
 }
 
-func TestSweepRetainsWrongRepositoryAndGitCleanupFailure(t *testing.T) {
+func TestSweepRetainsWrongRepositoryMetadataAndRemovesExpiredPrivateRepository(t *testing.T) {
 	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
-	fail := false
-	runner := func(ctx context.Context, root string, args ...string) error {
-		if fail && len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
-			return errors.New("injected cleanup failure")
-		}
-		return runGit(ctx, root, args...)
-	}
-	manager, repo, _ := testManager(t, &now, runner)
-	for _, id := range []string{"01234567-89ab-4cde-8fab-0123456789a1", "01234567-89ab-4cde-8fab-0123456789a2"} {
+	manager, repo, _ := testManager(t, &now, nil)
+	ids := []string{"01234567-89ab-4cde-8fab-0123456789a1", "01234567-89ab-4cde-8fab-0123456789a2"}
+	for _, id := range ids {
 		if _, err := manager.Create(id); err != nil {
 			t.Fatal(err)
 		}
 		if err := manager.MarkSucceeded(id); err != nil {
 			t.Fatal(err)
 		}
-	}
-	first := filepath.Join(manager.root, "01234567-89ab-4cde-8fab-0123456789a1", markerName)
-	data, err := os.ReadFile(first)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrongRepo := filepath.Join(filepath.Dir(repo), "different")
-	data = []byte(strings.Replace(string(data), repo, wrongRepo, 1))
-	data = []byte(strings.Replace(string(data), "2026-01-03T03:04:05Z", "2026-01-01T03:04:04Z", 1))
-	if err := os.WriteFile(first, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(manager.root, "01234567-89ab-4cde-8fab-0123456789a2", markerName)
-	data, err = os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	data = []byte(strings.Replace(string(data), "2026-01-03T03:04:05Z", "2026-01-01T03:04:04Z", 1))
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	fail = true
-	report := manager.Sweep()
-	if report.Removed != 0 || report.Retained != 2 || len(report.Errors) != 2 {
-		t.Fatalf("cleanup failure/wrong repo report: %+v", report)
-	}
-	for _, id := range []string{"01234567-89ab-4cde-8fab-0123456789a1", "01234567-89ab-4cde-8fab-0123456789a2"} {
-		if _, err := os.Lstat(filepath.Join(manager.root, id)); err != nil {
-			t.Fatalf("job was removed: %v", err)
+		path := filepath.Join(manager.root, id, markerName)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
 		}
+		data = []byte(strings.Replace(string(data), "2026-01-03T03:04:05Z", "2026-01-01T03:04:04Z", 1))
+		if id == ids[0] {
+			data = []byte(strings.Replace(string(data), repo, filepath.Join(filepath.Dir(repo), "different"), 1))
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report := manager.Sweep()
+	if report.Removed != 1 || report.Retained != 1 || len(report.Errors) != 1 {
+		t.Fatalf("wrong repository/expired workspace sweep: %+v", report)
+	}
+	if _, err := os.Lstat(filepath.Join(manager.root, ids[0])); err != nil {
+		t.Fatalf("wrong-repository job was removed: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(manager.root, ids[1])); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expired job remains: %v", err)
 	}
 }
 
@@ -688,28 +886,20 @@ func TestNewRejectsBroadResultsParentWithoutChangingModes(t *testing.T) {
 
 func TestSweepRetainsWhenChildIdentityChangesDuringCleanup(t *testing.T) {
 	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
-	var manager *Manager
-	var outside string
-	runner := func(ctx context.Context, root string, args ...string) error {
-		if err := runGit(ctx, root, args...); err != nil {
-			return err
-		}
-		if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
-			child := filepath.Join(manager.root, testJobID, "output")
-			if err := os.RemoveAll(child); err != nil {
-				return err
-			}
-			return os.Symlink(outside, child)
-		}
-		return nil
-	}
-	var repo string
-	manager, repo, _ = testManager(t, &now, runner)
-	outside = t.TempDir()
+	manager, _, _ := testManager(t, &now, nil)
 	if _, err := manager.Create(testJobID); err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.MarkSucceeded(testJobID); err != nil {
+		t.Fatal(err)
+	}
+	jobDir := filepath.Join(manager.root, testJobID)
+	path := filepath.Join(jobDir, "output")
+	outside := t.TempDir()
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, path); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(25 * time.Hour)
@@ -717,15 +907,12 @@ func TestSweepRetainsWhenChildIdentityChangesDuringCleanup(t *testing.T) {
 	if report.Removed != 0 || report.Retained != 1 || len(report.Errors) != 1 {
 		t.Fatalf("changed child was not retained: %+v", report)
 	}
-	if _, err := os.Lstat(filepath.Join(manager.root, testJobID)); err != nil {
+	if _, err := os.Lstat(jobDir); err != nil {
 		t.Fatalf("job directory removed after child identity change: %v", err)
 	}
 	entries, err := os.ReadDir(outside)
 	if err != nil || len(entries) != 0 {
 		t.Fatalf("symlink target was changed: entries=%v err=%v", entries, err)
-	}
-	if _, err := os.Stat(repo); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -769,7 +956,7 @@ func TestCreateAndSweepSerializeWithinManager(t *testing.T) {
 	enteredGit := make(chan struct{})
 	releaseGit := make(chan struct{})
 	runner := func(ctx context.Context, root string, args ...string) error {
-		if len(args) >= 2 && args[0] == "worktree" && args[1] == "add" {
+		if len(args) > 0 && args[0] == "init" {
 			close(enteredGit)
 			<-releaseGit
 		}

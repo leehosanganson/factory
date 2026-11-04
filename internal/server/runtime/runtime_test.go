@@ -1217,7 +1217,7 @@ func TestRunCancellationDoesNotWaitBeyondDeadlineForBlockedWorkspaceGit(t *testi
 			ResultsBase: resultsBase, ShutdownTimeout: shutdownBound,
 			WorkspaceNow: func() time.Time { return time.Unix(0, sweepNow.Load()).UTC() }, SweepInterval: 10 * time.Millisecond,
 			WorkspaceGit: func(runCtx context.Context, root string, args ...string) error {
-				if len(args) >= 2 && args[0] == "worktree" && args[1] == "remove" {
+				if len(args) >= 2 && args[0] == "rev-parse" && args[1] == "--show-toplevel" && root != config.Repositories["trusted"] {
 					close(enteredGit)
 					select {
 					case <-runCtx.Done():

@@ -1,5 +1,5 @@
-// Package restworkspace manages isolated Git worktrees and private per-job
-// result directories. The results root must be owned by the server account and
+// Package restworkspace manages private per-job Git repositories and result
+// directories. The results root must be owned by the server account and
 // private (0700); processes running as that same UID are trusted operators with
 // filesystem control. Successful workspaces are retained until Sweep observes
 // protected completion metadata older than the retention period.
@@ -40,10 +40,17 @@ type Config struct {
 // Workspace contains server-derived per-job paths. Do not accept these paths
 // back from a client as authority for filesystem operations.
 type Workspace struct {
-	JobID        string
-	WorktreePath string
-	StatePath    string
-	OutputPath   string
+	JobID          string
+	WorktreePath   string
+	StatePath      string
+	OutputPath     string
+	SourceRevision SourceRevision
+}
+
+// SourceRevision identifies the exact Git source captured for a job.
+type SourceRevision struct {
+	Commit string
+	Tree   string
 }
 
 // SweepReport summarizes one fail-closed expiry pass.
@@ -133,28 +140,63 @@ func New(config Config) (*Manager, error) {
 // RepositoryRoot returns the canonical trusted checkout root owned by this manager.
 func (m *Manager) RepositoryRoot() string { return m.repoRoot }
 
-// Create creates a separate detached worktree at the repository's current
-// checkout HEAD and private state/output directories. It creates no branch and
-// leaves partial results in place on failure so startup recovery fails closed.
+// Create creates a private repository at the checkout's current source revision.
 func (m *Manager) Create(jobID string) (Workspace, error) {
 	return m.CreateContext(context.Background(), jobID)
 }
 
-// CreateContext creates a separate detached worktree at the repository's
-// current checkout HEAD and private state/output directories. It creates no
-// branch and leaves partial results in place on failure so startup recovery
-// fails closed. Cancellation before provisioning starts creates no job files;
-// cancellation during Git work retains any partial results for fail-closed
-// recovery.
+// CreateContext captures the current checkout and materializes that revision.
 func (m *Manager) CreateContext(ctx context.Context, jobID string) (Workspace, error) {
+	revision, err := m.CaptureContext(ctx)
+	if err != nil {
+		return Workspace{}, err
+	}
+	return m.CreateRevisionContext(ctx, jobID, revision)
+}
+
+// CaptureContext records the current commit and tree and rejects source trees
+// that need Git submodule or checkout-filter processing.
+func (m *Manager) CaptureContext(ctx context.Context) (SourceRevision, error) {
+	if ctx == nil {
+		return SourceRevision{}, errors.New("creation context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return SourceRevision{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.verifyRepositoryContext(ctx); err != nil {
+		return SourceRevision{}, err
+	}
+	commit, err := gitOutputContext(ctx, m.repoRoot, "rev-parse", "--verify", "HEAD^{commit}")
+	if err != nil || !validGitObjectID(commit) {
+		return SourceRevision{}, errors.New("capture repository source revision")
+	}
+	tree, err := gitOutputContext(ctx, m.repoRoot, "rev-parse", "--verify", commit+"^{tree}")
+	if err != nil || !validGitObjectID(tree) {
+		return SourceRevision{}, errors.New("capture repository source tree")
+	}
+	if err := validateSourceTree(ctx, m.repoRoot, commit); err != nil {
+		return SourceRevision{}, err
+	}
+	if err := m.verifyRepositoryContext(ctx); err != nil {
+		return SourceRevision{}, err
+	}
+	return SourceRevision{Commit: commit, Tree: tree}, nil
+}
+
+// CreateRevisionContext materializes a previously captured tree in a private
+// repository, without a linked-worktree dependency on the configured checkout.
+// Partial job directories are retained on failure for fail-closed recovery.
+func (m *Manager) CreateRevisionContext(ctx context.Context, jobID string, revision SourceRevision) (Workspace, error) {
 	if ctx == nil {
 		return Workspace{}, errors.New("creation context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return Workspace{}, err
 	}
-	if !validJobID(jobID) {
-		return Workspace{}, errors.New("invalid job ID")
+	if !validJobID(jobID) || !validGitObjectID(revision.Commit) || !validGitObjectID(revision.Tree) {
+		return Workspace{}, errors.New("invalid job or source revision")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -175,7 +217,7 @@ func (m *Manager) CreateContext(ctx context.Context, jobID string) (Workspace, e
 		return Workspace{}, fmt.Errorf("create job result directory: %w", err)
 	}
 	workspace := Workspace{
-		JobID: jobID, WorktreePath: filepath.Join(jobDir, "worktree"),
+		JobID: jobID, WorktreePath: filepath.Join(jobDir, "worktree"), SourceRevision: revision,
 		StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output"),
 	}
 	for _, path := range []string{workspace.StatePath, workspace.OutputPath} {
@@ -186,34 +228,47 @@ func (m *Manager) CreateContext(ctx context.Context, jobID string) (Workspace, e
 	if err := verifyProtectedDir(jobDir); err != nil {
 		return Workspace{}, fmt.Errorf("validate job result directory: %w", err)
 	}
-	head, err := gitOutput(m.repoRoot, "rev-parse", "--verify", "HEAD")
-	if err != nil || !validGitObjectID(head) {
-		return Workspace{}, errors.New("read repository checkout HEAD")
+	actualTree, err := gitOutputContext(ctx, m.repoRoot, "rev-parse", "--verify", revision.Commit+"^{tree}")
+	if err != nil || actualTree != revision.Tree {
+		return Workspace{}, errors.New("source revision is unavailable")
 	}
-	if err := m.verifyRepository(); err != nil {
+	if err := validateSourceTree(ctx, m.repoRoot, revision.Commit); err != nil {
+		return Workspace{}, err
+	}
+	if err := m.verifyRepositoryContext(ctx); err != nil {
 		return Workspace{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return Workspace{}, err
 	}
-	if err := m.runGit(ctx, m.repoRoot, "worktree", "add", "--detach", workspace.WorktreePath, head); err != nil {
-		return Workspace{}, fmt.Errorf("create detached job worktree: %w", err)
+	if err := m.runGit(ctx, m.repoRoot, "init", "--quiet", "--template="+workspace.StatePath, workspace.WorktreePath); err != nil {
+		return Workspace{}, fmt.Errorf("initialize private job repository: %w", err)
+	}
+	if err := m.runGit(ctx, workspace.WorktreePath, "-c", "protocol.file.allow=always", "fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", m.repoRoot, revision.Commit); err != nil {
+		return Workspace{}, fmt.Errorf("transfer captured job source: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return Workspace{}, fmt.Errorf("create detached job worktree: %w", err)
+		return Workspace{}, fmt.Errorf("transfer captured job source: %w", err)
 	}
-	// If the configured repository changed while Git was adding the worktree,
-	// retain the result directory rather than attempting cleanup through an
-	// untrusted repository path.
-	if err := m.verifyRepository(); err != nil {
+	if err := m.runGit(ctx, workspace.WorktreePath, "-c", "core.autocrlf=false", "-c", "core.hooksPath="+workspace.StatePath, "checkout", "--detach", "--force", "FETCH_HEAD"); err != nil {
+		return Workspace{}, fmt.Errorf("materialize captured job source: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Workspace{}, fmt.Errorf("materialize captured job source: %w", err)
+	}
+	if err := m.verifyRepositoryContext(ctx); err != nil {
 		return Workspace{}, err
 	}
-	if err := verifyWorktreeDir(workspace.WorktreePath); err != nil {
-		return Workspace{}, fmt.Errorf("validate created worktree: %w", err)
+	if err := verifyPrivateRepository(workspace.WorktreePath); err != nil {
+		return Workspace{}, fmt.Errorf("validate private job repository: %w", err)
+	}
+	if got, err := gitOutputContext(ctx, workspace.WorktreePath, "rev-parse", "HEAD^{tree}"); err != nil || got != revision.Tree {
+		return Workspace{}, errors.New("materialized job source tree does not match captured revision")
 	}
 	if err := m.verifySameDevice(jobDir, workspace.StatePath, workspace.OutputPath, workspace.WorktreePath); err != nil {
 		return Workspace{}, err
 	}
+	workspace.SourceRevision = revision
 	return workspace, nil
 }
 
@@ -231,8 +286,8 @@ func (m *Manager) VerifyResultDirectory(path string) error {
 	return verifyProtectedDir(path)
 }
 
-// RetainedWorkspace returns the validated original worktree for an operator
-// reconciliation without creating or mutating job workspace state.
+// RetainedWorkspace returns the validated private repository or legacy linked
+// worktree for read-only operator reconciliation.
 func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
 	if !validJobID(jobID) {
 		return Workspace{}, errors.New("invalid job ID")
@@ -253,10 +308,7 @@ func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
 		return Workspace{}, errors.New("retained job workspace is unavailable")
 	}
 	worktree := filepath.Join(jobDir, "worktree")
-	if err := registeredWorktree(m.repoRoot, worktree); err != nil {
-		return Workspace{}, errors.New("retained job worktree is unavailable")
-	}
-	if err := verifyWorktreeDir(worktree); err != nil {
+	if err := verifyManagedRepository(m.repoRoot, worktree); err != nil {
 		return Workspace{}, errors.New("retained job worktree is unavailable")
 	}
 	return Workspace{JobID: jobID, WorktreePath: worktree, StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output")}, nil
@@ -284,7 +336,7 @@ func (m *Manager) MarkSucceeded(jobID string) error {
 		return err
 	}
 	worktree := filepath.Join(jobDir, "worktree")
-	if err := registeredWorktree(m.repoRoot, worktree); err != nil {
+	if err := verifyPrivateRepository(worktree); err != nil {
 		return err
 	}
 	if err := m.verifyRepository(); err != nil {
@@ -522,18 +574,15 @@ func (m *Manager) removeExpired(ctx context.Context, jobDir, jobID string, metad
 		return errors.New("completion metadata changed")
 	}
 	worktree := filepath.Join(jobDir, "worktree")
-	if err := verifyWorktreeDir(worktree); err != nil {
+	if err := verifyPrivateRepository(worktree); err != nil {
 		return err
 	}
 	dev, inode, err := directoryIdentity(worktree)
 	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode {
 		return errors.New("worktree identity changed")
 	}
-	if err := registeredWorktreeContext(ctx, m.repoRoot, worktree); err != nil {
-		return err
-	}
-	// Revalidate the repository, root, job ID, metadata, and worktree at the
-	// last path-based boundary before asking Git to remove the worktree.
+	// Revalidate the repository, root, job ID, metadata, and workspace before
+	// removing the job's private repository.
 	if err := m.verifyRoot(); err != nil {
 		return err
 	}
@@ -548,14 +597,14 @@ func (m *Manager) removeExpired(ctx context.Context, jobDir, jobID string, metad
 		return errors.New("job identity changed before worktree cleanup")
 	}
 	dev, inode, err = directoryIdentity(worktree)
-	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode || registeredWorktreeContext(ctx, m.repoRoot, worktree) != nil {
+	if err != nil || dev != metadata.WorktreeDev || inode != metadata.WorktreeInode || verifyPrivateRepository(worktree) != nil {
 		return errors.New("worktree identity changed before cleanup")
 	}
-	if err := m.runGit(ctx, m.repoRoot, "worktree", "remove", "--force", worktree); err != nil || ctx.Err() != nil {
-		return errors.New("git worktree cleanup failed")
+	if err := m.runGit(ctx, worktree, "rev-parse", "--show-toplevel"); err != nil || ctx.Err() != nil {
+		return errors.New("private job repository cleanup validation failed")
 	}
-	if _, err := os.Lstat(worktree); !errors.Is(err, os.ErrNotExist) {
-		return errors.New("git worktree path remains after cleanup")
+	if err := removeOwnedDirectory(worktree, dev, inode); err != nil || ctx.Err() != nil {
+		return errors.New("private job repository cleanup failed")
 	}
 	if err := m.verifyRoot(); err != nil || !identityMatches(jobDir, jobDev, jobInode) {
 		return errors.New("job result directory changed after worktree cleanup")
@@ -714,6 +763,142 @@ func verifyExpectedWorkspace(jobDir string) error {
 
 func validJobID(id string) bool { return jobIDPattern.MatchString(id) }
 
+func validateSourceTree(ctx context.Context, root, commit string) error {
+	listing, err := gitRawOutputContext(ctx, root, "ls-tree", "-r", "-z", "--full-tree", commit)
+	if err != nil {
+		return errors.New("inspect captured repository source")
+	}
+	paths := make([]byte, 0, len(listing))
+	for _, entry := range bytes.Split(listing, []byte{0}) {
+		if len(entry) == 0 {
+			continue
+		}
+		metadata, path, ok := bytes.Cut(entry, []byte{'\t'})
+		if !ok {
+			return errors.New("invalid captured repository tree")
+		}
+		fields := strings.Fields(string(metadata))
+		if len(fields) != 3 {
+			return errors.New("invalid captured repository tree")
+		}
+		if fields[0] == "160000" {
+			return errors.New("repository source contains an unsupported submodule")
+		}
+		paths = append(paths, path...)
+		paths = append(paths, 0)
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	lfsCommand := exec.CommandContext(ctx, "git", "-C", root, "grep", "--no-textconv", "-I", "-l", "-F", "-z", "-e", "version https://git-lfs.github.com/spec/v1", commit)
+	lfsCommand.Env = gitEnvironment(os.Environ())
+	var lfsMatches bytes.Buffer
+	lfsCommand.Stdout = &lfsMatches
+	lfsErr := lfsCommand.Run()
+	if lfsErr != nil {
+		if exitErr, ok := lfsErr.(*exec.ExitError); !ok || exitErr.ExitCode() != 1 {
+			return errors.New("inspect captured repository Git LFS objects")
+		}
+	}
+	for _, match := range bytes.Split(lfsMatches.Bytes(), []byte{0}) {
+		if len(match) == 0 {
+			continue
+		}
+		prefix := append([]byte(commit), ':')
+		if !bytes.HasPrefix(match, prefix) {
+			return errors.New("invalid captured Git LFS path")
+		}
+		path := string(match[len(prefix):])
+		pointer, err := gitRawOutputContext(ctx, root, "cat-file", "blob", commit+":"+path)
+		if err != nil {
+			return errors.New("inspect captured repository Git LFS object")
+		}
+		if isGitLFSPointer(pointer) {
+			return errors.New("repository source contains an unsupported Git LFS pointer")
+		}
+	}
+	command := exec.CommandContext(ctx, "git", "-C", root, "check-attr", "--source", commit, "-z", "--stdin", "filter", "working-tree-encoding", "eol", "text", "ident")
+	command.Env = gitSourceEnvironment(os.Environ())
+	command.Stdin = bytes.NewReader(paths)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		return errors.New("inspect captured repository checkout attributes")
+	}
+	attributes := bytes.Split(stdout.Bytes(), []byte{0})
+	if len(attributes)%3 != 1 {
+		return errors.New("invalid repository checkout attributes")
+	}
+	for index := 0; index+2 < len(attributes); index += 3 {
+		name, value := string(attributes[index+1]), string(attributes[index+2])
+		if value == "unspecified" || value == "unset" {
+			continue
+		}
+		switch name {
+		case "filter":
+			return errors.New("repository source uses an unsupported checkout filter")
+		case "working-tree-encoding", "eol", "text", "ident":
+			return errors.New("repository source uses unsupported checkout transformations")
+		default:
+			return errors.New("repository source has unsupported checkout attributes")
+		}
+	}
+	return nil
+}
+
+func isGitLFSPointer(content []byte) bool {
+	if len(content) > 1024 || !bytes.HasPrefix(content, []byte("version https://git-lfs.github.com/spec/v1\n")) {
+		return false
+	}
+	lines := strings.Split(string(content), "\n")
+	if len(lines) < 4 || !strings.HasPrefix(lines[1], "oid sha256:") || !strings.HasPrefix(lines[2], "size ") || lines[len(lines)-1] != "" {
+		return false
+	}
+	for _, extension := range lines[3 : len(lines)-1] {
+		if !strings.HasPrefix(extension, "ext-") || !strings.Contains(extension, " ") {
+			return false
+		}
+	}
+	digest := strings.TrimPrefix(lines[1], "oid sha256:")
+	if len(digest) != 64 || strings.Trim(digest, "0123456789abcdef") != "" {
+		return false
+	}
+	size := strings.TrimPrefix(lines[2], "size ")
+	if size == "" || strings.Trim(size, "0123456789") != "" {
+		return false
+	}
+	return true
+}
+
+func verifyManagedRepository(repositoryRoot, path string) error {
+	if err := verifyPrivateRepository(path); err == nil {
+		return nil
+	}
+	if err := registeredWorktree(repositoryRoot, path); err != nil {
+		return errors.New("job repository is not managed by the configured checkout")
+	}
+	return verifyWorktreeDir(path)
+}
+
+func verifyPrivateRepository(path string) error {
+	if err := verifyWorktreeDir(path); err != nil {
+		return err
+	}
+	info, err := os.Lstat(filepath.Join(path, ".git"))
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("job repository is not private")
+	}
+	reported, err := gitOutput(path, "rev-parse", "--show-toplevel")
+	if err != nil || reported != path {
+		return errors.New("job repository is not an independent checkout")
+	}
+	gitDir, err := gitOutput(path, "rev-parse", "--absolute-git-dir")
+	if err != nil || filepath.Clean(gitDir) != filepath.Join(path, ".git") {
+		return errors.New("job repository shares Git metadata")
+	}
+	return nil
+}
+
 func validGitObjectID(value string) bool {
 	if len(value) != 40 && len(value) != 64 {
 		return false
@@ -856,6 +1041,19 @@ func ownedByEffectiveUser(info os.FileInfo) bool {
 	return ok && stat.Uid == uint32(os.Geteuid())
 }
 
+func registeredWorktree(root, path string) error {
+	output, err := gitOutput(root, "worktree", "list", "--porcelain")
+	if err != nil {
+		return errors.New("cannot verify registered worktree")
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "worktree ") && strings.TrimPrefix(line, "worktree ") == path {
+			return nil
+		}
+	}
+	return errors.New("worktree is not registered to configured repository")
+}
+
 func gitIsRepository(root string) error {
 	return gitIsRepositoryContext(context.Background(), root)
 }
@@ -868,43 +1066,59 @@ func gitIsRepositoryContext(ctx context.Context, root string) error {
 	return nil
 }
 
+func gitSourceEnvironment(source []string) []string {
+	environment := make([]string, 0, len(source)+2)
+	for _, entry := range source {
+		name, _, ok := strings.Cut(entry, "=")
+		if ok && !strings.HasPrefix(name, "GIT_") {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, "GIT_ATTR_NOSYSTEM=1", "GIT_ATTR_NOGLOBAL=1")
+}
+
+func gitEnvironment(source []string) []string {
+	environment := make([]string, 0, len(source)+2)
+	for _, entry := range source {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || strings.HasPrefix(name, "GIT_") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	return append(environment, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_ATTR_NOSYSTEM=1", "GIT_ATTR_NOGLOBAL=1")
+}
+
 func gitOutput(root string, args ...string) (string, error) {
 	return gitOutputContext(context.Background(), root, args...)
 }
 
 func gitOutputContext(ctx context.Context, root string, args ...string) (string, error) {
+	output, err := gitRawOutputContext(ctx, root, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func gitRawOutputContext(ctx context.Context, root string, args ...string) ([]byte, error) {
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
+	command.Env = gitEnvironment(os.Environ())
 	var stdout, stderr bytes.Buffer
 	command.Stdout, command.Stderr = &stdout, &stderr
 	if err := command.Run(); err != nil {
-		return "", err
+		return nil, err
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return stdout.Bytes(), nil
 }
 
 func runGit(ctx context.Context, root string, args ...string) error {
 	command := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
+	command.Env = gitEnvironment(os.Environ())
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
 		return err
 	}
 	return nil
-}
-
-func registeredWorktree(root, path string) error {
-	return registeredWorktreeContext(context.Background(), root, path)
-}
-
-func registeredWorktreeContext(ctx context.Context, root, path string) error {
-	output, err := gitOutputContext(ctx, root, "worktree", "list", "--porcelain")
-	if err != nil {
-		return errors.New("cannot verify registered worktree")
-	}
-	for _, line := range strings.Split(output, "\n") {
-		if strings.HasPrefix(line, "worktree ") && strings.TrimPrefix(line, "worktree ") == path {
-			return nil
-		}
-	}
-	return errors.New("worktree is not registered to configured repository")
 }

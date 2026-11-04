@@ -25,13 +25,15 @@ const (
 )
 
 type testWorkspaceManager struct {
-	root      string
-	workspace restworkspace.Workspace
-	createdID string
-	markedID  string
-	markErr   error
-	createErr error
-	createFn  func(context.Context) (restworkspace.Workspace, error)
+	root       string
+	workspace  restworkspace.Workspace
+	createdID  string
+	markedID   string
+	markErr    error
+	createErr  error
+	createFn   func(context.Context) (restworkspace.Workspace, error)
+	revision   restworkspace.SourceRevision
+	captureErr error
 }
 
 func (m *testWorkspaceManager) RepositoryRoot() string { return m.root }
@@ -43,7 +45,11 @@ func (m *testWorkspaceManager) VerifyResultDirectory(path string) error {
 	return nil
 }
 
-func (m *testWorkspaceManager) CreateContext(ctx context.Context, id string) (restworkspace.Workspace, error) {
+func (m *testWorkspaceManager) CaptureContext(context.Context) (restworkspace.SourceRevision, error) {
+	return m.revision, m.captureErr
+}
+
+func (m *testWorkspaceManager) CreateRevisionContext(ctx context.Context, id string, revision restworkspace.SourceRevision) (restworkspace.Workspace, error) {
 	m.createdID = id
 	if m.createFn != nil {
 		return m.createFn(ctx)
@@ -51,7 +57,9 @@ func (m *testWorkspaceManager) CreateContext(ctx context.Context, id string) (re
 	if m.createErr != nil {
 		return restworkspace.Workspace{}, m.createErr
 	}
-	return m.workspace, nil
+	workspace := m.workspace
+	workspace.SourceRevision = revision
+	return workspace, nil
 }
 
 func (m *testWorkspaceManager) MarkSucceeded(id string) error {
@@ -329,6 +337,18 @@ func TestNewFactoryExecutorRequiresWorkspaceForMatchingTrustedRepository(t *test
 	workflowConfig := workflow.Config{Command: "agent", Args: []string{"{task}", "{system_prompt}"}}
 	if _, err := NewFactoryExecutor(FactoryExecutorConfig{Server: server, Workflow: workflowConfig}); err == nil {
 		t.Fatal("NewFactoryExecutor() accepted a missing workspace manager")
+	}
+}
+
+func TestFactoryExecutorRejectsUncapturableSourceBeforeWorkspaceOrWorkflow(t *testing.T) {
+	agent := &executorTestAgent{}
+	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+	manager.captureErr = errors.New("unsupported source")
+	if err := executor.Execute(context.Background(), executorJob("do not run")); !errors.Is(err, errExecutionFailed) {
+		t.Fatalf("Execute() error = %v, want sanitized execution failure", err)
+	}
+	if manager.createdID != "" || len(agent.calls) != 0 {
+		t.Fatalf("unsupported source caused side effects: workspace=%q stages=%v", manager.createdID, agent.calls)
 	}
 }
 
