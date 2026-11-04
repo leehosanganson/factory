@@ -13,6 +13,27 @@ type WorkerMappingState struct {
 	Mappings   map[string]string
 }
 
+// lookupWorkerMapping returns the current active principal for a certificate fingerprint.
+func lookupWorkerMapping(ctx context.Context, db *sql.DB, fingerprint, placeholder string) (string, bool, error) {
+	if ctx == nil || len(fingerprint) != 64 || !validWorkerFingerprint(fingerprint) {
+		return "", false, ErrInvalidInput
+	}
+	query := `SELECT principal_id FROM factory_worker_mappings WHERE fingerprint=? AND revoked=?`
+	if placeholder != "?" {
+		query = `SELECT principal_id FROM factory_worker_mappings WHERE fingerprint=$1 AND revoked=$2`
+	}
+	var principal sql.NullString
+	if err := db.QueryRowContext(ctx, query, fingerprint, false).Scan(&principal); errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	} else if err != nil {
+		return "", false, errors.New("read worker mapping")
+	}
+	if !principal.Valid || !validPostgresOwnerID(principal.String) || principal.String == "legacy-shared" {
+		return "", false, errors.New("decode worker mapping")
+	}
+	return principal.String, true, nil
+}
+
 func validateWorkerMappingInput(mappings map[string]string) error {
 	for fingerprint, principal := range mappings {
 		if len(fingerprint) != 64 || !validWorkerFingerprint(fingerprint) || !validPostgresOwnerID(principal) || principal == "legacy-shared" {
@@ -211,6 +232,16 @@ type storedWorkerMapping struct {
 func (s *SQLiteStore) ReconcileWorkerMappings(ctx context.Context, mappings map[string]string) (WorkerMappingState, error) {
 	return reconcileSQLiteWorkerMappings(ctx, s.db, mappings)
 }
+
+// LookupWorkerMapping returns the current active principal for a certificate fingerprint.
+func (s *SQLiteStore) LookupWorkerMapping(ctx context.Context, fingerprint string) (string, bool, error) {
+	return lookupWorkerMapping(ctx, s.db, fingerprint, "?")
+}
 func (s *PostgresStore) ReconcileWorkerMappings(ctx context.Context, mappings map[string]string) (WorkerMappingState, error) {
 	return reconcilePostgresWorkerMappings(ctx, s.db, mappings)
+}
+
+// LookupWorkerMapping returns the current active principal for a certificate fingerprint.
+func (s *PostgresStore) LookupWorkerMapping(ctx context.Context, fingerprint string) (string, bool, error) {
+	return lookupWorkerMapping(ctx, s.db, fingerprint, "$")
 }

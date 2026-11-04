@@ -1,6 +1,7 @@
 package restserver
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -18,12 +19,17 @@ import (
 
 const maxWorkerSessionRequestBytes = 1024
 
+type WorkerMappingLookup interface {
+	LookupWorkerMapping(context.Context, string) (string, bool, error)
+}
+
 type WorkerListenerHandler struct {
-	store      restjobs.WorkerSessionStore
-	principals map[string]string
-	mappings   *WorkerMappingRegistry
-	ready      func() bool
-	logger     *log.Logger
+	store           restjobs.WorkerSessionStore
+	principals      map[string]string
+	mappingFileMode bool
+	lookup          WorkerMappingLookup
+	ready           func() bool
+	logger          *log.Logger
 }
 
 func NewWorkerListenerHandler(config WorkerListenerConfig, store restjobs.WorkerSessionStore, ready func() bool, loggers ...*log.Logger) (*WorkerListenerHandler, error) {
@@ -40,11 +46,11 @@ func NewWorkerListenerHandler(config WorkerListenerConfig, store restjobs.Worker
 	if len(loggers) > 0 {
 		logger = loggers[0]
 	}
-	return &WorkerListenerHandler{store: store, principals: principals, ready: ready, logger: logger}, nil
+	return &WorkerListenerHandler{store: store, principals: principals, mappingFileMode: config.MappingFile != "", ready: ready, logger: logger}, nil
 }
 
-func (h *WorkerListenerHandler) SetMappingRegistry(registry *WorkerMappingRegistry) {
-	h.mappings = registry
+func (h *WorkerListenerHandler) SetMappingLookup(lookup WorkerMappingLookup) {
+	h.lookup = lookup
 }
 
 func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -85,8 +91,13 @@ func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		writeWorkerJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 		return
 	}
-	principal, ok := h.certificatePrincipal(r)
-	if !ok {
+	principal, lookupErr := h.certificatePrincipal(r)
+	if lookupErr != nil {
+		h.logAuthentication(false)
+		writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "service_unavailable"})
+		return
+	}
+	if principal == "" {
 		h.logAuthentication(false)
 		writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
 		return
@@ -180,9 +191,14 @@ func bearerCapability(r *http.Request) string {
 }
 
 func (h *WorkerListenerHandler) requireCapability(w http.ResponseWriter, r *http.Request) (restjobs.WorkerSession, bool) {
-	principal, ok := h.certificatePrincipal(r)
+	principal, err := h.certificatePrincipal(r)
 	capability := bearerCapability(r)
-	if !ok || capability == "" {
+	if err != nil {
+		h.logAuthentication(false)
+		writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "service_unavailable"})
+		return restjobs.WorkerSession{}, false
+	}
+	if principal == "" || capability == "" {
 		h.logAuthentication(false)
 		writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
 		return restjobs.WorkerSession{}, false
@@ -197,17 +213,26 @@ func (h *WorkerListenerHandler) requireCapability(w http.ResponseWriter, r *http
 	return session, true
 }
 
-func (h *WorkerListenerHandler) certificatePrincipal(r *http.Request) (string, bool) {
+func (h *WorkerListenerHandler) certificatePrincipal(r *http.Request) (string, error) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
-		return "", false
+		return "", nil
 	}
 	fingerprint := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
 	key := hex.EncodeToString(fingerprint[:])
-	if h.mappings != nil {
-		return h.mappings.Principal(key)
+	if h.mappingFileMode {
+		if h.lookup == nil {
+			return "", errors.New("worker mapping lookup is unavailable")
+		}
+		principal, found, err := h.lookup.LookupWorkerMapping(r.Context(), key)
+		if err != nil {
+			return "", err
+		}
+		if !found {
+			return "", nil
+		}
+		return principal, nil
 	}
-	principal, ok := h.principals[key]
-	return principal, ok
+	return h.principals[key], nil
 }
 
 func NewWorkerListenerTLS(config WorkerListenerConfig) (*tls.Config, error) {
