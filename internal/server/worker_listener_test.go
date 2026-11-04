@@ -1,6 +1,7 @@
 package restserver
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"log"
 	"math/big"
 	"net"
@@ -113,14 +115,29 @@ func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if session.PrincipalID != "worker-one" || session.BootID != "boot-1" || session.Status != "active" {
-		t.Fatalf("session identity derived incorrectly: %+v", session)
+	if session.PrincipalID != "worker-one" || session.BootID != "boot-1" || session.Status != "active" || session.Capability == "" || session.CapabilityExpiresAt == nil {
+		t.Fatalf("session identity/capability derived incorrectly: %+v", session)
 	}
+	firstCapability := session.Capability
 	response = register(knownClient, `{"boot_id":"boot-1"}`)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("same boot retry status=%d, want 200", response.StatusCode)
 	}
+	var retried restjobs.WorkerSession
+	if err := json.NewDecoder(response.Body).Decode(&retried); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
 	response.Body.Close()
+	if retried.ID != session.ID || retried.Capability == "" || retried.Capability == firstCapability {
+		t.Fatalf("same-boot retry did not rotate capability: first=%+v retry=%+v", session, retried)
+	}
+	if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-one", firstCapability); !errors.Is(err, restjobs.ErrNotFound) {
+		t.Fatalf("prior registration capability error=%v, want invalid", err)
+	}
+	if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-one", retried.Capability); err != nil {
+		t.Fatalf("replacement registration capability invalid: %v", err)
+	}
 	response = register(knownClient, `{"boot_id":"boot-2"}`)
 	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("different boot status=%d, want conflict", response.StatusCode)
@@ -181,6 +198,9 @@ func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *
 		t.Fatalf("retirement status=%d", response.StatusCode)
 	}
 	response.Body.Close()
+	if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-one", retried.Capability); !errors.Is(err, restjobs.ErrNotFound) {
+		t.Fatalf("retired session capability error=%v, want invalid", err)
+	}
 	request, _ = http.NewRequest(http.MethodDelete, server.URL+"/v1/worker/session/"+session.ID, strings.NewReader(`{"boot_id":"boot-1"}`))
 	response, err = unknownClient.Do(request)
 	if err != nil {
@@ -199,6 +219,188 @@ func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *
 		t.Fatalf("draining readiness status=%d", response.StatusCode)
 	}
 	response.Body.Close()
+}
+
+func TestWorkerCapabilitySessionEndpointsUseOnlyAuthenticatedOwnSession(t *testing.T) {
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-session-capability-http.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ownCert := workerTestCertificate(t, "own-session", true)
+	otherCert := workerTestCertificate(t, "other-session", true)
+	ownFingerprint := sha256.Sum256(ownCert.Certificate[0])
+	otherFingerprint := sha256.Sum256(otherCert.Certificate[0])
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{
+		{SHA256: hex.EncodeToString(ownFingerprint[:]), PrincipalID: "worker-own", Enabled: true},
+		{SHA256: hex.EncodeToString(otherFingerprint[:]), PrincipalID: "worker-other", Enabled: true},
+	}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverCert := workerTestCertificate(t, "session-server", false)
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{serverCert}, ClientAuth: tls.RequireAnyClientCert}
+	server.StartTLS()
+	defer server.Close()
+	clientFor := func(cert tls.Certificate) *http.Client {
+		return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{cert}}}} // test certificates are intentionally ephemeral
+	}
+	ownClient, otherClient := clientFor(ownCert), clientFor(otherCert)
+	own, _, err := store.RegisterWorkerSession(context.Background(), "worker-own", "boot-own")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, _, err := store.RegisterWorkerSession(context.Background(), "worker-other", "boot-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	do := func(client *http.Client, method, path, capability string) *http.Response {
+		t.Helper()
+		request, err := http.NewRequest(method, server.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if capability != "" {
+			request.Header.Set("Authorization", "Bearer "+capability)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	response := do(ownClient, http.MethodGet, "/v1/worker/session", own.Capability)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("own-session inspection status=%d, want 200", response.StatusCode)
+	}
+	var inspected restjobs.WorkerSession
+	if err := json.NewDecoder(response.Body).Decode(&inspected); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if inspected.ID != own.ID || inspected.PrincipalID != "worker-own" || inspected.BootID != "boot-own" || inspected.Status != "active" {
+		t.Fatalf("inspection returned wrong session: %+v", inspected)
+	}
+	if inspected.Capability != "" {
+		t.Fatal("inspection response leaked the bearer capability")
+	}
+	response = do(ownClient, http.MethodPut, "/v1/worker/session", own.Capability)
+	if response.StatusCode != http.StatusNotFound {
+		t.Errorf("unsupported session method status=%d, want 404", response.StatusCode)
+	}
+	response.Body.Close()
+	response = do(ownClient, http.MethodGet, "/v1/worker/session?session_id="+other.ID, own.Capability)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Errorf("caller-selected session query status=%d, want 400", response.StatusCode)
+	}
+	response.Body.Close()
+	response = do(ownClient, http.MethodDelete, "/v1/worker/session?session_id="+other.ID, own.Capability)
+	if response.StatusCode != http.StatusBadRequest {
+		t.Errorf("DELETE with caller-selected session query status=%d, want 400", response.StatusCode)
+	}
+	response.Body.Close()
+	if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-own", own.Capability); err != nil {
+		t.Fatalf("rejected caller-selected DELETE changed own session: %v", err)
+	}
+	response = do(ownClient, http.MethodGet, "/v1/worker/session/"+other.ID, own.Capability)
+	if response.StatusCode != http.StatusNotFound {
+		t.Errorf("caller-selected session path status=%d, want 404", response.StatusCode)
+	}
+	response.Body.Close()
+	for _, test := range []struct {
+		name       string
+		client     *http.Client
+		capability string
+	}{
+		{name: "invalid bearer", client: ownClient, capability: "invalid"},
+		{name: "wrong mTLS principal", client: otherClient, capability: own.Capability},
+	} {
+		for _, method := range []string{http.MethodGet, http.MethodDelete} {
+			response = do(test.client, method, "/v1/worker/session", test.capability)
+			if response.StatusCode != http.StatusUnauthorized {
+				t.Errorf("%s %s status=%d, want 401", test.name, method, response.StatusCode)
+			}
+			response.Body.Close()
+		}
+	}
+	response = do(ownClient, http.MethodDelete, "/v1/worker/session", own.Capability)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("own-session retirement status=%d, want 200", response.StatusCode)
+	}
+	var retired restjobs.WorkerSession
+	if err := json.NewDecoder(response.Body).Decode(&retired); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if retired.ID != own.ID || retired.Status != "retired" || retired.Capability != "" {
+		t.Fatalf("retirement returned wrong or sensitive session: %+v", retired)
+	}
+	if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-own", own.Capability); !errors.Is(err, restjobs.ErrNotFound) {
+		t.Fatalf("retired capability authentication error=%v, want invalid", err)
+	}
+	if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-other", other.Capability); err != nil {
+		t.Fatalf("retiring own session affected another principal: %v", err)
+	}
+}
+
+func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-capability-auth.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	clientCert := workerTestCertificate(t, "capability-client", true)
+	fingerprint := sha256.Sum256(clientCert.Certificate[0])
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-capability", Enabled: true}}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := store.RegisterWorkerSession(context.Background(), "worker-capability", "boot-capability")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/worker/session", nil)
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.Header.Set("Authorization", "Bearer "+session.Capability)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("valid matching credentials status=%d, want 200", response.Code)
+	}
+	request.Header.Set("Authorization", "Bearer invalid")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("invalid bearer status=%d, want 401", response.Code)
+	}
+	request.Header.Set("Authorization", "Bearer  "+session.Capability)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("malformed bearer status=%d, want 401", response.Code)
+	}
+	request.Header.Del("Authorization")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("mTLS-only request status=%d, want 401", response.Code)
+	}
+	otherCert := workerTestCertificate(t, "other", true)
+	otherFingerprint := sha256.Sum256(otherCert.Certificate[0])
+	otherHandler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(otherFingerprint[:]), PrincipalID: "worker-other", Enabled: true}}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: otherCert.Certificate[0]}}}
+	request.Header.Set("Authorization", "Bearer "+session.Capability)
+	response = httptest.NewRecorder()
+	otherHandler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong mTLS principal status=%d, want 401", response.Code)
+	}
 }
 
 func TestWorkerListenerRequiresVerifiedMTLSAndExactCertificateFingerprint(t *testing.T) {
