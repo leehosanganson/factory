@@ -1719,6 +1719,43 @@ func TestOperationsSummaryIsAuthenticatedBoundedAndSanitized(t *testing.T) {
 	}
 }
 
+func TestOperationsIncludesOnlyCuratedWorkerMappingStatus(t *testing.T) {
+	manager := newTestManager(t, managerConfig(1, 3, 4))
+	handler := newTestHandler(t, manager, func() bool { return true })
+	handler.config.WorkerMappingStatus = func() restserver.WorkerMappingStatus {
+		at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+		return restserver.WorkerMappingStatus{Generation: 7, Count: 2, Result: "rejected", At: &at}
+	}
+	response := request(handler, http.MethodGet, "/v1/operations", "", true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("operations status=%d", response.Code)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"worker_mapping_generation", "worker_mapping_count", "worker_mapping_reload_result", "worker_mapping_reload_at"} {
+		if _, ok := fields[name]; !ok {
+			t.Errorf("operations missing %s", name)
+		}
+	}
+	var generation, count int
+	if err := json.Unmarshal(fields["worker_mapping_generation"], &generation); err != nil || generation != 7 {
+		t.Errorf("generation=%d err=%v", generation, err)
+	}
+	if err := json.Unmarshal(fields["worker_mapping_count"], &count); err != nil || count != 2 {
+		t.Errorf("count=%d err=%v", count, err)
+	}
+	if string(fields["worker_mapping_reload_result"]) != `"rejected"` {
+		t.Errorf("reload result=%s", fields["worker_mapping_reload_result"])
+	}
+	for _, forbidden := range []string{"fingerprint", "principal", "secret", "path", "error"} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Errorf("operations leaked %q: %s", forbidden, response.Body.String())
+		}
+	}
+}
+
 func TestOperationsSummaryStoreFailureIsSanitized(t *testing.T) {
 	manager := errorSummaryManager{Manager: newTestManager(t, managerConfig(1, 1, 1)), err: errors.New("/private/store.db credential=never-log")}
 	handler := newTestHandler(t, manager, func() bool { return true })

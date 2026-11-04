@@ -21,12 +21,13 @@ const maxWorkerSessionRequestBytes = 1024
 type WorkerListenerHandler struct {
 	store      restjobs.WorkerSessionStore
 	principals map[string]string
+	mappings   *WorkerMappingRegistry
 	ready      func() bool
 	logger     *log.Logger
 }
 
 func NewWorkerListenerHandler(config WorkerListenerConfig, store restjobs.WorkerSessionStore, ready func() bool, loggers ...*log.Logger) (*WorkerListenerHandler, error) {
-	if store == nil || ready == nil || len(config.Certificates) == 0 {
+	if store == nil || ready == nil || (len(config.Certificates) == 0 && config.MappingFile == "") {
 		return nil, errors.New("worker listener dependencies are unavailable")
 	}
 	principals := make(map[string]string, len(config.Certificates))
@@ -40,6 +41,10 @@ func NewWorkerListenerHandler(config WorkerListenerConfig, store restjobs.Worker
 		logger = loggers[0]
 	}
 	return &WorkerListenerHandler{store: store, principals: principals, ready: ready, logger: logger}, nil
+}
+
+func (h *WorkerListenerHandler) SetMappingRegistry(registry *WorkerMappingRegistry) {
+	h.mappings = registry
 }
 
 func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -197,7 +202,11 @@ func (h *WorkerListenerHandler) certificatePrincipal(r *http.Request) (string, b
 		return "", false
 	}
 	fingerprint := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
-	principal, ok := h.principals[hex.EncodeToString(fingerprint[:])]
+	key := hex.EncodeToString(fingerprint[:])
+	if h.mappings != nil {
+		return h.mappings.Principal(key)
+	}
+	principal, ok := h.principals[key]
 	return principal, ok
 }
 

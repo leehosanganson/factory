@@ -51,6 +51,7 @@ type Config struct {
 	CancelJob           func(context.Context, string) (restjobs.Snapshot, error)
 	DashboardOperatorID string
 	GitHubWebhook       GitHubWebhookConfig
+	WorkerMappingStatus func() restserver.WorkerMappingStatus
 }
 
 // Handler serves the REST API using the supplied manager and immutable API key.
@@ -555,6 +556,15 @@ func (h *Handler) getOperations(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "An internal error occurred.")
 		return
+	}
+	if h.config.WorkerMappingStatus != nil {
+		mapping := h.config.WorkerMappingStatus()
+		summary.WorkerMappingGeneration = &mapping.Generation
+		summary.WorkerMappingCount = &mapping.Count
+		if mapping.Result != "" {
+			summary.WorkerMappingReloadResult = &mapping.Result
+		}
+		summary.WorkerMappingReloadAt = mapping.At
 	}
 	writeJSON(w, http.StatusOK, summary)
 }
