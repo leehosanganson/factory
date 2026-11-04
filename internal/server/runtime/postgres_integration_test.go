@@ -223,28 +223,37 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 		if err := admin.QueryRow(`SELECT generation FROM `+schema+`.factory_rest_worker_ownership WHERE job_id=$1`, job.ID).Scan(&generation); err != nil || generation != claim.Attempt.Generation {
 			t.Fatalf("generation after delayed provider completion=(%d,%v), want unchanged generation %d", generation, err, claim.Attempt.Generation)
 		}
-		if err := recoveryStore.ReconcileProviderOutcome(job.ID, confirmed); err != nil {
-			t.Fatalf("reconcile injected matching outcome after simulated delay: %v", err)
+		if err := recoveryStore.ReconcileProviderOutcome(job.ID, confirmed); !errors.Is(err, restjobs.ErrInvalidTransition) {
+			t.Fatalf("legacy reconciliation method error=%v, want unresolved conflict", err)
 		}
-		if err := recoveryStore.ReconcileProviderOutcome(job.ID, confirmed); err != nil {
-			t.Fatalf("repeat matching durable reconciliation: %v", err)
+		for range 2 {
+			if err := recoveryStore.ObserveProviderOutcome(job.ID, confirmed); err != nil {
+				t.Fatalf("record matching provider observation: %v", err)
+			}
 		}
-		reconciled, err := recoveryStore.Get(job.ID)
-		if err != nil || reconciled.Status != restjobs.StatusSucceeded || reconciled.Provider == nil || *reconciled.Provider != outcome {
-			t.Fatalf("reconciled job=(%+v,%v), want matching succeeded outcome", reconciled, err)
+		unresolved, err := recoveryStore.Get(job.ID)
+		if err != nil || unresolved.Status != restjobs.StatusRunning || unresolved.Provider != nil {
+			t.Fatalf("provider observation changed job=(%+v,%v)", unresolved, err)
+		}
+		observation, err := recoveryStore.ProviderObservation(job.ID)
+		if err != nil || observation.Outcome != confirmed || observation.ObservedAt.IsZero() {
+			t.Fatalf("provider observation=(%+v,%v)", observation, err)
 		}
 		history, err := recoveryStore.History(job.ID)
 		if err != nil {
-			t.Fatal("read reconciled history")
+			t.Fatal("read provider observation history")
 		}
-		reconciliations := 0
+		observations := 0
 		for _, event := range history.Events {
-			if event.Type == "provider_reconciled" {
-				reconciliations++
+			if event.Type == "provider_observed" {
+				observations++
+			}
+			if event.Type == string(restjobs.StatusSucceeded) || event.Type == "provider_reconciled" {
+				t.Fatalf("provider observation created success history: %+v", history.Events)
 			}
 		}
-		if reconciliations != 1 {
-			t.Fatalf("provider reconciliation audit events=%d, want exactly one", reconciliations)
+		if observations != 1 {
+			t.Fatalf("provider observation audit events=%d, want exactly one", observations)
 		}
 	})
 	t.Run("runtime FactoryExecutor fences a delayed fake provider write across lease expiry", func(t *testing.T) {
@@ -414,18 +423,22 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 		if _, err := recoveryStore.ClaimNextAttempt(); !errors.Is(err, restjobs.ErrNoQueuedJobs) {
 			t.Fatalf("claim after delayed write=%v, want no replay", err)
 		}
-		if status := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusOK {
-			t.Fatalf("post-write read-only reconciliation status=%d, want success", status)
+		if status := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusConflict {
+			t.Fatalf("post-write read-only matching lookup status=%d, want unresolved conflict", status)
 		}
-		reconciled := getRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID)
-		if reconciled.Status != restjobs.StatusSucceeded || reconciled.Provider == nil || reconciled.Provider.Repository != "acme/widget" || reconciled.Provider.Branch != publishRequest.Branch || reconciled.Provider.Commit != publishRequest.Commit {
-			t.Fatalf("reconciled runtime job=%+v, want confirmed provider success", reconciled)
+		unresolved := getRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID)
+		if unresolved.Status != restjobs.StatusRunning || unresolved.Provider != nil {
+			t.Fatalf("matching provider observation resolved runtime job=%+v", unresolved)
+		}
+		observation, err := recoveryStore.ProviderObservation(admission.Job.ID)
+		if err != nil || observation.Outcome.Repository != "acme/widget" || observation.Outcome.Branch != publishRequest.Branch || observation.Outcome.Commit != publishRequest.Commit {
+			t.Fatalf("matching provider observation not retained=(%+v,%v)", observation, err)
 		}
 		if publisher.publishes.Load() != 1 || publisher.writes.Load() != 1 || publisher.reconciliations.Load() != 2 {
 			t.Fatalf("final fake provider calls: Publish=%d writes=%d Reconcile=%d, want 1/1/2", publisher.publishes.Load(), publisher.writes.Load(), publisher.reconciliations.Load())
 		}
-		if err := admin.QueryRow(`SELECT COUNT(*) FROM `+schema+`.factory_job_provider_outcomes WHERE job_id=$1`, admission.Job.ID).Scan(&outcomeCount); err != nil || outcomeCount != 1 {
-			t.Fatalf("provider outcome after reconciliation count=%d err=%v, want one durable outcome", outcomeCount, err)
+		if err := admin.QueryRow(`SELECT COUNT(*) FROM `+schema+`.factory_job_provider_outcomes WHERE job_id=$1`, admission.Job.ID).Scan(&outcomeCount); err != nil || outcomeCount != 0 {
+			t.Fatalf("provider outcome after observation count=%d err=%v, want none", outcomeCount, err)
 		}
 	})
 	seedDBConfig, err := pgx.ParseConfig(scopedDSN)

@@ -1274,16 +1274,45 @@ func (s *SQLiteStore) ProviderAttempt(id string) (ProviderAttempt, error) {
 	return attempt, nil
 }
 
-func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcome) error {
-	if err := validateProviderOutcome(outcome); err != nil {
+// ProviderObservation returns the durable read-only provider observation for a job.
+func (s *SQLiteStore) ProviderObservation(id string) (ProviderObservation, error) {
+	if err := s.checkOpen(); err != nil {
+		return ProviderObservation{}, err
+	}
+	var encoded string
+	if err := s.db.QueryRow(`SELECT observation_json FROM factory_job_provider_observations WHERE job_id=?`, id).Scan(&encoded); errors.Is(err, sql.ErrNoRows) {
+		var exists int
+		if queryErr := s.db.QueryRow(`SELECT COUNT(*) FROM factory_jobs WHERE id=?`, id).Scan(&exists); queryErr != nil {
+			return ProviderObservation{}, errors.New("read SQLite provider observation")
+		}
+		if exists == 0 {
+			return ProviderObservation{}, ErrNotFound
+		}
+		return ProviderObservation{}, ErrInvalidTransition
+	} else if err != nil {
+		return ProviderObservation{}, errors.New("read SQLite provider observation")
+	}
+	var observation ProviderObservation
+	if json.Unmarshal([]byte(encoded), &observation) != nil || validateProviderOutcome(observation.Outcome) != nil || observation.ObservedAt.IsZero() {
+		return ProviderObservation{}, errors.New("SQLite provider observation is invalid")
+	}
+	return observation, nil
+}
+
+// ReconcileProviderOutcome remains for source compatibility. A read-only lookup
+// does not prove that an earlier provider write is quiescent.
+func (s *SQLiteStore) ReconcileProviderOutcome(string, ProviderOutcome) error {
+	return ErrInvalidTransition
+}
+
+// ObserveProviderOutcome atomically stores an exact read-only observation and
+// its audit event without changing job status or provider outcome.
+func (s *SQLiteStore) ObserveProviderOutcome(id string, outcome ProviderOutcome) error {
+	if validateProviderOutcome(outcome) != nil {
 		return ErrInvalidInput
 	}
 	if err := s.checkOpen(); err != nil {
 		return err
-	}
-	encoded, err := json.Marshal(outcome)
-	if err != nil {
-		return ErrInvalidInput
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
 	defer cancel()
@@ -1292,18 +1321,11 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 		return errors.New("SQLite job store unavailable")
 	}
 	defer tx.Rollback()
-	var status, attemptJSON string
+	var status string
 	if err := tx.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return errors.New("read SQLite job state")
-	}
-	if status == string(StatusSucceeded) {
-		var previous string
-		if err := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=?`, id).Scan(&previous); err != nil || previous != string(encoded) {
-			return ErrInvalidTransition
-		}
-		return tx.Commit()
 	}
 	if status != string(StatusFailed) && status != string(StatusRunning) {
 		return ErrInvalidTransition
@@ -1314,70 +1336,47 @@ func (s *SQLiteStore) ReconcileProviderOutcome(id string, outcome ProviderOutcom
 	if status == string(StatusRunning) && !interrupted {
 		return ErrInvalidTransition
 	}
-	attemptErr := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&attemptJSON)
-	var attempt ProviderAttempt
-	if attemptErr == nil {
-		if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
-			return ErrInvalidInput
-		}
-	} else if !errors.Is(attemptErr, sql.ErrNoRows) {
+	var attemptJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&attemptJSON); errors.Is(err, sql.ErrNoRows) {
+		return ErrInvalidTransition
+	} else if err != nil {
 		return errors.New("read SQLite provider attempt")
-	} else {
-		var previous string
-		if err := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=?`, id).Scan(&previous); err != nil {
-			return ErrInvalidTransition
-		}
-		var persisted ProviderOutcome
-		if json.Unmarshal([]byte(previous), &persisted) != nil || validateProviderOutcome(persisted) != nil {
-			return errors.New("SQLite provider outcome is invalid")
-		}
-		if persisted != outcome {
-			return ErrInvalidInput
-		}
-		attempt = ProviderAttempt{Provider: persisted.Provider, Repository: persisted.Repository, Branch: persisted.Branch, Commit: persisted.Commit}
+	}
+	var attempt ProviderAttempt
+	if json.Unmarshal([]byte(attemptJSON), &attempt) != nil || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+id || !validCommitID(attempt.Commit) {
+		return ErrInvalidInput
 	}
 	if outcome.Provider != attempt.Provider || outcome.Repository != attempt.Repository || outcome.Branch != attempt.Branch || outcome.Commit != attempt.Commit {
 		return ErrInvalidInput
 	}
-	var previous string
-	previousErr := tx.QueryRowContext(ctx, `SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=?`, id).Scan(&previous)
-	if previousErr == nil && previous != string(encoded) {
-		return ErrInvalidTransition
-	}
-	if previousErr != nil && !errors.Is(previousErr, sql.ErrNoRows) {
-		return errors.New("read SQLite provider outcome")
+	var existingJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT observation_json FROM factory_job_provider_observations WHERE job_id=?`, id).Scan(&existingJSON); err == nil {
+		var existing ProviderObservation
+		if json.Unmarshal([]byte(existingJSON), &existing) != nil || validateProviderOutcome(existing.Outcome) != nil || existing.ObservedAt.IsZero() {
+			return errors.New("SQLite provider observation is invalid")
+		}
+		if existing.Outcome != outcome {
+			return ErrInvalidTransition
+		}
+		return tx.Commit()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("read SQLite provider observation")
 	}
 	now := time.Now().UTC()
-	stamp := now.Format(time.RFC3339Nano)
-	if previousErr != nil {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_outcomes(job_id,provider_json,updated_at) VALUES(?,?,?)`, id, string(encoded), stamp); err != nil {
-			return errors.New("record SQLite provider outcome")
-		}
-	}
-	threadID, wasDone, err := sqliteThreadDoneTransition(ctx, tx, id)
+	observation := ProviderObservation{Outcome: outcome, ObservedAt: now}
+	encoded, err := json.Marshal(observation)
 	if err != nil {
-		return err
+		return ErrInvalidInput
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='succeeded',updated_at=? WHERE id=? AND status=?`, stamp, id, status)
-	if err != nil {
-		return errors.New("finish reconciled SQLite job")
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_provider_observations(job_id,observation_json) VALUES(?,?)`, id, string(encoded)); err != nil {
+		return errors.New("record SQLite provider observation")
 	}
-	if changed, _ := result.RowsAffected(); changed != 1 {
-		return ErrInvalidTransition
-	}
-	if err := insertEvent(ctx, tx, id, string(StatusSucceeded), "Job finished", now, s.config.MaxEventsPerJob); err != nil {
-		return errors.New("record SQLite job completion")
-	}
-	if err := insertEvent(ctx, tx, id, "provider_reconciled", "Operator confirmed provider outcome", now, s.config.MaxEventsPerJob); err != nil {
-		return errors.New("record SQLite reconciliation history")
-	}
-	if err := recordSQLiteDoneTransition(ctx, tx, threadID, wasDone, now); err != nil {
-		return err
+	if err := insertEvent(ctx, tx, id, "provider_observed", "Matching pull request observed; outcome unresolved", now, s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record SQLite provider observation audit event")
 	}
 	if err := tx.Commit(); err != nil {
-		return errors.New("commit SQLite provider reconciliation")
+		return errors.New("commit SQLite provider observation")
 	}
-	delete(s.recoveryNeeded, id)
 	return nil
 }
 

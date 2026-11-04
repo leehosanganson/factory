@@ -1547,7 +1547,7 @@ func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *test
 	handler := newTestHandler(t, manager, func() bool { return true })
 	handler.config.ReconcileProvider = func(context.Context, string) error {
 		called.Add(1)
-		return restjobs.ErrInvalidTransition
+		return nil
 	}
 	if response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", "", false); response.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated reconciliation status=%d", response.Code)
@@ -1556,6 +1556,10 @@ func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *test
 	assertError(t, response, http.StatusConflict, "reconciliation_not_allowed")
 	if called.Load() != 1 || strings.Contains(response.Body.String(), "secret") {
 		t.Fatalf("reconcile callback count=%d response=%s", called.Load(), response.Body.String())
+	}
+	unchanged, err := manager.Get(job.ID)
+	if err != nil || unchanged.Status != restjobs.StatusQueued || unchanged.Provider != nil {
+		t.Fatalf("read-only reconciliation route changed job=(%+v,%v)", unchanged, err)
 	}
 	if response := request(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/reconcile", "", true); response.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("reconcile GET status=%d", response.Code)

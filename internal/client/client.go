@@ -187,7 +187,7 @@ func (c *Client) Disposition(ctx context.Context, id string, disposition restjob
 	return result, err
 }
 
-// Reconcile requests read-only provider confirmation for an eligible SQLite job.
+// Reconcile requests a read-only provider observation for an eligible durable job.
 func (c *Client) Reconcile(ctx context.Context, id string) (restjobs.Snapshot, error) {
 	var result restjobs.Snapshot
 	err := c.request(ctx, http.MethodPost, "/v1/jobs/"+url.PathEscape(id)+"/reconcile", nil, http.StatusOK, decodeJSON(&result), nil)

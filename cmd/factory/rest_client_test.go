@@ -480,11 +480,6 @@ func TestRESTReconcileCommandUsesOnlyReadOnlyBodylessRoute(t *testing.T) {
 		if r.Method != http.MethodPost || len(body) != 0 {
 			t.Errorf("reconcile request method/body = %s %q", r.Method, body)
 		}
-		if r.URL.Path == "/v1/jobs/reconciled-id/reconcile" {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"id":"reconciled-id","status":"succeeded","request":{"task":"PRIVATE_TASK"},"provider":{"url":"PRIVATE_PROVIDER"},"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`)
-			return
-		}
 		w.WriteHeader(http.StatusConflict)
 		_, _ = io.WriteString(w, `{"code":"reconciliation_not_allowed","message":"PRIVATE_SERVER_DETAIL"}`)
 	}))
@@ -524,22 +519,8 @@ func TestRESTReconcileCommandUsesOnlyReadOnlyBodylessRoute(t *testing.T) {
 		t.Fatalf("invalid reconcile arguments sent HTTP requests: %v", requests)
 	}
 	stdout, stderr, err := run("rest", "reconcile", "--config", configPath, "--json", "reconciled-id")
-	if err != nil || stderr != "" {
-		t.Fatalf("reconcile: err=%v stderr=%q stdout=%q", err, stderr, stdout)
-	}
-	var result struct {
-		SchemaVersion int `json:"schema_version"`
-		Result        struct {
-			Job map[string]json.RawMessage `json:"job"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &result); err != nil || result.SchemaVersion != 1 || len(result.Result.Job) != 4 {
-		t.Fatalf("reconcile JSON = %+v err=%v output=%q", result, err, stdout)
-	}
-	for _, secret := range []string{"PRIVATE_TASK", "PRIVATE_PROVIDER", token} {
-		if strings.Contains(stdout, secret) {
-			t.Errorf("reconcile leaked %q: %s", secret, stdout)
-		}
+	if err == nil || stdout != "" || !strings.Contains(stderr, "409") || strings.Contains(stderr, "PRIVATE_SERVER_DETAIL") {
+		t.Fatalf("unresolved provider observation: err=%v stdout=%q stderr=%q", err, stdout, stderr)
 	}
 	stdout, stderr, err = run("rest", "reconcile", "--config", configPath, "ineligible-id")
 	if err == nil || stdout != "" || !strings.Contains(stderr, "409") || strings.Contains(stderr, "PRIVATE_SERVER_DETAIL") {
@@ -644,7 +625,7 @@ func TestRESTRecoveryCommandsRespectSQLiteEligibilityAndPreserveOtherJobs(t *tes
 				return restjobs.ErrInvalidTransition
 			}
 			outcome := restjobs.ProviderOutcome{Provider: gotAttempt.Provider, Repository: gotAttempt.Repository, Number: 42, URL: "https://github.com/acme/widget/pull/42", Branch: gotAttempt.Branch, Commit: gotAttempt.Commit, State: "open"}
-			return store.ReconcileProviderOutcome(id, outcome)
+			return store.ObserveProviderOutcome(id, outcome)
 		},
 	})
 	if err != nil {
@@ -686,8 +667,11 @@ func TestRESTRecoveryCommandsRespectSQLiteEligibilityAndPreserveOtherJobs(t *tes
 		t.Fatalf("provider-attempt disposition should conflict: err=%v stderr=%q stdout=%q", err, stderr, stdout)
 	}
 	stdout, stderr, err = run("rest", "reconcile", "--config", configPath, withAttempt.ID)
-	if err != nil || stderr != "" || !strings.Contains(stdout, "succeeded") || strings.Contains(stdout, "PRIVATE") {
-		t.Fatalf("eligible SQLite reconciliation: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	if err == nil || stdout != "" || !strings.Contains(stderr, "409") || strings.Contains(stderr, "PRIVATE") {
+		t.Fatalf("eligible SQLite observation remains unresolved: err=%v stderr=%q stdout=%q", err, stderr, stdout)
+	}
+	if observed, observationErr := store.ProviderObservation(withAttempt.ID); observationErr != nil || observed.Outcome.Number != 42 {
+		t.Fatalf("provider observation not persisted=(%+v,%v)", observed, observationErr)
 	}
 	if got := lookups.Load(); got != 1 {
 		t.Fatalf("read-only provider lookups=%d, want one explicit reconciliation lookup", got)
@@ -695,7 +679,7 @@ func TestRESTRecoveryCommandsRespectSQLiteEligibilityAndPreserveOtherJobs(t *tes
 	if got := providerWrites.Load(); got != 0 {
 		t.Fatalf("provider writes=%d, want none", got)
 	}
-	for id, want := range map[string]restjobs.Status{noAttempt.ID: restjobs.StatusFailed, canceled.ID: restjobs.StatusCanceled, withAttempt.ID: restjobs.StatusSucceeded, unrelated.ID: restjobs.StatusSucceeded} {
+	for id, want := range map[string]restjobs.Status{noAttempt.ID: restjobs.StatusFailed, canceled.ID: restjobs.StatusCanceled, withAttempt.ID: restjobs.StatusRunning, unrelated.ID: restjobs.StatusSucceeded} {
 		job, err := store.Get(id)
 		if err != nil || job.Status != want {
 			t.Errorf("job %s status=(%s,%v), want %s", id, job.Status, err, want)
@@ -704,7 +688,7 @@ func TestRESTRecoveryCommandsRespectSQLiteEligibilityAndPreserveOtherJobs(t *tes
 	if got, err := store.History(unrelated.ID); err != nil || len(got.Events) != 3 {
 		t.Errorf("unrelated job history changed: (%+v,%v)", got, err)
 	}
-	if summary, err := store.OperationalSummary(t.Context()); err != nil || summary.Queued != 0 || summary.Failed != 1 || summary.Canceled != 1 || summary.Succeeded != 2 || summary.RecoveryNeeded != 0 {
+	if summary, err := store.OperationalSummary(t.Context()); err != nil || summary.Queued != 0 || summary.Running != 1 || summary.Failed != 1 || summary.Canceled != 1 || summary.Succeeded != 1 || summary.RecoveryNeeded != 1 {
 		t.Errorf("post-recovery summary=(%+v,%v)", summary, err)
 	}
 

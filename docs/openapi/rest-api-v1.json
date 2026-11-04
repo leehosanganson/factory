@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.11.0",
+    "version": "1.12.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -402,21 +402,17 @@
     "/v1/jobs/{id}/reconcile": {
       "post": {
         "operationId": "reconcileJob",
-        "summary": "Confirm an uncertain provider outcome",
+        "summary": "Observe an uncertain provider outcome",
         "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
-        "description": "Bodyless, authenticated operator action. Eligibility is limited to SQLite or PostgreSQL jobs with a persisted provider attempt/outcome and retained workspace: startup-interrupted running jobs or terminal failed jobs. It validates retained repository/branch/commit identity and performs read-only provider confirmation; it does not run the harness or write to the provider. Only a matching confirmed open PR and successful atomic recording can mark the job succeeded. Memory storage has no durable startup-recovery classification and does not support this recovery. Reconciliation is unavailable through a PostgreSQL API process configured with workers_enabled=false because that API process lacks the worker-local workspace and provider reconciliation executor callback; shared storage alone does not supply the callback. Failed or ambiguous reconciliation remains unresolved for operator investigation. PR publication and agent completion are not independent correctness verdicts.",
+        "description": "Bodyless, authenticated operator action. Eligibility is limited to SQLite or PostgreSQL jobs with a persisted provider attempt and retained workspace: startup-interrupted running jobs or terminal failed jobs. It verifies retained repository/branch/commit identity and performs a read-only provider lookup; it does not run the harness or write to the provider. An exact matching open PR is atomically recorded as a separate provider observation with a bounded audit event. It does not record a provider outcome or change job status: the prior write may still be in flight. Identical observations are idempotent; conflicting observations are rejected. The route returns 409 and the job remains unresolved. Memory storage has no durable startup-recovery classification and does not support this recovery. Reconciliation is unavailable through a PostgreSQL API process configured with workers_enabled=false because that API process lacks the worker-local workspace and provider lookup executor callback; shared storage alone does not supply the callback. Failed or ambiguous lookup remains unresolved for operator investigation. PR publication and agent completion are not independent correctness verdicts.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
         "responses": {
-          "200": {
-            "description": "The provider outcome was read-only confirmed and recorded, or the already-reconciled snapshot was returned.",
-            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/JobSnapshot" } } }
-          },
           "400": { "$ref": "#/components/responses/InvalidRequest" },
           "401": { "$ref": "#/components/responses/Unauthenticated" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": {
-            "description": "Reconciliation is unavailable or the job is ineligible, mismatched, ambiguous, or could not be durably updated. The job remains unresolved.",
+            "description": "The lookup is unavailable, ineligible, mismatched, ambiguous, or unresolved. Exact matches are recorded as provider observations but never establish success; the job remains unresolved.",
             "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
           },
           "500": { "$ref": "#/components/responses/InternalError" },
@@ -846,7 +842,7 @@
         "required": [ "at", "type" ],
         "properties": {
           "at": { "type": "string", "format": "date-time" },
-          "type": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition" ] }
+          "type": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_observed", "operator_disposition" ] }
         },
         "additionalProperties": false
       },
@@ -855,7 +851,7 @@
         "required": [ "id", "event", "data" ],
         "properties": {
           "id": { "type": "string", "pattern": "^[0-9]+$", "description": "Monotonic per-job event sequence used as Last-Event-ID." },
-          "event": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition", "stage_progress" ] },
+          "event": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_observed", "operator_disposition", "stage_progress" ] },
           "data": {
             "oneOf": [
               { "$ref": "#/components/schemas/JobEventStreamData" },
@@ -912,9 +908,9 @@
           "at": { "type": "string", "format": "date-time" },
           "type": {
             "type": "string",
-            "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_reconciled", "operator_disposition", "stage_progress" ]
+            "enum": [ "queued", "running", "succeeded", "failed", "canceled", "cancel_requested", "provider_observed", "operator_disposition", "stage_progress" ]
           },
-          "message": { "type": "string", "enum": [ "Job admitted", "Job started", "Cancellation requested", "Job canceled before start", "Operator confirmed provider outcome", "failed", "canceled", "Job finished" ], "description": "Only known fixed lifecycle messages may be returned; raw stage-progress messages and unrecognized messages are omitted." }
+          "message": { "type": "string", "enum": [ "Job admitted", "Job started", "Cancellation requested", "Job canceled before start", "Matching pull request observed; outcome unresolved", "failed", "canceled", "Job finished" ], "description": "Only known fixed lifecycle messages may be returned; raw stage-progress messages and unrecognized messages are omitted." }
         },
         "additionalProperties": false
       },

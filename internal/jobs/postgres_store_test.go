@@ -431,11 +431,37 @@ func TestPostgresStoreIntegration(t *testing.T) {
 			t.Fatalf("provider-side-effect disposition=%v, want rejected", err)
 		}
 		outcome := ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
-		if err := reopened.ReconcileProviderOutcome(providerJob.ID, outcome); err != nil {
-			t.Fatalf("reconcile provider identity: %v", err)
+		if err := reopened.ReconcileProviderOutcome(providerJob.ID, outcome); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("legacy reconciliation method error=%v, want unresolved conflict", err)
 		}
-		if got, err := reopened.Get(providerJob.ID); err != nil || got.Status != StatusSucceeded || got.Provider == nil || *got.Provider != outcome {
-			t.Fatalf("reconciled result=(%+v,%v)", got, err)
+		if err := reopened.ObserveProviderOutcome(providerJob.ID, outcome); err != nil {
+			t.Fatalf("record provider observation: %v", err)
+		}
+		if err := reopened.ObserveProviderOutcome(providerJob.ID, outcome); err != nil {
+			t.Fatalf("repeat provider observation: %v", err)
+		}
+		if got, err := reopened.Get(providerJob.ID); err != nil || got.Status != StatusRunning || got.Provider != nil {
+			t.Fatalf("provider observation changed job=(%+v,%v)", got, err)
+		}
+		observed, err := reopened.ProviderObservation(providerJob.ID)
+		if err != nil || observed.Outcome != outcome || observed.ObservedAt.IsZero() {
+			t.Fatalf("persisted provider observation=(%+v,%v)", observed, err)
+		}
+		history, err := reopened.History(providerJob.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observations := 0
+		for _, event := range history.Events {
+			if event.Type == "provider_observed" {
+				observations++
+			}
+			if event.Type == string(StatusSucceeded) || event.Type == "provider_reconciled" {
+				t.Fatalf("provider observation created success history: %+v", history.Events)
+			}
+		}
+		if observations != 1 {
+			t.Fatalf("provider observation audit events=%d history=%+v", observations, history.Events)
 		}
 	})
 
