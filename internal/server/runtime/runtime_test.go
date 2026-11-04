@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -282,8 +283,57 @@ func TestRunDashboardRoutesAreIntegratedWithoutChangingAPIListener(t *testing.T)
 	}
 }
 
+func TestRunRejectsMissingOrInvalidWorkerMappingsBeforeEitherListenerStarts(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		mappingData *string
+	}{
+		{name: "missing"},
+		{name: "invalid", mappingData: stringPointer(`{"version":2,"mappings":[]}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, _ := runtimeFixture(t)
+			stateDir := filepath.Join(t.TempDir(), "private-state")
+			if err := os.Mkdir(stateDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(stateDir, "jobs.db")}
+			mappingPath := filepath.Join(stateDir, "worker-mappings.json")
+			if test.mappingData != nil {
+				if err := os.WriteFile(mappingPath, []byte(*test.mappingData), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			config.WorkerListener = &restserver.WorkerListenerConfig{
+				ListenAddress: "127.0.0.1:0", ServerCertFile: filepath.Join(stateDir, "server.crt"),
+				ServerKeyFile: filepath.Join(stateDir, "server.key"), ClientCAFile: filepath.Join(stateDir, "client-ca.crt"),
+				MappingFile: mappingPath,
+			}
+			var apiListenCalls, workerListenCalls atomic.Int32
+			err := run(context.Background(), config, runtimeOptions{
+				OpenStore: func(serverConfig restserver.Config) (restjobs.Store, error) {
+					return restjobs.OpenSQLiteStore(serverConfig.Persistence.Path, restjobs.Config{QueueCapacity: serverConfig.Limits.QueueCapacity, MaxConcurrentJobs: serverConfig.Limits.Workers, MaxRecords: serverConfig.Limits.MaxRecords, MaxEventsPerJob: serverConfig.Limits.MaxEventsPerJob, MaxTaskBytes: serverConfig.Limits.TaskBytes})
+				},
+				Listen: func(string, string) (net.Listener, error) {
+					apiListenCalls.Add(1)
+					return nil, errors.New("unexpected API listener start")
+				},
+				ListenWorker: func(string, string, *tls.Config) (net.Listener, error) {
+					workerListenCalls.Add(1)
+					return nil, errors.New("unexpected worker listener start")
+				},
+			})
+			if err == nil || apiListenCalls.Load() != 0 || workerListenCalls.Load() != 0 {
+				t.Fatalf("startup error=%v listener calls API/worker=%d/%d; want mapping failure before listeners", err, apiListenCalls.Load(), workerListenCalls.Load())
+			}
+		})
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
 func TestRunConfiguredGitHubIssueWebhookAndWorkerIdentityTogether(t *testing.T) {
-	config, _ := runtimeFixture(t)
+	config, apiToken := runtimeFixture(t)
 	disabledWorkers := false
 	config.WorkersEnabled = &disabledWorkers
 	stateDir := filepath.Join(t.TempDir(), "private-state")
@@ -307,7 +357,9 @@ func TestRunConfiguredGitHubIssueWebhookAndWorkerIdentityTogether(t *testing.T) 
 	config.Principals = append(config.Principals, restserver.PrincipalConfig{ID: "issue-owner", Role: "submitter", TokenFile: ownerVerifier, Enabled: true})
 	config.GitHubWebhook = restserver.GitHubWebhookConfig{SecretFile: secretPath, TriggerLabel: "factory:ready", Sources: map[string]string{"acme/issues": "trusted"}, Owners: map[string]string{"acme/issues": "issue-owner"}}
 	serverCert, serverCA := runtimeTestCertificate(t, "server", false)
-	clientCert, workerCA := runtimeTestCertificate(t, "worker", true)
+	clientCert, workerCA := runtimeTestCertificate(t, "worker-old", true)
+	rotatedClientCert, rotatedWorkerCA := runtimeTestCertificate(t, "worker-new", true)
+	workerCA = append(workerCA, rotatedWorkerCA...)
 	certPath, keyPath, caPath := filepath.Join(stateDir, "worker-server.crt"), filepath.Join(stateDir, "worker-server.key"), filepath.Join(stateDir, "worker-ca.crt")
 	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: serverCert.Certificate[0]}), 0o600); err != nil {
 		t.Fatal(err)
@@ -323,8 +375,15 @@ func TestRunConfiguredGitHubIssueWebhookAndWorkerIdentityTogether(t *testing.T) 
 		t.Fatal(err)
 	}
 	clientFingerprint := sha256.Sum256(clientCert.Certificate[0])
+	rotatedFingerprint := sha256.Sum256(rotatedClientCert.Certificate[0])
+	clientFingerprintText, rotatedFingerprintText := hex.EncodeToString(clientFingerprint[:]), hex.EncodeToString(rotatedFingerprint[:])
 	workerAddress := runtimeFreeAddress(t)
-	config.WorkerListener = &restserver.WorkerListenerConfig{ListenAddress: workerAddress, ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath, Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(clientFingerprint[:]), PrincipalID: "worker-runtime", Enabled: true}}}
+	mappingPath := filepath.Join(stateDir, "worker-mappings.json")
+	mappingData := `{"version":1,"mappings":[{"sha256":"` + clientFingerprintText + `","principal_id":"worker-runtime"},{"sha256":"` + rotatedFingerprintText + `","principal_id":"worker-runtime"}]}`
+	if err := os.WriteFile(mappingPath, []byte(mappingData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.WorkerListener = &restserver.WorkerListenerConfig{ListenAddress: workerAddress, ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath, MappingFile: mappingPath}
 	var store *restjobs.SQLiteStore
 	listenerReady := make(chan net.Listener, 1)
 	workerListenerReady := make(chan net.Listener, 1)
@@ -375,7 +434,11 @@ func TestRunConfiguredGitHubIssueWebhookAndWorkerIdentityTogether(t *testing.T) 
 	defer workerListener.Close()
 	workerRoots := x509.NewCertPool()
 	workerRoots.AppendCertsFromPEM(serverCA)
-	workerClient := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{clientCert}, RootCAs: workerRoots}}}
+	workerClientFor := func(cert tls.Certificate) *http.Client {
+		return &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: workerRoots}}}
+	}
+	workerClient := workerClientFor(clientCert)
+	rotatedWorkerClient := workerClientFor(rotatedClientCert)
 	workerRequest, err := http.NewRequest(http.MethodPost, "https://"+workerListener.Addr().String()+"/v1/worker/session", strings.NewReader(`{"boot_id":"boot-combined-runtime"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -385,12 +448,87 @@ func TestRunConfiguredGitHubIssueWebhookAndWorkerIdentityTogether(t *testing.T) 
 		t.Fatal(err)
 	}
 	var workerSession restjobs.WorkerSession
-	if workerResponse.StatusCode != http.StatusCreated || json.NewDecoder(workerResponse.Body).Decode(&workerSession) != nil || workerSession.PrincipalID != "worker-runtime" {
+	if workerResponse.StatusCode != http.StatusCreated || json.NewDecoder(workerResponse.Body).Decode(&workerSession) != nil || workerSession.PrincipalID != "worker-runtime" || workerSession.Capability == "" {
 		workerResponse.Body.Close()
 		t.Fatalf("worker session registration status=%d session=%+v", workerResponse.StatusCode, workerSession)
 	}
 	workerResponse.Body.Close()
+	authenticateWith := func(client *http.Client) *http.Response {
+		t.Helper()
+		request, err := http.NewRequest(http.MethodGet, "https://"+workerListener.Addr().String()+"/v1/worker/session", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer "+workerSession.Capability)
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+	rotationAuth := authenticateWith(rotatedWorkerClient)
+	if rotationAuth.StatusCode != http.StatusOK {
+		rotationAuth.Body.Close()
+		t.Fatalf("overlap certificate could not authenticate registered session: status=%d", rotationAuth.StatusCode)
+	}
+	rotationAuth.Body.Close()
+	if err := os.WriteFile(mappingPath, []byte(`{"version":1,"mappings":[{"sha256":"`+rotatedFingerprintText+`","principal_id":"worker-runtime"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
 	client := &http.Client{Timeout: 2 * time.Second}
+	var mappingStatus struct {
+		Generation uint64 `json:"worker_mapping_generation"`
+		Count      int    `json:"worker_mapping_count"`
+		Result     string `json:"worker_mapping_reload_result"`
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		operations, err := http.NewRequest(http.MethodGet, "http://"+listener.Addr().String()+"/v1/operations", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		operations.Header.Set("Authorization", "Bearer "+apiToken)
+		response, err := client.Do(operations)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&mappingStatus)
+		response.Body.Close()
+		if decodeErr == nil && mappingStatus.Generation == 2 && mappingStatus.Count == 1 && mappingStatus.Result == "accepted" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if mappingStatus.Generation != 2 || mappingStatus.Count != 1 || mappingStatus.Result != "accepted" {
+		t.Fatalf("SIGHUP mapping status=%+v", mappingStatus)
+	}
+	rotationAuth = authenticateWith(rotatedWorkerClient)
+	if rotationAuth.StatusCode != http.StatusOK {
+		rotationAuth.Body.Close()
+		t.Fatalf("rotated certificate could not authenticate existing session after reload: status=%d", rotationAuth.StatusCode)
+	}
+	rotationAuth.Body.Close()
+	oldCertificateAuth := authenticateWith(workerClient)
+	if oldCertificateAuth.StatusCode != http.StatusUnauthorized {
+		oldCertificateAuth.Body.Close()
+		t.Fatalf("removed certificate authentication status=%d, want 401", oldCertificateAuth.StatusCode)
+	}
+	oldCertificateAuth.Body.Close()
+	retiredRequest, err := http.NewRequest(http.MethodPost, "https://"+workerListener.Addr().String()+"/v1/worker/session", strings.NewReader(`{"boot_id":"boot-after-revoke"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiredResponse, err := workerClient.Do(retiredRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retiredResponse.Body.Close()
+	if retiredResponse.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked certificate status=%d, want 401", retiredResponse.StatusCode)
+	}
 	body := `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":42,"title":"Issue","state":"open","labels":[{"name":"factory:ready"}]},"repository":{"full_name":"acme/issues"}}`
 	request, err := http.NewRequest(http.MethodPost, "http://"+listener.Addr().String()+"/v1/webhooks/github/issues", strings.NewReader(body))
 	if err != nil {

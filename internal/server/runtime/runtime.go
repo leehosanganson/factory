@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -284,6 +285,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	var workerHandler http.Handler
 	var workerTLS *tls.Config
+	var workerMappings *restserver.WorkerMappingRegistry
 	if config.WorkerListener != nil {
 		sessionStore, ok := store.(restjobs.WorkerSessionStore)
 		if !ok {
@@ -305,11 +307,33 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			closeStore()
 			return err
 		}
+		if config.WorkerListener.MappingFile != "" {
+			mappingStore, ok := store.(restserver.WorkerMappingRegistryStore)
+			if !ok {
+				closeStore()
+				return errors.New("configured SQL store does not support worker mapping registry")
+			}
+			workerMappings, err = restserver.NewWorkerMappingRegistry(config.WorkerListener.MappingFile, mappingStore)
+			if err == nil {
+				err = workerMappings.Reload(ctx)
+			}
+			if err != nil {
+				closeStore()
+				return errors.New("worker mapping file is invalid or unavailable")
+			}
+			if handler, ok := workerHandler.(*restserver.WorkerListenerHandler); ok {
+				handler.SetMappingRegistry(workerMappings)
+			}
+		}
 		workerTLS, err = restserver.NewWorkerListenerTLS(*config.WorkerListener)
 		if err != nil {
 			closeStore()
 			return err
 		}
+	}
+	var mappingStatus func() restserver.WorkerMappingStatus
+	if workerMappings != nil {
+		mappingStatus = workerMappings.Status
 	}
 	apiHandler, err := restapi.New(manager, key, restapi.Config{
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
@@ -339,8 +363,9 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			}
 			return recoveryStore.ResolveInterrupted(id, disposition)
 		},
-		ReconcileProvider: reconcileProvider,
-		Ready:             func() bool { return ready.Load() },
+		ReconcileProvider:   reconcileProvider,
+		WorkerMappingStatus: mappingStatus,
+		Ready:               func() bool { return ready.Load() },
 		ReadyError: func(requestCtx context.Context) error {
 			if !ready.Load() {
 				return errors.New("server not initialized")
@@ -458,13 +483,28 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	ready.Store(true)
 	logger.Printf("REST server ready; persistence backend: %s", config.Persistence.Backend)
-
+	signals := make(chan os.Signal, 1)
+	if workerMappings != nil {
+		signal.Notify(signals, syscall.SIGHUP)
+		defer signal.Stop(signals)
+	}
 	var serveErr error
-	select {
-	case <-ctx.Done():
-	case err := <-serveDone:
-		if !errors.Is(err, http.ErrServerClosed) {
-			serveErr = errors.New("serve REST listener")
+	serving := true
+	for serving {
+		select {
+		case <-ctx.Done():
+			serving = false
+		case <-signals:
+			if workerMappings != nil {
+				if reloadErr := workerMappings.Reload(ctx); reloadErr != nil {
+					logger.Printf("worker identity mapping reload rejected")
+				}
+			}
+		case err := <-serveDone:
+			if !errors.Is(err, http.ErrServerClosed) {
+				serveErr = errors.New("serve REST listener")
+			}
+			serving = false
 		}
 	}
 	shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)

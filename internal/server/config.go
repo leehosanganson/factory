@@ -146,7 +146,8 @@ type WorkerListenerConfig struct {
 	ServerCertFile string                       `json:"server_cert_file"`
 	ServerKeyFile  string                       `json:"server_key_file"`
 	ClientCAFile   string                       `json:"client_ca_file"`
-	Certificates   []WorkerCertificatePrincipal `json:"certificates"`
+	MappingFile    string                       `json:"mapping_file,omitempty"`
+	Certificates   []WorkerCertificatePrincipal `json:"certificates,omitempty"`
 }
 
 // WorkerCertificatePrincipal maps an exact client certificate DER fingerprint to an identity.
@@ -362,8 +363,14 @@ func (c Config) Validate() error {
 				return fmt.Errorf("worker_listener.%s must be an absolute path", path.name)
 			}
 		}
-		if len(listener.Certificates) == 0 {
-			return errors.New("worker_listener.certificates must not be empty")
+		if listener.MappingFile != "" && (!filepath.IsAbs(listener.MappingFile) || strings.TrimSpace(listener.MappingFile) == "" || strings.ContainsRune(listener.MappingFile, 0)) {
+			return errors.New("worker_listener.mapping_file must be an absolute path")
+		}
+		if listener.MappingFile == "" && len(listener.Certificates) == 0 {
+			return errors.New("worker_listener requires mapping_file")
+		}
+		if listener.MappingFile != "" && len(listener.Certificates) != 0 {
+			return errors.New("worker_listener must not combine mapping_file and certificates")
 		}
 		fingerprints := make(map[string]struct{}, len(listener.Certificates))
 		hasEnabledCertificate := false
@@ -380,7 +387,7 @@ func (c Config) Validate() error {
 			fingerprints[certificate.SHA256] = struct{}{}
 			hasEnabledCertificate = hasEnabledCertificate || certificate.Enabled
 		}
-		if !hasEnabledCertificate {
+		if listener.MappingFile == "" && !hasEnabledCertificate {
 			return errors.New("worker_listener requires at least one enabled certificate mapping")
 		}
 	}
@@ -701,7 +708,7 @@ func configFieldAllowed(parent, key string) bool {
 	case "web_ui":
 		fields = map[string]struct{}{"enabled": {}, "operator_id": {}}
 	case "worker_listener":
-		fields = map[string]struct{}{"listen_address": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "certificates": {}}
+		fields = map[string]struct{}{"listen_address": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "mapping_file": {}, "certificates": {}}
 	case "github_webhook":
 		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}}
 	case "github_webhook_sources", "github_webhook_owners":
@@ -807,14 +814,21 @@ func validateRequiredConfigFields(data []byte) error {
 		if err := json.Unmarshal(raw, &listener); err != nil {
 			return errors.New("worker_listener must be an object")
 		}
-		for _, field := range []string{"listen_address", "server_cert_file", "server_key_file", "client_ca_file", "certificates"} {
+		for _, field := range []string{"listen_address", "server_cert_file", "server_key_file", "client_ca_file"} {
 			if _, ok := listener[field]; !ok {
 				return fmt.Errorf("required worker_listener field %q is missing", field)
 			}
 		}
+		if _, hasMappingFile := listener["mapping_file"]; !hasMappingFile {
+			if _, hasCertificates := listener["certificates"]; !hasCertificates {
+				return errors.New("worker_listener requires mapping_file")
+			}
+		}
 		var certificates []map[string]json.RawMessage
-		if err := json.Unmarshal(listener["certificates"], &certificates); err != nil {
-			return errors.New("worker_listener.certificates must be an array")
+		if raw, exists := listener["certificates"]; exists {
+			if err := json.Unmarshal(raw, &certificates); err != nil {
+				return errors.New("worker_listener.certificates must be an array")
+			}
 		}
 		for index, certificate := range certificates {
 			for _, field := range []string{"sha256", "principal_id", "enabled"} {

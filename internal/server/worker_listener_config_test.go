@@ -34,6 +34,18 @@ func TestWorkerListenerConfigRequiresSQLAndValidCertificateMappings(t *testing.T
 	}
 }
 
+func TestWorkerListenerMappingFileConfig(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"admin","role":"operator","token_file":"/run/admin","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://factory:secret@localhost/factory"}`
+	listener := `"worker_listener":{"listen_address":"127.0.0.1:8081","server_cert_file":"/run/tls/server.crt","server_key_file":"/run/tls/server.key","client_ca_file":"/run/tls/ca.crt","mapping_file":"/run/worker-mappings.json"}`
+	config, err := LoadConfig(writeConfig(t, `{`+base+`,`+listener+`}`))
+	if err != nil || config.WorkerListener == nil || config.WorkerListener.MappingFile != "/run/worker-mappings.json" {
+		t.Fatalf("LoadConfig() mapping_file=(%+v,%v)", config.WorkerListener, err)
+	}
+	if _, err := LoadConfig(writeConfig(t, `{`+base+`,"worker_listener":{"listen_address":"127.0.0.1:8081","server_cert_file":"/run/cert","server_key_file":"/run/key","client_ca_file":"/run/ca"}}`)); err == nil {
+		t.Fatal("accepted worker listener with neither certificates nor mapping file")
+	}
+}
+
 func TestWorkerListenerConfigRejectsIncompleteAndUnknownFields(t *testing.T) {
 	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"admin","role":"operator","token_file":"/run/admin","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://factory:secret@localhost/factory"}}`
 	for _, workerListener := range []string{

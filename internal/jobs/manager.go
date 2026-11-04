@@ -274,16 +274,20 @@ const (
 
 // OperationalSummary reports bounded aggregate job state without job payloads.
 type OperationalSummary struct {
-	RetainedRecords int  `json:"retained_records"`
-	RecordLimit     int  `json:"record_limit"`
-	QueueCapacity   int  `json:"queue_capacity"`
-	Queued          int  `json:"queued"`
-	Running         int  `json:"running"`
-	Succeeded       int  `json:"succeeded"`
-	Failed          int  `json:"failed"`
-	Canceled        int  `json:"canceled"`
-	QueueSaturated  bool `json:"queue_saturated"`
-	RecoveryNeeded  int  `json:"recovery_needed"`
+	RetainedRecords           int        `json:"retained_records"`
+	RecordLimit               int        `json:"record_limit"`
+	QueueCapacity             int        `json:"queue_capacity"`
+	Queued                    int        `json:"queued"`
+	Running                   int        `json:"running"`
+	Succeeded                 int        `json:"succeeded"`
+	Failed                    int        `json:"failed"`
+	Canceled                  int        `json:"canceled"`
+	QueueSaturated            bool       `json:"queue_saturated"`
+	RecoveryNeeded            int        `json:"recovery_needed"`
+	WorkerMappingGeneration   *uint64    `json:"worker_mapping_generation,omitempty"`
+	WorkerMappingCount        *int       `json:"worker_mapping_count,omitempty"`
+	WorkerMappingReloadResult *string    `json:"worker_mapping_reload_result,omitempty"`
+	WorkerMappingReloadAt     *time.Time `json:"worker_mapping_reload_at,omitempty"`
 }
 
 // RecoveryReport classifies retained work after opening a store. Only queued

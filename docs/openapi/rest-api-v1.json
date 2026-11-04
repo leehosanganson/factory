@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.10.0",
+    "version": "1.11.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict."
   },
   "paths": {
@@ -931,7 +931,11 @@
           "failed": { "type": "integer", "format": "int64", "minimum": 0 },
           "canceled": { "type": "integer", "format": "int64", "minimum": 0 },
           "queue_saturated": { "type": "boolean" },
-          "recovery_needed": { "type": "integer", "format": "int64", "minimum": 0 }
+          "recovery_needed": { "type": "integer", "format": "int64", "minimum": 0 },
+          "worker_mapping_generation": { "type": "integer", "format": "int64", "minimum": 0 },
+          "worker_mapping_count": { "type": "integer", "format": "int64", "minimum": 0 },
+          "worker_mapping_reload_result": { "type": "string", "enum": [ "accepted", "rejected" ] },
+          "worker_mapping_reload_at": { "type": "string", "format": "date-time" }
         }
       },
       "HealthResponse": {
