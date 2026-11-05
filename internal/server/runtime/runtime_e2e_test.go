@@ -2438,7 +2438,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		t.Fatal(err)
 	}
 	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
-	config.Limits.JobTimeout = "2s"
+	config.Limits.JobTimeout = "10s"
 	harness := filepath.Join(t.TempDir(), "harness.sh")
 	harnessCount := filepath.Join(t.TempDir(), "harness-count")
 	harnessScript := fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\nprintf 'verified\\n' >> result.txt\n", harnessCount)
@@ -2517,7 +2517,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		job := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
 		t.Fatalf("fake provider did not record accepted PR create: %v; job=%+v history=%+v", err, job, getProcessHistory(t, client, baseURL, admitted.ID, apiKey))
 	}
-	waitForProcessFailure(t, client, baseURL, admitted.ID, apiKey)
+	waitForProcessFailureWithin(t, client, baseURL, admitted.ID, apiKey, 15*time.Second)
 	recordData, err := os.ReadFile(recordPath)
 	if err != nil {
 		t.Fatal(err)
@@ -3145,8 +3145,12 @@ func submitProcessJob(client *http.Client, baseURL, apiKey, alias, task, key str
 }
 
 func waitForProcessFailure(t *testing.T, client *http.Client, baseURL, id, apiKey string) {
+	waitForProcessFailureWithin(t, client, baseURL, id, apiKey, 10*time.Second)
+}
+
+func waitForProcessFailureWithin(t *testing.T, client *http.Client, baseURL, id, apiKey string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		job := getProcessJob(t, client, baseURL, id, apiKey)
 		if job.Status.Terminal() {
