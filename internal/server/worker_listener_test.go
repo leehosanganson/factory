@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"log"
 	"math/big"
 	"net"
@@ -658,6 +659,7 @@ func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 func TestWorkerListenerTLSRejectsClientCertificateFromUntrustedCA(t *testing.T) {
 	trustedCA := workerTestCertificateAuthority(t, "trusted-client-ca")
 	trustedClient := workerTestCertificateSignedBy(t, trustedCA, "trusted-client")
+	trustedUnmappedClient := workerTestCertificateSignedBy(t, trustedCA, "trusted-unmapped-client")
 	untrustedCA := workerTestCertificateAuthority(t, "untrusted-client-ca")
 	untrustedClient := workerTestCertificateSignedBy(t, untrustedCA, "untrusted-client")
 	serverCert := workerTestCertificate(t, "worker-listener-server", false)
@@ -720,13 +722,62 @@ func TestWorkerListenerTLSRejectsClientCertificateFromUntrustedCA(t *testing.T) 
 		t.Fatalf("untrusted certificate reached HTTP handler %d times", got)
 	}
 
+	response, err = clientFor(trustedUnmappedClient).Post(endpoint, "application/json", strings.NewReader(`{"boot_id":"boot-unmapped"}`))
+	if err != nil {
+		t.Fatalf("trusted but unmapped client did not complete the TLS handshake: %v", err)
+	}
+	assertUnauthenticatedResponse := func(response *http.Response) {
+		t.Helper()
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("response status=%d, want HTTP 401", response.StatusCode)
+		}
+		var payload map[string]json.RawMessage
+		decoder := json.NewDecoder(response.Body)
+		if err := decoder.Decode(&payload); err != nil {
+			t.Fatalf("decode unauthenticated response: %v", err)
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			t.Fatalf("unauthenticated response has trailing JSON: %v", err)
+		}
+		var code string
+		if len(payload) != 1 || json.Unmarshal(payload["code"], &code) != nil || code != "unauthenticated" {
+			t.Fatalf("unauthenticated response body=%v, want exactly {\"code\":\"unauthenticated\"}", payload)
+		}
+	}
+	assertUnauthenticatedResponse(response)
+	if handlerCalls.Load() != 1 {
+		t.Fatalf("trusted unmapped client handler calls=%d, want 1 after TLS", handlerCalls.Load())
+	}
+	if store.registrationCalls != 0 || store.capabilityCalls != 0 {
+		t.Fatalf("unmapped client reached session store: registrations=%d capability lookups=%d", store.registrationCalls, store.capabilityCalls)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer unused")
+	response, err = clientFor(trustedUnmappedClient).Do(request)
+	if err != nil {
+		t.Fatalf("trusted but unmapped client could not send capability request: %v", err)
+	}
+	assertUnauthenticatedResponse(response)
+	if handlerCalls.Load() != 2 {
+		t.Fatalf("unmapped capability request handler calls=%d, want 2", handlerCalls.Load())
+	}
+	if store.registrationCalls != 0 || store.capabilityCalls != 0 {
+		t.Fatalf("unmapped capability request reached session store: registrations=%d capability lookups=%d", store.registrationCalls, store.capabilityCalls)
+	}
+
 	response, err = clientFor(trustedClient).Post(endpoint, "application/json", strings.NewReader(`{"boot_id":"boot-trusted"}`))
 	if err != nil {
-		t.Fatalf("trusted client could not reach worker listener: %v", err)
+		t.Fatalf("mapped trusted client could not reach worker listener: %v", err)
 	}
 	response.Body.Close()
-	if response.StatusCode != http.StatusCreated || handlerCalls.Load() != 1 || store.registrationCalls != 1 {
-		t.Fatalf("trusted client response=%d handler calls=%d registrations=%d, want 201 and one registration", response.StatusCode, handlerCalls.Load(), store.registrationCalls)
+	if response.StatusCode != http.StatusCreated || handlerCalls.Load() != 3 || store.registrationCalls != 1 || store.capabilityCalls != 0 {
+		t.Fatalf("mapped trusted client response=%d handler calls=%d registrations=%d capability lookups=%d, want 201 and one registration", response.StatusCode, handlerCalls.Load(), store.registrationCalls, store.capabilityCalls)
 	}
 }
 
