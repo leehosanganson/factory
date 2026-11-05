@@ -369,8 +369,8 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 
 		// The fake adapter's first reconciliation is read-only and sees no write
 		// while Publish remains blocked; this is not a live-provider guarantee.
-		if status := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusConflict {
-			t.Fatalf("pre-write fake reconciliation status=%d, want conflict for no match", status)
+		if status, code, message := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusConflict || code != "reconciliation_not_allowed" || message != "Job is not eligible for provider reconciliation." {
+			t.Fatalf("pre-write fake reconciliation status=%d error=(%q, %q), want sanitized ineligible conflict", status, code, message)
 		}
 		if publisher.publishes.Load() != 1 || publisher.writes.Load() != 0 || publisher.reconciliations.Load() != 1 {
 			t.Fatalf("before delayed write: Publish=%d writes=%d Reconcile=%d, want 1/0/1", publisher.publishes.Load(), publisher.writes.Load(), publisher.reconciliations.Load())
@@ -405,6 +405,54 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 			t.Fatalf("provider outcome before delayed write count=%d err=%v, want none", outcomeCount, err)
 		}
 
+		// The provider can expose the matching PR before Publish returns. This
+		// visibility transition is separate from releaseWrite, which lets the
+		// original Publish call remain pending during reconciliation.
+		publisher.makeVisible(publishRequest)
+		select {
+		case <-publisher.returned:
+			t.Fatal("fake Publish returned before matching reconciliation")
+		default:
+		}
+		if status, code, message := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusConflict || code != "reconciliation_not_allowed" || message != "Provider outcome remains unresolved after read-only lookup." {
+			t.Fatalf("matching provider reconciliation while Publish is pending status=%d error=(%q, %q), want sanitized unresolved conflict", status, code, message)
+		}
+		unresolvedBeforeReturn := getRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID)
+		if unresolvedBeforeReturn.Status != restjobs.StatusRunning || unresolvedBeforeReturn.Provider != nil {
+			t.Fatalf("matching provider observation resolved pending runtime job=%+v", unresolvedBeforeReturn)
+		}
+		if publisher.publishes.Load() != 1 || publisher.writes.Load() != 1 || publisher.reconciliations.Load() != 2 {
+			t.Fatalf("while Publish is pending after matching observation: Publish=%d writes=%d Reconcile=%d, want 1/1/2", publisher.publishes.Load(), publisher.writes.Load(), publisher.reconciliations.Load())
+		}
+		if _, err := recoveryStore.ClaimNextAttempt(); !errors.Is(err, restjobs.ErrNoQueuedJobs) {
+			t.Fatalf("claim after matching observation while Publish is pending=%v, want no queued replay", err)
+		}
+		observationBeforeReturn, err := recoveryStore.ProviderObservation(admission.Job.ID)
+		if err != nil || observationBeforeReturn.Outcome.Provider != "github" || observationBeforeReturn.Outcome.Repository != publishRequest.Repository || observationBeforeReturn.Outcome.Number != 73 || observationBeforeReturn.Outcome.URL != "https://github.com/acme/widget/pull/73" || observationBeforeReturn.Outcome.Branch != publishRequest.Branch || observationBeforeReturn.Outcome.Commit != publishRequest.Commit || observationBeforeReturn.Outcome.State != "open" || observationBeforeReturn.ObservedAt.IsZero() {
+			t.Fatalf("provider observation while Publish is pending=(%+v,%v), want exact matching PR identity", observationBeforeReturn, err)
+		}
+		historyBeforeReturn, err := recoveryStore.History(admission.Job.ID)
+		if err != nil {
+			t.Fatal("read pending provider observation history")
+		}
+		observationsBeforeReturn, succeededBeforeReturn, reconciledBeforeReturn := 0, 0, 0
+		for _, event := range historyBeforeReturn.Events {
+			switch event.Type {
+			case "provider_observed":
+				observationsBeforeReturn++
+			case string(restjobs.StatusSucceeded):
+				succeededBeforeReturn++
+			case "provider_reconciled":
+				reconciledBeforeReturn++
+			}
+		}
+		if observationsBeforeReturn != 1 || succeededBeforeReturn != 0 || reconciledBeforeReturn != 0 {
+			t.Fatalf("pending observation audit events: observed=%d succeeded=%d provider_reconciled=%d, want 1/0/0", observationsBeforeReturn, succeededBeforeReturn, reconciledBeforeReturn)
+		}
+		if err := admin.QueryRow(`SELECT COUNT(*) FROM `+schema+`.factory_job_provider_outcomes WHERE job_id=$1`, admission.Job.ID).Scan(&outcomeCount); err != nil || outcomeCount != 0 {
+			t.Fatalf("provider outcome after pending matching observation count=%d err=%v, want none", outcomeCount, err)
+		}
+
 		publisher.releaseWrite()
 		select {
 		case <-publisher.returned:
@@ -414,8 +462,6 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 		if publisher.publishes.Load() != 1 || publisher.writes.Load() != 1 {
 			t.Fatalf("after delayed write: Publish=%d writes=%d, want exactly one each", publisher.publishes.Load(), publisher.writes.Load())
 		}
-		// Let the old coordinator call FinishAttempt after the executor returns.
-		time.Sleep(150 * time.Millisecond)
 		stillRunning, err := recoveryStore.Get(admission.Job.ID)
 		if err != nil || stillRunning.Status != restjobs.StatusRunning || stillRunning.Provider != nil || !recoveryStore.RecoveryNeeded(admission.Job.ID) {
 			t.Fatalf("old attempt changed recovered job=(%+v,%v), want recovery-needed running without outcome", stillRunning, err)
@@ -423,8 +469,8 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 		if _, err := recoveryStore.ClaimNextAttempt(); !errors.Is(err, restjobs.ErrNoQueuedJobs) {
 			t.Fatalf("claim after delayed write=%v, want no replay", err)
 		}
-		if status := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusConflict {
-			t.Fatalf("post-write read-only matching lookup status=%d, want unresolved conflict", status)
+		if status, code, message := reconcileRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID); status != http.StatusConflict || code != "reconciliation_not_allowed" || message != "Provider outcome remains unresolved after read-only lookup." {
+			t.Fatalf("post-write read-only matching lookup status=%d error=(%q, %q), want sanitized unresolved conflict", status, code, message)
 		}
 		unresolved := getRuntimeIntegrationJob(t, baseURL, key, admission.Job.ID)
 		if unresolved.Status != restjobs.StatusRunning || unresolved.Provider != nil {
@@ -628,7 +674,7 @@ type leaseExpiryPublisher struct {
 	reconciliations atomic.Int32
 	mu              sync.Mutex
 	outcome         restprovider.Outcome
-	written         bool
+	visible         bool
 }
 
 func newLeaseExpiryPublisher() *leaseExpiryPublisher {
@@ -649,15 +695,6 @@ func (p *leaseExpiryPublisher) Publish(ctx context.Context, request restprovider
 	<-ctx.Done()
 	close(p.canceled)
 	<-p.release
-	outcome := restprovider.Outcome{
-		Provider: "github", Repository: request.Repository, Number: 73,
-		URL: "https://github.com/acme/widget/pull/73", Branch: request.Branch, Commit: request.Commit, State: "open",
-	}
-	p.mu.Lock()
-	p.outcome = outcome
-	p.written = true
-	p.mu.Unlock()
-	p.writes.Add(1)
 	close(p.returned)
 	return restprovider.Outcome{}, fmt.Errorf("%w: fake accepted write response was delayed", restprovider.ErrUncertain)
 }
@@ -671,10 +708,21 @@ func (p *leaseExpiryPublisher) Reconcile(ctx context.Context, request restprovid
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.written || p.outcome.Repository != request.Repository || p.outcome.Branch != request.Branch || p.outcome.Commit != request.Commit {
+	if !p.visible || p.outcome.Repository != request.Repository || p.outcome.Branch != request.Branch || p.outcome.Commit != request.Commit {
 		return restprovider.Outcome{}, errors.New("fake provider has no matching outcome")
 	}
 	return p.outcome, nil
+}
+
+func (p *leaseExpiryPublisher) makeVisible(request restprovider.PublishRequest) {
+	p.mu.Lock()
+	p.outcome = restprovider.Outcome{
+		Provider: "github", Repository: request.Repository, Number: 73,
+		URL: "https://github.com/acme/widget/pull/73", Branch: request.Branch, Commit: request.Commit, State: "open",
+	}
+	p.visible = true
+	p.mu.Unlock()
+	p.writes.Add(1)
 }
 
 func (p *leaseExpiryPublisher) releaseWrite() {
@@ -700,7 +748,7 @@ func getRuntimeIntegrationJob(t *testing.T, baseURL, key, id string) restjobs.Sn
 	return snapshot
 }
 
-func reconcileRuntimeIntegrationJob(t *testing.T, baseURL, key, id string) int {
+func reconcileRuntimeIntegrationJob(t *testing.T, baseURL, key, id string) (int, string, string) {
 	t.Helper()
 	request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs/"+id+"/reconcile", nil)
 	if err != nil {
@@ -712,7 +760,19 @@ func reconcileRuntimeIntegrationJob(t *testing.T, baseURL, key, id string) int {
 		t.Fatal("reconcile PostgreSQL runtime job")
 	}
 	defer response.Body.Close()
-	return response.StatusCode
+	var result struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode PostgreSQL runtime reconciliation response: %v", err)
+	}
+	if result.Error.Code == "" || result.Error.Message == "" {
+		t.Fatalf("PostgreSQL runtime reconciliation response has incomplete error body: %+v", result)
+	}
+	return response.StatusCode, result.Error.Code, result.Error.Message
 }
 
 func findModuleRoot(t *testing.T) string {
