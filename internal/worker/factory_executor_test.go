@@ -161,8 +161,10 @@ func TestProviderReconciliationUsesExactGenerationAndLegacyWorkspace(t *testing.
 		if err != nil {
 			t.Fatal(err)
 		}
-		if output, err := exec.Command("git", "-C", workspace.WorktreePath, "config", "user.email", "test@example.com").CombinedOutput(); err != nil {
-			t.Fatalf("configure attempt: %v: %s", err, output)
+		for _, config := range [][2]string{{"user.email", "test@example.com"}, {"user.name", "Reconcile Test"}} {
+			if output, err := exec.Command("git", "-C", workspace.WorktreePath, "config", config[0], config[1]).CombinedOutput(); err != nil {
+				t.Fatalf("configure attempt %s: %v: %s", config[0], err, output)
+			}
 		}
 		if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "change"), []byte("change\n"), 0o600); err != nil {
 			t.Fatal(err)
