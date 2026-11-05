@@ -74,7 +74,7 @@ func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		}
 		retired, err := h.store.RetireWorkerCapability(r.Context(), session.PrincipalID, bearerCapability(r))
 		if err != nil {
-			writeWorkerError(w, err)
+			writeWorkerCapabilityError(w, err)
 			return
 		}
 		writeWorkerJSON(w, http.StatusOK, retired)
@@ -207,7 +207,11 @@ func (h *WorkerListenerHandler) requireCapability(w http.ResponseWriter, r *http
 	session, err := h.store.AuthenticateWorkerCapability(r.Context(), principal, capability)
 	if err != nil {
 		h.logAuthentication(false)
-		writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
+		if errors.Is(err, restjobs.ErrNotFound) {
+			writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
+		} else {
+			writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "service_unavailable"})
+		}
 		return restjobs.WorkerSession{}, false
 	}
 	h.logAuthentication(true)
@@ -257,16 +261,27 @@ func NewWorkerListenerTLS(config WorkerListenerConfig) (*tls.Config, error) {
 	return &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{certificate}, ClientCAs: clientCAs, ClientAuth: tls.RequireAndVerifyClientCert}, nil
 }
 
-func writeWorkerError(w http.ResponseWriter, err error) {
+func writeWorkerCapabilityError(w http.ResponseWriter, err error) {
 	if errors.Is(err, restjobs.ErrNotFound) {
+		writeWorkerJSON(w, http.StatusUnauthorized, map[string]string{"code": "unauthenticated"})
+		return
+	}
+	writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "service_unavailable"})
+}
+
+func writeWorkerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, restjobs.ErrNotFound):
 		writeWorkerJSON(w, http.StatusNotFound, map[string]string{"code": "not_found"})
-		return
-	}
-	if errors.Is(err, restjobs.ErrInvalidInput) {
+	case errors.Is(err, restjobs.ErrInvalidInput):
 		writeWorkerJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request"})
-		return
+	case errors.Is(err, restjobs.ErrWorkerSessionConflict):
+		writeWorkerJSON(w, http.StatusConflict, map[string]string{"code": "session_conflict"})
+	case errors.Is(err, restjobs.ErrWorkerSessionBusy):
+		writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "session_unavailable"})
+	default:
+		writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "service_unavailable"})
 	}
-	writeWorkerJSON(w, http.StatusConflict, map[string]string{"code": "session_conflict"})
 }
 
 func writeWorkerJSON(w http.ResponseWriter, status int, value any) {
