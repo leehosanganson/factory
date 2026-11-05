@@ -47,12 +47,19 @@ func TestRecoveryBundleCreateVerifyRestore(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	attemptRoot := filepath.Join(jobRoot, "attempts", "2")
 	for _, name := range []string{"worktree", "state", "output"} {
-		if err := os.MkdirAll(filepath.Join(jobRoot, name), 0o700); err != nil {
+		if err := os.MkdirAll(filepath.Join(attemptRoot, name), 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(jobRoot, "output", "artifact.txt"), []byte("retained synthetic artifact"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(attemptRoot, "output", "artifact.txt"), []byte("retained synthetic artifact"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(jobRoot, "legacy", "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobRoot, "legacy", "nested", "artifact.txt"), []byte("legacy nested artifact"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	bundlePath := filepath.Join(root, "recovery.tar.gz")
@@ -74,9 +81,13 @@ func TestRecoveryBundleCreateVerifyRestore(t *testing.T) {
 	if err != nil || got.Status != StatusFailed {
 		t.Fatalf("restored job = %+v, %v; want failed synthetic job", got, err)
 	}
-	artifact := filepath.Join(root, "restored", "factory", "rest-server", aliasDir, "results", job.ID, "output", "artifact.txt")
+	artifact := filepath.Join(root, "restored", "factory", "rest-server", aliasDir, "results", job.ID, "attempts", "2", "output", "artifact.txt")
 	if data, err := os.ReadFile(artifact); err != nil || string(data) != "retained synthetic artifact" {
 		t.Fatalf("restored artifact = %q, %v", data, err)
+	}
+	legacyArtifact := filepath.Join(root, "restored", "factory", "rest-server", aliasDir, "results", job.ID, "legacy", "nested", "artifact.txt")
+	if data, err := os.ReadFile(legacyArtifact); err != nil || string(data) != "legacy nested artifact" {
+		t.Fatalf("restored nested legacy artifact = %q, %v", data, err)
 	}
 }
 

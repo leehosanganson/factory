@@ -104,6 +104,66 @@ func TestCreateRevisionMaterializesCapturedTreeInPrivateRepository(t *testing.T)
 	}
 }
 
+func TestAttemptWorkspacesAreGenerationPrivateAndExclusive(t *testing.T) {
+	now := time.Now().UTC()
+	manager, _, _ := testManager(t, &now, nil)
+	revision, err := manager.CaptureContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := manager.CreateAttemptRevisionContext(context.Background(), testJobID, 1, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.CreateAttemptRevisionContext(context.Background(), testJobID, 2, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.WorktreePath == second.WorktreePath || filepath.Dir(first.WorktreePath) == filepath.Dir(second.WorktreePath) {
+		t.Fatalf("attempt workspaces are not generation-private: %q, %q", first.WorktreePath, second.WorktreePath)
+	}
+	if first.Generation != 1 || second.Generation != 2 {
+		t.Fatalf("workspace generations = %d, %d; want 1, 2", first.Generation, second.Generation)
+	}
+	for generation, expected := range map[int64]Workspace{1: first, 2: second} {
+		retained, err := manager.RetainedWorkspaceForGeneration(testJobID, generation)
+		if err != nil || retained.WorktreePath != expected.WorktreePath || retained.Generation != generation || retained.SourceRevision != revision {
+			t.Fatalf("retained generation %d = %+v, %v; want exact workspace %+v", generation, retained, err, expected)
+		}
+	}
+	if _, err := manager.CreateAttemptRevisionContext(context.Background(), testJobID, 1, revision); err == nil {
+		t.Fatal("reused an existing generation directory")
+	}
+	if _, err := manager.RetainedWorkspaceForGeneration(testJobID, 3); err == nil {
+		t.Fatal("fell back when exact generation directory was absent")
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(first.WorktreePath), sourceRevisionName))
+	if err != nil || !strings.Contains(string(data), `"generation":1`) {
+		t.Fatalf("source metadata = %q, %v; want generation binding", data, err)
+	}
+}
+
+func TestSweepRetainsAttemptWorkspacesWithoutCleanupProof(t *testing.T) {
+	now := time.Date(2026, 1, 3, 3, 4, 5, 0, time.UTC)
+	manager, _, _ := testManager(t, &now, nil)
+	revision, err := manager.CaptureContext(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt, err := manager.CreateAttemptRevisionContext(context.Background(), testJobID, 1, revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(25 * time.Hour)
+	report := manager.Sweep()
+	if report.Removed != 0 || report.Retained != 1 {
+		t.Fatalf("attempt workspace sweep = %+v; want retained", report)
+	}
+	if _, err := os.Stat(attempt.WorktreePath); err != nil {
+		t.Fatalf("sweep removed attempt worktree without stop proof: %v", err)
+	}
+}
+
 func TestCaptureRejectsUnsupportedGitSourceFeatures(t *testing.T) {
 	for _, test := range []struct {
 		name  string

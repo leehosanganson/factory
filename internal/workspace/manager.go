@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -42,6 +43,7 @@ type Config struct {
 // back from a client as authority for filesystem operations.
 type Workspace struct {
 	JobID          string
+	Generation     int64
 	WorktreePath   string
 	StatePath      string
 	OutputPath     string
@@ -79,10 +81,11 @@ type Manager struct {
 }
 
 type sourceRevisionRecord struct {
-	Version int    `json:"version"`
-	JobID   string `json:"job_id"`
-	Commit  string `json:"commit"`
-	Tree    string `json:"tree"`
+	Version    int    `json:"version"`
+	JobID      string `json:"job_id"`
+	Generation int64  `json:"generation,omitempty"`
+	Commit     string `json:"commit"`
+	Tree       string `json:"tree"`
 }
 
 type completion struct {
@@ -197,14 +200,27 @@ func (m *Manager) CaptureContext(ctx context.Context) (SourceRevision, error) {
 // repository, without a linked-worktree dependency on the configured checkout.
 // Partial job directories are retained on failure for fail-closed recovery.
 func (m *Manager) CreateRevisionContext(ctx context.Context, jobID string, revision SourceRevision) (Workspace, error) {
+	return m.createRevisionContext(ctx, jobID, 0, revision)
+}
+
+// CreateAttemptRevisionContext creates an exclusive workspace for one positive
+// execution generation. Existing attempt directories are never reused.
+func (m *Manager) CreateAttemptRevisionContext(ctx context.Context, jobID string, generation int64, revision SourceRevision) (Workspace, error) {
+	if generation <= 0 {
+		return Workspace{}, errors.New("invalid attempt generation")
+	}
+	return m.createRevisionContext(ctx, jobID, generation, revision)
+}
+
+func (m *Manager) createRevisionContext(ctx context.Context, jobID string, generation int64, revision SourceRevision) (Workspace, error) {
 	if ctx == nil {
 		return Workspace{}, errors.New("creation context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return Workspace{}, err
 	}
-	if !validJobID(jobID) || !validGitObjectID(revision.Commit) || !validGitObjectID(revision.Tree) {
-		return Workspace{}, errors.New("invalid job or source revision")
+	if !validJobID(jobID) || generation < 0 || !validGitObjectID(revision.Commit) || !validGitObjectID(revision.Tree) {
+		return Workspace{}, errors.New("invalid job, generation, or source revision")
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -221,11 +237,25 @@ func (m *Manager) CreateRevisionContext(ctx context.Context, jobID string, revis
 		return Workspace{}, err
 	}
 	jobDir := filepath.Join(m.root, jobID)
-	if err := os.Mkdir(jobDir, 0o700); err != nil {
-		return Workspace{}, fmt.Errorf("create job result directory: %w", err)
+	if generation == 0 {
+		if err := os.Mkdir(jobDir, 0o700); err != nil {
+			return Workspace{}, fmt.Errorf("create job result directory: %w", err)
+		}
+	} else {
+		if err := mkdirProtected(jobDir); err != nil {
+			return Workspace{}, fmt.Errorf("create job result directory: %w", err)
+		}
+		attemptsDir := filepath.Join(jobDir, "attempts")
+		if err := mkdirProtected(attemptsDir); err != nil {
+			return Workspace{}, fmt.Errorf("create attempt result directory: %w", err)
+		}
+		jobDir = filepath.Join(attemptsDir, fmt.Sprint(generation))
+		if err := os.Mkdir(jobDir, 0o700); err != nil {
+			return Workspace{}, fmt.Errorf("create exclusive attempt result directory: %w", err)
+		}
 	}
 	workspace := Workspace{
-		JobID: jobID, WorktreePath: filepath.Join(jobDir, "worktree"), SourceRevision: revision,
+		JobID: jobID, Generation: generation, WorktreePath: filepath.Join(jobDir, "worktree"), SourceRevision: revision,
 		StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output"),
 	}
 	for _, path := range []string{workspace.StatePath, workspace.OutputPath} {
@@ -276,7 +306,7 @@ func (m *Manager) CreateRevisionContext(ctx context.Context, jobID string, revis
 	if err := m.verifySameDevice(jobDir, workspace.StatePath, workspace.OutputPath, workspace.WorktreePath); err != nil {
 		return Workspace{}, err
 	}
-	if err := m.writeSourceRevision(jobDir, jobID, revision); err != nil {
+	if err := m.writeSourceRevision(jobDir, jobID, generation, revision); err != nil {
 		return Workspace{}, err
 	}
 	workspace.SourceRevision = revision
@@ -286,7 +316,7 @@ func (m *Manager) CreateRevisionContext(ctx context.Context, jobID string, revis
 // VerifyResultDirectory accepts only the exact direct job directory beneath the
 // managed results root and validates its protected filesystem identity.
 func (m *Manager) VerifyResultDirectory(path string) error {
-	if !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Dir(path) != m.root || !validJobID(filepath.Base(path)) {
+	if !m.validResultDirectory(path) {
 		return errors.New("result directory is outside the managed root")
 	}
 	m.mu.Lock()
@@ -294,12 +324,45 @@ func (m *Manager) VerifyResultDirectory(path string) error {
 	if err := m.verifyRoot(); err != nil {
 		return err
 	}
+	if filepath.Dir(path) != m.root {
+		for _, parent := range []string{filepath.Dir(filepath.Dir(path)), filepath.Dir(path)} {
+			if err := verifyProtectedDir(parent); err != nil {
+				return err
+			}
+		}
+	}
 	return verifyProtectedDir(path)
+}
+
+func (m *Manager) validResultDirectory(path string) bool {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return false
+	}
+	if filepath.Dir(path) == m.root {
+		return validJobID(filepath.Base(path))
+	}
+	generation, err := strconv.ParseInt(filepath.Base(path), 10, 64)
+	attemptsDir := filepath.Dir(path)
+	jobDir := filepath.Dir(attemptsDir)
+	return err == nil && generation > 0 && strconv.FormatInt(generation, 10) == filepath.Base(path) && filepath.Base(attemptsDir) == "attempts" && filepath.Dir(jobDir) == m.root && validJobID(filepath.Base(jobDir))
 }
 
 // RetainedWorkspace returns the validated private repository or legacy linked
 // worktree for read-only operator reconciliation.
 func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
+	return m.retainedWorkspace(jobID, 0)
+}
+
+// RetainedWorkspaceForGeneration selects only the exact persisted attempt
+// directory. It never falls back to another generation or the legacy path.
+func (m *Manager) RetainedWorkspaceForGeneration(jobID string, generation int64) (Workspace, error) {
+	if generation <= 0 {
+		return Workspace{}, errors.New("invalid attempt generation")
+	}
+	return m.retainedWorkspace(jobID, generation)
+}
+
+func (m *Manager) retainedWorkspace(jobID string, generation int64) (Workspace, error) {
 	if !validJobID(jobID) {
 		return Workspace{}, errors.New("invalid job ID")
 	}
@@ -312,6 +375,16 @@ func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
 		return Workspace{}, err
 	}
 	jobDir := filepath.Join(m.root, jobID)
+	if generation > 0 {
+		jobDir = filepath.Join(jobDir, "attempts", strconv.FormatInt(generation, 10))
+	}
+	if generation > 0 {
+		for _, parent := range []string{filepath.Dir(filepath.Dir(jobDir)), filepath.Dir(jobDir)} {
+			if err := verifyProtectedDir(parent); err != nil {
+				return Workspace{}, errors.New("retained job workspace is unavailable")
+			}
+		}
+	}
 	if err := verifyProtectedDir(jobDir); err != nil {
 		return Workspace{}, errors.New("retained job workspace is unavailable")
 	}
@@ -322,11 +395,11 @@ func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
 	if err := verifyManagedRepository(m.repoRoot, worktree); err != nil {
 		return Workspace{}, errors.New("retained job worktree is unavailable")
 	}
-	revision, err := m.readSourceRevision(jobDir, jobID, worktree)
+	revision, err := m.readSourceRevision(jobDir, jobID, generation, worktree)
 	if err != nil {
 		return Workspace{}, errors.New("retained job source identity is unavailable")
 	}
-	return Workspace{JobID: jobID, WorktreePath: worktree, StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output"), SourceRevision: revision}, nil
+	return Workspace{JobID: jobID, Generation: generation, WorktreePath: worktree, StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output"), SourceRevision: revision}, nil
 }
 
 // MarkSucceeded atomically records trusted completion metadata with mode 0600.
@@ -452,6 +525,14 @@ func (m *Manager) SweepContext(ctx context.Context) SweepReport {
 			continue
 		}
 		jobDir := filepath.Join(m.root, name)
+		if _, err := os.Lstat(filepath.Join(jobDir, "attempts")); err == nil {
+			report.Retained++
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			report.Retained++
+			report.Errors = append(report.Errors, errors.New("retained job with invalid attempt directory"))
+			continue
+		}
 		metadata, err := m.readCompletion(jobDir, name)
 		if err != nil || !metadata.CompletedAt.Before(cutoff) {
 			report.Retained++
@@ -540,11 +621,11 @@ func (m *Manager) readCompletion(jobDir, jobID string) (completion, error) {
 	return m.readMarker(jobDir, jobID)
 }
 
-func (m *Manager) writeSourceRevision(jobDir, jobID string, revision SourceRevision) error {
+func (m *Manager) writeSourceRevision(jobDir, jobID string, generation int64, revision SourceRevision) error {
 	if err := verifyProtectedDir(jobDir); err != nil {
 		return errors.New("validate job result directory before source identity write")
 	}
-	record := sourceRevisionRecord{Version: 1, JobID: jobID, Commit: revision.Commit, Tree: revision.Tree}
+	record := sourceRevisionRecord{Version: 1, JobID: jobID, Generation: generation, Commit: revision.Commit, Tree: revision.Tree}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return fmt.Errorf("encode source identity: %w", err)
@@ -586,7 +667,7 @@ func (m *Manager) writeSourceRevision(jobDir, jobID string, revision SourceRevis
 	return nil
 }
 
-func (m *Manager) readSourceRevision(jobDir, jobID, worktree string) (SourceRevision, error) {
+func (m *Manager) readSourceRevision(jobDir, jobID string, generation int64, worktree string) (SourceRevision, error) {
 	path := filepath.Join(jobDir, sourceRevisionName)
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -615,7 +696,7 @@ func (m *Manager) readSourceRevision(jobDir, jobID, worktree string) (SourceRevi
 	if err := decodeUniqueJSON(data, &record); err != nil {
 		return SourceRevision{}, err
 	}
-	if record.Version != 1 || record.JobID != jobID || !validJobID(record.JobID) || !validGitObjectID(record.Commit) || !validGitObjectID(record.Tree) || len(record.Commit) != len(record.Tree) {
+	if record.Version != 1 || record.JobID != jobID || record.Generation != generation || !validJobID(record.JobID) || !validGitObjectID(record.Commit) || !validGitObjectID(record.Tree) || len(record.Commit) != len(record.Tree) {
 		return SourceRevision{}, errors.New("source identity does not match retained job")
 	}
 	actualTree, err := gitOutput(worktree, "rev-parse", "--verify", record.Commit+"^{tree}")
@@ -635,7 +716,7 @@ func decodeUniqueJSON(data []byte, destination any) error {
 		return errors.New("source identity must be a JSON object")
 	}
 	seen := make(map[string]bool, 4)
-	allowed := map[string]bool{"version": true, "job_id": true, "commit": true, "tree": true}
+	allowed := map[string]bool{"version": true, "job_id": true, "generation": true, "commit": true, "tree": true}
 	for decoder.More() {
 		token, err := decoder.Token()
 		key, ok := token.(string)

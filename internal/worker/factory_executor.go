@@ -28,6 +28,8 @@ type WorkspaceManager interface {
 	RepositoryRoot() string
 	CaptureContext(context.Context) (restworkspace.SourceRevision, error)
 	CreateRevisionContext(context.Context, string, restworkspace.SourceRevision) (restworkspace.Workspace, error)
+	CreateAttemptRevisionContext(context.Context, string, int64, restworkspace.SourceRevision) (restworkspace.Workspace, error)
+	RetainedWorkspaceForGeneration(string, int64) (restworkspace.Workspace, error)
 	VerifyResultDirectory(string) error
 	MarkSucceeded(string) error
 }
@@ -187,10 +189,8 @@ func (e *FactoryExecutor) CompleteResult(ctx context.Context, job restjobs.Snaps
 	if ctx == nil || ctx.Err() != nil || e.provider == nil || job.Provider == nil {
 		return errExecutionFailed
 	}
-	workspaceManager := e.workspaces[job.Request.Repository]
-	if workspaceManager == nil || workspaceManager.MarkSucceeded(job.ID) != nil {
-		return errExecutionFailed
-	}
+	// Provider completion must not depend on cleanup metadata. Attempt workspaces
+	// remain retained until cleanup can prove their process has stopped.
 	return nil
 }
 
@@ -206,13 +206,22 @@ func (e *FactoryExecutor) ReconcileInterruptedProvider(ctx context.Context, job 
 		return restjobs.ProviderOutcome{}, errExecutionFailed
 	}
 	workspaceManager := e.workspaces[job.Request.Repository]
-	retained, ok := workspaceManager.(interface {
-		RetainedWorkspace(string) (restworkspace.Workspace, error)
-	})
-	if !ok || workspaceManager == nil || e.validateRepositoryRoot(ctx, e.server.Repositories[job.Request.Repository]) != nil {
+	if workspaceManager == nil || e.validateRepositoryRoot(ctx, e.server.Repositories[job.Request.Repository]) != nil {
 		return restjobs.ProviderOutcome{}, errExecutionFailed
 	}
-	workspace, err := retained.RetainedWorkspace(job.ID)
+	var workspace restworkspace.Workspace
+	var err error
+	if attempt.Generation > 0 {
+		workspace, err = workspaceManager.RetainedWorkspaceForGeneration(job.ID, attempt.Generation)
+	} else {
+		retained, ok := workspaceManager.(interface {
+			RetainedWorkspace(string) (restworkspace.Workspace, error)
+		})
+		if !ok {
+			return restjobs.ProviderOutcome{}, errExecutionFailed
+		}
+		workspace, err = retained.RetainedWorkspace(job.ID)
+	}
 	if err != nil {
 		return restjobs.ProviderOutcome{}, errExecutionFailed
 	}
@@ -290,8 +299,13 @@ func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job rest
 	if err != nil || jobCtx.Err() != nil {
 		return nil, errExecutionFailed
 	}
-	workspace, err := workspaceManager.CreateRevisionContext(jobCtx, job.ID, revision)
-	if err != nil || jobCtx.Err() != nil || workspace.SourceRevision != revision || validateWorkspace(workspaceManager, job.ID, workspace) != nil {
+	var workspace restworkspace.Workspace
+	if attempt.Generation > 0 {
+		workspace, err = workspaceManager.CreateAttemptRevisionContext(jobCtx, job.ID, attempt.Generation, revision)
+	} else {
+		workspace, err = workspaceManager.CreateRevisionContext(jobCtx, job.ID, revision)
+	}
+	if err != nil || jobCtx.Err() != nil || workspace.SourceRevision != revision || workspace.Generation != attempt.Generation || validateWorkspace(workspaceManager, job.ID, workspace) != nil {
 		return nil, errExecutionFailed
 	}
 	outputFile, err := os.OpenFile(filepath.Join(workspace.OutputPath, "workflow.log"), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -360,7 +374,7 @@ func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job rest
 		e.providerAttemptsMu.Lock()
 		e.providerAttempts[job.ID] = true
 		e.providerAttemptsMu.Unlock()
-		if e.recordProviderAttempt != nil && e.recordProviderAttempt(attempt, restjobs.ProviderAttempt{Provider: "github", Repository: repository, Branch: branch, Commit: commit}) != nil {
+		if e.recordProviderAttempt != nil && e.recordProviderAttempt(attempt, restjobs.ProviderAttempt{Generation: attempt.Generation, Provider: "github", Repository: repository, Branch: branch, Commit: commit}) != nil {
 			return nil, errExecutionFailed
 		}
 		published, err := e.provider.Publish(jobCtx, restprovider.PublishRequest{JobID: job.ID, Repository: repository, Worktree: workspace.WorktreePath, Branch: branch, Commit: commit, Title: job.Request.Task, Summary: "Factory completed configured workflow and verification checks.", BaseBranch: e.server.Provider.BaseBranch})
@@ -372,7 +386,7 @@ func (e *FactoryExecutor) executeWithAttemptResult(ctx context.Context, job rest
 		}
 		providerOutcome = &restjobs.ProviderOutcome{Provider: published.Provider, Repository: published.Repository, Number: published.Number, URL: published.URL, Branch: published.Branch, Commit: published.Commit, State: published.State}
 	}
-	if e.provider == nil {
+	if e.provider == nil && workspace.Generation == 0 {
 		if err := workspaceManager.MarkSucceeded(job.ID); err != nil {
 			return nil, errExecutionFailed
 		}

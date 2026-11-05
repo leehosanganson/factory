@@ -405,9 +405,18 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		if err != nil || claim.Job.ID != providerJob.ID {
 			t.Fatalf("provider claim=(%+v,%v)", claim, err)
 		}
-		attempt := ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + providerJob.ID, Commit: "abcdef0", Uncertain: true}
+		attempt := ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + providerJob.ID, Commit: "abcdef0", Uncertain: true}
 		if err := store.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
 			t.Fatal(err)
+		}
+		persistedAttempt, err := store.ProviderAttempt(providerJob.ID)
+		if err != nil || persistedAttempt.Generation != claim.Attempt.Generation {
+			t.Fatalf("persisted PostgreSQL provider generation = %d, %v; want %d", persistedAttempt.Generation, err, claim.Attempt.Generation)
+		}
+		mismatched := attempt
+		mismatched.Generation++
+		if err := store.RecordProviderAttemptForAttempt(claim.Attempt, mismatched); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("mismatched PostgreSQL generation = %v, want ErrInvalidInput", err)
 		}
 		if err := store.CloseStore(); err != nil {
 			t.Fatal(err)

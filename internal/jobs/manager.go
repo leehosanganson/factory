@@ -122,6 +122,7 @@ type Config struct {
 
 // ProviderAttempt is durable identity captured immediately before the provider write.
 type ProviderAttempt struct {
+	Generation int64  `json:"generation,omitempty"`
 	Provider   string `json:"provider"`
 	Repository string `json:"repository"`
 	Branch     string `json:"branch"`
@@ -1088,7 +1089,7 @@ func (m *LocalManager) AddEventForAttempt(attempt AttemptHandle, eventType, mess
 }
 
 func (m *LocalManager) RecordProviderAttemptForAttempt(attemptHandle AttemptHandle, attempt ProviderAttempt) error {
-	if !validAttemptHandle(attemptHandle) || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+attemptHandle.JobID || !validCommitID(attempt.Commit) {
+	if !validAttemptHandle(attemptHandle) || attempt.Generation != attemptHandle.Generation || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+attemptHandle.JobID || !validCommitID(attempt.Commit) {
 		return ErrInvalidInput
 	}
 	m.mu.Lock()

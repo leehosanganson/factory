@@ -987,7 +987,7 @@ func (s *PostgresStore) lockPostgresJob(ctx context.Context, tx *sql.Tx, id stri
 }
 
 func (s *PostgresStore) RecordProviderAttemptForAttempt(a AttemptHandle, p ProviderAttempt) error {
-	if !validAttemptHandle(a) || validateProviderAttempt(p) != nil || p.Branch != "factory/job/"+a.JobID || !validCommitID(p.Commit) {
+	if !validAttemptHandle(a) || p.Generation != a.Generation || validateProviderAttempt(p) != nil || p.Branch != "factory/job/"+a.JobID || !validCommitID(p.Commit) {
 		return ErrInvalidInput
 	}
 	return s.recordProviderAttempt(a.JobID, &a, p)
