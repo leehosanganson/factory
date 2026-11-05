@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -581,6 +582,81 @@ func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 	}
 }
 
+func TestWorkerListenerTLSRejectsClientCertificateFromUntrustedCA(t *testing.T) {
+	trustedCA := workerTestCertificateAuthority(t, "trusted-client-ca")
+	trustedClient := workerTestCertificateSignedBy(t, trustedCA, "trusted-client")
+	untrustedCA := workerTestCertificateAuthority(t, "untrusted-client-ca")
+	untrustedClient := workerTestCertificateSignedBy(t, untrustedCA, "untrusted-client")
+	serverCert := workerTestCertificate(t, "worker-listener-server", false)
+
+	dir := t.TempDir()
+	certFile, keyFile, caFile := filepath.Join(dir, "server.crt"), filepath.Join(dir, "server.key"), filepath.Join(dir, "client-ca.crt")
+	if err := osWriteFile(certFile, encodeWorkerCert(serverCert)); err != nil {
+		t.Fatal(err)
+	}
+	if err := osWriteFile(keyFile, encodeWorkerKey(serverCert)); err != nil {
+		t.Fatal(err)
+	}
+	if err := osWriteFile(caFile, encodeWorkerCert(tls.Certificate{Certificate: [][]byte{trustedCA.certificate.Raw}})); err != nil {
+		t.Fatal(err)
+	}
+	tlsConfig, err := NewWorkerListenerTLS(WorkerListenerConfig{ServerCertFile: certFile, ServerKeyFile: keyFile, ClientCAFile: caFile})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fingerprint := sha256.Sum256(trustedClient.Certificate[0])
+	store := &workerSessionStoreSpy{}
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "trusted-worker", Enabled: true}}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var handlerCalls atomic.Int32
+	countedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerCalls.Add(1)
+		handler.ServeHTTP(w, r)
+	})
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &http.Server{Handler: countedHandler}
+	serveDone := make(chan error, 1)
+	go func() {
+		serveDone <- server.Serve(tls.NewListener(listener, tlsConfig))
+	}()
+	t.Cleanup(func() {
+		_ = server.Close()
+		if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("worker listener serve: %v", err)
+		}
+	})
+
+	serverRoots := x509.NewCertPool()
+	serverRoots.AddCert(workerTestParsedCertificate(t, serverCert.Certificate[0]))
+	clientFor := func(cert tls.Certificate) *http.Client {
+		return &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: serverRoots, Certificates: []tls.Certificate{cert}}}}
+	}
+	endpoint := "https://" + listener.Addr().String() + "/v1/worker/session"
+	response, err := clientFor(untrustedClient).Post(endpoint, "application/json", strings.NewReader(`{"boot_id":"boot-untrusted"}`))
+	if err == nil {
+		response.Body.Close()
+		t.Fatal("client certificate from untrusted CA completed TLS handshake")
+	}
+	if got := handlerCalls.Load(); got != 0 {
+		t.Fatalf("untrusted certificate reached HTTP handler %d times", got)
+	}
+
+	response, err = clientFor(trustedClient).Post(endpoint, "application/json", strings.NewReader(`{"boot_id":"boot-trusted"}`))
+	if err != nil {
+		t.Fatalf("trusted client could not reach worker listener: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated || handlerCalls.Load() != 1 || store.registrationCalls != 1 {
+		t.Fatalf("trusted client response=%d handler calls=%d registrations=%d, want 201 and one registration", response.StatusCode, handlerCalls.Load(), store.registrationCalls)
+	}
+}
+
 func TestWorkerListenerRequiresVerifiedMTLSAndExactCertificateFingerprint(t *testing.T) {
 	serverCert := workerTestCertificate(t, "server", false)
 	clientCert := workerTestCertificate(t, "client", true)
@@ -620,6 +696,60 @@ func workerTestParsedCertificate(t *testing.T, der []byte) *x509.Certificate {
 		t.Fatal(err)
 	}
 	return certificate
+}
+
+type workerTestCA struct {
+	certificate *x509.Certificate
+	privateKey  *ecdsa.PrivateKey
+}
+
+func workerTestCertificateAuthority(t *testing.T, commonName string) workerTestCA {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: commonName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return workerTestCA{certificate: certificate, privateKey: key}
+}
+
+func workerTestCertificateSignedBy(t *testing.T, ca workerTestCA, commonName string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: commonName},
+		DNSNames:     []string{"example.test"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, ca.certificate, &key.PublicKey, ca.privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
 func workerTestCertificate(t *testing.T, commonName string, client bool) tls.Certificate {
