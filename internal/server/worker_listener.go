@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/leehosanganson/factory/internal/jobs"
 )
@@ -217,7 +218,12 @@ func (h *WorkerListenerHandler) certificatePrincipal(r *http.Request) (string, e
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return "", nil
 	}
-	fingerprint := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+	leaf := r.TLS.PeerCertificates[0]
+	now := time.Now()
+	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+		return "", nil
+	}
+	fingerprint := sha256.Sum256(leaf.Raw)
 	key := hex.EncodeToString(fingerprint[:])
 	if h.mappingFileMode {
 		if h.lookup == nil {
