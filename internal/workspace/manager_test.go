@@ -218,6 +218,245 @@ func TestCreateRevisionPreservesRawTreeBytesWithAmbientGitConfiguration(t *testi
 	}
 }
 
+func TestRetainedWorkspaceRestoresSourceRevisionAfterManagerRestart(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, root := testManager(t, &now, nil)
+	workspace, err := manager.Create(testJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := workspace.SourceRevision
+	if revision.Commit == "" || revision.Tree == "" {
+		t.Fatalf("Create() source revision = %+v, want captured commit and tree", revision)
+	}
+	recordPath := filepath.Join(manager.root, testJobID, sourceRevisionName)
+	info, err := os.Stat(recordPath)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("source identity permissions = %v, err=%v; want 0600", info, err)
+	}
+	data, err := os.ReadFile(recordPath)
+	if err != nil || strings.Contains(string(data), "path") {
+		t.Fatalf("source identity contains unexpected path or cannot be read: data=%q err=%v", data, err)
+	}
+
+	manager, err = New(Config{RepositoryRoot: repo, ResultsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := manager.RetainedWorkspace(testJobID)
+	if err != nil {
+		t.Fatalf("RetainedWorkspace() after manager restart: %v", err)
+	}
+	if retained.SourceRevision != revision {
+		t.Fatalf("retained source revision = %+v, want %+v", retained.SourceRevision, revision)
+	}
+}
+
+func TestRetainedWorkspaceRejectsPrivateWorkspaceWithMissingSourceIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, root := testManager(t, &now, nil)
+	workspace, err := manager.Create(testJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(manager.root, testJobID, sourceRevisionName)); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err = New(Config{RepositoryRoot: repo, ResultsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RetainedWorkspace(testJobID); err == nil {
+		t.Fatalf("RetainedWorkspace() accepted private workspace %q without its source identity", workspace.WorktreePath)
+	}
+}
+
+func TestRetainedWorkspaceAcceptsDescendantCommitAfterProviderPreparation(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, root := testManager(t, &now, nil)
+	workspace, err := manager.Create(testJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, workspace.WorktreePath, "config", "user.email", "test@example.com")
+	gitTest(t, workspace.WorktreePath, "config", "user.name", "Workspace Test")
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "provider.txt"), []byte("prepared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, workspace.WorktreePath, "add", "provider.txt")
+	gitTest(t, workspace.WorktreePath, "commit", "-qm", "provider preparation")
+	manager, err = New(Config{RepositoryRoot: repo, ResultsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	retained, err := manager.RetainedWorkspace(testJobID)
+	if err != nil {
+		t.Fatalf("RetainedWorkspace() rejected descendant HEAD: %v", err)
+	}
+	if retained.SourceRevision != workspace.SourceRevision {
+		t.Fatalf("retained source revision = %+v, want original %+v", retained.SourceRevision, workspace.SourceRevision)
+	}
+}
+
+func TestRetainedWorkspaceRejectsUnrelatedHead(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, root := testManager(t, &now, nil)
+	workspace, err := manager.Create(testJobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, workspace.WorktreePath, "checkout", "--orphan", "unrelated")
+	gitTest(t, workspace.WorktreePath, "rm", "-rf", ".")
+	if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "unrelated.txt"), []byte("unrelated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	gitTest(t, workspace.WorktreePath, "add", "unrelated.txt")
+	gitTest(t, workspace.WorktreePath, "-c", "user.email=test@example.com", "-c", "user.name=Workspace Test", "commit", "-qm", "unrelated")
+	manager, err = New(Config{RepositoryRoot: repo, ResultsRoot: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.RetainedWorkspace(testJobID); err == nil {
+		t.Fatal("RetainedWorkspace() accepted unrelated HEAD")
+	}
+}
+
+func TestRetainedWorkspaceRejectsTamperedSourceIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, string, SourceRevision)
+	}{
+		{name: "duplicate field", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"` + testJobID + `","commit":"` + revision.Commit + `","tree":"` + revision.Tree + `","version":1}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unknown field", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"` + testJobID + `","commit":"` + revision.Commit + `","tree":"` + revision.Tree + `","path":"secret"}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "trailing data", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"` + testJobID + `","commit":"` + revision.Commit + `","tree":"` + revision.Tree + `"} {}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "wrong job", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"11234567-89ab-4cde-8fab-0123456789ab","commit":"` + revision.Commit + `","tree":"` + revision.Tree + `"}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "invalid commit ID", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"` + testJobID + `","commit":"` + strings.Repeat("z", len(revision.Commit)) + `","tree":"` + revision.Tree + `"}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "invalid job identity", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"not-a-uuid","commit":"` + revision.Commit + `","tree":"` + revision.Tree + `"}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "malformed JSON", mutate: func(t *testing.T, path string, _ SourceRevision) {
+			t.Helper()
+			if err := os.WriteFile(path, []byte(`{"version":`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "nonregular file", mutate: func(t *testing.T, path string, _ SourceRevision) {
+			t.Helper()
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "unsupported version", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":2,"job_id":"` + testJobID + `","commit":"` + revision.Commit + `","tree":"` + revision.Tree + `"}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "commit tree mismatch", mutate: func(t *testing.T, path string, revision SourceRevision) {
+			t.Helper()
+			content := `{"version":1,"job_id":"` + testJobID + `","commit":"` + revision.Commit + `","tree":"` + strings.Repeat("0", len(revision.Tree)) + `"}`
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "insecure permissions", mutate: func(t *testing.T, path string, _ SourceRevision) {
+			t.Helper()
+			if err := os.Chmod(path, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "symlink", mutate: func(t *testing.T, path string, _ SourceRevision) {
+			t.Helper()
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(filepath.Dir(path), "state"), path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Now().UTC()
+			manager, repo, root := testManager(t, &now, nil)
+			workspace, err := manager.Create(testJobID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(manager.root, testJobID, sourceRevisionName)
+			test.mutate(t, path, workspace.SourceRevision)
+			manager, err = New(Config{RepositoryRoot: repo, ResultsRoot: root})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.RetainedWorkspace(testJobID); err == nil {
+				t.Fatal("RetainedWorkspace() accepted tampered source identity")
+			}
+		})
+	}
+}
+
+func TestCreateRevisionFailsWhenSourceIdentityCannotBePublished(t *testing.T) {
+	now := time.Now().UTC()
+	var manager *Manager
+	runner := func(ctx context.Context, root string, args ...string) error {
+		if err := runGit(ctx, root, args...); err != nil {
+			return err
+		}
+		for _, arg := range args {
+			if arg == "checkout" {
+				return os.WriteFile(filepath.Join(manager.root, testJobID, sourceRevisionName), []byte("occupied"), 0o600)
+			}
+		}
+		return nil
+	}
+	manager, _, _ = testManager(t, &now, runner)
+	if _, err := manager.Create(testJobID); err == nil {
+		t.Fatal("Create() succeeded without publishing source identity")
+	}
+	if _, err := os.Stat(filepath.Join(manager.root, testJobID, "worktree", ".git")); err != nil {
+		t.Fatalf("failed creation did not retain materialized workspace: %v", err)
+	}
+}
+
 func TestRetainedWorkspaceAcceptsLegacyLinkedWorktreeForReconciliation(t *testing.T) {
 	now := time.Now().UTC()
 	manager, repo, _ := testManager(t, &now, nil)
@@ -238,6 +477,9 @@ func TestRetainedWorkspaceAcceptsLegacyLinkedWorktreeForReconciliation(t *testin
 	}
 	if workspace.WorktreePath != legacyWorktree || workspace.JobID != testJobID {
 		t.Fatalf("RetainedWorkspace() = %+v, want legacy path %q", workspace, legacyWorktree)
+	}
+	if workspace.SourceRevision != (SourceRevision{}) {
+		t.Fatalf("legacy workspace source revision = %+v, want empty", workspace.SourceRevision)
 	}
 	if got, err := os.ReadFile(filepath.Join(workspace.WorktreePath, "original.txt")); err != nil || string(got) != "original" {
 		t.Fatalf("legacy linked worktree content = %q, err=%v", got, err)
