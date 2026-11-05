@@ -23,8 +23,9 @@ import (
 )
 
 const (
-	Retention  = 24 * time.Hour
-	markerName = ".completion.json"
+	Retention          = 24 * time.Hour
+	markerName         = ".completion.json"
+	sourceRevisionName = ".source-revision.json"
 )
 
 var jobIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
@@ -75,6 +76,13 @@ type Manager struct {
 	repoIno   uint64
 	now       func() time.Time
 	runGit    func(context.Context, string, ...string) error
+}
+
+type sourceRevisionRecord struct {
+	Version int    `json:"version"`
+	JobID   string `json:"job_id"`
+	Commit  string `json:"commit"`
+	Tree    string `json:"tree"`
 }
 
 type completion struct {
@@ -268,6 +276,9 @@ func (m *Manager) CreateRevisionContext(ctx context.Context, jobID string, revis
 	if err := m.verifySameDevice(jobDir, workspace.StatePath, workspace.OutputPath, workspace.WorktreePath); err != nil {
 		return Workspace{}, err
 	}
+	if err := m.writeSourceRevision(jobDir, jobID, revision); err != nil {
+		return Workspace{}, err
+	}
 	workspace.SourceRevision = revision
 	return workspace, nil
 }
@@ -311,7 +322,11 @@ func (m *Manager) RetainedWorkspace(jobID string) (Workspace, error) {
 	if err := verifyManagedRepository(m.repoRoot, worktree); err != nil {
 		return Workspace{}, errors.New("retained job worktree is unavailable")
 	}
-	return Workspace{JobID: jobID, WorktreePath: worktree, StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output")}, nil
+	revision, err := m.readSourceRevision(jobDir, jobID, worktree)
+	if err != nil {
+		return Workspace{}, errors.New("retained job source identity is unavailable")
+	}
+	return Workspace{JobID: jobID, WorktreePath: worktree, StatePath: filepath.Join(jobDir, "state"), OutputPath: filepath.Join(jobDir, "output"), SourceRevision: revision}, nil
 }
 
 // MarkSucceeded atomically records trusted completion metadata with mode 0600.
@@ -523,6 +538,141 @@ func (m *Manager) readCompletion(jobDir, jobID string) (completion, error) {
 		return completion{}, err
 	}
 	return m.readMarker(jobDir, jobID)
+}
+
+func (m *Manager) writeSourceRevision(jobDir, jobID string, revision SourceRevision) error {
+	if err := verifyProtectedDir(jobDir); err != nil {
+		return errors.New("validate job result directory before source identity write")
+	}
+	record := sourceRevisionRecord{Version: 1, JobID: jobID, Commit: revision.Commit, Tree: revision.Tree}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return fmt.Errorf("encode source identity: %w", err)
+	}
+	data = append(data, '\n')
+	tmpPath := filepath.Join(jobDir, sourceRevisionName+".tmp")
+	tmp, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return fmt.Errorf("create source identity: %w", err)
+	}
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write source identity: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync source identity: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close source identity: %w", err)
+	}
+	if err := verifyProtectedDir(jobDir); err != nil {
+		return errors.New("revalidate job result directory before source identity publish")
+	}
+	path := filepath.Join(jobDir, sourceRevisionName)
+	if err := os.Link(tmpPath, path); err != nil {
+		return fmt.Errorf("publish source identity: %w", err)
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return fmt.Errorf("finalize source identity: %w", err)
+	}
+	if err := verifyProtectedFile(path); err != nil {
+		return err
+	}
+	if err := syncDirectory(jobDir); err != nil {
+		return fmt.Errorf("sync source identity directory: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) readSourceRevision(jobDir, jobID, worktree string) (SourceRevision, error) {
+	path := filepath.Join(jobDir, sourceRevisionName)
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := verifyLegacyLinkedWorktree(m.repoRoot, worktree); err != nil {
+			return SourceRevision{}, errors.New("source identity is missing from a private job repository")
+		}
+		return SourceRevision{}, nil
+	}
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 || !ownedByEffectiveUser(info) {
+		return SourceRevision{}, errors.New("source identity file is not a private regular file")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return SourceRevision{}, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || !ownedByEffectiveUser(opened) || !sameFileIdentity(info, opened) {
+		return SourceRevision{}, errors.New("source identity file changed while opening")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil || len(data) > 4096 {
+		return SourceRevision{}, errors.New("source identity file is invalid or too large")
+	}
+	var record sourceRevisionRecord
+	if err := decodeUniqueJSON(data, &record); err != nil {
+		return SourceRevision{}, err
+	}
+	if record.Version != 1 || record.JobID != jobID || !validJobID(record.JobID) || !validGitObjectID(record.Commit) || !validGitObjectID(record.Tree) || len(record.Commit) != len(record.Tree) {
+		return SourceRevision{}, errors.New("source identity does not match retained job")
+	}
+	actualTree, err := gitOutput(worktree, "rev-parse", "--verify", record.Commit+"^{tree}")
+	if err != nil || actualTree != record.Tree {
+		return SourceRevision{}, errors.New("source identity commit and tree do not match")
+	}
+	if _, err := gitOutput(worktree, "merge-base", "--is-ancestor", record.Commit, "HEAD"); err != nil {
+		return SourceRevision{}, errors.New("retained worktree is not descended from source identity")
+	}
+	return SourceRevision{Commit: record.Commit, Tree: record.Tree}, nil
+}
+
+func decodeUniqueJSON(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return errors.New("source identity must be a JSON object")
+	}
+	seen := make(map[string]bool, 4)
+	allowed := map[string]bool{"version": true, "job_id": true, "commit": true, "tree": true}
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok || !allowed[key] || seen[key] {
+			return errors.New("source identity has an invalid, unknown, or duplicate field")
+		}
+		seen[key] = true
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return errors.New("source identity has an invalid field value")
+		}
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return errors.New("source identity object is incomplete")
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return errors.New("source identity has trailing data")
+	}
+	strict := json.NewDecoder(bytes.NewReader(data))
+	strict.DisallowUnknownFields()
+	if err := strict.Decode(destination); err != nil {
+		return errors.New("source identity has unknown or invalid fields")
+	}
+	return nil
+}
+
+func syncDirectory(path string) error {
+	dir, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	info, err := dir.Stat()
+	if err != nil || !info.IsDir() {
+		return errors.New("source identity parent is not a directory")
+	}
+	return dir.Sync()
 }
 
 func (m *Manager) readMarker(jobDir, jobID string) (completion, error) {
@@ -1039,6 +1189,33 @@ func sameFileIdentity(a, b os.FileInfo) bool {
 func ownedByEffectiveUser(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == uint32(os.Geteuid())
+}
+
+func verifyLegacyLinkedWorktree(root, path string) error {
+	info, err := os.Lstat(filepath.Join(path, ".git"))
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("job repository does not have linked-worktree metadata")
+	}
+	if err := registeredWorktree(root, path); err != nil {
+		return err
+	}
+	commonDir, err := gitOutput(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return errors.New("cannot verify linked-worktree common directory")
+	}
+	rootCommonDir, err := gitOutput(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil || filepath.Clean(commonDir) != filepath.Clean(rootCommonDir) {
+		return errors.New("job repository does not share configured checkout metadata")
+	}
+	gitDir, err := gitOutput(path, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return errors.New("cannot verify linked-worktree git directory")
+	}
+	relative, err := filepath.Rel(commonDir, filepath.Clean(gitDir))
+	if err != nil || filepath.IsAbs(relative) || filepath.Clean(relative) == "." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || relative != filepath.Join("worktrees", filepath.Base(relative)) {
+		return errors.New("job repository git directory is not registered worktree metadata")
+	}
+	return nil
 }
 
 func registeredWorktree(root, path string) error {
