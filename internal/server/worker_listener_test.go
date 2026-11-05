@@ -44,7 +44,7 @@ func TestWorkerListenerLogsBoundedAuthenticationOutcomesWithoutCredentials(t *te
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-log-test"}`))
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, clientCert.Certificate[0])}}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusCreated {
@@ -71,6 +71,80 @@ func TestWorkerListenerLogsBoundedAuthenticationOutcomesWithoutCredentials(t *te
 	if len(output) > 256 {
 		t.Errorf("authentication diagnostics unbounded: %d bytes", len(output))
 	}
+}
+
+func TestWorkerListenerRejectsClientCertificatesOutsideValidityWindowBeforeAuthentication(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name      string
+		notBefore time.Time
+		notAfter  time.Time
+	}{
+		{name: "expired", notBefore: now.Add(-2 * time.Hour), notAfter: now.Add(-time.Hour)},
+		{name: "not yet valid", notBefore: now.Add(time.Hour), notAfter: now.Add(2 * time.Hour)},
+		{name: "valid", notBefore: now.Add(-time.Hour), notAfter: now.Add(time.Hour)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			clientCert := workerTestCertificateWithValidity(t, "validity-"+test.name, true, test.notBefore, test.notAfter)
+			lookupCalls := 0
+			store := &workerSessionStoreSpy{}
+			handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MappingFile: "configured"}, store, func() bool { return true })
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler.SetMappingLookup(workerMappingLookupFunc(func(context.Context, string) (string, bool, error) {
+				lookupCalls++
+				return "worker-validity", true, nil
+			}))
+			leaf, err := x509.ParseCertificate(clientCert.Certificate[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer := &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+			request := httptest.NewRequest(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-validity"}`))
+			request.TLS = peer
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			if test.name == "valid" {
+				if response.Code != http.StatusCreated || store.registrationCalls != 1 || lookupCalls != 1 {
+					t.Fatalf("valid peer response=%d, mapping lookups=%d, registrations=%d; want 201 and one call each", response.Code, lookupCalls, store.registrationCalls)
+				}
+				return
+			}
+			if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"code":"unauthenticated"`) {
+				t.Fatalf("invalid peer response=%d %s, want generic unauthenticated", response.Code, response.Body.String())
+			}
+			request = httptest.NewRequest(http.MethodGet, "/v1/worker/session", nil)
+			request.TLS = peer
+			request.Header.Set("Authorization", "Bearer capability")
+			response = httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+			if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"code":"unauthenticated"`) {
+				t.Fatalf("invalid peer capability response=%d %s, want generic unauthenticated", response.Code, response.Body.String())
+			}
+			if lookupCalls != 0 || store.registrationCalls != 0 || store.capabilityCalls != 0 {
+				t.Fatalf("invalid peer reached downstream authentication: mapping lookups=%d registrations=%d capability checks=%d", lookupCalls, store.registrationCalls, store.capabilityCalls)
+			}
+		})
+	}
+}
+
+type workerSessionStoreSpy struct {
+	restjobs.WorkerSessionStore
+	registrationCalls int
+	capabilityCalls   int
+}
+
+func (s *workerSessionStoreSpy) RegisterWorkerSession(_ context.Context, principal, bootID string) (restjobs.WorkerSession, bool, error) {
+	s.registrationCalls++
+	return restjobs.WorkerSession{ID: "session", PrincipalID: principal, BootID: bootID, Status: "active"}, false, nil
+}
+
+func (s *workerSessionStoreSpy) AuthenticateWorkerCapability(context.Context, string, string) (restjobs.WorkerSession, error) {
+	s.capabilityCalls++
+	return restjobs.WorkerSession{}, restjobs.ErrNotFound
 }
 
 func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *testing.T) {
@@ -374,7 +448,7 @@ func TestWorkerCapabilityUsesLiveMappingBeforeBearerAuthentication(t *testing.T)
 	}
 	handler.SetMappingLookup(store)
 	request := httptest.NewRequest(http.MethodGet, "/v1/worker/session", nil)
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, clientCert.Certificate[0])}}
 	request.Header.Set("Authorization", "Bearer "+session.Capability)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -415,7 +489,7 @@ func TestWorkerMappingLookupFailureFailsClosedWithSanitized503(t *testing.T) {
 		return "", false, errors.New("private database credential and host")
 	}))
 	request := httptest.NewRequest(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-outage"}`))
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, clientCert.Certificate[0])}}
 	request.Header.Set("Authorization", "Bearer unused")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -442,7 +516,7 @@ func TestWorkerListenerInlineCertificateMappingRemainsProcessConfigured(t *testi
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-inline"}`))
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, clientCert.Certificate[0])}}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"principal_id":"worker-inline"`) {
@@ -467,7 +541,7 @@ func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := httptest.NewRequest(http.MethodGet, "/v1/worker/session", nil)
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientCert.Certificate[0]}}}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, clientCert.Certificate[0])}}
 	request.Header.Set("Authorization", "Bearer "+session.Capability)
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -498,7 +572,7 @@ func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: otherCert.Certificate[0]}}}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, otherCert.Certificate[0])}}
 	request.Header.Set("Authorization", "Bearer "+session.Capability)
 	response = httptest.NewRecorder()
 	otherHandler.ServeHTTP(response, request)
@@ -539,13 +613,26 @@ func TestWorkerListenerRequiresVerifiedMTLSAndExactCertificateFingerprint(t *tes
 	}
 }
 
+func workerTestParsedCertificate(t *testing.T, der []byte) *x509.Certificate {
+	t.Helper()
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate
+}
+
 func workerTestCertificate(t *testing.T, commonName string, client bool) tls.Certificate {
+	return workerTestCertificateWithValidity(t, commonName, client, time.Now().Add(-time.Hour), time.Now().Add(time.Hour))
+}
+
+func workerTestCertificateWithValidity(t *testing.T, commonName string, client bool, notBefore, notAfter time.Time) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	template := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: commonName}, DNSNames: []string{"example.test"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign}
+	template := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: commonName}, DNSNames: []string{"example.test"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, NotBefore: notBefore, NotAfter: notAfter, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign}
 	if client {
 		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
 	} else {
