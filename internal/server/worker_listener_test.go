@@ -296,6 +296,79 @@ func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *
 	response.Body.Close()
 }
 
+type workerSessionErrorStore struct {
+	restjobs.WorkerSessionStore
+	authenticateErr     error
+	retireCapabilityErr error
+	retireSessionErr    error
+}
+
+func (s *workerSessionErrorStore) AuthenticateWorkerCapability(context.Context, string, string) (restjobs.WorkerSession, error) {
+	return restjobs.WorkerSession{ID: "session", PrincipalID: "worker-errors", BootID: "boot-errors", Status: "active"}, s.authenticateErr
+}
+
+func (s *workerSessionErrorStore) RetireWorkerCapability(context.Context, string, string) (restjobs.WorkerSession, error) {
+	return restjobs.WorkerSession{}, s.retireCapabilityErr
+}
+
+func (s *workerSessionErrorStore) RetireWorkerSession(context.Context, string, string, string) (restjobs.WorkerSession, error) {
+	return restjobs.WorkerSession{}, s.retireSessionErr
+}
+
+func TestWorkerSessionRoutesClassifyStoreErrorsWithoutExposingDetails(t *testing.T) {
+	clientCert := workerTestCertificate(t, "session-errors", true)
+	fingerprint := sha256.Sum256(clientCert.Certificate[0])
+	leaf := workerTestParsedCertificate(t, clientCert.Certificate[0])
+	const rawError = "private database credential and host"
+
+	tests := []struct {
+		name                string
+		method              string
+		path                string
+		body                string
+		authenticateErr     error
+		retireCapabilityErr error
+		retireSessionErr    error
+		wantStatus          int
+		wantCode            string
+	}{
+		{name: "inspection invalid capability", method: http.MethodGet, path: "/v1/worker/session", authenticateErr: restjobs.ErrNotFound, wantStatus: http.StatusUnauthorized, wantCode: "unauthenticated"},
+		{name: "inspection store failure", method: http.MethodGet, path: "/v1/worker/session", authenticateErr: errors.New(rawError), wantStatus: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+		{name: "capability retirement invalidated", method: http.MethodDelete, path: "/v1/worker/session", retireCapabilityErr: restjobs.ErrNotFound, wantStatus: http.StatusUnauthorized, wantCode: "unauthenticated"},
+		{name: "capability retirement store failure", method: http.MethodDelete, path: "/v1/worker/session", retireCapabilityErr: errors.New(rawError), wantStatus: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+		{name: "ID retirement missing session", method: http.MethodDelete, path: "/v1/worker/session/session-id", body: `{"boot_id":"boot-errors"}`, retireSessionErr: restjobs.ErrNotFound, wantStatus: http.StatusNotFound, wantCode: "not_found"},
+		{name: "ID retirement malformed input", method: http.MethodDelete, path: "/v1/worker/session/session-id", body: `{}`, retireSessionErr: restjobs.ErrInvalidInput, wantStatus: http.StatusBadRequest, wantCode: "invalid_request"},
+		{name: "ID retirement conflict", method: http.MethodDelete, path: "/v1/worker/session/session-id", body: `{"boot_id":"boot-errors"}`, retireSessionErr: restjobs.ErrWorkerSessionConflict, wantStatus: http.StatusConflict, wantCode: "session_conflict"},
+		{name: "ID retirement busy", method: http.MethodDelete, path: "/v1/worker/session/session-id", body: `{"boot_id":"boot-errors"}`, retireSessionErr: restjobs.ErrWorkerSessionBusy, wantStatus: http.StatusServiceUnavailable, wantCode: "session_unavailable"},
+		{name: "ID retirement store failure", method: http.MethodDelete, path: "/v1/worker/session/session-id", body: `{"boot_id":"boot-errors"}`, retireSessionErr: errors.New(rawError), wantStatus: http.StatusServiceUnavailable, wantCode: "service_unavailable"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := &workerSessionErrorStore{authenticateErr: test.authenticateErr, retireCapabilityErr: test.retireCapabilityErr, retireSessionErr: test.retireSessionErr}
+			handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-errors", Enabled: true}}}, store, func() bool { return true })
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+			request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+			request.Header.Set("Authorization", "Bearer capability")
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, request)
+
+			var payload map[string]string
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode response %q: %v", response.Body.String(), err)
+			}
+			if response.Code != test.wantStatus || payload["code"] != test.wantCode {
+				t.Fatalf("response=%d %s, want %d code %q", response.Code, response.Body.String(), test.wantStatus, test.wantCode)
+			}
+			if strings.Contains(response.Body.String(), rawError) {
+				t.Fatalf("response exposed raw store error: %s", response.Body.String())
+			}
+		})
+	}
+}
+
 func TestWorkerCapabilitySessionEndpointsUseOnlyAuthenticatedOwnSession(t *testing.T) {
 	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-session-capability-http.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
 	if err != nil {
