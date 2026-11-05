@@ -574,6 +574,89 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		}
 	})
 
+	t.Run("claim and queued cancellation are atomic against each other", func(t *testing.T) {
+		store := newStore(t)
+		job, _, err := store.Admit("claim-cancel-race", Request{Repository: "widget", Task: "claim and cancellation must have one winner"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		start := make(chan struct{})
+		ready := make(chan struct{}, 2)
+		claims := make(chan struct {
+			job Snapshot
+			err error
+		}, 1)
+		cancellations := make(chan struct {
+			job Snapshot
+			err error
+		}, 1)
+		go func() {
+			ready <- struct{}{}
+			<-start
+			claimed, err := store.ClaimNext()
+			claims <- struct {
+				job Snapshot
+				err error
+			}{claimed, err}
+		}()
+		go func() {
+			ready <- struct{}{}
+			<-start
+			canceled, err := store.Cancel(job.ID)
+			cancellations <- struct {
+				job Snapshot
+				err error
+			}{canceled, err}
+		}()
+		<-ready
+		<-ready
+		close(start)
+
+		claim := <-claims
+		cancellation := <-cancellations
+		if claim.err == nil {
+			if claim.job.ID != job.ID || claim.job.Status != StatusRunning {
+				t.Fatalf("successful claim = (%+v, %v), want the running job %q", claim.job, claim.err, job.ID)
+			}
+			if cancellation.err != nil || cancellation.job.Status != StatusRunning || !cancellation.job.CancellationRequested {
+				t.Fatalf("cancel after claim = (%+v, %v), want running with cancellation requested", cancellation.job, cancellation.err)
+			}
+		} else if errors.Is(claim.err, ErrNoQueuedJobs) {
+			if cancellation.err != nil || cancellation.job.Status != StatusCanceled {
+				t.Fatalf("cancel before claim = (%+v, %v), want canceled", cancellation.job, cancellation.err)
+			}
+		} else {
+			t.Fatalf("claim error = %v, want successful claim or ErrNoQueuedJobs", claim.err)
+		}
+
+		got, err := store.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claim.err == nil {
+			if got.Status != StatusRunning || !got.CancellationRequested {
+				t.Fatalf("job after claim/cancel race = %+v, want running with cancellation requested", got)
+			}
+		} else if got.Status != StatusCanceled || got.CancellationRequested {
+			t.Fatalf("job after cancel/claim race = %+v, want canceled without a claim", got)
+		}
+		if _, err := store.ClaimNext(); !errors.Is(err, ErrNoQueuedJobs) {
+			t.Fatalf("second claim after race = %v, want ErrNoQueuedJobs", err)
+		}
+		history, err := store.History(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claim.err == nil {
+			if len(history.Events) != 3 || history.Events[1].Type != string(StatusRunning) || history.Events[2].Type != "cancel_requested" {
+				t.Fatalf("claimed job history = %+v, want queued/running/cancel_requested without terminal event", history.Events)
+			}
+		} else if len(history.Events) != 2 || history.Events[1].Type != string(StatusCanceled) {
+			t.Fatalf("canceled job history = %+v, want queued/canceled without a running event", history.Events)
+		}
+	})
+
 	t.Run("cancel queued work without claiming it", func(t *testing.T) {
 		store := newStore(t)
 		job, _, err := store.Admit("cancel-queued", Request{Repository: "widget", Task: "task"})
