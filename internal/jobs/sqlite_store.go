@@ -858,7 +858,7 @@ func (s *SQLiteStore) CloseStore() error {
 }
 
 func validateProviderAttempt(attempt ProviderAttempt) error {
-	if attempt.Provider != "github" || !validRepositoryName(attempt.Repository) || attempt.Branch == "" || attempt.Commit == "" || len(attempt.Commit) > 64 {
+	if attempt.Generation < 0 || attempt.Provider != "github" || !validRepositoryName(attempt.Repository) || attempt.Branch == "" || attempt.Commit == "" || len(attempt.Commit) > 64 {
 		return ErrInvalidInput
 	}
 	return nil
@@ -1005,7 +1005,7 @@ func (s *SQLiteStore) AddEventForAttempt(attempt AttemptHandle, eventType, messa
 }
 
 func (s *SQLiteStore) RecordProviderAttemptForAttempt(handle AttemptHandle, attempt ProviderAttempt) error {
-	if !validAttemptHandle(handle) || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+handle.JobID || !validCommitID(attempt.Commit) {
+	if !validAttemptHandle(handle) || attempt.Generation != handle.Generation || validateProviderAttempt(attempt) != nil || attempt.Branch != "factory/job/"+handle.JobID || !validCommitID(attempt.Commit) {
 		return ErrInvalidInput
 	}
 	encoded, err := json.Marshal(attempt)

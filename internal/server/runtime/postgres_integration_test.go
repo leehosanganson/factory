@@ -117,7 +117,7 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 			t.Fatalf("attempt-aware claim=(%+v,%v), want generation 1 for %q", claim, err, job.ID)
 		}
 		providerAttempt := restjobs.ProviderAttempt{
-			Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0",
+			Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0",
 		}
 		if err := workerStore.RecordProviderAttemptForAttempt(claim.Attempt, providerAttempt); err != nil {
 			t.Fatal("persist provider identity before simulated provider request")

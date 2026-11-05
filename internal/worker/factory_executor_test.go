@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ type testWorkspaceManager struct {
 func (m *testWorkspaceManager) RepositoryRoot() string { return m.root }
 
 func (m *testWorkspaceManager) VerifyResultDirectory(path string) error {
-	if filepath.Clean(path) != path || filepath.Base(path) != executorJobID || path != filepath.Dir(m.workspace.WorktreePath) {
+	if filepath.Clean(path) != path || (filepath.Base(path) != executorJobID && filepath.Base(filepath.Dir(filepath.Dir(path))) != executorJobID) {
 		return errors.New("invalid result directory")
 	}
 	return nil
@@ -62,9 +63,162 @@ func (m *testWorkspaceManager) CreateRevisionContext(ctx context.Context, id str
 	return workspace, nil
 }
 
+func (m *testWorkspaceManager) CreateAttemptRevisionContext(ctx context.Context, id string, generation int64, revision restworkspace.SourceRevision) (restworkspace.Workspace, error) {
+	m.createdID = id
+	if generation == 0 {
+		return m.CreateRevisionContext(ctx, id, revision)
+	}
+	if m.createFn != nil {
+		return m.createFn(ctx)
+	}
+	if m.createErr != nil {
+		return restworkspace.Workspace{}, m.createErr
+	}
+	workspace := m.workspace
+	workspace.Generation = generation
+	workspace.WorktreePath = filepath.Join(filepath.Dir(workspace.WorktreePath), "attempts", fmt.Sprint(generation), "worktree")
+	workspace.StatePath = filepath.Join(filepath.Dir(workspace.WorktreePath), "state")
+	workspace.OutputPath = filepath.Join(filepath.Dir(workspace.WorktreePath), "output")
+	workspace.SourceRevision = revision
+	if err := os.MkdirAll(filepath.Dir(workspace.WorktreePath), 0o700); err != nil {
+		return restworkspace.Workspace{}, err
+	}
+	if output, err := exec.Command("git", "-C", m.root, "worktree", "add", "--detach", workspace.WorktreePath, "HEAD").CombinedOutput(); err != nil {
+		return restworkspace.Workspace{}, fmt.Errorf("create attempt fixture worktree: %v: %s", err, output)
+	}
+	for _, path := range []string{workspace.StatePath, workspace.OutputPath} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return restworkspace.Workspace{}, err
+		}
+	}
+	m.workspace = workspace
+	return workspace, nil
+}
+
+func (m *testWorkspaceManager) RetainedWorkspaceForGeneration(id string, generation int64) (restworkspace.Workspace, error) {
+	workspace := m.workspace
+	workspace.Generation = generation
+	workspace.WorktreePath = filepath.Join(filepath.Dir(workspace.WorktreePath), "attempts", fmt.Sprint(generation), "worktree")
+	workspace.StatePath = filepath.Join(filepath.Dir(workspace.WorktreePath), "state")
+	workspace.OutputPath = filepath.Join(filepath.Dir(workspace.WorktreePath), "output")
+	return workspace, nil
+}
+
 func (m *testWorkspaceManager) MarkSucceeded(id string) error {
 	m.markedID = id
 	return m.markErr
+}
+
+func TestProviderReconciliationUsesExactGenerationAndLegacyWorkspace(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := filepath.Join(root, "repo")
+	if err := os.Mkdir(repo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"config", "user.email", "test@example.com"}, {"config", "user.name", "Reconcile Test"}} {
+		if output, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec.Command("git", "-C", repo, "add", "tracked").Run()
+	if output, err := exec.Command("git", "-C", repo, "commit", "-q", "-m", "base").CombinedOutput(); err != nil {
+		t.Fatalf("commit source: %v: %s", err, output)
+	}
+	manager, err := restworkspace.New(restworkspace.Config{RepositoryRoot: repo, ResultsRoot: filepath.Join(root, "server", "results")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := restserver.DefaultConfig()
+	server.Repositories = map[string]string{"trusted": repo}
+	server.Harness = restserver.HarnessConfig{Executable: "agent", Args: []string{"{task}", "{system_prompt}"}}
+	server.APIKeyFile = filepath.Join(root, "api-key")
+	server.Limits.JobTimeout = "10s"
+	executor, err := NewFactoryExecutor(FactoryExecutorConfig{Server: server, Workflow: workflow.DefaultConfig(), Workspaces: map[string]WorkspaceManager{"trusted": manager}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.server.Provider.Backend = "github"
+	executor.server.Provider.Repositories = map[string]string{"trusted": "acme/widget"}
+	executor.server.Provider.BaseBranch = "main"
+	publish := func(t *testing.T, generation int64, legacy bool) (string, string) {
+		t.Helper()
+		var workspace restworkspace.Workspace
+		if legacy {
+			workspace, err = manager.Create(executorJobID)
+		} else {
+			var revision restworkspace.SourceRevision
+			revision, err = manager.CaptureContext(context.Background())
+			if err == nil {
+				workspace, err = manager.CreateAttemptRevisionContext(context.Background(), executorJobID, generation, revision)
+			}
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, config := range [][2]string{{"user.email", "test@example.com"}, {"user.name", "Reconcile Test"}} {
+			if output, err := exec.Command("git", "-C", workspace.WorktreePath, "config", config[0], config[1]).CombinedOutput(); err != nil {
+				t.Fatalf("configure attempt %s: %v: %s", config[0], err, output)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(workspace.WorktreePath, "change"), []byte("change\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		branch := "factory/job/" + executorJobID
+		for _, args := range [][]string{{"add", "change"}, {"commit", "-q", "-m", "change"}, {"switch", "-c", branch}} {
+			if output, err := exec.Command("git", append([]string{"-C", workspace.WorktreePath}, args...)...).CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v: %s", args, err, output)
+			}
+		}
+		commit, err := exec.Command("git", "-C", workspace.WorktreePath, "rev-parse", "HEAD").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return workspace.WorktreePath, strings.TrimSpace(string(commit))
+	}
+	legacyPath, legacyCommit := publish(t, 0, true)
+	attemptPath, commit := publish(t, 2, false)
+	job := executorJob("read-only reconciliation")
+	job.Status = restjobs.StatusFailed
+	attempt := restjobs.ProviderAttempt{Generation: 2, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + executorJobID, Commit: commit}
+	var calls int
+	reconciler := testJobReconciler(func(_ context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+		calls++
+		if request.Worktree != attemptPath {
+			t.Errorf("lookup worktree = %q, want exact generation path %q", request.Worktree, attemptPath)
+		}
+		return restprovider.Outcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: attempt.Branch, Commit: commit, State: "open"}, nil
+	})
+	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, attempt, reconciler); err != nil || calls != 1 {
+		t.Fatalf("generation reconciliation = %v calls=%d", err, calls)
+	}
+	missing := attempt
+	missing.Generation = 3
+	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, missing, reconciler); err == nil || calls != 1 {
+		t.Fatalf("missing generation fell back: err=%v lookup calls=%d", err, calls)
+	}
+	legacy := attempt
+	legacy.Generation = 0
+	legacy.Commit = legacyCommit
+	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, legacy, testJobReconciler(func(_ context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+		if request.Worktree != legacyPath {
+			t.Errorf("legacy lookup worktree = %q, want %q", request.Worktree, legacyPath)
+		}
+		return restprovider.Outcome{Provider: "github", Repository: "acme/widget", Number: 8, URL: "https://github.com/acme/widget/pull/8", Branch: legacy.Branch, Commit: legacy.Commit, State: "open"}, nil
+	})); err != nil {
+		t.Fatalf("legacy reconciliation failed: %v", err)
+	}
+}
+
+type testJobReconciler func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error)
+
+func (f testJobReconciler) Reconcile(ctx context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+	return f(ctx, request)
 }
 
 func TestFactoryExecutorCancellationOutcomePreservesUncertainProviderAttempt(t *testing.T) {
@@ -94,8 +248,8 @@ func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t 
 	if err := executor.CompleteResult(context.Background(), job); err != nil {
 		t.Fatal(err)
 	}
-	if manager.markedID != executorJobID {
-		t.Fatalf("workspace completion after outcome persistence = %q", manager.markedID)
+	if manager.markedID != "" {
+		t.Fatalf("provider completion attempted legacy cleanup marker: %q", manager.markedID)
 	}
 }
 
@@ -378,8 +532,8 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	if got, want := strings.Join(agent.calls, ","), "requirements,implement,review,document"; got != want {
 		t.Fatalf("stage order = %q, want %q", got, want)
 	}
-	if workspace.createdID != executorJobID || workspace.markedID != executorJobID {
-		t.Fatalf("workspace IDs = create %q, success %q", workspace.createdID, workspace.markedID)
+	if workspace.createdID != executorJobID || workspace.markedID != "" {
+		t.Fatalf("attempt workspace IDs = create %q, cleanup marker %q; want created without marker", workspace.createdID, workspace.markedID)
 	}
 	if len(evidence.Checks) != 1 || evidence.Checks[0] != (restjobs.VerificationCheck{Name: "check-01", Outcome: restjobs.VerificationPassed}) || len(evidence.Limitations) != 1 || evidence.Limitations[0] != restjobs.LimitationAgentNotVerdict {
 		t.Fatalf("recorded verification evidence = %+v", evidence)
@@ -843,14 +997,14 @@ func TestFactoryExecutorMarksARealWorkspaceOnlyAfterCompleteWorkflow(t *testing.
 	}
 }
 
-func TestFactoryExecutorDoesNotReportSuccessWhenCompletionMarkerFails(t *testing.T) {
+func TestFactoryExecutorSuccessDoesNotDependOnAttemptCleanupMarker(t *testing.T) {
 	agent := &executorTestAgent{}
 	executor, manager, _ := newExecutorFixture(t, "1s", restJobOutputLimit, agent)
 	manager.markErr = errors.New("marker filesystem detail")
-	if err := executor.Execute(context.Background(), executorJob("complete work")); !errors.Is(err, errExecutionFailed) {
-		t.Fatalf("Execute() error = %v, want sanitized marker failure", err)
+	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("complete work"), executorAttempt()); err != nil {
+		t.Fatalf("ExecuteWithAttempt() failed due to cleanup marker: %v", err)
 	}
-	if manager.markedID != executorJobID {
-		t.Fatalf("completion marker attempted for %q, want %q", manager.markedID, executorJobID)
+	if manager.markedID != "" {
+		t.Fatalf("attempt workspace unexpectedly got a cleanup marker: %q", manager.markedID)
 	}
 }

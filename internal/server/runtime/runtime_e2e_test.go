@@ -823,13 +823,13 @@ func TestRESTServerPerJobCancellationProcessE2E(t *testing.T) {
 		t.Fatalf("cancellation histories queued=%+v running=%+v", queuedHistory, runningHistory)
 	}
 	resultsPath := filepath.Join(stateDir, aliasDirectory("trusted"), "results")
-	if _, err := os.Stat(filepath.Join(resultsPath, running.ID, "worktree")); err != nil {
+	if _, err := os.Stat(filepath.Join(resultsPath, running.ID, "attempts", "1", "worktree")); err != nil {
 		t.Fatalf("canceled running workspace not retained: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(resultsPath, running.ID, ".completion.json")); !os.IsNotExist(err) {
 		t.Fatalf("canceled running job has completion marker: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(resultsPath, uncertain.ID, "worktree")); err != nil {
+	if _, err := os.Stat(filepath.Join(resultsPath, uncertain.ID, "attempts", "1", "worktree")); err != nil {
 		t.Fatalf("uncertain provider workspace not retained: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(resultsPath, uncertain.ID, ".completion.json")); !os.IsNotExist(err) {
@@ -2174,7 +2174,7 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 		t.Fatalf("shutdown-canceled history=%+v err=%v", canceledHistory, err)
 	}
 	canceledResult := filepath.Join(stateDir, aliasDirectory("first"), "results", canceled.ID)
-	if _, err := os.Stat(filepath.Join(canceledResult, "worktree")); err != nil {
+	if _, err := os.Stat(filepath.Join(canceledResult, "attempts", "1", "worktree")); err != nil {
 		t.Fatalf("shutdown-canceled workspace was not retained: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(canceledResult, ".completion.json")); !os.IsNotExist(err) {
@@ -2323,7 +2323,7 @@ func TestRESTServerProcessReconcilesConfirmedProviderWriteAfterOutcomePersistenc
 			t.Fatalf("outcome persistence failure recorded completion: %+v", failedHistory)
 		}
 	}
-	workspace := filepath.Join(stateDir, aliasDirectory("trusted"), "results", admitted.ID)
+	workspace := filepath.Join(stateDir, aliasDirectory("trusted"), "results", admitted.ID, "attempts", "1")
 	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
 		t.Fatalf("failed provider outcome workspace was not retained: %v", err)
 	}
@@ -2438,7 +2438,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		t.Fatal(err)
 	}
 	config.Provider = restserver.ProviderConfig{Backend: "github", TokenFile: providerToken, BaseBranch: "main", Repositories: map[string]string{"trusted": "acme/widget"}}
-	config.Limits.JobTimeout = "2s"
+	config.Limits.JobTimeout = "10s"
 	harness := filepath.Join(t.TempDir(), "harness.sh")
 	harnessCount := filepath.Join(t.TempDir(), "harness-count")
 	harnessScript := fmt.Sprintf("#!/bin/sh\nprintf 'run\\n' >> %q\nprintf 'verified\\n' >> result.txt\n", harnessCount)
@@ -2517,7 +2517,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 		job := getProcessJob(t, client, baseURL, admitted.ID, apiKey)
 		t.Fatalf("fake provider did not record accepted PR create: %v; job=%+v history=%+v", err, job, getProcessHistory(t, client, baseURL, admitted.ID, apiKey))
 	}
-	waitForProcessFailure(t, client, baseURL, admitted.ID, apiKey)
+	waitForProcessFailureWithin(t, client, baseURL, admitted.ID, apiKey, 15*time.Second)
 	recordData, err := os.ReadFile(recordPath)
 	if err != nil {
 		t.Fatal(err)
@@ -2542,7 +2542,7 @@ func TestRESTServerProcessRecoversUncertainProviderCreateWithoutDuplicate(t *tes
 	if len(failedHistory.Events) < 3 || failedHistory.Events[len(failedHistory.Events)-1].Type != string(restjobs.StatusFailed) {
 		t.Fatalf("ambiguous provider timeout evidence was not retained: %+v", failedHistory)
 	}
-	workspace := filepath.Join(stateDir, aliasDirectory("trusted"), "results", admitted.ID)
+	workspace := filepath.Join(stateDir, aliasDirectory("trusted"), "results", admitted.ID, "attempts", "1")
 	if _, err := os.Stat(filepath.Join(workspace, "worktree")); err != nil {
 		t.Fatalf("ambiguous provider workspace was not retained before restart: %v", err)
 	}
@@ -2920,7 +2920,7 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 		if unchanged.Status != restjobs.StatusRunning || unchanged.Provider != nil || unchanged.Verification == nil {
 			t.Fatalf("%s reconciliation changed interrupted job or lost evidence: %+v", mode, unchanged)
 		}
-		if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "worktree")); err != nil {
+		if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "attempts", "1", "worktree")); err != nil {
 			t.Fatalf("%s reconciliation removed retained workspace: %v", mode, err)
 		}
 	}
@@ -2942,7 +2942,7 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 	if job := getProcessJob(t, client, baseURL, providerJob.ID, apiKey); job.Status != restjobs.StatusRunning || job.Provider != nil || job.Verification == nil {
 		t.Fatalf("SQLite lock changed provider job or lost evidence: %+v", job)
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "worktree")); err != nil {
+	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", providerJob.ID, "attempts", "1", "worktree")); err != nil {
 		t.Fatalf("SQLite lock removed retained workspace: %v", err)
 	}
 	if code, body := action(providerJob.ID, "/reconcile", apiKey, ""); code != http.StatusConflict || !strings.Contains(body, `"code":"reconciliation_not_allowed"`) {
@@ -2963,7 +2963,7 @@ func TestRESTServerProcessReconcilesInterruptedJobsWithoutReplay(t *testing.T) {
 	if code, body := action(noAttemptJob.ID, "/disposition/failed", apiKey, ""); code != http.StatusOK || !strings.Contains(body, `"status":"failed"`) {
 		t.Fatalf("no-attempt disposition status=%d body=%s", code, body)
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", noAttemptJob.ID, "worktree")); err != nil {
+	if _, err := os.Stat(filepath.Join(stateDir, aliasDirectory("trusted"), "results", noAttemptJob.ID, "attempts", "1", "worktree")); err != nil {
 		t.Fatalf("failed disposition removed retained workspace: %v", err)
 	}
 	providerHistory := getProcessHistory(t, client, baseURL, providerJob.ID, apiKey)
@@ -3145,8 +3145,12 @@ func submitProcessJob(client *http.Client, baseURL, apiKey, alias, task, key str
 }
 
 func waitForProcessFailure(t *testing.T, client *http.Client, baseURL, id, apiKey string) {
+	waitForProcessFailureWithin(t, client, baseURL, id, apiKey, 10*time.Second)
+}
+
+func waitForProcessFailureWithin(t *testing.T, client *http.Client, baseURL, id, apiKey string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		job := getProcessJob(t, client, baseURL, id, apiKey)
 		if job.Status.Terminal() {

@@ -174,9 +174,22 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 		if err := store.RecordVerificationEvidenceForAttempt(claim.Attempt, VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}); err != nil {
 			t.Fatalf("fenced evidence: %v", err)
 		}
-		providerAttempt := ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0"}
+		providerAttempt := ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0"}
+		mismatchedGeneration := providerAttempt
+		mismatchedGeneration.Generation++
+		if err := store.RecordProviderAttemptForAttempt(claim.Attempt, mismatchedGeneration); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("mismatched provider generation = %v, want ErrInvalidInput", err)
+		}
 		if err := store.RecordProviderAttemptForAttempt(claim.Attempt, providerAttempt); err != nil {
 			t.Fatalf("fenced provider attempt: %v", err)
+		}
+		if persisted, ok := store.(interface {
+			ProviderAttempt(string) (ProviderAttempt, error)
+		}); ok {
+			got, err := persisted.ProviderAttempt(job.ID)
+			if err != nil || got.Generation != claim.Attempt.Generation {
+				t.Fatalf("persisted provider generation = %d, %v; want %d", got.Generation, err, claim.Attempt.Generation)
+			}
 		}
 		if err := store.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
 			t.Fatalf("fenced uncertain attempt: %v", err)
@@ -192,7 +205,7 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 			"heartbeat": func() error { return store.HeartbeatAttempt(claim.Attempt) },
 			"event":     func() error { return store.AddEventForAttempt(claim.Attempt, "late", "stale") },
 			"provider attempt": func() error {
-				return store.RecordProviderAttemptForAttempt(claim.Attempt, ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0"})
+				return store.RecordProviderAttemptForAttempt(claim.Attempt, ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abcdef0"})
 			},
 			"uncertain provider attempt": func() error { return store.MarkProviderAttemptUncertainForAttempt(claim.Attempt) },
 			"provider outcome": func() error {

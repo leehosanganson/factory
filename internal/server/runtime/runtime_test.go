@@ -1156,7 +1156,8 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 	if _, err := os.Stat(checkMarker); err != nil {
 		t.Fatalf("operator-configured verification argv was not invoked: %v", err)
 	}
-	resultRoot := filepath.Join(resultsBase, aliasDirectory("trusted"), "results", admitted.Job.ID)
+	jobRoot := filepath.Join(resultsBase, aliasDirectory("trusted"), "results", admitted.Job.ID)
+	resultRoot := filepath.Join(jobRoot, "attempts", "1")
 	for index, workdir := range lines {
 		want := filepath.Join(resultRoot, "worktree")
 		if index == 0 {
@@ -1169,8 +1170,8 @@ func TestRunExecutesFactoryStagesInPrivateWorkspace(t *testing.T) {
 			t.Fatalf("harness stage %d ran in %q, want isolated path %q", index, workdir, want)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(resultRoot, ".completion.json")); err != nil {
-		t.Fatalf("successful workspace has no protected completion marker: %v", err)
+	if _, err := os.Stat(filepath.Join(jobRoot, ".completion.json")); !os.IsNotExist(err) {
+		t.Fatalf("attempt workspace unexpectedly has a cleanup marker: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(resultRoot, "output", "workflow.log")); err != nil {
 		t.Fatalf("private workflow output is missing: %v", err)
