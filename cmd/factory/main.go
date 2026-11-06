@@ -973,7 +973,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 	}
 	fmt.Fprintln(out)
 	commands := []helpCommand{
-		{"factory implement [-d|--detach] [--gate] [description...]", "Start an implementation workflow."},
+		{"factory implement [-d|--detach] [--gate] [description...]", "Run a bounded task locally in a Git checkout; see docs/features/primary-workflow.md."},
 		{"factory tidy [-d|--detach] [--gate] [description...]", "Review, fix, document, and verify."},
 		{"factory monitor <description>", "Monitor an open pull request."},
 		{"factory work <command>", "Queue and inspect issue work requests; does not start engineering."},
@@ -991,6 +991,14 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory help, -h, --help", "Show this concise help."},
 	}
 	printHelpCommands(out, commands, width)
+	for _, paragraph := range []string{
+		"For local coding tasks, start with `factory doctor`, then `factory implement <task>` from a named-branch Git checkout. Automatic PR publication also requires `gh`, an origin remote, and a clean checkout.",
+		"This local workflow is separate from the configured REST job service (`factory server` / `factory rest`). See docs/features/primary-workflow.md.",
+	} {
+		for _, line := range wrapHelpText(paragraph, width) {
+			fmt.Fprintln(out, line)
+		}
+	}
 }
 
 func detectHelpWidth(out io.Writer) int {

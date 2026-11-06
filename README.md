@@ -32,9 +32,11 @@ The REST server supports volatile memory mode and optional SQLite or PostgreSQL 
 
 Actionable product follow-ups and categorized usability findings are tracked in [GitHub Issues](https://github.com/leehosanganson/factory/issues). The former `docs/issues/` finding and session-observation archive was migrated to issue #292 and existing focused trackers; it is no longer maintained in this repository.
 
-## First task
+## First task: run a local coding job
 
-See the [primary Factory-to-Pi workflow](docs/features/primary-workflow.md) for setup diagnostics, project-appropriate checks, implementation, job handoff, and recovery guidance.
+For a bounded task in a repository you trust, use `factory doctor` to check local setup, then run `factory implement "<task with acceptance criteria>"` from the target Git checkout on a named branch. Automatic PR publication also requires `gh`, an `origin` remote, and a clean checkout; configure project-appropriate `pipeline_checks` before relying on the result. Factory runs the task in a separate worktree and attempts a PR handoff, but does not merge or guarantee correctness. This local CLI workflow is separate from the configured REST job service described below.
+
+See the [primary Factory-to-Pi workflow](docs/features/primary-workflow.md) for setup, checks, job handoff, and recovery guidance.
 
 ## Build and verify
 
