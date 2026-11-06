@@ -232,6 +232,99 @@ func TestFactoryExecutorCancellationOutcomePreservesUncertainProviderAttempt(t *
 	}
 }
 
+func TestFactoryExecutorAndWorkerPersistUncertainProviderAttempt(t *testing.T) {
+	databaseDir, err := os.MkdirTemp(t.TempDir(), "sqlite-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(databaseDir, "jobs.db")
+	store, err := restjobs.OpenSQLiteStore(database, restjobs.Config{
+		QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("uncertain-publish", restjobs.Request{Repository: "trusted", Task: "publish verified change"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agent := &executorTestAgent{createFileDuringStage: "implement"}
+	executor, _, repo := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+	canonicalDatabaseDir, err := filepath.EvalSymlinks(databaseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultsRoot := filepath.Join(canonicalDatabaseDir, "results")
+	if err := os.Mkdir(resultsRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workspaceManager, err := restworkspace.New(restworkspace.Config{RepositoryRoot: repo, ResultsRoot: resultsRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.workspaces["trusted"] = workspaceManager
+	executor.server.Provider.Repositories = map[string]string{"trusted": "acme/widget"}
+	executor.server.Provider.BaseBranch = "main"
+	executor.recordProviderAttempt = store.RecordProviderAttemptForAttempt
+	executor.markProviderAttemptUncertain = store.MarkProviderAttemptUncertainForAttempt
+	executor.recordVerificationEvidence = store.RecordVerificationEvidenceForAttempt
+	attemptBeforePublish := make(chan restjobs.ProviderAttempt, 1)
+	executor.provider = testJobPublisher(func(_ context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+		attempt, err := store.ProviderAttempt(request.JobID)
+		if err != nil {
+			t.Errorf("ProviderAttempt(%q) during Publish = %v", request.JobID, err)
+		} else {
+			attemptBeforePublish <- attempt
+		}
+		return restprovider.Outcome{}, fmt.Errorf("%w: simulated lost response", restprovider.ErrUncertain)
+	})
+
+	coordinator, err := New(store, executor, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+
+	failed := waitForStatus(t, store, job.ID, restjobs.StatusFailed)
+	if failed.Provider != nil {
+		t.Fatalf("uncertain publication recorded provider outcome: %+v", failed.Provider)
+	}
+	select {
+	case attempt := <-attemptBeforePublish:
+		if attempt.Generation != 1 || attempt.Provider != "github" || attempt.Repository != "acme/widget" || attempt.Branch != "factory/job/"+job.ID || attempt.Commit == "" || attempt.Uncertain {
+			t.Fatalf("persisted provider attempt visible during Publish = %+v", attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Publisher.Publish did not observe the persisted provider attempt")
+	}
+	persisted, err := store.ProviderAttempt(job.ID)
+	if err != nil || !persisted.Uncertain {
+		t.Fatalf("provider attempt after ErrUncertain = %+v, %v; want marked uncertain", persisted, err)
+	}
+	inspected, err := store.Get(job.ID)
+	if err != nil || inspected.Status != restjobs.StatusFailed || inspected.Provider != nil {
+		t.Fatalf("uncertain job inspection = %+v, %v; want failed with no provider outcome", inspected, err)
+	}
+	history, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history.Events) == 0 || history.Events[len(history.Events)-1].Type != string(restjobs.StatusFailed) {
+		t.Fatalf("uncertain job history = %+v, want terminal failed event", history.Events)
+	}
+}
+
 func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t *testing.T) {
 	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, &executorTestAgent{})
 	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
@@ -261,11 +354,12 @@ func (f testJobPublisher) Publish(ctx context.Context, request restprovider.Publ
 func (f testJobPublisher) Ping(context.Context) error { return nil }
 
 type executorTestAgent struct {
-	calls       []string
-	output      io.Writer
-	failAt      string
-	block       bool
-	outputBytes int
+	calls                 []string
+	output                io.Writer
+	failAt                string
+	block                 bool
+	outputBytes           int
+	createFileDuringStage string
 }
 
 func (a *executorTestAgent) WithOutputWriter(output io.Writer) workflow.Agent {
@@ -276,8 +370,13 @@ func (a *executorTestAgent) Run(stage, prompt, task, workdir, log string) error 
 	return a.RunWithContext(context.Background(), stage, prompt, task, workdir, log)
 }
 
-func (a *executorTestAgent) RunWithContext(ctx context.Context, stage, _, _, _, logPath string) error {
+func (a *executorTestAgent) RunWithContext(ctx context.Context, stage, _, _, workdir, logPath string) error {
 	a.calls = append(a.calls, stage)
+	if stage == a.createFileDuringStage {
+		if err := os.WriteFile(filepath.Join(workdir, "provider-change"), []byte("verified\n"), 0o600); err != nil {
+			return err
+		}
+	}
 	if _, err := os.Stat(logPath); err == nil {
 		return errors.New("unexpected per-stage transcript")
 	} else if !errors.Is(err, os.ErrNotExist) {
