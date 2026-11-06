@@ -480,7 +480,7 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 			t.Fatal(err)
 		}
 		text := strings.Join(strings.Fields(strings.ToLower(out.String())), " ")
-		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory work", "factory job", "factory run", "factory server", "--gate", "factory version"} {
+		for _, want := range []string{"usage: factory", "software factory workflows", "factory implement", "factory tidy", "factory monitor", "factory work", "factory job", "factory run", "factory server", "--gate", "factory version", "named-branch git checkout", "origin remote", "separate from the configured rest job service", "docs/features/primary-workflow.md"} {
 			if !strings.Contains(text, want) {
 				t.Errorf("root %v help missing %q: %s", args, want, out.String())
 			}
@@ -497,7 +497,12 @@ func TestRootHelpAliasesAreConciseAndConsistent(t *testing.T) {
 	}
 	out.Reset()
 	printRootHelpWithOptions(&out, 80, false, false)
-	if !strings.Contains(out.String(), "Usage:") || strings.Contains(out.String(), "full command overview") {
+	for _, want := range []string{"Usage:", "named-branch Git checkout", "origin remote", "separate from the configured REST job service"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("concise root help missing %q: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "full command overview") {
 		t.Fatalf("concise root help rendering is incorrect: %s", out.String())
 	}
 	out.Reset()
