@@ -255,7 +255,11 @@ func TestFactoryExecutorAndWorkerPersistUncertainProviderAttempt(t *testing.T) {
 
 	agent := &executorTestAgent{createFileDuringStage: "implement"}
 	executor, _, repo := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
-	resultsRoot := filepath.Join(databaseDir, "results")
+	canonicalDatabaseDir, err := filepath.EvalSymlinks(databaseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultsRoot := filepath.Join(canonicalDatabaseDir, "results")
 	if err := os.Mkdir(resultsRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
