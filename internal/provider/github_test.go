@@ -78,6 +78,27 @@ func TestGitHubPublisherRejectsUnmarkedExistingPullRequest(t *testing.T) {
 	}
 }
 
+func TestGitHubPublisherDoesNotCallProviderAPIAfterPushFailure(t *testing.T) {
+	apiCalls, pushes := 0, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls++
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer server.Close()
+
+	publisher := newGitHubPublisher("secret", server.Client(), server.URL, func(context.Context, string, string, string) error {
+		pushes++
+		return errors.New("simulated push failure")
+	})
+	_, err := publisher.Publish(context.Background(), PublishRequest{
+		JobID: testJobID, Repository: "acme/widget", Worktree: "/private/worktree",
+		Commit: "commit-sha", Title: "task", BaseBranch: "main",
+	})
+	if !errors.Is(err, ErrUncertain) || pushes != 1 || apiCalls != 0 {
+		t.Fatalf("Publish error=%v, pushes=%d, provider API calls=%d; want ErrUncertain, one push, and no API calls", err, pushes, apiCalls)
+	}
+}
+
 func TestGitHubPublisherRejectsInvalidRepositoryBeforePush(t *testing.T) {
 	called := false
 	publisher := newGitHubPublisher("secret", http.DefaultClient, "https://api.github.com", func(context.Context, string, string, string) error { called = true; return nil })
