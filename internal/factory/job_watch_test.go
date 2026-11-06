@@ -110,6 +110,51 @@ func TestJobWatchRefreshesStatusAndActivityWithoutPrintingLogs(t *testing.T) {
 	}
 }
 
+func TestJobWatchShowsRecognizedPublicationStatusOnlyForImplementationJobs(t *testing.T) {
+	store := newWatchTestStore(t)
+	jobs := []JobRecord{
+		{ID: "published", Type: implementationJobType, Status: "complete", PublicationStatus: "published", PublicationSummary: "PR https://example.com/private"},
+		{ID: "unpublished", Type: implementationJobType, Status: "complete", PublicationStatus: "unpublished"},
+		{ID: "no-op", Type: implementationJobType, Status: "complete", PublicationStatus: "no-op"},
+		{ID: "missing", Type: implementationJobType, Status: "complete"},
+		{ID: "unknown", Type: implementationJobType, Status: "complete", PublicationStatus: "unexpected", PublicationSummary: "private error"},
+		{ID: "tidy", Type: tidyJobType, Status: "complete", PublicationStatus: "published"},
+		{ID: "monitor", Type: monitorJobType, Status: "complete", PublicationStatus: "unpublished"},
+	}
+	for _, job := range jobs {
+		if err := store.CreateJob(job); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		ids = append(ids, job.ID)
+	}
+	var out bytes.Buffer
+	if err := watchJobs(context.Background(), store, ids, &out, false, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	text := out.String()
+	for id, status := range map[string]string{
+		"published": "published", "unpublished": "unpublished", "no-op": "no-op",
+	} {
+		if !strings.Contains(text, "Job "+id+"\n  Status: complete\n  Publication: "+status) {
+			t.Errorf("watch output omitted %s publication status %q: %s", id, status, text)
+		}
+	}
+	for _, omitted := range []string{
+		"Job missing\n  Status: complete\n  Publication:",
+		"Job unknown\n  Status: complete\n  Publication:",
+		"Job tidy\n  Status: complete\n  Publication:",
+		"Job monitor\n  Status: complete\n  Publication:",
+		"https://example.com/private", "private error", "unexpected",
+	} {
+		if strings.Contains(text, omitted) {
+			t.Errorf("watch output exposed omitted publication data %q: %s", omitted, text)
+		}
+	}
+}
+
 func TestJobWatchShowsUpdateFreshnessWithoutEstimates(t *testing.T) {
 	store := newWatchTestStore(t)
 	createWatchJob(t, store, "freshness", "running")

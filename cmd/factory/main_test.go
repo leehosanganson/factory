@@ -1326,7 +1326,7 @@ func TestJobWatchCLIUsesPlainSnapshotForNonTerminalStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	const id = "watch-terminal-job"
-	if err := store.CreateJob(factory.JobRecord{ID: id, Type: "implementation", Status: "complete"}); err != nil {
+	if err := store.CreateJob(factory.JobRecord{ID: id, Type: "implementation", Status: "complete", PublicationStatus: "published", PublicationSummary: "SECRET_PUBLICATION_SUMMARY"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1334,11 +1334,14 @@ func TestJobWatchCLIUsesPlainSnapshotForNonTerminalStreams(t *testing.T) {
 	if err := run([]string{"job", "watch", id}, strings.NewReader(""), &out, &errOut); err != nil {
 		t.Fatalf("job watch dispatch: %v", err)
 	}
-	if got, want := out.String(), "Selected jobs\nJob "+id+"\n  Status: complete\n  Latest activity: No recorded activity\n  Updated: 0 seconds ago\n  Next action: Inspect the completed result with `factory job get "+id+" --details`.\n  Completion estimate: none available; Factory does not predict completion time.\n\n"; got != want {
+	if got, want := out.String(), "Selected jobs\nJob "+id+"\n  Status: complete\n  Publication: published\n  Latest activity: No recorded activity\n  Updated: 0 seconds ago\n  Next action: Inspect the completed result with `factory job get "+id+" --details`.\n  Completion estimate: none available; Factory does not predict completion time.\n\n"; got != want {
 		t.Fatalf("non-terminal job watch output = %q, want snapshot %q", got, want)
 	}
 	if strings.Contains(out.String(), "\033[") {
 		t.Fatalf("non-terminal job watch output contains ANSI redraw codes: %q", out.String())
+	}
+	if strings.Contains(out.String(), "SECRET_PUBLICATION_SUMMARY") {
+		t.Fatalf("job watch exposed publication summary: %q", out.String())
 	}
 	if errOut.Len() != 0 {
 		t.Fatalf("job watch wrote unexpected stderr: %q", errOut.String())
