@@ -73,6 +73,12 @@ func TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers(t *testing.T) {
 	}
 	firstStore, secondStore := newStore(), newStore()
 	clientDER := []byte("shared-worker-certificate-der")
+	certificateTime := time.Now()
+	clientCertificate := &x509.Certificate{
+		Raw:       clientDER,
+		NotBefore: certificateTime.Add(-time.Hour),
+		NotAfter:  certificateTime.Add(time.Hour),
+	}
 	digest := sha256.Sum256(clientDER)
 	fingerprint := hex.EncodeToString(digest[:])
 	if _, err := firstStore.ReconcileWorkerMappings(context.Background(), map[string]string{fingerprint: "worker-before"}); err != nil {
@@ -91,7 +97,7 @@ func TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers(t *testing.T) {
 	request := func(handler http.Handler, capability string) int {
 		t.Helper()
 		r := httptest.NewRequest(http.MethodGet, "/v1/worker/session", nil)
-		r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: clientDER}}}
+		r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{clientCertificate}}
 		r.Header.Set("Authorization", "Bearer "+capability)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, r)
