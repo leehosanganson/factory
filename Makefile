@@ -39,7 +39,7 @@ test-postgres: test-postgres-up
 	@port="$$(docker compose -f docker-compose.postgres-test.yml port postgres-test 5432 | awk -F: '{print $$NF}')"; \
 	  test -n "$$port" || { echo 'could not resolve published PostgreSQL test port' >&2; exit 1; }; \
 	  FACTORY_TEST_POSTGRES_URL="postgres://factory:factory@127.0.0.1:$$port/factory_test?sslmode=disable" FACTORY_REQUIRE_POSTGRES_TEST=1 \
-	  go test ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestPostgresIntakeOwnerRegistrationAndTransferFencesAdapters|TestRunConfiguredPostgresStoreIntegration|TestRunConfiguredPostgresGitHubWebhookOwnerGenerationIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically|TestPostgresIntakeOwnerRegistrationAndTransferFencesAdapters|TestPostgresWorkerMappingReconciliationAndAuditFailureAtomicity|TestPostgresWorkerMappingLookupUsesCurrentCommittedRegistry|TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers)$$' -count=1 -v
+	  go test ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestPostgresIntakeOwnerRegistrationAndTransferFencesAdapters|TestRunConfiguredPostgresStoreIntegration|TestRunConfiguredPostgresGitHubWebhookOwnerGenerationIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically|TestPostgresWorkerMappingReconciliationAndAuditFailureAtomicity|TestPostgresWorkerMappingLookupUsesCurrentCommittedRegistry|TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers|TestPostgresScheduleStorePersistsAndEnforcesRevision)$$' -count=1 -v
 
 test-postgres-down:
 	docker compose -f docker-compose.postgres-test.yml down --volumes
@@ -56,7 +56,7 @@ help:
 		fmt 'Format Go source files' \
 		vet 'Run go vet' \
 		test-postgres-up 'Start the disposable PostgreSQL 18 test service' \
-		test-postgres 'Run PostgreSQL 18 Store, worker, webhook, migration, and issue-poller integration tests' \
+		test-postgres 'Run PostgreSQL 18 Store, schedule, worker, webhook, migration, and issue-poller integration tests' \
 		test-postgres-down 'Stop the PostgreSQL 18 test service' \
 		clean 'Remove build artifacts' \
 		help 'List available Make targets'

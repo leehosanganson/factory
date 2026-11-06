@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.12.0",
-    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict."
+    "version": "1.13.0",
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Persistent UTC cron schedule definitions are available to named submitters on SQLite or PostgreSQL."
   },
   "paths": {
     "/v1/webhooks/github/issues": {
@@ -81,6 +81,329 @@
           "405": {
             "description": "The request used a method other than GET; the response has no body.",
             "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } }
+          }
+        }
+      }
+    },
+    "/v1/schedules": {
+      "get": {
+        "operationId": "listSchedules",
+        "summary": "List the caller\u2019s schedules",
+        "description": "Returns all persistent schedules owned by the authenticated named submitter, including paused and removed tombstones. Operators and the legacy shared key cannot manage schedules. Requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required. There is no per-owner schedule cap.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedules ordered by creation time.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleList"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "description": "Readiness or durable storage unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Only GET and POST are supported."
+          }
+        }
+      },
+      "post": {
+        "operationId": "createSchedule",
+        "summary": "Create a recurring schedule",
+        "description": "Creates an active persistent schedule. Idempotency-Key is required and scoped to the named submitter; matching retries return the original schedule and changed requests conflict. The body accepts only cron, repository, and task. Cron uses exactly five fields (minute hour day-of-month month day-of-week), UTC only, DOM/DOW OR when both are restricted, and one-minute minimum granularity. Occurrences start at the next matching UTC minute strictly after creation. A schedule definition does not dispatch Jobs. Requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleInput"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateScheduleResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Idempotent replay.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateScheduleResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "409": {
+            "description": "Idempotency key conflicts with a different request."
+          },
+          "415": {
+            "$ref": "#/components/responses/UnsupportedMediaType"
+          },
+          "503": {
+            "description": "Durable storage is required or unavailable.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Only GET and POST are supported."
+          }
+        }
+      }
+    },
+    "/v1/schedules/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ScheduleId"
+        }
+      ],
+      "get": {
+        "operationId": "getSchedule",
+        "summary": "Inspect an owned schedule",
+        "description": "Only the owning named submitter can inspect this schedule; missing and foreign IDs both return 404. ETag is the current strong revision tag.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Schedule snapshot.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Schedule"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "503": {
+            "description": "Durable storage is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Only GET, PATCH, and DELETE are supported."
+          }
+        }
+      },
+      "patch": {
+        "operationId": "mutateSchedule",
+        "summary": "Edit, pause, or resume an owned schedule",
+        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Every successful mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Each mutation changes future occurrences only; Jobs already admitted remain unchanged. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^\"[1-9][0-9]*\"$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleMutation"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated schedule.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Schedule"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Stale revision or invalid lifecycle transition."
+          },
+          "412": {
+            "description": "If-Match is required."
+          },
+          "503": {
+            "description": "Durable storage is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Only GET, PATCH, and DELETE are supported."
+          }
+        }
+      },
+      "delete": {
+        "operationId": "removeSchedule",
+        "summary": "Remove an owned schedule",
+        "description": "Requires a matching strong If-Match revision and an empty request body. Removal creates a retained terminal tombstone and prevents future occurrences. Previously admitted Jobs are unchanged; IDs are never reused.",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "If-Match",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^\"[1-9][0-9]*\"$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Removed tombstone.",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Schedule"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthenticated"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Stale revision or invalid lifecycle transition."
+          },
+          "412": {
+            "description": "If-Match is required."
+          },
+          "503": {
+            "description": "Durable storage is required.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "405": {
+            "description": "Only GET, PATCH, and DELETE are supported."
           }
         }
       }
@@ -526,7 +849,17 @@
         "description": "Non-empty retry key, at most 256 UTF-8 bytes. Identical normalized requests map to the same retained job; a different payload with the same key conflicts. Retention is bounded by the configured store and persistence mode.",
         "schema": { "type": "string", "minLength": 1, "maxLength": 256 }
       },
-      "JobId": {
+      "ScheduleId": {
+      "name": "id",
+      "in": "path",
+      "required": true,
+      "description": "Opaque persistent schedule identifier.",
+      "schema": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "JobId": {
         "name": "id",
         "in": "path",
         "required": true,
@@ -555,7 +888,7 @@
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
       },
       "NotFound": {
-        "description": "The requested job does not exist or is not exposed.",
+        "description": "The requested job, schedule, or other resource does not exist or is not exposed.",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
       },
       "NotReady": {
@@ -641,6 +974,163 @@
           "completed_at": { "type": "string", "format": "date-time", "description": "Present only after an explicit authenticated owner completion action." },
           "completed_by": { "type": "string", "description": "Authenticated principal that explicitly completed the Thread." }
         }
+      },
+      "ScheduleInput": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cron",
+          "repository",
+          "task"
+        ],
+        "properties": {
+          "cron": {
+            "type": "string",
+            "minLength": 9,
+            "maxLength": 128,
+            "description": "Exactly five UTC cron fields: minute, hour, day-of-month, month, day-of-week. DOM and DOW use OR when both restricted. Expressions longer than 128 characters are rejected."
+          },
+          "repository": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Operator-configured repository alias."
+          },
+          "task": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 262144,
+            "description": "Bounded UTF-8 task text."
+          }
+        }
+      },
+      "Schedule": {
+        "type": "object",
+        "required": [
+          "id",
+          "owner",
+          "cron",
+          "repository",
+          "task",
+          "status",
+          "revision",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "cron": {
+            "type": "string"
+          },
+          "repository": {
+            "type": "string"
+          },
+          "task": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "active",
+              "paused",
+              "removed"
+            ]
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "ScheduleList": {
+        "type": "object",
+        "required": [
+          "schedules"
+        ],
+        "properties": {
+          "schedules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Schedule"
+            }
+          }
+        }
+      },
+      "CreateScheduleResponse": {
+        "type": "object",
+        "required": [
+          "schedule",
+          "replayed"
+        ],
+        "properties": {
+          "schedule": {
+            "$ref": "#/components/schemas/Schedule"
+          },
+          "replayed": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ScheduleMutation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "pause",
+                  "resume"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "cron",
+              "repository",
+              "task"
+            ],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": [
+                  "edit"
+                ]
+              },
+              "cron": {
+                "type": "string"
+              },
+              "repository": {
+                "type": "string"
+              },
+              "task": {
+                "type": "string"
+              }
+            }
+          }
+        ]
       },
       "CreateJobRequest": {
         "type": "object",

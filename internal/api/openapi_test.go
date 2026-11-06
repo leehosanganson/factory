@@ -30,6 +30,29 @@ func isOpenAPI3Version(version string) bool {
 	return err == nil && major == 3
 }
 
+func TestScheduleOpenAPICronLengthMatchesServerValidation(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
+	if err != nil {
+		t.Fatalf("read OpenAPI spec: %v", err)
+	}
+	var document struct {
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]struct {
+					MaxLength int `json:"maxLength"`
+				} `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatalf("decode OpenAPI spec: %v", err)
+	}
+	const expectedCronLimit = 128
+	if got := document.Components.Schemas["ScheduleInput"].Properties["cron"].MaxLength; got != expectedCronLimit {
+		t.Fatalf("ScheduleInput.cron maxLength=%d; want server limit %d", got, expectedCronLimit)
+	}
+}
+
 func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
 	if err != nil {
@@ -43,8 +66,8 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.12.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.12.0", document.Info.Version)
+	if document.Info.Version != "1.13.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.13.0", document.Info.Version)
 	}
 }
 
@@ -90,8 +113,8 @@ func TestThreadOpenAPIContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.12.0" {
-		t.Fatalf("version=%q want 1.12.0", document.Info.Version)
+	if document.Info.Version != "1.13.0" {
+		t.Fatalf("version=%q want 1.13.0", document.Info.Version)
 	}
 	for path, method := range map[string]string{"/v1/threads": "post", "/v1/threads/{id}": "get", "/v1/threads/{id}/jobs": "post", "/v1/threads/{id}/complete": "post", "/v1/notifications": "get"} {
 		var operation map[string]json.RawMessage
@@ -266,8 +289,18 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.12.0" {
-		t.Errorf("OpenAPI version = %q, want 1.12.0", document.Info.Version)
+	if document.Info.Version != "1.13.0" {
+		t.Errorf("OpenAPI version = %q, want 1.13.0", document.Info.Version)
+	}
+	for _, route := range []string{"/v1/schedules", "/v1/schedules/{id}"} {
+		if _, ok := document.Paths[route]; !ok {
+			t.Errorf("OpenAPI spec is missing %s", route)
+		}
+	}
+	for _, name := range []string{"ScheduleInput", "Schedule", "ScheduleList", "ScheduleMutation"} {
+		if _, ok := document.Components.Schemas[name]; !ok {
+			t.Errorf("OpenAPI spec is missing %s schema", name)
+		}
 	}
 	provenanceRoute, ok := document.Paths["/v1/jobs/{id}/issue-provenance"]
 	if !ok {
@@ -393,6 +426,11 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"POST /v1/jobs":                           "createJob",
 		"POST /v1/webhooks/github/issues":         "receiveGitHubIssueWebhook",
 		"POST /v1/threads":                        "createThread",
+		"GET /v1/schedules":                       "listSchedules",
+		"POST /v1/schedules":                      "createSchedule",
+		"GET /v1/schedules/{id}":                  "getSchedule",
+		"PATCH /v1/schedules/{id}":                "mutateSchedule",
+		"DELETE /v1/schedules/{id}":               "removeSchedule",
 		"GET /v1/threads/{id}":                    "getThread",
 		"GET /v1/notifications":                   "listNotifications",
 		"POST /v1/threads/{id}/jobs":              "addThreadJob",
