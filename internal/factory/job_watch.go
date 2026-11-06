@@ -18,6 +18,7 @@ type watchedJob struct {
 	UpdatedAt         time.Time
 	NextAction        string
 	Phase             string
+	PublicationStatus string
 	LatestCheckAt     time.Time
 	LatestCheckResult string
 	RecentEvents      []monitorTraceEvent
@@ -40,6 +41,9 @@ func watchJobs(ctx context.Context, store *JobStore, ids []string, out io.Writer
 				return fmt.Errorf("watch job %s: %w", id, err)
 			}
 			watched := watchedJob{ID: id, Status: job.Status, Activity: summarizeJobTrace(store, job).Activity, UpdatedAt: job.UpdatedAt, NextAction: jobWatchNextAction(job)}
+			if job.Type == implementationJobType && containsJobListValue("published, unpublished, no-op", job.PublicationStatus) {
+				watched.PublicationStatus = job.PublicationStatus
+			}
 			if job.Monitor != nil {
 				watched.Phase = monitorDisplayPhase(job.Monitor)
 				watched.LatestCheckAt = job.Monitor.LatestCheckAt
@@ -170,7 +174,15 @@ func writeJobWatchSnapshotAt(out io.Writer, jobs []watchedJob, now time.Time, te
 		return err
 	}
 	for _, job := range jobs {
-		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n  Latest activity: %s\n  Updated: %s\n  Next action: %s\n", job.ID, job.Status, strings.TrimSpace(job.Activity), describeUpdateAge(now, job.UpdatedAt), job.NextAction); err != nil {
+		if _, err := fmt.Fprintf(out, "Job %s\n  Status: %s\n", job.ID, job.Status); err != nil {
+			return err
+		}
+		if job.PublicationStatus != "" {
+			if _, err := fmt.Fprintf(out, "  Publication: %s\n", job.PublicationStatus); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(out, "  Latest activity: %s\n  Updated: %s\n  Next action: %s\n", strings.TrimSpace(job.Activity), describeUpdateAge(now, job.UpdatedAt), job.NextAction); err != nil {
 			return err
 		}
 		if _, err := io.WriteString(out, "  Completion estimate: none available; Factory does not predict completion time.\n"); err != nil {
