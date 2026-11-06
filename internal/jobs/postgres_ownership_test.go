@@ -1337,6 +1337,7 @@ func scopedPostgresDB(t *testing.T, admin *sql.DB, dsn string) *sql.DB {
 		t.Fatalf("create schema: %v", err)
 	}
 	db := postgresDBForSchema(t, dsn, schema)
+	admin.SetMaxOpenConns(1)
 	t.Cleanup(func() {
 		if _, err := admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`); err != nil {
 			t.Errorf("drop test schema: %v", err)

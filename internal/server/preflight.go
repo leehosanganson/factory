@@ -13,6 +13,9 @@ import (
 // Returned messages contain config field names only.
 func CheckLocalPrerequisites(config Config) []string {
 	var issues []string
+	if config.GitHubWebhook.Enabled() && config.Persistence.Backend != PersistenceBackendPostgres {
+		issues = append(issues, "github_webhook requires PostgreSQL persistence")
+	}
 	if _, err := LoadAPIKey(config.APIKeyFile); err != nil {
 		issues = append(issues, "api_key_file: unavailable or invalid")
 	}

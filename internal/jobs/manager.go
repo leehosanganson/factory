@@ -34,6 +34,8 @@ var (
 	ErrStaleAttempt        = errors.New("stale worker attempt")
 )
 
+var ErrGitHubWebhookUnavailable = errors.New("GitHub issue webhook admission is unavailable for this store")
+
 func validateProviderOutcome(outcome ProviderOutcome) error {
 	parsed, err := url.Parse(outcome.URL)
 	if outcome.Provider != "github" || !validRepositoryName(outcome.Repository) || outcome.Number <= 0 || outcome.Branch == "" || outcome.Commit == "" || outcome.State != "open" || err != nil || parsed.Scheme != "https" || parsed.Host != "github.com" || parsed.User != nil || parsed.RawPath != "" || parsed.Path != "/"+outcome.Repository+"/pull/"+fmt.Sprint(outcome.Number) || parsed.RawQuery != "" || parsed.Fragment != "" {

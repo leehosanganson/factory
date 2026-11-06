@@ -88,6 +88,8 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			ctx, stop := foregroundContext()
 			defer stop()
 			return serverruntime.RunWorker(ctx, config)
+		case "intake-owner":
+			return runIntakeOwnerCommand(args[1:], out)
 		case "issue-poller":
 			if len(args) > 1 && (args[1] == "list" || args[1] == "resolve") {
 				ctx, stop := foregroundContext()
@@ -308,6 +310,13 @@ func validateNestedCommand(args []string) error {
 		default:
 			return fmt.Errorf("unknown issue-poller command %q (try factory issue-poller help)", args[1])
 		}
+	case "intake-owner":
+		switch args[1] {
+		case "register", "inspect", "transfer", "help":
+			return nil
+		default:
+			return fmt.Errorf("unknown intake-owner action %q (try factory intake-owner help)", args[1])
+		}
 	}
 	return nil
 }
@@ -347,7 +356,7 @@ func commandHelpRequested(args []string) bool {
 		return len(args) == 4 && args[1] == "bundle" && (args[2] == "create" || args[2] == "verify" || args[2] == "inspect" || args[2] == "restore") && (args[3] == "-h" || args[3] == "--help" || args[3] == "help")
 	}
 	switch args[0] {
-	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker", "issue-poller", "probe":
+	case "implement", "tidy", "job", "run", "monitor", "work", "rest", "doctor", "worker", "issue-poller", "intake-owner", "probe":
 		for _, arg := range args[1:] {
 			if arg == "-h" || arg == "--help" || arg == "help" && len(args) == 2 {
 				return true
@@ -403,6 +412,10 @@ func printCommandHelp(out io.Writer, args []string) {
 	case "work":
 		title = "Issue work requests"
 		commands, paragraphs = workHelp(subcommand)
+	case "intake-owner":
+		title = "GitHub issue intake owner"
+		commands = []helpCommand{{"factory intake-owner register --config <path> --source <owner/repo> --label <label> --kind webhook|poller", "Assign one exact source/label pair before starting its adapter."}, {"factory intake-owner inspect --config <path> --source <owner/repo> --label <label>", "Show the current sticky owner and append-only transfer audit."}, {"factory intake-owner transfer --config <path> --source <owner/repo> --label <label> --kind webhook|poller --attest <statement>", "Transfer ownership after stopping the old adapter and reconciling source effects."}}
+		paragraphs = []string{"Uses the PostgreSQL job database. Transfer attestation is an operator statement, not machine proof; stop old binaries before migrating. Different databases and old binaries cannot be fenced remotely."}
 	case "issue-poller":
 		title = "GitHub issue poller"
 		commands = []helpCommand{{"factory issue-poller --config <absolute-path>", "Start a dedicated allowlisted GitHub issue admission process."}, {"factory issue-poller list --config <absolute-path> [--limit <1..100>]", "List safe unresolved quarantine/operator outcomes."}, {"factory issue-poller resolve --config <absolute-path> --source <owner/repo> --issue <number> --version <sha256>", "Record explicit handling of one unresolved issue-poller outcome."}}
@@ -969,6 +982,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory server --config <absolute-path>", "Start the REST API server."},
 		{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."},
 		{"factory issue-poller --config <absolute-path>", "Poll allowlisted GitHub issues and admit jobs into PostgreSQL."},
+		{"factory intake-owner register|inspect|transfer --config <absolute-path> --source <owner/repo> --label <exact-label> --kind webhook|poller [--attest <statement>]", "Register, inspect, or transfer ownership of one exact PostgreSQL issue-intake pair."},
 		{"factory issue-poller list|resolve --config <absolute-path>", "Inspect or resolve bounded issue-poller operator outcomes."},
 		{"factory rest <command>", "Submit and inspect jobs on a configured REST server."},
 		{"factory doctor", "Check local setup without starting work."},

@@ -61,6 +61,7 @@ type GitHubWebhookConfig struct {
 	TriggerLabel string
 	Sources      map[string]string
 	Owners       map[string]string
+	Generations  map[string]int64
 }
 
 type Handler struct {
@@ -1336,6 +1337,8 @@ func (h *Handler) writeManagerError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusServiceUnavailable, "registry_full", "Job registry is full.")
 	case errors.Is(err, restjobs.ErrManagerClosed):
 		writeError(w, http.StatusServiceUnavailable, "server_shutting_down", "The server is shutting down.")
+	case errors.Is(err, restjobs.ErrGitHubWebhookUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "webhook_unavailable", "GitHub webhook admission is unavailable for this persistence backend.")
 	case errors.Is(err, restjobs.ErrInvalidTransition):
 		writeError(w, http.StatusConflict, "reconciliation_not_allowed", "Job is not eligible for provider reconciliation.")
 	case errors.Is(err, restjobs.ErrThreadClosed):

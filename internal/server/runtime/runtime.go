@@ -290,6 +290,22 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		webhook = restapi.GitHubWebhookConfig{
 			Secret: secret.Value(), TriggerLabel: config.GitHubWebhook.TriggerLabel,
 			Sources: cloneStringMap(config.GitHubWebhook.Sources), Owners: cloneStringMap(config.GitHubWebhook.Owners),
+			Generations: make(map[string]int64, len(config.GitHubWebhook.Sources)),
+		}
+		for source, expectedGeneration := range config.GitHubWebhook.Generations {
+			ownerStore, supported := store.(interface {
+				GetIntakeOwner(context.Context, string, string) (restjobs.IntakeOwner, error)
+			})
+			if !supported {
+				closeStore()
+				return errors.New("configured job store does not support intake-owner registration")
+			}
+			owner, ownerErr := ownerStore.GetIntakeOwner(ctx, source, config.GitHubWebhook.TriggerLabel)
+			if ownerErr != nil || owner.Kind != restjobs.IntakeOwnerWebhook || owner.Generation != expectedGeneration {
+				closeStore()
+				return errors.New("configured GitHub webhook intake-owner registration is missing or mismatched")
+			}
+			webhook.Generations[source] = expectedGeneration
 		}
 	}
 	var workerHandler http.Handler

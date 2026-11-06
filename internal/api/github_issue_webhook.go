@@ -131,7 +131,7 @@ func (h *Handler) receiveGitHubIssueWebhook(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	digest := sha256.Sum256(body)
-	snapshot, replay, err := store.AdmitGitHubIssueWebhook(r.Context(), deliveryIDs[0], hex.EncodeToString(digest[:]), owner, restjobs.Request{Repository: alias, Task: task, Issue: &event.Issue.Number})
+	snapshot, replay, err := store.AdmitGitHubIssueWebhook(r.Context(), deliveryIDs[0], hex.EncodeToString(digest[:]), owner, restjobs.Request{Repository: alias, Task: task, Issue: &event.Issue.Number}, restjobs.IntakeOwner{SourceRepository: event.Repository.FullName, TriggerLabel: policy.TriggerLabel, Kind: restjobs.IntakeOwnerWebhook, Generation: policy.Generations[event.Repository.FullName]})
 	if err != nil {
 		if errors.Is(err, restjobs.ErrIdempotencyConflict) {
 			writeError(w, http.StatusConflict, "delivery_conflict", "GitHub delivery identity conflicts with a prior request.")

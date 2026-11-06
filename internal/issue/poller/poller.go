@@ -33,7 +33,7 @@ type Provider interface {
 }
 
 type Store interface {
-	AdmitIssuePollerThread(context.Context, string, string, restjobs.Request, string) (restjobs.ThreadSnapshot, bool, error)
+	AdmitIssuePollerThread(context.Context, string, string, restjobs.Request, string, ...restjobs.IntakeOwner) (restjobs.ThreadSnapshot, bool, error)
 	ListIssuePollerPending(context.Context) ([]restjobs.IssuePollerOutcome, error)
 	IssuePollerCursor(context.Context, string) (int, error)
 	AdvanceIssuePollerCursor(context.Context, string, int, int) error
@@ -44,10 +44,11 @@ type Store interface {
 }
 
 type Poller struct {
-	Config   Config
-	Provider Provider
-	Store    Store
-	Log      io.Writer
+	Config     Config
+	Generation map[string]int64
+	Provider   Provider
+	Store      Store
+	Log        io.Writer
 }
 
 func (p Poller) Run(ctx context.Context) error {
@@ -211,7 +212,11 @@ func (p Poller) dispatch(ctx context.Context, destination string, snapshot issue
 		Tracker: "github", SourceRepository: snapshot.Repository, IssueNumber: snapshot.Number,
 		Version: snapshot.Version, URL: snapshot.URL, Title: EscapeIssueContent(snapshot.Title),
 	}}
-	thread, _, err := p.Store.AdmitIssuePollerThread(ctx, idempotencyKey(destination, snapshot.Repository, snapshot.Number, snapshot.Version), principalID, request, p.Config.Trigger)
+	generation := p.Generation[snapshot.Repository]
+	if generation < 1 {
+		generation = 1
+	}
+	thread, _, err := p.Store.AdmitIssuePollerThread(ctx, idempotencyKey(destination, snapshot.Repository, snapshot.Number, snapshot.Version), principalID, request, p.Config.Trigger, restjobs.IntakeOwner{SourceRepository: snapshot.Repository, TriggerLabel: p.Config.Trigger, Kind: restjobs.IntakeOwnerPoller, Generation: generation})
 	if errors.Is(err, restjobs.ErrProvenanceConflict) {
 		if quarantineErr := p.Store.RecordIssuePollerQuarantine(ctx, snapshot.Repository, snapshot.Number, snapshot.Version, "provenance_conflict"); quarantineErr != nil {
 			return false, errors.New("issue provenance conflict quarantine was not durably confirmed; trigger label retained")
