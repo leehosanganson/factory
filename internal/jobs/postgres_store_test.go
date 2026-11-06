@@ -640,6 +640,40 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	})
 }
 
+func TestPostgresScheduleStorePersistsAndEnforcesRevision(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule integration tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	input := ScheduleInput{Cron: "0 9 * * 1-5", Repository: "widget", Task: "durable task"}
+	created, replay, err := store.CreateSchedule("alice", "schedule", input)
+	if err != nil || replay {
+		t.Fatalf("create=(%+v,%t,%v)", created, replay, err)
+	}
+	if got, err := store.MutateSchedule(created.ID, "alice", 1, SchedulePause, nil); err != nil || got.Status != SchedulePaused || got.Revision != 2 {
+		t.Fatalf("pause=(%+v,%v)", got, err)
+	}
+	if _, err := store.MutateSchedule(created.ID, "alice", 1, ScheduleResume, nil); !errors.Is(err, ErrScheduleConflict) {
+		t.Fatalf("stale revision error=%v", err)
+	}
+	if got, err := store.GetSchedule(created.ID); err != nil || got.Status != SchedulePaused {
+		t.Fatalf("read schedule=(%+v,%v)", got, err)
+	}
+}
+
 func TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {

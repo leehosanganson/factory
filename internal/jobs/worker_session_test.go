@@ -394,8 +394,8 @@ func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	}
 	defer store.CloseStore()
 	var version int
-	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 19 {
-		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 19", version, err)
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 20 {
+		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 20", version, err)
 	}
 	var retainedAudit int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
@@ -479,8 +479,8 @@ func TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.CloseStore() })
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 15 {
-		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 15", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 16 {
+		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 16", version, err)
 	}
 	var retainedAudit int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {

@@ -150,6 +150,9 @@ func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Reques
 }
 
 func dashboardRoute(path, method string) bool {
+	if isSchedulesPath(path) {
+		return false
+	}
 	if path == "/v1/jobs" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
@@ -199,7 +202,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		h.receiveGitHubIssueWebhook(w, r)
 		return
 	}
-	if !isJobsPath(r.URL.Path) && !isThreadsPath(r.URL.Path) && r.URL.Path != "/v1/operations" && r.URL.Path != "/v1/notifications" {
+	if !isJobsPath(r.URL.Path) && !isThreadsPath(r.URL.Path) && !isSchedulesPath(r.URL.Path) && r.URL.Path != "/v1/operations" && r.URL.Path != "/v1/notifications" {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -271,6 +274,10 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 			return
 		}
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+	case path == "/v1/schedules":
+		h.handleSchedules(w, r, caller)
+	case strings.HasPrefix(path, "/v1/schedules/"):
+		h.handleSchedule(w, r, strings.TrimPrefix(path, "/v1/schedules/"), caller)
 	case path == "/v1/jobs":
 		if r.Method == http.MethodGet {
 			if caller.Role == "submitter" {
@@ -367,6 +374,13 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 }
 
 func submitterRoute(path, method string) bool {
+	if path == "/v1/schedules" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	if strings.HasPrefix(path, "/v1/schedules/") {
+		tail := strings.TrimPrefix(path, "/v1/schedules/")
+		return tail != "" && !strings.Contains(tail, "/") && (method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete)
+	}
 	if path == "/v1/notifications" {
 		return method == http.MethodGet
 	}
@@ -571,6 +585,10 @@ func (h *Handler) getOperations(w http.ResponseWriter, r *http.Request) {
 
 func isJobsPath(path string) bool {
 	return path == "/v1/jobs" || strings.HasPrefix(path, "/v1/jobs/")
+}
+
+func isSchedulesPath(path string) bool {
+	return path == "/v1/schedules" || strings.HasPrefix(path, "/v1/schedules/")
 }
 
 func isThreadsPath(path string) bool {
@@ -1300,6 +1318,12 @@ func validProvenanceShape(raw json.RawMessage) bool {
 
 func (h *Handler) writeManagerError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, restjobs.ErrScheduleTransition):
+		writeError(w, http.StatusConflict, "schedule_not_mutable", "Schedule state does not allow this mutation.")
+	case errors.Is(err, restjobs.ErrScheduleConflict):
+		writeError(w, http.StatusConflict, "revision_conflict", "Schedule revision does not match the current revision.")
+	case errors.Is(err, restjobs.ErrScheduleIDConflict):
+		writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency key conflicts with an existing schedule request.")
 	case errors.Is(err, restjobs.ErrInvalidInput):
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 	case errors.Is(err, restjobs.ErrIdempotencyConflict):
