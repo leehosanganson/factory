@@ -86,7 +86,7 @@ func TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers(t *testing.T) {
 	}
 	newHandler := func(store *restjobs.PostgresStore) *restserver.WorkerListenerHandler {
 		t.Helper()
-		handler, err := restserver.NewWorkerListenerHandler(restserver.WorkerListenerConfig{MappingFile: "mapping-file-mode"}, store, func() bool { return true })
+		handler, err := restserver.NewWorkerListenerHandler(restserver.WorkerListenerConfig{MaxClientCertLifetime: "72h", MappingFile: "mapping-file-mode"}, store, func() bool { return true })
 		if err != nil {
 			t.Fatal(err)
 		}

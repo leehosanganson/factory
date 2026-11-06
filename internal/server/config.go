@@ -143,12 +143,13 @@ func (c GitHubWebhookConfig) Enabled() bool {
 
 // WorkerListenerConfig enables the isolated authenticated worker identity API.
 type WorkerListenerConfig struct {
-	ListenAddress  string                       `json:"listen_address"`
-	ServerCertFile string                       `json:"server_cert_file"`
-	ServerKeyFile  string                       `json:"server_key_file"`
-	ClientCAFile   string                       `json:"client_ca_file"`
-	MappingFile    string                       `json:"mapping_file,omitempty"`
-	Certificates   []WorkerCertificatePrincipal `json:"certificates,omitempty"`
+	ListenAddress         string                       `json:"listen_address"`
+	MaxClientCertLifetime string                       `json:"max_client_cert_lifetime"`
+	ServerCertFile        string                       `json:"server_cert_file"`
+	ServerKeyFile         string                       `json:"server_key_file"`
+	ClientCAFile          string                       `json:"client_ca_file"`
+	MappingFile           string                       `json:"mapping_file,omitempty"`
+	Certificates          []WorkerCertificatePrincipal `json:"certificates,omitempty"`
 }
 
 // WorkerCertificatePrincipal maps an exact client certificate DER fingerprint to an identity.
@@ -353,6 +354,10 @@ func (c Config) Validate() error {
 			return errors.New("worker_listener requires SQLite or PostgreSQL persistence")
 		}
 		listener := c.WorkerListener
+		maxClientCertLifetime, err := time.ParseDuration(listener.MaxClientCertLifetime)
+		if err != nil || maxClientCertLifetime <= 0 {
+			return errors.New("worker_listener.max_client_cert_lifetime must be a positive duration")
+		}
 		if err := validateListenAddress(listener.ListenAddress); err != nil {
 			return fmt.Errorf("worker_listener.%w", err)
 		}
@@ -717,7 +722,7 @@ func configFieldAllowed(parent, key string) bool {
 	case "web_ui":
 		fields = map[string]struct{}{"enabled": {}, "operator_id": {}}
 	case "worker_listener":
-		fields = map[string]struct{}{"listen_address": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "mapping_file": {}, "certificates": {}}
+		fields = map[string]struct{}{"listen_address": {}, "max_client_cert_lifetime": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "mapping_file": {}, "certificates": {}}
 	case "github_webhook":
 		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}, "owner_generations": {}}
 	case "github_webhook_sources", "github_webhook_owners", "github_webhook_owner_generations":
@@ -823,7 +828,7 @@ func validateRequiredConfigFields(data []byte) error {
 		if err := json.Unmarshal(raw, &listener); err != nil {
 			return errors.New("worker_listener must be an object")
 		}
-		for _, field := range []string{"listen_address", "server_cert_file", "server_key_file", "client_ca_file"} {
+		for _, field := range []string{"listen_address", "max_client_cert_lifetime", "server_cert_file", "server_key_file", "client_ca_file"} {
 			if _, ok := listener[field]; !ok {
 				return fmt.Errorf("required worker_listener field %q is missing", field)
 			}
