@@ -20,6 +20,14 @@ func Run(ctx context.Context, config Config) error {
 		return err
 	}
 	defer guard.Close()
+	generations := make(map[string]int64, len(config.Sources))
+	for source := range config.Sources {
+		owner, err := store.GetIntakeOwner(ctx, source, config.Trigger)
+		if err != nil || owner.Kind != restjobs.IntakeOwnerPoller {
+			return errors.New("configured issue-poller intake-owner registration is missing or mismatched")
+		}
+		generations[source] = owner.Generation
+	}
 	token, err := loadToken(config.TokenFile)
 	if err != nil {
 		return err
@@ -28,5 +36,5 @@ func Run(ctx context.Context, config Config) error {
 	if err != nil {
 		return err
 	}
-	return (Poller{Config: config, Provider: provider, Store: store, Log: os.Stderr}).Run(ctx)
+	return (Poller{Config: config, Generation: generations, Provider: provider, Store: store, Log: os.Stderr}).Run(ctx)
 }

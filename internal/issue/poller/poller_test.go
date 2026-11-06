@@ -98,7 +98,7 @@ type fakeStore struct {
 	onAdmit          func()
 }
 
-func (s *fakeStore) AdmitIssuePollerThread(_ context.Context, key, principal string, request restjobs.Request, label string) (restjobs.ThreadSnapshot, bool, error) {
+func (s *fakeStore) AdmitIssuePollerThread(_ context.Context, key, principal string, request restjobs.Request, label string, _ ...restjobs.IntakeOwner) (restjobs.ThreadSnapshot, bool, error) {
 	s.threadAdmissions++
 	job, replay, err := s.admitIssuePoller(key, request)
 	if err != nil {
@@ -199,7 +199,7 @@ func fixture() (Config, *fakeProvider, *fakeStore) {
 
 func TestPollerExactAllowlistAndTriggerDispatch(t *testing.T) {
 	config, provider, store := fixture()
-	if err := (Poller{Config: config, Provider: provider, Store: store}).PollOnce(context.Background()); err != nil {
+	if err := (Poller{Config: config, Generation: map[string]int64{"source/repo": 1}, Provider: provider, Store: store}).PollOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !store.admitted || store.threadAdmissions != 1 || store.request.Repository != "destination" || store.request.IssueProvenance.SourceRepository != "source/repo" || store.request.Task == "" {
@@ -213,7 +213,7 @@ func TestPollerExactAllowlistAndTriggerDispatch(t *testing.T) {
 func TestPollerRejectsAdmissionWithoutOneCanonicalThreadMember(t *testing.T) {
 	config, provider, store := fixture()
 	store.badThread = true
-	if err := (Poller{Config: config, Provider: provider, Store: store}).PollOnce(context.Background()); err == nil {
+	if err := (Poller{Config: config, Generation: map[string]int64{"source/repo": 1}, Provider: provider, Store: store}).PollOnce(context.Background()); err == nil {
 		t.Fatal("poller accepted admission without a verifiable one-job Thread")
 	}
 	if provider.removals != 0 || !containsExact(provider.labels, "ready") {
@@ -239,7 +239,7 @@ func TestPollerRemovesLabelWhenIssueChangesAfterDurableAdmission(t *testing.T) {
 func TestPollerUsesRecheckedVersionAndRemovesLabelAfterAdmission(t *testing.T) {
 	config, provider, store := fixture()
 	provider.current.Version = strings.Repeat("b", 64)
-	if err := (Poller{Config: config, Provider: provider, Store: store}).PollOnce(context.Background()); err != nil {
+	if err := (Poller{Config: config, Generation: map[string]int64{"source/repo": 1}, Provider: provider, Store: store}).PollOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if !store.admitted || store.request.IssueProvenance.Version != provider.current.Version || provider.removals != 1 {

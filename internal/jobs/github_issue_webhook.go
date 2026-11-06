@@ -12,10 +12,12 @@ import (
 )
 
 // GitHubIssueWebhookStore binds a stable GitHub delivery identity to the
-// canonical Thread+Job admission transaction.
+// canonical Thread+Job admission transaction. PostgreSQL is required so
+// webhook admission shares the intake-owner registry with the issue poller.
 type GitHubIssueWebhookStore interface {
 	ThreadStore
-	AdmitGitHubIssueWebhook(ctx context.Context, deliveryID, bodySHA256, principalID string, request Request) (ThreadSnapshot, bool, error)
+	AdmitGitHubIssueWebhook(ctx context.Context, deliveryID, bodySHA256, principalID string, request Request, owner IntakeOwner) (ThreadSnapshot, bool, error)
+	supportsGitHubIssueWebhook()
 }
 
 func validateGitHubWebhookAdmission(ctx context.Context, deliveryID, bodySHA256, principalID string, request Request, maxTaskBytes int) (string, string, Request, error) {
@@ -39,128 +41,16 @@ func validateGitHubWebhookAdmission(ctx context.Context, deliveryID, bodySHA256,
 	return key, principalID, normalized, nil
 }
 
-func (s *SQLiteStore) AdmitGitHubIssueWebhook(ctx context.Context, deliveryID, bodySHA256, principalID string, request Request) (ThreadSnapshot, bool, error) {
-	key, principalID, request, err := validateGitHubWebhookAdmission(ctx, deliveryID, bodySHA256, principalID, request, s.config.MaxTaskBytes)
-	if err != nil {
-		return ThreadSnapshot{}, false, err
-	}
-	if err := s.checkAccepting(); err != nil {
-		return ThreadSnapshot{}, false, err
-	}
-	ctx, cancel := context.WithTimeout(ctx, sqliteBusyTimeout)
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ThreadSnapshot{}, false, errors.New("SQLite job store unavailable")
-	}
-	defer tx.Rollback()
-	var priorDigest, priorThread string
-	err = tx.QueryRowContext(ctx, `SELECT body_sha256,thread_id FROM factory_github_issue_webhook_deliveries WHERE delivery_id=?`, deliveryID).Scan(&priorDigest, &priorThread)
-	if err == nil {
-		if priorDigest != bodySHA256 {
-			return ThreadSnapshot{}, false, ErrIdempotencyConflict
-		}
-		var owner string
-		if err := tx.QueryRowContext(ctx, `SELECT submitter FROM factory_threads WHERE id=?`, priorThread).Scan(&owner); err != nil || owner != principalID {
-			return ThreadSnapshot{}, false, ErrIdempotencyConflict
-		}
-		snapshot, err := s.threadSnapshotTx(ctx, tx, priorThread, principalID)
-		if err != nil {
-			return ThreadSnapshot{}, false, errors.New("read SQLite GitHub webhook Thread")
-		}
-		if len(snapshot.Jobs) != 1 || snapshot.Jobs[0].Submitter != principalID {
-			return ThreadSnapshot{}, false, ErrIdempotencyConflict
-		}
-		if err := tx.Commit(); err != nil {
-			return ThreadSnapshot{}, false, errors.New("finish SQLite GitHub webhook replay")
-		}
-		return snapshot, true, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return ThreadSnapshot{}, false, errors.New("read SQLite GitHub webhook delivery")
-	}
-	snapshot, replay, err := admitThreadSQLiteTx(ctx, tx, s.config, key, principalID, request)
-	if err != nil {
-		return ThreadSnapshot{}, false, err
-	}
-	if replay {
-		return ThreadSnapshot{}, false, errors.New("SQLite GitHub webhook admission key collision")
-	}
-	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_github_issue_webhook_deliveries(delivery_id,body_sha256,thread_id,created_at) VALUES(?,?,?,?)`, deliveryID, bodySHA256, snapshot.Thread.ID, stamp); err != nil {
-		return ThreadSnapshot{}, false, errors.New("persist SQLite GitHub webhook delivery")
-	}
-	if err := tx.Commit(); err != nil {
-		return ThreadSnapshot{}, false, errors.New("commit SQLite GitHub webhook admission")
-	}
-	return snapshot, false, nil
+func (*SQLiteStore) AdmitGitHubIssueWebhook(context.Context, string, string, string, Request, IntakeOwner) (ThreadSnapshot, bool, error) {
+	return ThreadSnapshot{}, false, ErrGitHubWebhookUnavailable
 }
 
-// admitThreadSQLiteTx creates one canonical Thread and its initial Job in the
-// caller's transaction so webhook identity and all queue records commit together.
-func admitThreadSQLiteTx(ctx context.Context, tx *sql.Tx, config Config, key, principalID string, request Request) (ThreadSnapshot, bool, error) {
-	var existingID, raw string
-	err := tx.QueryRowContext(ctx, `SELECT thread_id,request_json FROM factory_thread_idempotency WHERE principal_id=? AND key=?`, principalID, key).Scan(&existingID, &raw)
-	if err == nil {
-		var existing Request
-		if json.Unmarshal([]byte(raw), &existing) != nil || !sameRequest(existing, request) {
-			return ThreadSnapshot{}, false, ErrIdempotencyConflict
-		}
-		return ThreadSnapshot{}, true, errors.New("unexpected webhook Thread idempotency replay")
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return ThreadSnapshot{}, false, errors.New("read SQLite webhook Thread idempotency")
-	}
-	var retained, active int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*),COUNT(*) FILTER (WHERE status IN ('queued','running')) FROM factory_jobs`).Scan(&retained, &active); err != nil {
-		return ThreadSnapshot{}, false, errors.New("check SQLite webhook admission capacity")
-	}
-	if retained >= config.MaxRecords {
-		return ThreadSnapshot{}, false, ErrRegistryFull
-	}
-	if active >= config.QueueCapacity+config.MaxConcurrentJobs {
-		return ThreadSnapshot{}, false, ErrQueueFull
-	}
-	threadID, err := newJobID()
-	if err != nil {
-		return ThreadSnapshot{}, false, errors.New("create SQLite webhook Thread identifier")
-	}
-	jobID, err := newJobID()
-	if err != nil {
-		return ThreadSnapshot{}, false, errors.New("create SQLite webhook Job identifier")
-	}
-	var sequence int64
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(queue_sequence),0)+1 FROM factory_jobs`).Scan(&sequence); err != nil {
-		return ThreadSnapshot{}, false, errors.New("allocate SQLite webhook queue position")
-	}
-	now := time.Now().UTC()
-	stamp := now.Format(time.RFC3339Nano)
-	encoded, err := json.Marshal(request)
-	if err != nil {
+func (*PostgresStore) supportsGitHubIssueWebhook() {}
+
+func (s *PostgresStore) AdmitGitHubIssueWebhook(ctx context.Context, deliveryID, bodySHA256, principalID string, request Request, owner IntakeOwner) (ThreadSnapshot, bool, error) {
+	key, principalID, request, err := validateGitHubWebhookAdmission(ctx, deliveryID, bodySHA256, principalID, request, s.config.MaxTaskBytes)
+	if err != nil || owner.SourceRepository == "" || validateIntakeOwner(owner.SourceRepository, owner.TriggerLabel, IntakeOwnerWebhook, owner.Generation) != nil {
 		return ThreadSnapshot{}, false, ErrInvalidInput
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,history_truncated,submitter) VALUES(?,?,'queued',?,?,?,0,?)`, jobID, string(encoded), stamp, stamp, sequence, principalID); err != nil {
-		return ThreadSnapshot{}, false, errors.New("persist SQLite webhook Job")
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_threads(id,submitter,created_at,initial_job_id) VALUES(?,?,?,?)`, threadID, principalID, stamp, jobID); err != nil {
-		return ThreadSnapshot{}, false, errors.New("persist SQLite webhook Thread")
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_thread_jobs(thread_id,job_id,position,created_at) VALUES(?,?,1,?)`, threadID, jobID, stamp); err != nil {
-		return ThreadSnapshot{}, false, errors.New("persist SQLite webhook Thread membership")
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_thread_idempotency(principal_id,key,thread_id,request_json) VALUES(?,?,?,?)`, principalID, key, threadID, string(encoded)); err != nil {
-		return ThreadSnapshot{}, false, errors.New("persist SQLite webhook Thread idempotency")
-	}
-	if err := insertEvent(ctx, tx, jobID, "queued", "Job admitted", now, config.MaxEventsPerJob); err != nil {
-		return ThreadSnapshot{}, false, errors.New("persist SQLite webhook admission history")
-	}
-	return ThreadSnapshot{Thread: Thread{ID: threadID, Submitter: principalID, CreatedAt: now, UpdatedAt: now, JobIDs: []string{jobID}, Status: ThreadStatusInProgress}, Jobs: []Snapshot{{ID: jobID, Submitter: principalID, Request: request, Status: StatusQueued, CreatedAt: now, UpdatedAt: now}}}, false, nil
-}
-
-func (s *PostgresStore) AdmitGitHubIssueWebhook(ctx context.Context, deliveryID, bodySHA256, principalID string, request Request) (ThreadSnapshot, bool, error) {
-	key, principalID, request, err := validateGitHubWebhookAdmission(ctx, deliveryID, bodySHA256, principalID, request, s.config.MaxTaskBytes)
-	if err != nil {
-		return ThreadSnapshot{}, false, err
 	}
 	if err := s.checkAccepting(); err != nil {
 		return ThreadSnapshot{}, false, err
@@ -174,6 +64,9 @@ func (s *PostgresStore) AdmitGitHubIssueWebhook(ctx context.Context, deliveryID,
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresStoreMigrationLock+1); err != nil {
 		return ThreadSnapshot{}, false, errors.New("lock PostgreSQL webhook admission")
+	}
+	if err := s.checkIntakeOwnerTx(ctx, tx, owner.SourceRepository, owner.TriggerLabel, IntakeOwnerWebhook, owner.Generation); err != nil {
+		return ThreadSnapshot{}, false, err
 	}
 	var priorDigest, priorThread string
 	err = tx.QueryRowContext(ctx, `SELECT body_sha256,thread_id FROM factory_github_issue_webhook_deliveries WHERE delivery_id=$1`, deliveryID).Scan(&priorDigest, &priorThread)
@@ -255,5 +148,4 @@ func (s *PostgresStore) AdmitGitHubIssueWebhook(ctx context.Context, deliveryID,
 	return snapshot, false, nil
 }
 
-var _ GitHubIssueWebhookStore = (*SQLiteStore)(nil)
 var _ GitHubIssueWebhookStore = (*PostgresStore)(nil)

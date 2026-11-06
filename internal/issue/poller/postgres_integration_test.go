@@ -10,7 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/leehosanganson/factory/internal/jobs"
+	restjobs "github.com/leehosanganson/factory/internal/jobs"
 
 	issuepkg "github.com/leehosanganson/factory/internal/issue"
 )
@@ -33,6 +33,7 @@ func TestPostgresProvenanceConflictQuarantinesAndAdvancesScan(t *testing.T) {
 	if _, err := admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
 		t.Fatal(err)
 	}
+	admin.SetMaxOpenConns(1)
 	t.Cleanup(func() {
 		if _, err := admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`); err != nil {
 			t.Errorf("drop test schema: %v", err)
@@ -64,6 +65,9 @@ func TestPostgresProvenanceConflictQuarantinesAndAdvancesScan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.RegisterIntakeOwner(context.Background(), "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+		t.Fatal(err)
+	}
 
 	const privateBody = "ISSUE_BODY_MUST_NOT_BE_PERSISTED_8f2d"
 	snapshot := issuepkg.IssueSnapshot{
@@ -79,7 +83,12 @@ func TestPostgresProvenanceConflictQuarantinesAndAdvancesScan(t *testing.T) {
 		Sources: map[string]string{"source/repo": "destination"}, Trigger: "ready", BatchSize: 10,
 		QueueCapacity: 8, Workers: 2, MaxRecords: 8, MaxEvents: 8, TaskBytes: 256 << 10, RegistryBytes: 256 << 20,
 	}
-	if err := (Poller{Config: config, Provider: provider, Store: store}).PollOnce(context.Background()); err != nil {
+	owner, err := store.GetIntakeOwner(context.Background(), "source/repo", "ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	poller := Poller{Config: config, Generation: map[string]int64{"source/repo": owner.Generation}, Provider: provider, Store: store}
+	if err := poller.PollOnce(context.Background()); err != nil {
 		t.Fatalf("poll conflicting provenance: %v", err)
 	}
 

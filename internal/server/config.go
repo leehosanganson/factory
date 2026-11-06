@@ -134,10 +134,11 @@ type GitHubWebhookConfig struct {
 	TriggerLabel string            `json:"trigger_label"`
 	Sources      map[string]string `json:"sources,omitempty"`
 	Owners       map[string]string `json:"owners,omitempty"`
+	Generations  map[string]int64  `json:"owner_generations,omitempty"`
 }
 
 func (c GitHubWebhookConfig) Enabled() bool {
-	return c.SecretFile != "" || c.TriggerLabel != "" || len(c.Sources) != 0 || len(c.Owners) != 0
+	return c.SecretFile != "" || c.TriggerLabel != "" || len(c.Sources) != 0 || len(c.Owners) != 0 || len(c.Generations) != 0
 }
 
 // WorkerListenerConfig enables the isolated authenticated worker identity API.
@@ -392,8 +393,16 @@ func (c Config) Validate() error {
 		}
 	}
 	if c.GitHubWebhook.Enabled() {
-		if c.Persistence.Backend == PersistenceBackendMemory {
-			return errors.New("github_webhook requires SQLite or PostgreSQL persistence")
+		if c.Persistence.Backend != PersistenceBackendPostgres {
+			return errors.New("github_webhook requires PostgreSQL persistence")
+		}
+		if len(c.GitHubWebhook.Generations) != len(c.GitHubWebhook.Sources) {
+			return errors.New("github_webhook.owner_generations must map every configured source")
+		}
+		for source, generation := range c.GitHubWebhook.Generations {
+			if _, ok := c.GitHubWebhook.Sources[source]; !ok || generation < 1 {
+				return errors.New("github_webhook.owner_generations must map every configured source to a positive generation")
+			}
 		}
 		if !filepath.IsAbs(c.GitHubWebhook.SecretFile) || strings.TrimSpace(c.GitHubWebhook.SecretFile) == "" || strings.ContainsRune(c.GitHubWebhook.SecretFile, 0) {
 			return errors.New("github_webhook.secret_file must be an absolute path")
@@ -710,8 +719,8 @@ func configFieldAllowed(parent, key string) bool {
 	case "worker_listener":
 		fields = map[string]struct{}{"listen_address": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "mapping_file": {}, "certificates": {}}
 	case "github_webhook":
-		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}}
-	case "github_webhook_sources", "github_webhook_owners":
+		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}, "owner_generations": {}}
+	case "github_webhook_sources", "github_webhook_owners", "github_webhook_owner_generations":
 		return validGitHubRepository(key)
 	case "certificates":
 		fields = map[string]struct{}{"sha256": {}, "principal_id": {}, "enabled": {}}
@@ -849,6 +858,8 @@ func configChild(key string) string {
 		return "github_webhook_sources"
 	case "owners":
 		return "github_webhook_owners"
+	case "owner_generations":
+		return "github_webhook_owner_generations"
 	default:
 		return ""
 	}

@@ -30,6 +30,7 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 	}
 	admin := stdlib.OpenDB(*adminConfig)
 	t.Cleanup(func() { _ = admin.Close() })
+	admin.SetMaxOpenConns(1)
 	var version int
 	if err := admin.QueryRow(`SHOW server_version_num`).Scan(&version); err != nil {
 		t.Fatal(err)
@@ -54,6 +55,9 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		t.Cleanup(func() { _ = first.CloseStore(); _ = second.CloseStore() })
 		ctx := context.Background()
 		req := issueThreadRequest(77, strings.Repeat("a", 64))
+		if _, err := first.RegisterIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+			t.Fatal(err)
+		}
 
 		start := make(chan struct{})
 		type result struct {
@@ -73,7 +77,7 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 			go func(i int, store *restjobs.PostgresStore) {
 				defer wg.Done()
 				<-start
-				snapshot, replay, err := store.AdmitIssuePollerThread(ctx, fmt.Sprintf("issue-key-%d", i), "github-issue-poller", req, "ready")
+				snapshot, replay, err := store.AdmitIssuePollerThread(ctx, fmt.Sprintf("issue-key-%d", i), "github-issue-poller", req, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1})
 				results <- result{snapshot, replay, err}
 			}(i, store)
 		}
@@ -102,7 +106,7 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 			t.Fatalf("created=%d replays=%d, want one new and %d attaches", created, replays, callers-1)
 		}
 		// A third key attaches the same source/version to exactly the same pair.
-		attached, replay, err := second.AdmitIssuePollerThread(ctx, "issue-key-third", "github-issue-poller", req, "ready")
+		attached, replay, err := second.AdmitIssuePollerThread(ctx, "issue-key-third", "github-issue-poller", req, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1})
 		if err != nil || !replay || attached.Thread.ID != threadID || attached.Jobs[0].ID != jobID {
 			t.Fatalf("distinct-key retry=(%+v,%t,%v)", attached, replay, err)
 		}
@@ -111,11 +115,18 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		if _, err := db1.Exec(`DELETE FROM factory_issue_poller_outcomes WHERE tracker='github' AND source_repository='source/repo' AND issue_number=77 AND version=$1`, req.IssueProvenance.Version); err != nil {
 			t.Fatal(err)
 		}
-		afterLedgerLoss, replay, err := first.AdmitIssuePollerThread(ctx, "issue-key-after-ledger-loss", "github-issue-poller", req, "ready")
+		afterLedgerLoss, replay, err := first.AdmitIssuePollerThread(ctx, "issue-key-after-ledger-loss", "github-issue-poller", req, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1})
 		if err != nil || !replay || afterLedgerLoss.Thread.ID != threadID || afterLedgerLoss.Jobs[0].ID != jobID {
 			t.Fatalf("retry after label-ledger eviction=(%+v,%t,%v)", afterLedgerLoss, replay, err)
 		}
 		assertIssueThreadCounts(t, db1, req, jobID, threadID, 1, 1)
+		transferred, err := first.TransferIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerWebhook, "poller stopped; GitHub effects reconciled")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := second.AdmitIssuePollerThread(ctx, "stale-generation", "github-issue-poller", req, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: transferred.Generation - 1}); err == nil {
+			t.Fatal("poller admission with stale generation succeeded")
+		}
 		var jobKeys, threadKeys, queuedEvents int
 		if err := db1.QueryRow(`SELECT COUNT(*) FROM factory_job_idempotency WHERE job_id=$1`, jobID).Scan(&jobKeys); err != nil {
 			t.Fatal(err)
@@ -141,11 +152,14 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		t.Cleanup(func() { _ = store.CloseStore() })
 		ctx := context.Background()
 		req := issueThreadRequest(78, strings.Repeat("b", 64))
+		if _, err := store.RegisterIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+			t.Fatal(err)
+		}
 		prior, replay, err := store.AdmitIssuePoller(ctx, "legacy-poller-key", principalID, req, "ready")
 		if err != nil || replay {
 			t.Fatalf("existing Job admission=(%+v,%t,%v)", prior, replay, err)
 		}
-		thread, replay, err := store.AdmitIssuePollerThread(ctx, "thread-key-different", principalID, req, "ready")
+		thread, replay, err := store.AdmitIssuePollerThread(ctx, "thread-key-different", principalID, req, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1})
 		if err != nil || !replay || len(thread.Jobs) != 1 || thread.Jobs[0].ID != prior.ID {
 			t.Fatalf("Thread attach=(%+v,%t,%v)", thread, replay, err)
 		}
@@ -169,6 +183,9 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		t.Cleanup(func() { _ = store.CloseStore() })
 		ctx := context.Background()
 		req := issueThreadRequest(82, strings.Repeat("f", 64))
+		if _, err := store.RegisterIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+			t.Fatal(err)
+		}
 		job, replay, err := store.AdmitIssuePoller(ctx, "pre-existing-poller-key", principalID, req, "ready")
 		if err != nil || replay {
 			t.Fatalf("existing Job=(%+v,%t,%v)", job, replay, err)
@@ -180,7 +197,7 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		if _, err := db.Exec(`INSERT INTO factory_thread_jobs(thread_id,job_id,position) VALUES($1,$2,2)`, otherThread.Thread.ID, job.ID); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := store.AdmitIssuePollerThread(ctx, "attempt-attach", principalID, req, "ready"); !errors.Is(err, restjobs.ErrProvenanceConflict) {
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "attempt-attach", principalID, req, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); !errors.Is(err, restjobs.ErrProvenanceConflict) {
 			t.Fatalf("unproven membership error=%v, want provenance conflict", err)
 		}
 		var threads, threadKeys, members, pollerRows int
@@ -210,12 +227,15 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		t.Cleanup(func() { _ = store.CloseStore() })
 		ctx := context.Background()
 		request := issueThreadRequest(85, strings.Repeat("3", 64))
-		if _, _, err := store.AdmitIssuePoller(ctx, "existing-request", principalID, request, "ready"); err != nil {
+		if _, err := store.RegisterIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "existing-request", principalID, request, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); err != nil {
 			t.Fatal(err)
 		}
 		conflict := request
 		conflict.Task += " changed"
-		if _, _, err := store.AdmitIssuePollerThread(ctx, "conflicting-request", principalID, conflict, "ready"); !errors.Is(err, restjobs.ErrProvenanceConflict) {
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "conflicting-request", principalID, conflict, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); !errors.Is(err, restjobs.ErrProvenanceConflict) {
 			t.Fatalf("changed request error=%v, want provenance conflict", err)
 		}
 		var threads, threadKeys, members, labels int
@@ -231,8 +251,8 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		if err := db.QueryRow(`SELECT COUNT(*) FROM factory_issue_poller_outcomes`).Scan(&labels); err != nil {
 			t.Fatal(err)
 		}
-		if threads != 0 || threadKeys != 0 || members != 0 || labels != 1 {
-			t.Fatalf("request conflict mutated state: threads=%d keys=%d members=%d labels=%d", threads, threadKeys, members, labels)
+		if threads != 1 || threadKeys != 0 || members != 1 || labels != 1 {
+			t.Fatalf("request conflict changed the original Thread/Job or created a retry key: threads=%d keys=%d members=%d labels=%d", threads, threadKeys, members, labels)
 		}
 	})
 
@@ -245,15 +265,18 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = store.CloseStore() })
 		ctx := context.Background()
+		if _, err := store.RegisterIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+			t.Fatal(err)
+		}
 		first := issueThreadRequest(83, strings.Repeat("1", 64))
-		if _, _, err := store.AdmitIssuePollerThread(ctx, "queue-first", principalID, first, "ready"); err != nil {
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "queue-first", principalID, first, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := store.AdmitAs("queue-filler", "another-principal", restjobs.Request{Repository: "destination", Task: "fill active queue capacity"}); err != nil {
 			t.Fatal(err)
 		}
 		blocked := issueThreadRequest(84, strings.Repeat("2", 64))
-		if _, _, err := store.AdmitIssuePollerThread(ctx, "queue-blocked", principalID, blocked, "ready"); !errors.Is(err, restjobs.ErrQueueFull) {
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "queue-blocked", principalID, blocked, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); !errors.Is(err, restjobs.ErrQueueFull) {
 			t.Fatalf("queue capacity error=%v, want ErrQueueFull", err)
 		}
 		assertNoIssueAdmissionRows(t, db, blocked)
@@ -268,6 +291,9 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		}
 		t.Cleanup(func() { _ = store.CloseStore() })
 		ctx := context.Background()
+		if _, err := store.RegisterIntakeOwner(ctx, "source/repo", "ready", restjobs.IntakeOwnerPoller); err != nil {
+			t.Fatal(err)
+		}
 		foreign := issueThreadRequest(81, strings.Repeat("e", 64))
 		if _, _, err := store.AdmitAs("foreign-key", "some-other-principal", foreign); err != nil {
 			t.Fatal(err)
@@ -275,7 +301,7 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 		// Fill the bounded pending-label ledger, then assert the combined
 		// admission transaction rolls back Job, provenance, and Thread rows.
 		blocked := issueThreadRequest(80, strings.Repeat("d", 64))
-		if _, _, err := store.AdmitIssuePollerThread(ctx, "foreign-conflict", principalID, foreign, "ready"); !errors.Is(err, restjobs.ErrProvenanceConflict) {
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "foreign-conflict", principalID, foreign, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); !errors.Is(err, restjobs.ErrProvenanceConflict) {
 			t.Fatalf("foreign provenance error=%v, want conflict", err)
 		}
 		var foreignThreadKeys, foreignLedger int
@@ -297,7 +323,7 @@ func TestPostgresIssueAdmissionCreatesOneThreadAtomically(t *testing.T) {
 				t.Fatalf("fill pending label ledger %d: %v", i, err)
 			}
 		}
-		if _, _, err := store.AdmitIssuePollerThread(ctx, "capacity-second", principalID, blocked, "ready"); err == nil {
+		if _, _, err := store.AdmitIssuePollerThread(ctx, "capacity-second", principalID, blocked, "ready", restjobs.IntakeOwner{SourceRepository: "source/repo", TriggerLabel: "ready", Kind: restjobs.IntakeOwnerPoller, Generation: 1}); err == nil {
 			t.Fatal("admission succeeded with a full bounded label ledger")
 		}
 		assertNoIssueAdmissionRows(t, db, blocked)

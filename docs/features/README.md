@@ -15,7 +15,8 @@ This section describes implemented behavior, distinct from the remaining target 
 - [Embedded REST operator dashboard](rest-web-ui.md) — optional same-listener browser UI and control-plane container image.
 - [Local Compose API control plane](compose-local-control-plane.md) — isolated local PostgreSQL API setup with no worker service.
 - [Autonomous GitHub issue poller](issue-poller.md) — dedicated PostgreSQL-backed admission into the shared REST job queue.
-- [GitHub issue webhook](github-issue-webhook.md) — optional durable admission of authenticated `issues.labeled` deliveries into the same Thread/Job lifecycle.
+- [GitHub issue webhook](github-issue-webhook.md) — optional PostgreSQL-backed admission of authenticated `issues.labeled` deliveries into the same Thread/Job lifecycle.
+- [GitHub issue intake ownership](intake-owner.md) — PostgreSQL source/label owner registration, transfer, and audit.
 - [REST server operations](rest-server-operations.md) — health/readiness probes, authenticated aggregate status, SQLite backup and portable recovery bundles, restart recovery classification, limits, and trusted-network operations.
 - [REST job client](rest-client.md) — separate protected client configuration and CLI commands for remote submit, inspect, watch, cooperative cancellation, read-only aggregate operations, and explicit SQLite interrupted-job recovery actions.
 - [Supervised systemd deployment](rest-server-systemd.md) — dedicated service account, private paths, installed binary unit, lifecycle, and single-host operations.

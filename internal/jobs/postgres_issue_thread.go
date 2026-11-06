@@ -10,7 +10,7 @@ import (
 
 // AdmitIssuePollerThread atomically admits one source/version as a canonical
 // Thread and its Job, or attaches the exact retained poller Job to its Thread.
-func (s *PostgresStore) AdmitIssuePollerThread(ctx context.Context, key, principalID string, request Request, triggerLabel string) (ThreadSnapshot, bool, error) {
+func (s *PostgresStore) AdmitIssuePollerThread(ctx context.Context, key, principalID string, request Request, triggerLabel string, owners ...IntakeOwner) (ThreadSnapshot, bool, error) {
 	s.admitMu.Lock()
 	defer s.admitMu.Unlock()
 	if ctx == nil || triggerLabel == "" || request.IssueProvenance == nil || request.IssueProvenance.Tracker != "github" {
@@ -29,6 +29,9 @@ func (s *PostgresStore) AdmitIssuePollerThread(ctx context.Context, key, princip
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	if len(owners) != 1 || owners[0].SourceRepository != request.IssueProvenance.SourceRepository || owners[0].TriggerLabel != triggerLabel || owners[0].Kind != IntakeOwnerPoller || validateIntakeOwner(owners[0].SourceRepository, owners[0].TriggerLabel, IntakeOwnerPoller, owners[0].Generation) != nil {
+		return ThreadSnapshot{}, false, errors.New("intake-owner registration is missing, mismatched, or stale")
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return ThreadSnapshot{}, false, errors.New("PostgreSQL job store unavailable")
@@ -36,6 +39,9 @@ func (s *PostgresStore) AdmitIssuePollerThread(ctx context.Context, key, princip
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresStoreMigrationLock+1); err != nil {
 		return ThreadSnapshot{}, false, errors.New("lock PostgreSQL issue Thread admission")
+	}
+	if err := s.checkIntakeOwnerTx(ctx, tx, owners[0].SourceRepository, owners[0].TriggerLabel, IntakeOwnerPoller, owners[0].Generation); err != nil {
+		return ThreadSnapshot{}, false, err
 	}
 
 	p := request.IssueProvenance

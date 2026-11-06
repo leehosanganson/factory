@@ -6,7 +6,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -81,27 +80,17 @@ func githubWebhookRequest(handler http.Handler, body, delivery, event string, si
 	return response
 }
 
-func TestGitHubIssueWebhookAdmitsLabeledIssueToConfiguredOwnerAndCanonicalThread(t *testing.T) {
+func TestGitHubIssueWebhookAdmissionOnSQLiteFailsWithoutPartialRows(t *testing.T) {
 	manager, handler := newSQLiteWebhookHandler(t, 4096, 2048)
+	defer manager.CloseStore()
 	body := `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":42,"title":"Fix issue","body":"Do work","state":"open","labels":[{"name":"factory:ready"}]},"repository":{"full_name":"acme/issues"}}`
-	response := githubWebhookRequest(handler, body, "delivery-42", "issues", true)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("webhook response=%d %s", response.Code, response.Body.String())
+	response := githubWebhookRequest(handler, body, "sqlite-delivery", "issues", true)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "webhook_unavailable") {
+		t.Fatalf("SQLite webhook response=%d %s, want unavailable", response.Code, response.Body.String())
 	}
-	var result struct {
-		ThreadID string `json:"thread_id"`
-		JobID    string `json:"job_id"`
-		Replayed bool   `json:"replayed"`
-	}
-	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.ThreadID == "" || result.JobID == "" || result.Replayed {
-		t.Fatalf("webhook admission response=(%+v,%v) body=%s", result, err, response.Body.String())
-	}
-	thread, err := manager.GetThread(result.ThreadID)
-	if err != nil || len(thread.Jobs) != 1 || len(thread.Thread.JobIDs) != 1 || thread.Thread.JobIDs[0] != result.JobID || thread.Thread.Submitter != "issue-owner" || thread.Jobs[0].Submitter != "issue-owner" || thread.Jobs[0].Request.Repository != "widget" || thread.Jobs[0].Request.Issue == nil || *thread.Jobs[0].Request.Issue != 42 || !strings.Contains(thread.Jobs[0].Request.Task, "BEGIN UNTRUSTED ISSUE CONTEXT") {
-		t.Fatalf("webhook Thread/Job=(%+v,%v), want configured owner and existing lifecycle", thread, err)
-	}
-	if strings.Contains(response.Body.String(), "Do work") || strings.Contains(response.Body.String(), "BEGIN UNTRUSTED") {
-		t.Fatalf("admission response exposed issue task content: %s", response.Body.String())
+	jobs, err := manager.ListJobs(context.Background(), 0, 0, 20)
+	if err != nil || len(jobs.Jobs) != 0 {
+		t.Fatalf("SQLite API webhook admission left work: jobs=%+v err=%v", jobs, err)
 	}
 }
 
@@ -178,26 +167,18 @@ func fmtWebhook(format, action, eventLabel, state, issueLabel, extra, source str
 	return fmt.Sprintf(format, action, eventLabel, state, issueLabel, extra, source)
 }
 
-func TestGitHubIssueWebhookSameDeliveryReplaysAndChangedBodyConflicts(t *testing.T) {
+func TestGitHubIssueWebhookOnSQLiteDoesNotPersistDeliveryOrAdmitWork(t *testing.T) {
 	manager, handler := newSQLiteWebhookHandler(t, 4096, 2048)
 	defer manager.CloseStore()
 	body := `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":42,"title":"Fix","state":"open","labels":[{"name":"factory:ready"}]},"repository":{"full_name":"acme/issues"}}`
-	first := githubWebhookRequest(handler, body, "stable-delivery", "issues", true)
-	retry := githubWebhookRequest(handler, body, "stable-delivery", "issues", true)
-	if first.Code != http.StatusAccepted || retry.Code != http.StatusAccepted {
-		t.Fatalf("delivery statuses first=%d retry=%d", first.Code, retry.Code)
+	for _, delivery := range []string{"stable-delivery", "retry-delivery"} {
+		response := githubWebhookRequest(handler, body, delivery, "issues", true)
+		if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "webhook_unavailable") {
+			t.Fatalf("SQLite webhook status=%d body=%s, want unavailable", response.Code, response.Body.String())
+		}
 	}
-	var a, b struct {
-		ThreadID string `json:"thread_id"`
-		JobID    string `json:"job_id"`
-		Replayed bool   `json:"replayed"`
-	}
-	if json.Unmarshal(first.Body.Bytes(), &a) != nil || json.Unmarshal(retry.Body.Bytes(), &b) != nil || a.ThreadID != b.ThreadID || a.JobID != b.JobID || !b.Replayed {
-		t.Fatalf("same delivery did not replay one Thread+Job: first=%s retry=%s", first.Body.String(), retry.Body.String())
-	}
-	changed := strings.Replace(body, `"title":"Fix"`, `"title":"Different"`, 1)
-	conflict := githubWebhookRequest(handler, changed, "stable-delivery", "issues", true)
-	if conflict.Code != http.StatusConflict || strings.Contains(conflict.Body.String(), "Different") {
-		t.Fatalf("changed body conflict=(%d,%s), want sanitized 409", conflict.Code, conflict.Body.String())
+	jobs, err := manager.ListJobs(context.Background(), 0, 0, 20)
+	if err != nil || len(jobs.Jobs) != 0 {
+		t.Fatalf("SQLite webhook admitted jobs: %+v %v", jobs, err)
 	}
 }

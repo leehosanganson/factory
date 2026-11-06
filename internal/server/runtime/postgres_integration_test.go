@@ -2,7 +2,9 @@ package runtime
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,7 +22,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
-	"github.com/leehosanganson/factory/internal/jobs"
+	restjobs "github.com/leehosanganson/factory/internal/jobs"
 	"github.com/leehosanganson/factory/internal/provider"
 	"github.com/leehosanganson/factory/internal/server"
 	"github.com/leehosanganson/factory/internal/worker"
@@ -661,6 +663,195 @@ func TestRunConfiguredPostgresStoreIntegration(t *testing.T) {
 	if err != nil || persisted.Status != restjobs.StatusSucceeded {
 		t.Fatalf("persisted runtime job=(%+v,%v), want successful durable record", persisted, err)
 	}
+}
+
+func TestRunConfiguredPostgresGitHubWebhookOwnerGenerationIntegration(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("PostgreSQL test DSN is required")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL 18 webhook runtime integration")
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") {
+		t.Fatal("invalid test PostgreSQL URL")
+	}
+	adminConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal("invalid test PostgreSQL URL")
+	}
+	admin := stdlib.OpenDB(*adminConfig)
+	defer admin.Close()
+	var version int
+	if err := admin.QueryRow(`SHOW server_version_num`).Scan(&version); err != nil || version < 180000 || version >= 190000 {
+		t.Fatalf("requires PostgreSQL 18: version=%d err=%v", version, err)
+	}
+
+	schema := fmt.Sprintf("factory_webhook_runtime_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(`CREATE SCHEMA ` + schema); err != nil {
+		t.Fatal("create PostgreSQL webhook test schema")
+	}
+	defer func() {
+		if _, err := admin.Exec(`DROP SCHEMA ` + schema + ` CASCADE`); err != nil {
+			t.Errorf("drop PostgreSQL webhook test schema: %v", err)
+		}
+	}()
+	query := parsed.Query()
+	query.Set("search_path", schema)
+	parsed.RawQuery = query.Encode()
+	scopedDSN := parsed.String()
+	config, _ := runtimeFixture(t)
+	workersDisabled := false
+	config.WorkersEnabled = &workersDisabled
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendPostgres, DSN: scopedDSN}
+	stateDir := t.TempDir()
+	secret := []byte("postgres-runtime-webhook-secret-over-32-bytes")
+	secretPath := filepath.Join(stateDir, "webhook-secret")
+	if err := os.WriteFile(secretPath, secret, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const ownerToken = "postgres-runtime-issue-owner-token"
+	ownerDigest := sha256.Sum256([]byte(ownerToken))
+	ownerVerifier, err := json.Marshal(map[string]any{"version": 1, "principals": []any{map[string]string{"id": "issue-owner", "token_sha256": hex.EncodeToString(ownerDigest[:])}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerVerifierPath := filepath.Join(stateDir, "owner-verifier.json")
+	if err := os.WriteFile(ownerVerifierPath, ownerVerifier, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config.Principals = append(config.Principals, restserver.PrincipalConfig{ID: "issue-owner", Role: "submitter", TokenFile: ownerVerifierPath, Enabled: true})
+	config.GitHubWebhook = restserver.GitHubWebhookConfig{
+		SecretFile: secretPath, TriggerLabel: "factory:ready",
+		Sources: map[string]string{"acme/issues": "trusted"}, Owners: map[string]string{"acme/issues": "issue-owner"},
+		Generations: map[string]int64{"acme/issues": 1},
+	}
+
+	storeConfig := restjobs.Config{
+		QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers,
+		MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob,
+		MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes,
+	}
+	seedStore, err := restjobs.OpenPostgresStore(scopedDSN, storeConfig)
+	if err != nil {
+		t.Fatal("initialize isolated PostgreSQL webhook schema")
+	}
+	registeredOwner, err := seedStore.RegisterIntakeOwner(context.Background(), "acme/issues", "factory:ready", restjobs.IntakeOwnerWebhook)
+	if err != nil || registeredOwner.Generation != 1 {
+		t.Fatalf("register webhook owner=(%+v,%v), want generation 1", registeredOwner, err)
+	}
+	if err := seedStore.CloseStore(); err != nil {
+		t.Fatal("close PostgreSQL webhook setup store")
+	}
+
+	resultsBase := testResultsBase(t)
+	startServer := func(name string, cfg restserver.Config) (string, context.CancelFunc, <-chan error) {
+		t.Helper()
+		listenerReady := make(chan net.Listener, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			done <- run(ctx, cfg, runtimeOptions{
+				ResultsBase: resultsBase,
+				Listen: func(network, _ string) (net.Listener, error) {
+					listener, listenErr := net.Listen(network, "127.0.0.1:0")
+					if listenErr == nil {
+						listenerReady <- listener
+					}
+					return listener, listenErr
+				},
+			})
+		}()
+		select {
+		case listener := <-listenerReady:
+			baseURL := "http://" + listener.Addr().String()
+			waitForStatus(t, baseURL+"/readyz", http.StatusOK)
+			t.Logf("%s webhook runtime ready", name)
+			return baseURL, cancel, done
+		case runErr := <-done:
+			cancel()
+			t.Fatalf("%s PostgreSQL webhook runtime startup: %v", name, runErr)
+		case <-time.After(10 * time.Second):
+			cancel()
+			t.Fatalf("%s PostgreSQL webhook runtime did not open listener", name)
+		}
+		return "", nil, nil
+	}
+	stopServer := func(name string, cancel context.CancelFunc, done <-chan error) {
+		t.Helper()
+		cancel()
+		select {
+		case runErr := <-done:
+			if runErr != nil {
+				t.Errorf("%s PostgreSQL webhook runtime shutdown: %v", name, runErr)
+			}
+		case <-time.After(10 * time.Second):
+			t.Errorf("%s PostgreSQL webhook runtime did not shut down", name)
+		}
+	}
+	firstURL, cancelFirst, doneFirst := startServer("first", config)
+	secondURL, cancelSecond, doneSecond := startServer("second", config)
+	defer stopServer("first", cancelFirst, doneFirst)
+	defer stopServer("second", cancelSecond, doneSecond)
+
+	const bodyOne = `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":42,"title":"First synthetic issue","body":"no external GitHub access","state":"open","labels":[{"name":"factory:ready"}]},"repository":{"full_name":"acme/issues"}}`
+	const bodyTwo = `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":43,"title":"Second synthetic issue","body":"also synthetic","state":"open","labels":[{"name":"factory:ready"}]},"repository":{"full_name":"acme/issues"}}`
+	admissionOne := postSignedRuntimeWebhook(t, firstURL, secret, "postgres-webhook-delivery-one", bodyOne)
+	replayOne := postSignedRuntimeWebhook(t, secondURL, secret, "postgres-webhook-delivery-one", bodyOne)
+	admissionTwo := postSignedRuntimeWebhook(t, secondURL, secret, "postgres-webhook-delivery-two", bodyTwo)
+	replayTwo := postSignedRuntimeWebhook(t, firstURL, secret, "postgres-webhook-delivery-two", bodyTwo)
+	if admissionOne.Replayed || !replayOne.Replayed || admissionOne.ThreadID == "" || replayOne.ThreadID != admissionOne.ThreadID {
+		t.Fatalf("cross-instance replay of first delivery=(%+v,%+v), want one shared Thread", admissionOne, replayOne)
+	}
+	if admissionTwo.Replayed || !replayTwo.Replayed || admissionTwo.ThreadID == "" || replayTwo.ThreadID != admissionTwo.ThreadID {
+		t.Fatalf("cross-instance replay of second delivery=(%+v,%+v), want one shared Thread", admissionTwo, replayTwo)
+	}
+
+	staleConfig := config
+	staleConfig.GitHubWebhook.Generations = map[string]int64{"acme/issues": registeredOwner.Generation + 1}
+	var staleListenCalls atomic.Int32
+	staleErr := run(context.Background(), staleConfig, runtimeOptions{Listen: func(string, string) (net.Listener, error) {
+		staleListenCalls.Add(1)
+		return net.Listen("tcp", "127.0.0.1:0")
+	}})
+	if staleErr == nil || !strings.Contains(staleErr.Error(), "intake-owner registration is missing or mismatched") {
+		t.Fatalf("stale webhook owner generation startup error=%v, want fail-closed mismatch", staleErr)
+	}
+	if staleListenCalls.Load() != 0 {
+		t.Fatalf("stale webhook owner startup opened listener %d times, want zero", staleListenCalls.Load())
+	}
+}
+
+type runtimeWebhookAdmission struct {
+	ThreadID string `json:"thread_id"`
+	JobID    string `json:"job_id"`
+	Replayed bool   `json:"replayed"`
+}
+
+func postSignedRuntimeWebhook(t *testing.T, baseURL string, secret []byte, delivery, body string) runtimeWebhookAdmission {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/webhooks/github/issues", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-GitHub-Delivery", delivery)
+	request.Header.Set("X-GitHub-Event", "issues")
+	request.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatalf("send signed synthetic webhook %q: %v", delivery, err)
+	}
+	defer response.Body.Close()
+	var admission runtimeWebhookAdmission
+	if err := json.NewDecoder(response.Body).Decode(&admission); response.StatusCode != http.StatusAccepted || err != nil || admission.ThreadID == "" || admission.JobID == "" {
+		t.Fatalf("signed synthetic webhook %q response status=%d admission=%+v err=%v", delivery, response.StatusCode, admission, err)
+	}
+	return admission
 }
 
 type leaseExpiryPublisher struct {

@@ -333,14 +333,26 @@ func TestLoadConfigAcceptsGitHubProviderAndRejectsPartialProviderConfig(t *testi
 	}
 }
 
+func TestGitHubWebhookRequiresPostgresAndOwnerGenerations(t *testing.T) {
+	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"issue-owner","role":"submitter","token_file":"/run/owner-verifier","enabled":true},{"id":"admin","role":"operator","token_file":"/run/admin-verifier","enabled":true}],"persistence":{"backend":"sqlite","path":"/var/lib/factory/jobs.db"},"github_webhook":{"secret_file":"/run/secrets/github-webhook","trigger_label":"factory:ready","sources":{"acme/issues":"widget"},"owners":{"acme/issues":"issue-owner"},"owner_generations":{"acme/issues":1}}}`
+	if _, err := LoadConfig(writeConfig(t, base)); err == nil || !strings.Contains(err.Error(), "github_webhook requires PostgreSQL persistence") {
+		t.Fatalf("SQLite webhook config error=%v, want PostgreSQL requirement", err)
+	}
+	postgres := strings.Replace(base, `"backend":"sqlite","path":"/var/lib/factory/jobs.db"`, `"backend":"postgres","dsn":"postgres://localhost/factory"`, 1)
+	missingGeneration := strings.Replace(postgres, `,"owner_generations":{"acme/issues":1}`, "", 1)
+	if _, err := LoadConfig(writeConfig(t, missingGeneration)); err == nil || !strings.Contains(err.Error(), "owner_generations") {
+		t.Fatalf("missing webhook generation error=%v", err)
+	}
+}
+
 func TestLoadConfigValidatesGitHubIssueWebhookPrincipalMappingAndDurability(t *testing.T) {
-	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"issue-owner","role":"submitter","token_file":"/run/owner-verifier","enabled":true},{"id":"admin","role":"operator","token_file":"/run/admin-verifier","enabled":true}],"persistence":{"backend":"sqlite","path":"/var/lib/factory/jobs.db"},"github_webhook":{"secret_file":"/run/secrets/github-webhook","trigger_label":"factory:ready","sources":{"acme/issues":"widget"},"owners":{"acme/issues":"issue-owner"}}}`
+	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"issue-owner","role":"submitter","token_file":"/run/owner-verifier","enabled":true},{"id":"admin","role":"operator","token_file":"/run/admin-verifier","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://localhost/factory"},"github_webhook":{"secret_file":"/run/secrets/github-webhook","trigger_label":"factory:ready","sources":{"acme/issues":"widget"},"owners":{"acme/issues":"issue-owner"},"owner_generations":{"acme/issues":1}}}`
 	config, err := LoadConfig(writeConfig(t, base))
 	if err != nil || config.GitHubWebhook.Owners["acme/issues"] != "issue-owner" || config.GitHubWebhook.Sources["acme/issues"] != "widget" {
 		t.Fatalf("valid GitHub webhook config=(%+v,%v)", config.GitHubWebhook, err)
 	}
 	for _, invalid := range []string{
-		strings.Replace(base, `"backend":"sqlite"`, `"backend":"memory"`, 1),
+		strings.Replace(base, `"backend":"postgres"`, `"backend":"memory"`, 1),
 		strings.Replace(base, `"owners":{"acme/issues":"issue-owner"}`, `"owners":{"acme/issues":"missing"}`, 1),
 		strings.Replace(base, `"sources":{"acme/issues":"widget"}`, `"sources":{"acme/unknown":"widget"}`, 1),
 		strings.Replace(base, `"trigger_label":"factory:ready"`, `"trigger_label":" factory:ready"`, 1),
