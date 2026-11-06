@@ -2290,6 +2290,13 @@ func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 		t.Fatalf("git commit: %v\n%s", err, output)
 	}
 	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	origin := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git init bare origin: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git remote add origin: %v\n%s", err, output)
+	}
 	target, err = filepath.EvalSymlinks(target)
 	if err != nil {
 		t.Fatal(err)
@@ -2520,11 +2527,11 @@ func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 	if !store.StopRequested(job.ID) {
 		t.Fatal("separate-process stop command did not persist a stop request")
 	}
-	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
-		t.Fatalf("release detached worker after stop request: %v", err)
-	}
 	if err := waitForShutdown(10*time.Second, "stopped"); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release detached worker after it stopped: %v", err)
 	}
 	job, found, err = findJob()
 	if err != nil || !found {
@@ -2979,6 +2986,13 @@ func TestDetachedImplementCrashIsInspectableAndNotReplayed(t *testing.T) {
 	}
 	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	origin := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git init bare origin: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git remote add origin: %v\n%s", err, output)
 	}
 	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
 	initialStatus := runTestGit(t, "-C", target, "status", "--porcelain")

@@ -700,6 +700,9 @@ func startWorkflowJob(store *JobStore, cfg Config, target, description, jobType 
 			return "", err
 		}
 		if cfg.AutoPublish {
+			if err := requireLocalPublicationPrerequisites(context.Background(), resolvedTarget); err != nil {
+				return "", err
+			}
 			if err := requireCleanCheckout(context.Background(), resolvedTarget); err != nil {
 				return "", err
 			}
