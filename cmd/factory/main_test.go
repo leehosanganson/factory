@@ -2285,6 +2285,13 @@ func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 		t.Fatalf("git commit: %v\n%s", err, output)
 	}
 	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	origin := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git init bare origin: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git remote add origin: %v\n%s", err, output)
+	}
 	target, err = filepath.EvalSymlinks(target)
 	if err != nil {
 		t.Fatal(err)
@@ -2974,6 +2981,13 @@ func TestDetachedImplementCrashIsInspectableAndNotReplayed(t *testing.T) {
 	}
 	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	origin := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git init bare origin: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", origin).CombinedOutput(); err != nil {
+		t.Fatalf("git remote add origin: %v\n%s", err, output)
 	}
 	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
 	initialStatus := runTestGit(t, "-C", target, "status", "--porcelain")

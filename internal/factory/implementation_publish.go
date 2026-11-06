@@ -54,6 +54,18 @@ func ValidateImplementationCheckout(target string) error {
 	return requireImplementationCheckout(context.Background(), target)
 }
 
+func requireLocalPublicationPrerequisites(ctx context.Context, target string) error {
+	_, ghErr := implementationLookPath("gh")
+	_, originErr := implementationCommand(ctx, target, "git", "remote", "get-url", "origin")
+	if ghErr != nil {
+		return fmt.Errorf("automatic PR publication requires the `gh` executable on PATH")
+	}
+	if originErr != nil {
+		return fmt.Errorf("automatic PR publication requires an `origin` remote")
+	}
+	return nil
+}
+
 func requireCleanCheckout(ctx context.Context, target string) error {
 	if err := requireImplementationCheckout(ctx, target); err != nil {
 		return err
@@ -71,6 +83,11 @@ func requireCleanCheckout(ctx context.Context, target string) error {
 func runAutomaticImplementation(ctx context.Context, cfg Config, target, task string, in io.Reader, out io.Writer, terminal, gate bool) error {
 	if err := requireCleanCheckout(ctx, target); err != nil {
 		return err
+	}
+	if cfg.AutoPublish {
+		if err := requireLocalPublicationPrerequisites(ctx, target); err != nil {
+			return err
+		}
 	}
 	baseline, err := implementationCommand(ctx, target, "git", "rev-parse", "HEAD")
 	if err != nil {

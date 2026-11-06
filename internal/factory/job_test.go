@@ -907,6 +907,59 @@ func TestDetachedImplementationPublicationOutcomePersistsAndCleansOnlyOnPublish(
 	}
 }
 
+func TestImplementationAdmissionRejectsMissingLocalPublicationPrerequisitesBeforeWork(t *testing.T) {
+	for _, missing := range []string{"gh", "origin"} {
+		t.Run(missing, func(t *testing.T) {
+			target := initTestGitRepo(t)
+			if missing != "origin" {
+				remote := filepath.Join(t.TempDir(), "origin.git")
+				runPublishTestGit(t, "init", "--bare", remote)
+				runPublishTestGit(t, "-C", target, "remote", "add", "origin", remote)
+			}
+			agent := filepath.Join(t.TempDir(), "agent")
+			marker := filepath.Join(t.TempDir(), "agent-ran")
+			if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf called > "+marker+"\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			cfg.Command = agent
+			cfg.Args = []string{"{system_prompt}", "{task}"}
+			cfg.StateDir = filepath.Join(t.TempDir(), "state")
+			cfg.AutoPublish = true
+			oldLookPath := implementationLookPath
+			implementationLookPath = func(name string) (string, error) {
+				if name != "gh" {
+					t.Fatalf("unexpected executable lookup: %s", name)
+				}
+				if missing == "gh" {
+					return "", exec.ErrNotFound
+				}
+				return "/fake/gh", nil
+			}
+			t.Cleanup(func() { implementationLookPath = oldLookPath })
+
+			_, err := StartImplementationJob(cfg, target, "must fail before work")
+			if err == nil || !strings.Contains(err.Error(), "automatic PR publication requires") {
+				t.Fatalf("StartImplementationJob error=%v, want local publication prerequisite error", err)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("agent ran despite preflight failure: stat marker error=%v", err)
+			}
+			store, err := NewJobStore(filepath.Join(cfg.StateDir, "factory", "detached-jobs"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			jobs, err := store.ListJobs()
+			if err != nil || len(jobs) != 0 {
+				t.Fatalf("preflight created jobs: jobs=%+v err=%v", jobs, err)
+			}
+			if worktrees := runPublishTestGit(t, "-C", target, "worktree", "list", "--porcelain"); strings.Contains(worktrees, "factory-job/") {
+				t.Fatalf("preflight created an implementation worktree:\\n%s", worktrees)
+			}
+		})
+	}
+}
+
 func TestImplementationOptOutStillRequiresGitButAllowsDirtyCheckout(t *testing.T) {
 	cfg := Config{StateDir: filepath.Join(t.TempDir(), "state"), Command: "/bin/true", Args: []string{"{task}"}, AutoPublish: false}
 	if _, err := StartImplementationJob(cfg, t.TempDir(), "non-Git target"); err == nil || !strings.Contains(err.Error(), "Git checkout") {

@@ -304,6 +304,51 @@ func TestRunAutomaticImplementationPreservesWorktreeWhenGitCleanupFails(t *testi
 	}
 }
 
+func TestRequireLocalPublicationPrerequisitesAreReadOnly(t *testing.T) {
+	for _, missing := range []string{"gh", "origin", "none"} {
+		t.Run(missing, func(t *testing.T) {
+			target := initTestGitRepo(t)
+			remote := filepath.Join(t.TempDir(), "origin.git")
+			runPublishTestGit(t, "init", "--bare", remote)
+			if missing != "origin" {
+				runPublishTestGit(t, "-C", target, "remote", "add", "origin", remote)
+			}
+			oldLookPath := implementationLookPath
+			implementationLookPath = func(name string) (string, error) {
+				if name != "gh" {
+					t.Fatalf("unexpected executable lookup: %s", name)
+				}
+				if missing == "gh" {
+					return "", exec.ErrNotFound
+				}
+				return "/fake/gh", nil
+			}
+			t.Cleanup(func() { implementationLookPath = oldLookPath })
+			originalCommand := implementationCommand
+			calls := 0
+			implementationCommand = func(ctx context.Context, dir, name string, args ...string) (string, error) {
+				calls++
+				if name != "git" || len(args) != 3 || args[0] != "remote" || args[1] != "get-url" || args[2] != "origin" {
+					t.Fatalf("unexpected preflight command: %s %v", name, args)
+				}
+				return originalCommand(ctx, dir, name, args...)
+			}
+			t.Cleanup(func() { implementationCommand = originalCommand })
+
+			err := requireLocalPublicationPrerequisites(context.Background(), target)
+			if missing == "none" && err != nil {
+				t.Fatalf("all local prerequisites present: %v", err)
+			}
+			if missing != "none" && err == nil {
+				t.Fatalf("missing %s prerequisite was accepted", missing)
+			}
+			if calls != 1 {
+				t.Fatalf("local Git queries=%d, want exactly one", calls)
+			}
+		})
+	}
+}
+
 func TestRequireImplementationCheckoutNeedsGitRootAndNamedBranch(t *testing.T) {
 	if err := requireImplementationCheckout(context.Background(), t.TempDir()); err == nil || !strings.Contains(err.Error(), "Git checkout") {
 		t.Fatalf("non-Git error = %v", err)
@@ -334,6 +379,54 @@ func TestRequireCleanCheckoutRejectsUntrackedChanges(t *testing.T) {
 	}
 	if err := requireCleanCheckout(context.Background(), target); err == nil || !strings.Contains(err.Error(), "clean Git checkout") {
 		t.Fatalf("dirty error = %v", err)
+	}
+}
+
+func TestRunAutomaticImplementationRejectsMissingLocalPublicationPrerequisitesBeforeWork(t *testing.T) {
+	for _, missing := range []string{"gh", "origin"} {
+		t.Run(missing, func(t *testing.T) {
+			target := initTestGitRepo(t)
+			if missing != "origin" {
+				remote := filepath.Join(t.TempDir(), "origin.git")
+				runPublishTestGit(t, "init", "--bare", remote)
+				runPublishTestGit(t, "-C", target, "remote", "add", "origin", remote)
+			}
+			agent := filepath.Join(t.TempDir(), "agent")
+			marker := filepath.Join(t.TempDir(), "agent-ran")
+			if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf called > "+marker+"\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			cfg := DefaultConfig()
+			cfg.Command = agent
+			cfg.Args = []string{"{system_prompt}", "{task}"}
+			cfg.StateDir = filepath.Join(t.TempDir(), "state")
+			oldLookPath := implementationLookPath
+			implementationLookPath = func(name string) (string, error) {
+				if name != "gh" {
+					t.Fatalf("unexpected executable lookup: %s", name)
+				}
+				if missing == "gh" {
+					return "", exec.ErrNotFound
+				}
+				return "/fake/gh", nil
+			}
+			t.Cleanup(func() { implementationLookPath = oldLookPath })
+
+			var output strings.Builder
+			err := RunAutomaticImplementation(context.Background(), cfg, target, "must fail before work", strings.NewReader(""), &output, false, true)
+			if err == nil || !strings.Contains(err.Error(), "automatic PR publication requires") {
+				t.Fatalf("RunAutomaticImplementation error=%v, want local publication prerequisite error", err)
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("agent ran despite preflight failure: stat marker error=%v", err)
+			}
+			if worktrees := runPublishTestGit(t, "-C", target, "worktree", "list", "--porcelain"); strings.Contains(worktrees, ".factory-implement-") {
+				t.Fatalf("preflight created an implementation worktree:\n%s", worktrees)
+			}
+			if _, err := os.Stat(cfg.StateDir); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("preflight created managed state: stat error=%v", err)
+			}
+		})
 	}
 }
 
@@ -454,6 +547,9 @@ func TestRunAutomaticImplementationReturnsPublicationCancellationAndInterruptsMa
 
 func TestRunAutomaticImplementationPreservesWorktreeWhenPublicationIsUnavailable(t *testing.T) {
 	target := initTestGitRepo(t)
+	remote := filepath.Join(t.TempDir(), "origin.git")
+	runPublishTestGit(t, "init", "--bare", remote)
+	runPublishTestGit(t, "-C", target, "remote", "add", "origin", remote)
 	agent := filepath.Join(t.TempDir(), "agent")
 	if err := os.WriteFile(agent, []byte("#!/bin/sh\nprintf 'PASS\\n'\nprintf 'recovery\\n' > generated.txt\n"), 0o700); err != nil {
 		t.Fatal(err)
