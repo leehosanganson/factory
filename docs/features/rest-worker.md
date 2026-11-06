@@ -14,7 +14,7 @@ Protect worker configs: the DSN and repository/harness/provider settings are ope
 
 Authenticated job detail and history expose only the safe worker/boot labels and the latest bounded stage/state summary (`requirements`, `implement`, `review`, or `document`; `started`, `completed`, or `failed`). The summary is dedicated metadata, separate from lifecycle history events. The SSE stream emits an allowlisted `workflow_progress` control event with only the stage and state. Raw logs, commands, and private observer messages are not included. Stage detail is retained as bounded PostgreSQL/SQLite metadata and does not create lifecycle history records.
 
-A worker shutdown stops claims, cancels active executions cooperatively, and waits up to the standard shutdown deadline. A process interruption may leave a running job requiring operator investigation; running work is not automatically replayed. Run API and worker processes under appropriately restricted service accounts and network controls.
+A worker shutdown closes job admission and claiming, cancels queued jobs and claims that have not started execution, and lets already-running executions finish. If the shutdown deadline expires first, it requests cooperative cancellation and returns at the deadline; executors must honor their context for work to stop. A later shutdown call can wait for workers that are still finishing, but shutdown never reopens claims. This does not stop external processes that ignore cancellation, reassign jobs, or clean up workspaces. A process interruption may leave a running job requiring operator investigation; running work is not automatically replayed. Run API and worker processes under appropriately restricted service accounts and network controls.
 
 Example:
 

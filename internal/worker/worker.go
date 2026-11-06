@@ -39,6 +39,8 @@ type CoordinatorConfig struct {
 	Workers  int
 	WorkerID string
 	BootID   string
+
+	beforeStart func()
 }
 
 // Coordinator dispatches manager claims to a fixed set of workers.
@@ -49,14 +51,18 @@ type Coordinator struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 
-	mu       sync.Mutex
-	stopped  bool
-	stop     sync.Once
-	wg       sync.WaitGroup
-	jobsMu   sync.Mutex
-	jobs     map[string]context.CancelFunc
-	workerID string
-	bootID   string
+	mu            sync.Mutex
+	stopped       bool
+	starting      int
+	startsDone    chan struct{}
+	startsDoneSet bool
+	beforeStart   func()
+	stop          sync.Once
+	wg            sync.WaitGroup
+	jobsMu        sync.Mutex
+	jobs          map[string]context.CancelFunc
+	workerID      string
+	bootID        string
 }
 
 // New starts the configured fixed set of worker goroutines.
@@ -88,7 +94,8 @@ func New(manager restjobs.Manager, executor Executor, config CoordinatorConfig) 
 	}
 	coordinator := &Coordinator{
 		manager: manager, executor: executor, ctx: ctx, cancel: cancel,
-		done: make(chan struct{}), jobs: make(map[string]context.CancelFunc), workerID: workerID, bootID: bootID,
+		done: make(chan struct{}), startsDone: make(chan struct{}), jobs: make(map[string]context.CancelFunc), workerID: workerID, bootID: bootID,
+		beforeStart: config.beforeStart,
 	}
 	coordinator.wg.Add(config.Workers)
 	for i := 0; i < config.Workers; i++ {
@@ -101,9 +108,10 @@ func New(manager restjobs.Manager, executor Executor, config CoordinatorConfig) 
 	return coordinator, nil
 }
 
-// Shutdown stops claims, cancels queued and active work, and waits for all
-// workers until ctx expires. Calling it again can wait for workers that did
-// not finish before an earlier caller's deadline.
+// Shutdown stops admission and claims, cancels queued work, and lets running
+// executions finish until ctx expires. On deadline it requests cooperative
+// cancellation. Calling it again can wait for workers that did not finish
+// before an earlier caller's deadline.
 func (c *Coordinator) Shutdown(ctx context.Context) error {
 	if ctx == nil {
 		return errors.New("shutdown context must not be nil")
@@ -111,14 +119,21 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 	c.stop.Do(func() {
 		c.mu.Lock()
 		c.stopped = true
+		c.closeStartsDoneIfReady()
 		c.mu.Unlock()
 		c.manager.Close()
-		c.cancel()
 	})
+	select {
+	case <-c.startsDone:
+	case <-ctx.Done():
+		c.cancel()
+		return ctx.Err()
+	}
 	select {
 	case <-c.done:
 		return nil
 	case <-ctx.Done():
+		c.cancel()
 		return ctx.Err()
 	}
 }
@@ -156,14 +171,6 @@ func (c *Coordinator) worker() {
 			// could create an unbounded error loop against a broken manager.
 			return
 		}
-		c.mu.Lock()
-		stopped = c.stopped
-		c.mu.Unlock()
-		if stopped {
-			// No executor has received this claim, so ending it here is safe.
-			_ = c.manager.FinishAttempt(claim.Attempt, restjobs.StatusCanceled)
-			return
-		}
 		claim.Attempt.WorkerID = defaultCoordinatorIdentity(claim.Attempt.WorkerID, c.workerID)
 		claim.Attempt.BootID = defaultCoordinatorIdentity(claim.Attempt.BootID, c.bootID)
 		if _, ok := c.manager.(*restjobs.PostgresStore); !ok {
@@ -171,11 +178,46 @@ func (c *Coordinator) worker() {
 				_ = identityStore.SetAttemptIdentity(claim.Attempt)
 			}
 		}
-		c.execute(claim.Job, claim.Attempt)
+		if !c.claimExecutionStart() {
+			// Shutdown won the synchronized claim-to-start boundary. The executor
+			// has not received this claim, so ending it here is safe.
+			_ = c.manager.FinishAttempt(claim.Attempt, restjobs.StatusCanceled)
+			return
+		}
+		if c.beforeStart != nil {
+			c.beforeStart()
+		}
+		c.execute(claim.Job, claim.Attempt, c.markExecutionStarted)
 	}
 }
 
-func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHandle) {
+// claimExecutionStart reserves a claimed job for transition to executor start.
+// Shutdown waits for reserved transitions, but never holds mu across executor code.
+func (c *Coordinator) claimExecutionStart() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.stopped {
+		return false
+	}
+	c.starting++
+	return true
+}
+
+func (c *Coordinator) markExecutionStarted() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.starting--
+	c.closeStartsDoneIfReady()
+}
+
+func (c *Coordinator) closeStartsDoneIfReady() {
+	if c.stopped && c.starting == 0 && !c.startsDoneSet {
+		close(c.startsDone)
+		c.startsDoneSet = true
+	}
+}
+
+func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHandle, markStarted func()) {
 	jobCtx, cancel := context.WithCancel(c.ctx)
 	heartbeatDone := make(chan struct{})
 	go func() {
@@ -214,6 +256,16 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 	}()
 	status := restjobs.StatusFailed
 	requiresProviderOutcome := false
+	var startOnce sync.Once
+	startExecutor := func() bool {
+		started := false
+		startOnce.Do(func() {
+			markStarted()
+			started = jobCtx.Err() == nil
+		})
+		return started
+	}
+	defer startExecutor()
 	func() {
 		defer func() {
 			if recover() != nil {
@@ -226,6 +278,9 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 			var err error
 			executor, ok := c.executor.(AttemptResultExecutor)
 			if !ok {
+				return
+			}
+			if !startExecutor() {
 				return
 			}
 			outcome, err = executor.ExecuteWithAttemptResult(jobCtx, job, attempt)
@@ -246,6 +301,9 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 			return
 		}
 		if executor, ok := c.executor.(AttemptResultExecutor); ok {
+			if !startExecutor() {
+				return
+			}
 			outcome, err := executor.ExecuteWithAttemptResult(jobCtx, job, attempt)
 			if err == nil && outcome == nil {
 				status = restjobs.StatusSucceeded
@@ -253,6 +311,9 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 			return
 		}
 		if executor, ok := c.executor.(ResultExecutor); ok {
+			if !startExecutor() {
+				return
+			}
 			outcome, err := executor.ExecuteWithResult(jobCtx, job)
 			if err == nil && outcome == nil {
 				status = restjobs.StatusSucceeded
@@ -262,11 +323,19 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 		if executor, ok := c.executor.(interface {
 			ExecuteWithAttempt(context.Context, restjobs.Snapshot, restjobs.AttemptHandle) error
 		}); ok {
+			if !startExecutor() {
+				return
+			}
 			if err := executor.ExecuteWithAttempt(jobCtx, job, attempt); err == nil {
 				status = restjobs.StatusSucceeded
 			}
-		} else if err := c.executor.Execute(jobCtx, job); err == nil {
-			status = restjobs.StatusSucceeded
+		} else {
+			if !startExecutor() {
+				return
+			}
+			if err := c.executor.Execute(jobCtx, job); err == nil {
+				status = restjobs.StatusSucceeded
+			}
 		}
 	}()
 	c.jobsMu.Lock()
