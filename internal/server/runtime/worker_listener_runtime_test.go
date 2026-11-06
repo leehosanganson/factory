@@ -113,7 +113,7 @@ func TestRunStartsIndependentMutualTLSWorkerListenerAndDrainsBoth(t *testing.T) 
 	apiAddress, workerAddress := runtimeFreeAddress(t), runtimeFreeAddress(t)
 	config.ListenAddress = apiAddress
 	apiListenerReady, workerListenerReady := make(chan net.Listener, 1), make(chan net.Listener, 1)
-	config.WorkerListener = &restserver.WorkerListenerConfig{ListenAddress: workerAddress, ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath, Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(clientFingerprint[:]), PrincipalID: "worker-runtime", Enabled: true}}}
+	config.WorkerListener = &restserver.WorkerListenerConfig{MaxClientCertLifetime: "72h", ListenAddress: workerAddress, ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath, Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(clientFingerprint[:]), PrincipalID: "worker-runtime", Enabled: true}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -228,7 +228,8 @@ func TestRunWorkerListenerBindFailureClosesAPIAndCleansUpBeforeReadiness(t *test
 		t.Fatal(err)
 	}
 	config.WorkerListener = &restserver.WorkerListenerConfig{
-		ListenAddress: runtimeFreeAddress(t), ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath,
+		MaxClientCertLifetime: "72h",
+		ListenAddress:         runtimeFreeAddress(t), ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath,
 		Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: strings.Repeat("a", 64), PrincipalID: "worker-runtime", Enabled: true}},
 	}
 
@@ -313,7 +314,7 @@ func (s *bindFailureTrackingStore) Close() {
 func TestRunRejectsWorkerListenerOnSameAddressBeforeOpeningResources(t *testing.T) {
 	config, _ := runtimeFixture(t)
 	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(t.TempDir(), "jobs.db")}
-	config.WorkerListener = &restserver.WorkerListenerConfig{ListenAddress: config.ListenAddress, ServerCertFile: "/missing/cert", ServerKeyFile: "/missing/key", ClientCAFile: "/missing/ca", Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: strings.Repeat("a", 64), PrincipalID: "worker", Enabled: true}}}
+	config.WorkerListener = &restserver.WorkerListenerConfig{MaxClientCertLifetime: "72h", ListenAddress: config.ListenAddress, ServerCertFile: "/missing/cert", ServerKeyFile: "/missing/key", ClientCAFile: "/missing/ca", Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: strings.Repeat("a", 64), PrincipalID: "worker", Enabled: true}}}
 	opened := false
 	err := run(context.Background(), config, runtimeOptions{OpenStore: func(restserver.Config) (restjobs.Store, error) {
 		opened = true

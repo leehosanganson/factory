@@ -25,16 +25,18 @@ type WorkerMappingLookup interface {
 }
 
 type WorkerListenerHandler struct {
-	store           restjobs.WorkerSessionStore
-	principals      map[string]string
-	mappingFileMode bool
-	lookup          WorkerMappingLookup
-	ready           func() bool
-	logger          *log.Logger
+	store                 restjobs.WorkerSessionStore
+	maxClientCertLifetime time.Duration
+	principals            map[string]string
+	mappingFileMode       bool
+	lookup                WorkerMappingLookup
+	ready                 func() bool
+	logger                *log.Logger
 }
 
 func NewWorkerListenerHandler(config WorkerListenerConfig, store restjobs.WorkerSessionStore, ready func() bool, loggers ...*log.Logger) (*WorkerListenerHandler, error) {
-	if store == nil || ready == nil || (len(config.Certificates) == 0 && config.MappingFile == "") {
+	maxClientCertLifetime, err := time.ParseDuration(config.MaxClientCertLifetime)
+	if store == nil || ready == nil || (len(config.Certificates) == 0 && config.MappingFile == "") || err != nil || maxClientCertLifetime <= 0 {
 		return nil, errors.New("worker listener dependencies are unavailable")
 	}
 	principals := make(map[string]string, len(config.Certificates))
@@ -47,7 +49,7 @@ func NewWorkerListenerHandler(config WorkerListenerConfig, store restjobs.Worker
 	if len(loggers) > 0 {
 		logger = loggers[0]
 	}
-	return &WorkerListenerHandler{store: store, principals: principals, mappingFileMode: config.MappingFile != "", ready: ready, logger: logger}, nil
+	return &WorkerListenerHandler{store: store, maxClientCertLifetime: maxClientCertLifetime, principals: principals, mappingFileMode: config.MappingFile != "", ready: ready, logger: logger}, nil
 }
 
 func (h *WorkerListenerHandler) SetMappingLookup(lookup WorkerMappingLookup) {
@@ -224,7 +226,7 @@ func (h *WorkerListenerHandler) certificatePrincipal(r *http.Request) (string, e
 	}
 	leaf := r.TLS.PeerCertificates[0]
 	now := time.Now()
-	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
+	if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) || !leaf.NotAfter.After(leaf.NotBefore) || leaf.NotAfter.Sub(leaf.NotBefore) > h.maxClientCertLifetime || leaf.NotAfter.After(leaf.NotBefore.Add(h.maxClientCertLifetime)) {
 		return "", nil
 	}
 	fingerprint := sha256.Sum256(leaf.Raw)

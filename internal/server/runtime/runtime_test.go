@@ -305,7 +305,8 @@ func TestRunRejectsMissingOrInvalidWorkerMappingsBeforeEitherListenerStarts(t *t
 				}
 			}
 			config.WorkerListener = &restserver.WorkerListenerConfig{
-				ListenAddress: "127.0.0.1:0", ServerCertFile: filepath.Join(stateDir, "server.crt"),
+				MaxClientCertLifetime: "72h",
+				ListenAddress:         "127.0.0.1:0", ServerCertFile: filepath.Join(stateDir, "server.crt"),
 				ServerKeyFile: filepath.Join(stateDir, "server.key"), ClientCAFile: filepath.Join(stateDir, "client-ca.crt"),
 				MappingFile: mappingPath,
 			}
@@ -383,7 +384,7 @@ func TestRunConfiguredGitHubIssueWebhookAndWorkerIdentityTogether(t *testing.T) 
 	if err := os.WriteFile(mappingPath, []byte(mappingData), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	config.WorkerListener = &restserver.WorkerListenerConfig{ListenAddress: workerAddress, ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath, MappingFile: mappingPath}
+	config.WorkerListener = &restserver.WorkerListenerConfig{MaxClientCertLifetime: "72h", ListenAddress: workerAddress, ServerCertFile: certPath, ServerKeyFile: keyPath, ClientCAFile: caPath, MappingFile: mappingPath}
 	var store *restjobs.SQLiteStore
 	listenerReady := make(chan net.Listener, 1)
 	workerListenerReady := make(chan net.Listener, 1)

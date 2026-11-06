@@ -41,7 +41,7 @@ func TestWorkerListenerLogsBoundedAuthenticationOutcomesWithoutCredentials(t *te
 	fingerprint := sha256.Sum256(clientCert.Certificate[0])
 	var logs strings.Builder
 	logger := log.New(&logs, "", 0)
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-log-test", Enabled: true}}}, store, func() bool { return true }, logger)
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-log-test", Enabled: true}}}, store, func() bool { return true }, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +75,90 @@ func TestWorkerListenerLogsBoundedAuthenticationOutcomesWithoutCredentials(t *te
 	}
 }
 
+func TestWorkerListenerEnforcesMaximumClientCertificateLifetimeBeforeAuthentication(t *testing.T) {
+	const maxLifetime = 72 * time.Hour
+	base := time.Now().UTC().Truncate(time.Second)
+	notBefore := base.Add(-time.Hour)
+	tests := []struct {
+		name      string
+		notBefore time.Time
+		notAfter  time.Time
+		accepted  bool
+	}{
+		{name: "exact maximum accepted", notBefore: notBefore, notAfter: notBefore.Add(maxLifetime), accepted: true},
+		{name: "one second over maximum rejected", notBefore: notBefore, notAfter: notBefore.Add(maxLifetime + time.Second)},
+		{name: "zero-length interval rejected", notBefore: notBefore, notAfter: notBefore},
+		{name: "negative-length interval rejected", notBefore: notBefore, notAfter: notBefore.Add(-time.Second)},
+	}
+	for _, mode := range []string{"inline mapping", "mapping file"} {
+		for _, test := range tests {
+			t.Run(mode+"/"+test.name, func(t *testing.T) {
+				clientCert := workerTestCertificateWithValidity(t, "lifetime-"+mode+"-"+test.name, true, test.notBefore, test.notAfter)
+				leaf := workerTestParsedCertificate(t, clientCert.Certificate[0])
+				fingerprint := sha256.Sum256(leaf.Raw)
+				store := &workerSessionStoreSpy{}
+				lookupCalls := 0
+				config := WorkerListenerConfig{MaxClientCertLifetime: maxLifetime.String()}
+				if mode == "mapping file" {
+					config.MappingFile = "configured"
+				} else {
+					config.Certificates = []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-lifetime", Enabled: true}}
+				}
+				handler, err := NewWorkerListenerHandler(config, store, func() bool { return true })
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "mapping file" {
+					handler.SetMappingLookup(workerMappingLookupFunc(func(context.Context, string) (string, bool, error) {
+						lookupCalls++
+						return "worker-lifetime", true, nil
+					}))
+				}
+
+				request := func(method, path string, body io.Reader, capability string) *httptest.ResponseRecorder {
+					t.Helper()
+					r := httptest.NewRequest(method, path, body)
+					r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+					if capability != "" {
+						r.Header.Set("Authorization", "Bearer "+capability)
+					}
+					response := httptest.NewRecorder()
+					handler.ServeHTTP(response, r)
+					return response
+				}
+				register := func() *httptest.ResponseRecorder {
+					return request(http.MethodPost, "/v1/worker/session", strings.NewReader(`{"boot_id":"boot-lifetime"}`), "")
+				}
+
+				if test.accepted {
+					response := register()
+					if response.Code != http.StatusCreated || store.registrationCalls != 1 {
+						t.Fatalf("exact-maximum certificate response=%d registrations=%d; want 201 and one registration: %s", response.Code, store.registrationCalls, response.Body.String())
+					}
+					if mode == "mapping file" && lookupCalls != 1 {
+						t.Fatalf("exact-maximum mapping lookups=%d, want 1", lookupCalls)
+					}
+					return
+				}
+
+				assertUnauthenticated := func(label string, response *httptest.ResponseRecorder) {
+					t.Helper()
+					if response.Code != http.StatusUnauthorized || strings.TrimSpace(response.Body.String()) != `{"code":"unauthenticated"}` {
+						t.Fatalf("%s response=%d %s; want generic 401 unauthenticated", label, response.Code, response.Body.String())
+					}
+				}
+				assertUnauthenticated("registration", register())
+				assertUnauthenticated("capability authentication", request(http.MethodGet, "/v1/worker/session", nil, "capability"))
+				assertUnauthenticated("capability retirement", request(http.MethodDelete, "/v1/worker/session", nil, "capability"))
+				assertUnauthenticated("session retirement", request(http.MethodDelete, "/v1/worker/session/session-id", strings.NewReader(`{"boot_id":"boot-lifetime"}`), ""))
+				if lookupCalls != 0 || store.registrationCalls != 0 || store.capabilityCalls != 0 || store.capabilityRetirementCalls != 0 || store.sessionRetirementCalls != 0 {
+					t.Fatalf("rejected certificate reached downstream handling: mapping lookups=%d registrations=%d capability authentications=%d capability retirements=%d session retirements=%d", lookupCalls, store.registrationCalls, store.capabilityCalls, store.capabilityRetirementCalls, store.sessionRetirementCalls)
+				}
+			})
+		}
+	}
+}
+
 func TestWorkerListenerRejectsClientCertificatesOutsideValidityWindowBeforeAuthentication(t *testing.T) {
 	now := time.Now()
 	tests := []struct {
@@ -91,7 +175,7 @@ func TestWorkerListenerRejectsClientCertificatesOutsideValidityWindowBeforeAuthe
 			clientCert := workerTestCertificateWithValidity(t, "validity-"+test.name, true, test.notBefore, test.notAfter)
 			lookupCalls := 0
 			store := &workerSessionStoreSpy{}
-			handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MappingFile: "configured"}, store, func() bool { return true })
+			handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", MappingFile: "configured"}, store, func() bool { return true })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,8 +219,10 @@ func TestWorkerListenerRejectsClientCertificatesOutsideValidityWindowBeforeAuthe
 
 type workerSessionStoreSpy struct {
 	restjobs.WorkerSessionStore
-	registrationCalls int
-	capabilityCalls   int
+	registrationCalls         int
+	capabilityCalls           int
+	capabilityRetirementCalls int
+	sessionRetirementCalls    int
 }
 
 func (s *workerSessionStoreSpy) RegisterWorkerSession(_ context.Context, principal, bootID string) (restjobs.WorkerSession, bool, error) {
@@ -149,6 +235,16 @@ func (s *workerSessionStoreSpy) AuthenticateWorkerCapability(context.Context, st
 	return restjobs.WorkerSession{}, restjobs.ErrNotFound
 }
 
+func (s *workerSessionStoreSpy) RetireWorkerCapability(context.Context, string, string) (restjobs.WorkerSession, error) {
+	s.capabilityRetirementCalls++
+	return restjobs.WorkerSession{}, restjobs.ErrNotFound
+}
+
+func (s *workerSessionStoreSpy) RetireWorkerSession(context.Context, string, string, string) (restjobs.WorkerSession, error) {
+	s.sessionRetirementCalls++
+	return restjobs.WorkerSession{}, restjobs.ErrNotFound
+}
+
 func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *testing.T) {
 	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-listener.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
 	if err != nil {
@@ -158,7 +254,7 @@ func TestWorkerListenerMapsExactClientCertificateAndOnlyExposesSessionRoutes(t *
 	clientCert := workerTestCertificate(t, "client", true)
 	fingerprint := sha256.Sum256(clientCert.Certificate[0])
 	wrongCert := workerTestCertificate(t, "other-client", true)
-	config := WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-one", Enabled: true}}}
+	config := WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-one", Enabled: true}}}
 	ready := true
 	handler, err := NewWorkerListenerHandler(config, store, func() bool { return ready })
 	if err != nil {
@@ -346,7 +442,7 @@ func TestWorkerSessionRoutesClassifyStoreErrorsWithoutExposingDetails(t *testing
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			store := &workerSessionErrorStore{authenticateErr: test.authenticateErr, retireCapabilityErr: test.retireCapabilityErr, retireSessionErr: test.retireSessionErr}
-			handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-errors", Enabled: true}}}, store, func() bool { return true })
+			handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-errors", Enabled: true}}}, store, func() bool { return true })
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -380,7 +476,7 @@ func TestWorkerCapabilitySessionEndpointsUseOnlyAuthenticatedOwnSession(t *testi
 	otherCert := workerTestCertificate(t, "other-session", true)
 	ownFingerprint := sha256.Sum256(ownCert.Certificate[0])
 	otherFingerprint := sha256.Sum256(otherCert.Certificate[0])
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{
 		{SHA256: hex.EncodeToString(ownFingerprint[:]), PrincipalID: "worker-own", Enabled: true},
 		{SHA256: hex.EncodeToString(otherFingerprint[:]), PrincipalID: "worker-other", Enabled: true},
 	}}, store, func() bool { return true })
@@ -517,7 +613,7 @@ func TestWorkerCapabilityUsesLiveMappingBeforeBearerAuthentication(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MappingFile: "configured"}, store, func() bool { return true })
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", MappingFile: "configured"}, store, func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -556,7 +652,7 @@ func TestWorkerMappingLookupFailureFailsClosedWithSanitized503(t *testing.T) {
 	defer store.Close()
 	clientCert := workerTestCertificate(t, "mapping-outage", true)
 	fingerprint := sha256.Sum256(clientCert.Certificate[0])
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MappingFile: "configured"}, store, func() bool { return true })
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", MappingFile: "configured"}, store, func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,7 +682,7 @@ func TestWorkerListenerInlineCertificateMappingRemainsProcessConfigured(t *testi
 	defer store.Close()
 	clientCert := workerTestCertificate(t, "inline-mapping", true)
 	digest := sha256.Sum256(clientCert.Certificate[0])
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(digest[:]), PrincipalID: "worker-inline", Enabled: true}}}, store, func() bool { return true })
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(digest[:]), PrincipalID: "worker-inline", Enabled: true}}}, store, func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -607,7 +703,7 @@ func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 	defer store.Close()
 	clientCert := workerTestCertificate(t, "capability-client", true)
 	fingerprint := sha256.Sum256(clientCert.Certificate[0])
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-capability", Enabled: true}}}, store, func() bool { return true })
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-capability", Enabled: true}}}, store, func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -643,7 +739,7 @@ func TestWorkerCapabilityRequiresBearerAndMatchingMTLSPrincipal(t *testing.T) {
 	}
 	otherCert := workerTestCertificate(t, "other", true)
 	otherFingerprint := sha256.Sum256(otherCert.Certificate[0])
-	otherHandler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(otherFingerprint[:]), PrincipalID: "worker-other", Enabled: true}}}, store, func() bool { return true })
+	otherHandler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(otherFingerprint[:]), PrincipalID: "worker-other", Enabled: true}}}, store, func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -682,7 +778,7 @@ func TestWorkerListenerTLSRejectsClientCertificateFromUntrustedCA(t *testing.T) 
 
 	fingerprint := sha256.Sum256(trustedClient.Certificate[0])
 	store := &workerSessionStoreSpy{}
-	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "trusted-worker", Enabled: true}}}, store, func() bool { return true })
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "trusted-worker", Enabled: true}}}, store, func() bool { return true })
 	if err != nil {
 		t.Fatal(err)
 	}
