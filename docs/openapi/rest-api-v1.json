@@ -3,7 +3,7 @@
   "info": {
     "title": "Factory REST Job API",
     "version": "1.13.0",
-    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Persistent UTC cron schedule definitions are available to named submitters on SQLite or PostgreSQL."
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create persistent UTC cron schedules on SQLite or PostgreSQL; a bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
     "/v1/webhooks/github/issues": {
@@ -89,7 +89,7 @@
       "get": {
         "operationId": "listSchedules",
         "summary": "List the caller\u2019s schedules",
-        "description": "Returns all persistent schedules owned by the authenticated named submitter, including paused and removed tombstones. Operators and the legacy shared key cannot manage schedules. Requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required. There is no per-owner schedule cap.",
+        "description": "Returns all persistent schedules owned by the authenticated named submitter, including paused and removed tombstones. Active schedules are dispatched in bounded batches; the oldest capacity-blocked occurrence is reported as pending and later missed occurrences are represented by a bounded skipped summary. Operators and the legacy shared key cannot manage schedules. Requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required. There is no per-owner schedule cap.",
         "security": [
           {
             "bearerAuth": []
@@ -133,7 +133,7 @@
       "post": {
         "operationId": "createSchedule",
         "summary": "Create a recurring schedule",
-        "description": "Creates an active persistent schedule. Idempotency-Key is required and scoped to the named submitter; matching retries return the original schedule and changed requests conflict. The body accepts only cron, repository, and task. Cron uses exactly five fields (minute hour day-of-month month day-of-week), UTC only, DOM/DOW OR when both are restricted, and one-minute minimum granularity. Occurrences start at the next matching UTC minute strictly after creation. A schedule definition does not dispatch Jobs. Requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required.",
+        "description": "Creates an active persistent schedule. Idempotency-Key is required and scoped to the named submitter; matching retries return the original schedule and changed requests conflict. The body accepts only cron, repository, and task. Cron uses exactly five fields (minute hour day-of-month month day-of-week), UTC only, DOM/DOW OR when both are restricted, and one-minute minimum granularity. Occurrences start at the next matching UTC minute strictly after creation. A bounded server dispatcher admits due occurrences as standalone Jobs. The oldest due occurrence remains pending if queue or retained-record capacity is full, while later missed occurrences are summarized as skipped. Dispatch requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required.",
         "security": [
           {
             "bearerAuth": []
@@ -267,7 +267,7 @@
       "patch": {
         "operationId": "mutateSchedule",
         "summary": "Edit, pause, or resume an owned schedule",
-        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Every successful mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Each mutation changes future occurrences only; Jobs already admitted remain unchanged. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
+        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Every successful user mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Mutation serializes on the schedule row with dispatch: if dispatch commits first, that old-revision occurrence remains immutable and the mutation proceeds when its If-Match revision is still current; cursor advancement does not change the user revision. If mutation commits first, the old occurrence is excluded. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
         "security": [
           {
             "bearerAuth": []
@@ -1006,6 +1006,7 @@
       },
       "Schedule": {
         "type": "object",
+        "description": "Owner-scoped schedule view. Pending and skipped fields are bounded dispatch summaries; internal cursor and bookkeeping fields are not exposed.",
         "required": [
           "id",
           "owner",
@@ -1053,8 +1054,27 @@
           "updated_at": {
             "type": "string",
             "format": "date-time"
+          },
+          "pending_occurrence_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Oldest occurrence retained for retry when queue or record capacity blocked admission. Omitted when no occurrence is pending."
+          },
+          "skipped_occurrences": {
+            "$ref": "#/components/schemas/SkippedScheduleOccurrences"
           }
         }
+      },
+      "SkippedScheduleOccurrences": {
+        "type": "object",
+        "required": ["revision", "first_at", "last_at", "count"],
+        "properties": {
+          "revision": { "type": "integer", "format": "int64", "minimum": 1 },
+          "first_at": { "type": "string", "format": "date-time" },
+          "last_at": { "type": "string", "format": "date-time" },
+          "count": { "type": "integer", "format": "int64", "minimum": 1 }
+        },
+        "description": "Compact summary of skipped occurrences for one schedule revision; later missed occurrences are not queued as backlog."
       },
       "ScheduleList": {
         "type": "object",

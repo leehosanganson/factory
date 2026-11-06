@@ -1,6 +1,7 @@
 package restjobs
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -55,8 +56,12 @@ func (s *PostgresStore) CreateSchedule(owner, key string, input ScheduleInput) (
 		return Schedule{}, false, err
 	}
 	now := time.Now().UTC()
-	schedule := Schedule{ID: id, Owner: owner, Cron: input.Cron, Repository: input.Repository, Task: input.Task, Status: ScheduleActive, Revision: 1, CreatedAt: now, UpdatedAt: now}
-	if _, err = tx.Exec(`INSERT INTO factory_schedules(id,owner,cron,repository,task,status,revision,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, owner, input.Cron, input.Repository, input.Task, schedule.Status, schedule.Revision, now, now); err != nil {
+	nextOccurrence, err := NextScheduleOccurrence(input.Cron, now)
+	if err != nil {
+		return Schedule{}, false, ErrInvalidInput
+	}
+	schedule := Schedule{ID: id, Owner: owner, Cron: input.Cron, Repository: input.Repository, Task: input.Task, Status: ScheduleActive, Revision: 1, CreatedAt: now, UpdatedAt: now, nextOccurrenceAt: nextOccurrence, skippedRevision: 1}
+	if _, err = tx.Exec(`INSERT INTO factory_schedules(id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,skipped_revision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$7)`, id, owner, input.Cron, input.Repository, input.Task, schedule.Status, schedule.Revision, now, now, nextOccurrence); err != nil {
 		return Schedule{}, false, errors.New("create PostgreSQL schedule")
 	}
 	if _, err = tx.Exec(`INSERT INTO factory_schedule_idempotency(owner,idempotency_key,schedule_id,request_json) VALUES($1,$2,$3,$4)`, owner, key, id, string(request)); err != nil {
@@ -81,7 +86,7 @@ func (s *PostgresStore) ListSchedules(owner string) ([]Schedule, error) {
 	if err != nil {
 		return nil, ErrInvalidInput
 	}
-	rows, err := s.db.Query(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at FROM factory_schedules WHERE owner=$1 ORDER BY created_at,id`, owner)
+	rows, err := s.db.Query(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,pending_occurrence_at,skipped_revision,skipped_first_at,skipped_last_at,skipped_count FROM factory_schedules WHERE owner=$1 ORDER BY created_at,id`, owner)
 	if err != nil {
 		return nil, errors.New("list PostgreSQL schedules")
 	}
@@ -132,9 +137,12 @@ func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutatio
 		return Schedule{}, errors.New("PostgreSQL schedule store unavailable")
 	}
 	defer tx.Rollback()
-	schedule, err := getPostgresSchedule(tx, id)
+	schedule, err := scanPostgresSchedule(tx.QueryRow(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,pending_occurrence_at,skipped_revision,skipped_first_at,skipped_last_at,skipped_count FROM factory_schedules WHERE id=$1 FOR UPDATE`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Schedule{}, ErrNotFound
+	}
 	if err != nil {
-		return Schedule{}, err
+		return Schedule{}, errors.New("lock PostgreSQL schedule mutation")
 	}
 	if schedule.Owner != owner {
 		return Schedule{}, ErrNotFound
@@ -168,11 +176,20 @@ func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutatio
 	}
 	schedule.Revision++
 	schedule.UpdatedAt = time.Now().UTC()
+	if mutation == ScheduleEdit || mutation == ScheduleResume || mutation == SchedulePause || mutation == ScheduleRemove {
+		schedule.nextOccurrenceAt, err = NextScheduleOccurrence(schedule.Cron, schedule.UpdatedAt)
+		if err != nil {
+			return Schedule{}, ErrInvalidInput
+		}
+		schedule.Skipped = nil
+		schedule.pendingOccurrenceAt = nil
+		schedule.skippedRevision, schedule.skippedFirstAt, schedule.skippedLastAt, schedule.skippedCount = schedule.Revision, nil, nil, 0
+	}
 	var result sql.Result
 	if mutation == ScheduleEdit {
-		result, err = tx.Exec(`UPDATE factory_schedules SET cron=$1,repository=$2,task=$3,status=$4,revision=$5,updated_at=$6 WHERE id=$7 AND owner=$8 AND revision=$9`, schedule.Cron, schedule.Repository, schedule.Task, schedule.Status, schedule.Revision, schedule.UpdatedAt, id, owner, revision)
+		result, err = tx.Exec(`UPDATE factory_schedules SET cron=$1,repository=$2,task=$3,status=$4,revision=$5,updated_at=$6,next_occurrence_at=$7,pending_occurrence_at=NULL,skipped_revision=$5,skipped_first_at=NULL,skipped_last_at=NULL,skipped_count=0 WHERE id=$8 AND owner=$9 AND revision=$10`, schedule.Cron, schedule.Repository, schedule.Task, schedule.Status, schedule.Revision, schedule.UpdatedAt, schedule.nextOccurrenceAt, id, owner, revision)
 	} else {
-		result, err = tx.Exec(`UPDATE factory_schedules SET status=$1,revision=$2,updated_at=$3 WHERE id=$4 AND owner=$5 AND revision=$6`, schedule.Status, schedule.Revision, schedule.UpdatedAt, id, owner, revision)
+		result, err = tx.Exec(`UPDATE factory_schedules SET status=$1,revision=$2,updated_at=$3,next_occurrence_at=$4,pending_occurrence_at=NULL,skipped_revision=$2,skipped_first_at=NULL,skipped_last_at=NULL,skipped_count=0 WHERE id=$5 AND owner=$6 AND revision=$7`, schedule.Status, schedule.Revision, schedule.UpdatedAt, schedule.nextOccurrenceAt, id, owner, revision)
 	}
 	if err != nil {
 		return Schedule{}, errors.New("update PostgreSQL schedule")
@@ -187,10 +204,52 @@ func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutatio
 	return schedule, nil
 }
 
+func (s *PostgresStore) backfillScheduleCursors(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dbClosed {
+		return ErrManagerClosed
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id,cron,updated_at FROM factory_schedules WHERE next_occurrence_at IS NULL`)
+	if err != nil {
+		return errors.New("read PostgreSQL schedules missing occurrence cursors")
+	}
+	type cursor struct {
+		id, cron string
+		updated  time.Time
+	}
+	var missing []cursor
+	for rows.Next() {
+		var item cursor
+		if err := rows.Scan(&item.id, &item.cron, &item.updated); err != nil {
+			rows.Close()
+			return errors.New("read PostgreSQL schedule cursor")
+		}
+		missing = append(missing, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return errors.New("read PostgreSQL schedule cursor")
+	}
+	if err := rows.Close(); err != nil {
+		return errors.New("close PostgreSQL schedule cursors")
+	}
+	for _, item := range missing {
+		next, err := NextScheduleOccurrence(item.cron, item.updated)
+		if err != nil {
+			return errors.New("calculate PostgreSQL schedule cursor")
+		}
+		if _, err := s.db.ExecContext(ctx, `UPDATE factory_schedules SET next_occurrence_at=$1,skipped_revision=revision WHERE id=$2 AND next_occurrence_at IS NULL`, next, item.id); err != nil {
+			return errors.New("backfill PostgreSQL schedule cursor")
+		}
+	}
+	return nil
+}
+
 type postgresScheduleQuery interface{ QueryRow(string, ...any) *sql.Row }
 
 func getPostgresSchedule(query postgresScheduleQuery, id string) (Schedule, error) {
-	schedule, err := scanPostgresSchedule(query.QueryRow(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at FROM factory_schedules WHERE id=$1`, id))
+	schedule, err := scanPostgresSchedule(query.QueryRow(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,pending_occurrence_at,skipped_revision,skipped_first_at,skipped_last_at,skipped_count FROM factory_schedules WHERE id=$1`, id))
 	if err != nil {
 		return Schedule{}, ErrNotFound
 	}
@@ -199,11 +258,28 @@ func getPostgresSchedule(query postgresScheduleQuery, id string) (Schedule, erro
 func scanPostgresSchedule(row scheduleRow) (Schedule, error) {
 	var schedule Schedule
 	var status string
-	if err := row.Scan(&schedule.ID, &schedule.Owner, &schedule.Cron, &schedule.Repository, &schedule.Task, &status, &schedule.Revision, &schedule.CreatedAt, &schedule.UpdatedAt); err != nil {
+	var pending, skippedFirst, skippedLast sql.NullTime
+	if err := row.Scan(&schedule.ID, &schedule.Owner, &schedule.Cron, &schedule.Repository, &schedule.Task, &status, &schedule.Revision, &schedule.CreatedAt, &schedule.UpdatedAt, &schedule.nextOccurrenceAt, &pending, &schedule.skippedRevision, &skippedFirst, &skippedLast, &schedule.skippedCount); err != nil {
 		return Schedule{}, err
 	}
 	schedule.Status = ScheduleStatus(status)
 	schedule.CreatedAt = schedule.CreatedAt.UTC()
 	schedule.UpdatedAt = schedule.UpdatedAt.UTC()
+	schedule.nextOccurrenceAt = schedule.nextOccurrenceAt.UTC()
+	if pending.Valid {
+		value := pending.Time.UTC()
+		schedule.pendingOccurrenceAt = &value
+	}
+	if skippedFirst.Valid {
+		value := skippedFirst.Time.UTC()
+		schedule.skippedFirstAt = &value
+	}
+	if skippedLast.Valid {
+		value := skippedLast.Time.UTC()
+		schedule.skippedLastAt = &value
+	}
+	if schedule.skippedCount > 0 && schedule.skippedFirstAt != nil && schedule.skippedLastAt != nil {
+		schedule.Skipped = &SkippedScheduleOccurrences{Revision: schedule.skippedRevision, FirstAt: *schedule.skippedFirstAt, LastAt: *schedule.skippedLastAt, Count: schedule.skippedCount}
+	}
 	return schedule, nil
 }

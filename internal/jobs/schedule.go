@@ -1,6 +1,7 @@
 package restjobs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -27,15 +28,22 @@ const (
 )
 
 type Schedule struct {
-	ID         string         `json:"id"`
-	Owner      string         `json:"owner"`
-	Cron       string         `json:"cron"`
-	Repository string         `json:"repository"`
-	Task       string         `json:"task"`
-	Status     ScheduleStatus `json:"status"`
-	Revision   int64          `json:"revision"`
-	CreatedAt  time.Time      `json:"created_at"`
-	UpdatedAt  time.Time      `json:"updated_at"`
+	ID                  string                      `json:"id"`
+	Owner               string                      `json:"owner"`
+	Cron                string                      `json:"cron"`
+	Repository          string                      `json:"repository"`
+	Task                string                      `json:"task"`
+	Status              ScheduleStatus              `json:"status"`
+	Revision            int64                       `json:"revision"`
+	CreatedAt           time.Time                   `json:"created_at"`
+	UpdatedAt           time.Time                   `json:"updated_at"`
+	Skipped             *SkippedScheduleOccurrences `json:"skipped_occurrences,omitempty"`
+	nextOccurrenceAt    time.Time
+	pendingOccurrenceAt *time.Time
+	skippedRevision     int64
+	skippedFirstAt      *time.Time
+	skippedLastAt       *time.Time
+	skippedCount        int64
 }
 
 type ScheduleStore interface {
@@ -43,6 +51,40 @@ type ScheduleStore interface {
 	GetSchedule(id string) (Schedule, error)
 	ListSchedules(owner string) ([]Schedule, error)
 	MutateSchedule(id, owner string, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error)
+}
+
+type ScheduleDispatcher interface {
+	DispatchScheduleOccurrences(context.Context, time.Time, int) error
+}
+
+type ScheduleBatchDispatcher interface {
+	DispatchDueScheduleOccurrences(context.Context, time.Time, int) error
+}
+
+type SkippedScheduleOccurrences struct {
+	Revision int64     `json:"revision"`
+	FirstAt  time.Time `json:"first_at"`
+	LastAt   time.Time `json:"last_at"`
+	Count    int64     `json:"count"`
+}
+
+func (s Schedule) NextOccurrence() time.Time { return s.nextOccurrenceAt }
+func (s Schedule) PendingOccurrence() *time.Time {
+	if s.pendingOccurrenceAt == nil {
+		return nil
+	}
+	value := *s.pendingOccurrenceAt
+	return &value
+}
+func (s Schedule) SkippedOccurrences() *SkippedScheduleOccurrences {
+	if s.Skipped != nil {
+		value := *s.Skipped
+		return &value
+	}
+	if s.skippedCount == 0 || s.skippedFirstAt == nil || s.skippedLastAt == nil {
+		return nil
+	}
+	return &SkippedScheduleOccurrences{Revision: s.skippedRevision, FirstAt: *s.skippedFirstAt, LastAt: *s.skippedLastAt, Count: s.skippedCount}
 }
 
 const maxScheduleCronLength = 128

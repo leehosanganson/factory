@@ -37,6 +37,27 @@ func (f runtimeExecutor) Execute(ctx context.Context, request restjobs.Snapshot)
 	return f(ctx, request)
 }
 
+type scheduleDispatchProbe struct {
+	calls  atomic.Int32
+	errors atomic.Int32
+	called chan struct{}
+}
+
+func (p *scheduleDispatchProbe) DispatchDueScheduleOccurrences(ctx context.Context, _ time.Time, limit int) error {
+	if limit != maxScheduleDispatchBatch {
+		return errors.New("unexpected schedule batch size")
+	}
+	call := p.calls.Add(1)
+	select {
+	case p.called <- struct{}{}:
+	default:
+	}
+	if call == 1 {
+		return errors.New("store unavailable")
+	}
+	return nil
+}
+
 type readinessStore struct {
 	restjobs.Store
 	up atomic.Bool
@@ -78,6 +99,35 @@ func (p *readinessPublisher) Ping(context.Context) error {
 
 func (p *readinessPublisher) Publish(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
 	return restprovider.Outcome{}, errors.New("not used in readiness test")
+}
+
+func TestScheduleDispatcherPollRetriesAndStopsOnShutdown(t *testing.T) {
+	probe := &scheduleDispatchProbe{errors: atomic.Int32{}, called: make(chan struct{}, 8)}
+	probe.errors.Store(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go dispatchSchedules(ctx, done, probe, time.Millisecond, log.New(io.Discard, "", 0))
+	select {
+	case <-probe.called:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not poll")
+	}
+	select {
+	case <-probe.called:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not retry after store error")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dispatcher did not stop after cancellation")
+	}
+	calls := probe.calls.Load()
+	time.Sleep(10 * time.Millisecond)
+	if calls != 2 || probe.calls.Load() != calls {
+		t.Fatalf("dispatcher calls after shutdown=%d, want no further poll", probe.calls.Load())
+	}
 }
 
 func TestRunWorkersDisabledListenerFailureClosesStoreAndSanitizesError(t *testing.T) {

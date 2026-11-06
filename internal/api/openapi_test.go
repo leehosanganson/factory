@@ -30,6 +30,40 @@ func isOpenAPI3Version(version string) bool {
 	return err == nil && major == 3
 }
 
+func TestScheduleOpenAPIExposesDispatchStateWithoutInternalFields(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Info struct {
+			Description string `json:"description"`
+		} `json:"info"`
+		Components struct {
+			Schemas map[string]struct {
+				Properties map[string]json.RawMessage `json:"properties"`
+			} `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(document.Info.Description, "dispatcher admits due occurrences") {
+		t.Errorf("API-level description does not describe implemented schedule dispatch: %q", document.Info.Description)
+	}
+	properties := document.Components.Schemas["Schedule"].Properties
+	for _, field := range []string{"pending_occurrence_at", "skipped_occurrences"} {
+		if _, ok := properties[field]; !ok {
+			t.Errorf("Schedule schema lacks %q", field)
+		}
+	}
+	for _, field := range []string{"next_occurrence_at", "skipped_revision", "skipped_count"} {
+		if _, ok := properties[field]; ok {
+			t.Errorf("Schedule schema exposes internal field %q", field)
+		}
+	}
+}
+
 func TestScheduleOpenAPICronLengthMatchesServerValidation(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
 	if err != nil {

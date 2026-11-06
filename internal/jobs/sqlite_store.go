@@ -83,6 +83,10 @@ func OpenSQLiteStore(path string, config Config) (*SQLiteStore, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	if err := store.backfillScheduleCursors(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := ensureProviderColumn(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err

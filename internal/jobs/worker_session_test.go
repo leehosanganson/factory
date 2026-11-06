@@ -329,6 +329,64 @@ func TestWorkerSessionStoreRejectsInvalidIdentityAndUnknownRetirement(t *testing
 	}
 }
 
+func TestSQLiteScheduleDispatchMigrationBackfillsOldScheduleRows(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "schedule-upgrade.db")
+	dsn, err := sqliteDSN(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ensurePrivateSQLiteFile(path); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files, err := MigrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE factory_schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for index, name := range files[:20] {
+		payload, readErr := migrationFiles.ReadFile(name)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		tx, beginErr := db.Begin()
+		if beginErr != nil {
+			t.Fatal(beginErr)
+		}
+		if _, err := tx.Exec(string(payload)); err != nil {
+			t.Fatalf("apply legacy migration %s: %v", name, err)
+		}
+		if _, err := tx.Exec(`INSERT INTO factory_schema_migrations(version,name,applied_at) VALUES(?,?,?)`, index+1, filepath.Base(name), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer db.Close()
+	created := time.Now().UTC().Truncate(time.Minute).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO factory_schedules(id,owner,cron,repository,task,status,revision,created_at,updated_at) VALUES('old-schedule','alice','* * * * *','widget','task','active',3,?,?)`, created, created); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenSQLiteStore(path, Config{QueueCapacity: 32, MaxConcurrentJobs: 2, MaxRecords: 1000, MaxEventsPerJob: 200, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, err := store.GetSchedule("old-schedule")
+	if err != nil || !schedule.NextOccurrence().After(schedule.UpdatedAt) {
+		t.Fatalf("upgraded schedule=(%+v,%v)", schedule, err)
+	}
+}
+
 func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "pre-v15.db")
 	dsn, err := sqliteDSN(path)
@@ -394,8 +452,8 @@ func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	}
 	defer store.CloseStore()
 	var version int
-	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 20 {
-		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 20", version, err)
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 21 {
+		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 21", version, err)
 	}
 	var retainedAudit int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
@@ -479,8 +537,8 @@ func TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.CloseStore() })
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 17 {
-		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 17", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 18 {
+		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 18", version, err)
 	}
 	var retainedAudit int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
