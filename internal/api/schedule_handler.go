@@ -9,10 +9,34 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	restjobs "github.com/leehosanganson/factory/internal/jobs"
 	restserver "github.com/leehosanganson/factory/internal/server"
 )
+
+type scheduleResponse struct {
+	ID                string                               `json:"id"`
+	Owner             string                               `json:"owner"`
+	Cron              string                               `json:"cron"`
+	Repository        string                               `json:"repository"`
+	Task              string                               `json:"task"`
+	Status            restjobs.ScheduleStatus              `json:"status"`
+	Revision          int64                                `json:"revision"`
+	CreatedAt         time.Time                            `json:"created_at"`
+	UpdatedAt         time.Time                            `json:"updated_at"`
+	PendingOccurrence *time.Time                           `json:"pending_occurrence_at,omitempty"`
+	Skipped           *restjobs.SkippedScheduleOccurrences `json:"skipped_occurrences,omitempty"`
+}
+
+func scheduleView(schedule restjobs.Schedule) scheduleResponse {
+	return scheduleResponse{
+		ID: schedule.ID, Owner: schedule.Owner, Cron: schedule.Cron, Repository: schedule.Repository,
+		Task: schedule.Task, Status: schedule.Status, Revision: schedule.Revision,
+		CreatedAt: schedule.CreatedAt, UpdatedAt: schedule.UpdatedAt,
+		PendingOccurrence: schedule.PendingOccurrence(), Skipped: schedule.SkippedOccurrences(),
+	}
+}
 
 func (h *Handler) scheduleStore(w http.ResponseWriter) (restjobs.ScheduleStore, bool) {
 	store, ok := h.manager.(restjobs.ScheduleStore)
@@ -38,9 +62,13 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 			h.writeManagerError(w, err)
 			return
 		}
+		response := make([]scheduleResponse, 0, len(schedules))
+		for _, schedule := range schedules {
+			response = append(response, scheduleView(schedule))
+		}
 		writeJSON(w, http.StatusOK, struct {
-			Schedules []restjobs.Schedule `json:"schedules"`
-		}{schedules})
+			Schedules []scheduleResponse `json:"schedules"`
+		}{response})
 	case http.MethodPost:
 		h.createSchedule(w, r, caller, store)
 	default:
@@ -64,7 +92,7 @@ func (h *Handler) handleSchedule(w http.ResponseWriter, r *http.Request, id stri
 			return
 		}
 		setScheduleETag(w, schedule)
-		writeJSON(w, http.StatusOK, schedule)
+		writeJSON(w, http.StatusOK, scheduleView(schedule))
 	case http.MethodPatch:
 		h.mutateSchedule(w, r, id, caller, store)
 	case http.MethodDelete:
@@ -106,9 +134,9 @@ func (h *Handler) createSchedule(w http.ResponseWriter, r *http.Request, caller 
 		status = http.StatusOK
 	}
 	writeJSON(w, status, struct {
-		Schedule restjobs.Schedule `json:"schedule"`
-		Replayed bool              `json:"replayed"`
-	}{schedule, replayed})
+		Schedule scheduleResponse `json:"schedule"`
+		Replayed bool             `json:"replayed"`
+	}{scheduleView(schedule), replayed})
 }
 func (h *Handler) mutateSchedule(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal, store restjobs.ScheduleStore) {
 	revision, ok := scheduleIfMatch(w, r)
@@ -152,7 +180,7 @@ func (h *Handler) mutateSchedule(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	setScheduleETag(w, schedule)
-	writeJSON(w, http.StatusOK, schedule)
+	writeJSON(w, http.StatusOK, scheduleView(schedule))
 }
 func (h *Handler) removeSchedule(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal, store restjobs.ScheduleStore) {
 	revision, ok := scheduleIfMatch(w, r)
@@ -169,7 +197,7 @@ func (h *Handler) removeSchedule(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	setScheduleETag(w, schedule)
-	writeJSON(w, http.StatusOK, schedule)
+	writeJSON(w, http.StatusOK, scheduleView(schedule))
 }
 func scheduleIfMatch(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	values := r.Header.Values("If-Match")

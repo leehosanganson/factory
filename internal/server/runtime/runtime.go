@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/leehosanganson/factory/internal/api"
-	"github.com/leehosanganson/factory/internal/jobs"
+	restjobs "github.com/leehosanganson/factory/internal/jobs"
 	"github.com/leehosanganson/factory/internal/provider"
 	"github.com/leehosanganson/factory/internal/server"
 	"github.com/leehosanganson/factory/internal/web"
@@ -49,6 +49,7 @@ type runtimeOptions struct {
 	WorkspaceGit    func(context.Context, string, ...string) error
 	WorkspaceNow    func() time.Time
 	SweepInterval   time.Duration
+	SchedulePoll    time.Duration
 }
 
 type providerReconciliationStore interface {
@@ -211,6 +212,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			closeStore()
 			return fmt.Errorf("initialize REST workflow executor: %w", err)
 		}
+	}
+	var scheduleDispatcher restjobs.ScheduleBatchDispatcher
+	if dispatcher, ok := store.(restjobs.ScheduleBatchDispatcher); ok {
+		scheduleDispatcher = dispatcher
 	}
 	var ready atomic.Bool
 	var readyCheck func(context.Context) error
@@ -508,6 +513,9 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	serveDone := make(chan error, 2)
 	go func() { serveDone <- server.Serve(listener) }()
+	scheduleCtx, cancelSchedules := context.WithCancel(context.Background())
+	scheduleDone := make(chan struct{})
+	go dispatchSchedules(scheduleCtx, scheduleDone, scheduleDispatcher, options.SchedulePoll, logger)
 	if workerServer != nil {
 		go func() { serveDone <- workerServer.Serve(workerListener) }()
 	}
@@ -540,6 +548,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
 	defer cancel()
 	ready.Store(false)
+	cancelSchedules()
 	var workerDone chan error
 	if coordinator != nil {
 		workerDone = make(chan error, 1)
@@ -547,6 +556,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	cancelSweep()
 	sweepErr := waitForSweep(shutdownCtx, sweepDone)
+	scheduleErr := waitForSweep(shutdownCtx, scheduleDone)
 	var httpServers []*http.Server
 	httpServers = append(httpServers, server)
 	if workerServer != nil {
@@ -583,6 +593,9 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	}
 	if sweepErr != nil {
 		return fmt.Errorf("stop REST workspace sweeper: %w", sweepErr)
+	}
+	if scheduleErr != nil {
+		return fmt.Errorf("stop REST schedule dispatcher: %w", scheduleErr)
 	}
 	return nil
 }
@@ -683,6 +696,43 @@ func repositoryAliases(repositories map[string]string) map[string]struct{} {
 	}
 	return aliases
 }
+
+func dispatchSchedules(ctx context.Context, done chan<- struct{}, dispatcher restjobs.ScheduleBatchDispatcher, interval time.Duration, logger *log.Logger) {
+	defer close(done)
+	if dispatcher == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Second
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	backoff := interval
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			workCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := dispatcher.DispatchDueScheduleOccurrences(workCtx, time.Now().UTC(), maxScheduleDispatchBatch)
+			cancel()
+			if err != nil && !errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				logger.Printf("REST schedule dispatch failed; durable cursor will be retried")
+				if backoff < 30*time.Second {
+					backoff *= 2
+					if backoff > 30*time.Second {
+						backoff = 30 * time.Second
+					}
+				}
+			} else {
+				backoff = interval
+			}
+			timer.Reset(backoff)
+		}
+	}
+}
+
+const maxScheduleDispatchBatch = 32
 
 func sweepWorkspaces(ctx context.Context, done chan<- struct{}, managers map[string]*restworkspace.Manager, logger *log.Logger, interval time.Duration) {
 	defer close(done)

@@ -3,11 +3,15 @@ package restjobs
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"os"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 func TestPostgresStoreIntegration(t *testing.T) {
@@ -640,6 +644,146 @@ func TestPostgresStoreIntegration(t *testing.T) {
 	})
 }
 
+type failAfterCommitDriver struct{ base driver.Driver }
+type failAfterCommitConn struct{ driver.Conn }
+type failAfterCommitTx struct{ driver.Tx }
+
+func (d failAfterCommitDriver) Open(name string) (driver.Conn, error) {
+	conn, err := d.base.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return failAfterCommitConn{Conn: conn}, nil
+}
+func (c failAfterCommitConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	conn, ok := c.Conn.(driver.ConnBeginTx)
+	if !ok {
+		return nil, errors.New("underlying driver does not support BeginTx")
+	}
+	tx, err := conn.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	return failAfterCommitTx{Tx: tx}, nil
+}
+func (tx failAfterCommitTx) Commit() error {
+	if err := tx.Tx.Commit(); err != nil {
+		return err
+	}
+	return errors.New("injected response loss after successful commit")
+}
+
+func TestPostgresScheduleDispatchRetryAfterLostCommitResponseDoesNotDuplicate(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL ambiguous-commit schedule test")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := scopedPostgresDB(t, admin, dsn)
+	schema := currentTestSchema(t, db)
+	config := testConfig()
+	store, err := NewPostgresStore(db, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, _, err := store.CreateSchedule("alice", "ambiguous-schedule", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "ambiguous scheduled Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if _, err := db.Exec(`UPDATE factory_schedules SET next_occurrence_at=$1 WHERE id=$2`, occurrence, schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+	name := "factory-fail-after-commit-response"
+	sql.Register(name, failAfterCommitDriver{base: stdlib.GetDefaultDriver()})
+	pgConfig, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pgConfig.RuntimeParams["search_path"] = schema
+	uncertainDB, err := sql.Open(name, pgConfig.ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uncertainDB.Close()
+	uncertainStore := &PostgresStore{db: uncertainDB, config: config, recoveryNeeded: make(map[string]struct{})}
+	if err := uncertainStore.DispatchDueScheduleOccurrences(context.Background(), occurrence, 1); err == nil {
+		t.Fatal("first dispatch result unexpectedly succeeded; driver must fail after committing")
+	}
+	if err := store.DispatchDueScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatalf("retry after uncertain commit response: %v", err)
+	}
+	page, err := store.ListJobs(context.Background(), 0, 0, 8)
+	if err != nil || len(page.Jobs) != 1 {
+		t.Fatalf("Jobs after ambiguous retry=(%d,%v); want exactly one", len(page.Jobs), err)
+	}
+	job, err := store.Get(page.Jobs[0].ID)
+	if err != nil || job.Request.Task != "ambiguous scheduled Job" {
+		t.Fatalf("committed scheduled Job=(%+v,%v)", job, err)
+	}
+}
+
+func TestPostgresScheduleRegistryFullRetainsPendingOccurrence(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule capacity tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := scopedPostgresDB(t, admin, dsn)
+	config := testConfig()
+	config.QueueCapacity, config.MaxConcurrentJobs, config.MaxRecords = 4, 1, 4
+	store, err := NewPostgresStore(db, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	for i := range 4 {
+		job, _, err := store.AdmitAs("fill-"+string(rune('a'+i)), "alice", Request{Repository: "widget", Task: "fills retained registry"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, err := store.ClaimNextAttempt()
+		if err != nil || claim.Job.ID != job.ID {
+			t.Fatalf("claim=%+v err=%v", claim, err)
+		}
+		if err := store.FinishAttempt(claim.Attempt, StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+	}
+	schedule, _, err := store.CreateSchedule("alice", "registry-full", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "scheduled Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if _, err := db.Exec(`UPDATE factory_schedules SET next_occurrence_at=$1 WHERE id=$2`, occurrence, schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchDueScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetSchedule(schedule.ID)
+	if err != nil || got.PendingOccurrence() == nil || !got.PendingOccurrence().Equal(occurrence) {
+		t.Fatalf("pending occurrence=(%+v,%v); want %s", got.PendingOccurrence(), err, occurrence)
+	}
+	page, err := store.ListJobs(context.Background(), 0, 0, 8)
+	if err != nil || len(page.Jobs) != 4 {
+		t.Fatalf("retained Jobs=(%d,%v); want four capacity-filling records", len(page.Jobs), err)
+	}
+}
+
 func TestPostgresScheduleStorePersistsAndEnforcesRevision(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {
@@ -671,6 +815,232 @@ func TestPostgresScheduleStorePersistsAndEnforcesRevision(t *testing.T) {
 	}
 	if got, err := store.GetSchedule(created.ID); err != nil || got.Status != SchedulePaused {
 		t.Fatalf("read schedule=(%+v,%v)", got, err)
+	}
+}
+
+func TestPostgresScheduleOccurrenceAdmissionIsAtomicAcrossIndependentStores(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL for PostgreSQL schedule occurrence tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db1 := scopedPostgresDB(t, admin, dsn)
+	schema := currentTestSchema(t, db1)
+	db2 := postgresDBForSchema(t, dsn, schema)
+	config := testConfig()
+	config.QueueCapacity, config.MaxConcurrentJobs, config.MaxRecords = 8, 2, 16
+	first, err := NewPostgresStore(db1, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewPostgresStore(db2, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if first != nil {
+			_ = first.CloseStore()
+		}
+	}()
+	defer second.CloseStore()
+	schedule, _, err := first.CreateSchedule("alice", "occurrence", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "one occurrence"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if _, err := db1.Exec(`UPDATE factory_schedules SET next_occurrence_at=$1 WHERE id=$2`, occurrence, schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, store := range []*PostgresStore{first, second} {
+		go func(store *PostgresStore) {
+			<-start
+			errs <- store.DispatchDueScheduleOccurrences(context.Background(), occurrence, 16)
+		}(store)
+	}
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	jobs, err := first.ListJobs(context.Background(), 0, 0, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs.Jobs) != 1 {
+		t.Fatalf("jobs=%d, want exactly one occurrence Job", len(jobs.Jobs))
+	}
+	if err := first.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	first = nil
+	first, err = NewPostgresStore(postgresDBForSchema(t, dsn, schema), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := first.GetSchedule(schedule.ID)
+	if err != nil || reopened.PendingOccurrence() != nil || reopened.NextOccurrence().Before(occurrence) {
+		t.Fatalf("reopened schedule=(%+v,%v)", reopened, err)
+	}
+	job, err := second.Get(jobs.Jobs[0].ID)
+	if err != nil || job.Submitter != "alice" || job.Request.Task != "one occurrence" {
+		t.Fatalf("job=(%+v,%v)", job, err)
+	}
+}
+
+func TestPostgresScheduleMutationAndDispatchSerializeWithCurrentRevision(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule mutation tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := scopedPostgresDB(t, admin, dsn)
+	config := testConfig()
+	config.QueueCapacity, config.MaxConcurrentJobs, config.MaxRecords = 4, 1, 8
+	store, err := NewPostgresStore(db, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, _, err := store.CreateSchedule("alice", "schedule-race", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "old task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if _, err := db.Exec(`UPDATE factory_schedules SET next_occurrence_at=$1 WHERE id=$2`, occurrence, schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	type outcome struct {
+		mutation bool
+		err      error
+	}
+	results := make(chan outcome, 2)
+	go func() {
+		<-start
+		_, err := store.MutateSchedule(schedule.ID, "alice", schedule.Revision, ScheduleEdit, &ScheduleInput{Cron: "0 9 * * *", Repository: "widget", Task: "new task"})
+		results <- outcome{mutation: true, err: err}
+	}()
+	go func() {
+		<-start
+		results <- outcome{err: store.DispatchDueScheduleOccurrences(context.Background(), occurrence, 1)}
+	}()
+	close(start)
+	for range 2 {
+		if result := <-results; result.err != nil {
+			t.Fatalf("race participant (mutation=%t) failed: %v", result.mutation, result.err)
+		}
+	}
+	current, err := store.GetSchedule(schedule.ID)
+	if err != nil || current.Revision != schedule.Revision+1 || current.Task != "new task" {
+		t.Fatalf("schedule after race=(%+v,%v); want user edit at revision 2", current, err)
+	}
+	page, err := store.ListJobs(context.Background(), 0, 0, 8)
+	if err != nil || len(page.Jobs) > 1 {
+		t.Fatalf("jobs after race=(%+v,%v); want zero or one old occurrence", page.Jobs, err)
+	}
+	if len(page.Jobs) == 1 {
+		job, err := store.Get(page.Jobs[0].ID)
+		if err != nil || job.Request.Task != "old task" {
+			t.Fatalf("committed occurrence=(%+v,%v); want immutable old task", job, err)
+		}
+	}
+}
+
+func TestPostgresThreadAdmissionAndDispatchShareCapacityGate(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL admission concurrency tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db1 := scopedPostgresDB(t, admin, dsn)
+	schema := currentTestSchema(t, db1)
+	store1, err := NewPostgresStore(db1, Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store2, err := NewPostgresStore(postgresDBForSchema(t, dsn, schema), Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store1.CloseStore()
+	defer store2.CloseStore()
+	thread, _, err := store1.AdmitThreadAs("capacity-thread", "alice", Request{Repository: "widget", Task: "initial Thread job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	schedule, _, err := store1.CreateSchedule("alice", "capacity-schedule", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "scheduled job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if _, err := db1.Exec(`UPDATE factory_schedules SET next_occurrence_at=$1 WHERE id=$2`, occurrence, schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	go func() {
+		<-start
+		_, _, _, err := store2.AdmitThreadJobAs(thread.Thread.ID, "member", "alice", Request{Repository: "widget", Task: "Thread member job"})
+		results <- err
+	}()
+	go func() {
+		<-start
+		results <- store1.DispatchDueScheduleOccurrences(context.Background(), occurrence, 1)
+	}()
+	close(start)
+	var queueFull int
+	for range 2 {
+		if err := <-results; err != nil {
+			if errors.Is(err, ErrQueueFull) {
+				queueFull++
+				continue
+			}
+			t.Fatalf("concurrent admission/dispatch: %v", err)
+		}
+	}
+	page, err := store1.ListJobs(context.Background(), 0, 0, 8)
+	if err != nil || len(page.Jobs) != 2 || queueFull > 1 {
+		t.Fatalf("retained jobs=(%d,%v), queueFull=%d; want initial Thread Job plus at most one competing admission", len(page.Jobs), err, queueFull)
+	}
+	current, err := store1.GetSchedule(schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.PendingOccurrence() == nil {
+		// If dispatch won the gate, the Thread admission must have seen full capacity.
+		var memberCount int
+		if err := db1.QueryRow(`SELECT COUNT(*) FROM factory_thread_jobs WHERE thread_id=$1`, thread.Thread.ID).Scan(&memberCount); err != nil || memberCount != 1 || queueFull != 1 {
+			t.Fatalf("dispatch won but Thread member count=%d queueFull=%d err=%v; want no appended member and one capacity rejection", memberCount, queueFull, err)
+		}
+	} else if !current.PendingOccurrence().Equal(occurrence) {
+		t.Fatalf("pending occurrence=%s; want %s", current.PendingOccurrence(), occurrence)
+	} else {
+		// If the member admission won, dispatch must preserve its oldest occurrence.
+		var memberCount int
+		if err := db1.QueryRow(`SELECT COUNT(*) FROM factory_thread_jobs WHERE thread_id=$1`, thread.Thread.ID).Scan(&memberCount); err != nil || memberCount != 2 {
+			t.Fatalf("Thread admission won but member count=%d err=%v; want appended member", memberCount, err)
+		}
 	}
 }
 

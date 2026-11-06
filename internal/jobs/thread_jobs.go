@@ -208,6 +208,10 @@ func addThreadJobPostgres(ctx context.Context, db *sql.DB, config Config, thread
 		return ThreadSnapshot{}, Snapshot{}, false, errors.New("PostgreSQL job store unavailable")
 	}
 	defer tx.Rollback()
+	// All PostgreSQL Job admissions take the capacity gate before resource rows.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresStoreMigrationLock+1); err != nil {
+		return ThreadSnapshot{}, Snapshot{}, false, errors.New("lock PostgreSQL Thread member capacity")
+	}
 	var owner string
 	var completedAt sql.NullTime
 	if err := tx.QueryRowContext(ctx, `SELECT submitter,completed_at FROM factory_threads WHERE id=$1 FOR UPDATE`, threadID).Scan(&owner, &completedAt); errors.Is(err, sql.ErrNoRows) || err == nil && owner != principalID {

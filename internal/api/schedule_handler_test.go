@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	restjobs "github.com/leehosanganson/factory/internal/jobs"
 	restserver "github.com/leehosanganson/factory/internal/server"
@@ -51,6 +53,78 @@ func TestScheduleRoutesRequireDurableStoreAndNamedSubmitter(t *testing.T) {
 				t.Errorf("principal %q %s %s status=%d body=%s; want 404", token, tc.method, tc.path, got.Code, got.Body.String())
 			}
 		}
+	}
+}
+
+func TestScheduleAPIExposesOnlyBoundedOwnedDispatchSummary(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := restjobs.Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-response.db"), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true})
+	create := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"bounded scheduled task"}`))
+	create.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	create.Header.Set("Idempotency-Key", "summary-test")
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var createdBody struct {
+		Schedule struct {
+			ID string `json:"id"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createdBody); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := store.GetSchedule(createdBody.Schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"fill-one", "fill-two", "fill-three"} {
+		if _, _, err := store.Admit(key, restjobs.Request{Repository: "widget", Task: "fill queue"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), schedule.NextOccurrence(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), schedule.NextOccurrence().Add(2*time.Minute), 1); err != nil {
+		t.Fatal(err)
+	}
+	get := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID, "", namedPrincipalToken("alice"))
+	if get.Code != http.StatusOK {
+		t.Fatalf("get status=%d body=%s", get.Code, get.Body.String())
+	}
+	var response map[string]json.RawMessage
+	if err := json.Unmarshal(get.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"pending_occurrence_at", "skipped_occurrences"} {
+		if _, ok := response[field]; !ok {
+			t.Errorf("schedule response lacks %q: %s", field, get.Body.String())
+		}
+	}
+	for _, field := range []string{"next_occurrence_at", "pendingOccurrenceAt", "skippedRevision", "skippedCount"} {
+		if _, ok := response[field]; ok {
+			t.Errorf("schedule response leaked internal field %q: %s", field, get.Body.String())
+		}
+	}
+	foreign := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID, "", namedPrincipalToken("bob"))
+	if foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign schedule status=%d body=%s", foreign.Code, foreign.Body.String())
+	}
+	list := principalRequest(handler, http.MethodGet, "/v1/schedules", "", namedPrincipalToken("alice"))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"pending_occurrence_at"`) || !strings.Contains(list.Body.String(), `"skipped_occurrences"`) {
+		t.Fatalf("owned schedule list status=%d body=%s", list.Code, list.Body.String())
 	}
 }
 

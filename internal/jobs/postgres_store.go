@@ -101,6 +101,10 @@ func newPostgresStore(db *sql.DB, config Config, recover bool) (*PostgresStore, 
 		_ = db.Close()
 		return nil, err
 	}
+	if err := s.backfillScheduleCursors(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if !recover {
 		return s, nil
 	}
