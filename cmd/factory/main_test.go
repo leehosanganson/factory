@@ -2522,11 +2522,11 @@ func TestDetachedImplementCLIStopWorksAcrossProcesses(t *testing.T) {
 	if !store.StopRequested(job.ID) {
 		t.Fatal("separate-process stop command did not persist a stop request")
 	}
-	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
-		t.Fatalf("release detached worker after stop request: %v", err)
-	}
 	if err := waitForShutdown(10*time.Second, "stopped"); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.WriteFile(releaseWorker, nil, 0o600); err != nil {
+		t.Fatalf("release detached worker after it stopped: %v", err)
 	}
 	job, found, err = findJob()
 	if err != nil || !found {
