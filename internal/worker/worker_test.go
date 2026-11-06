@@ -187,7 +187,7 @@ func TestWorkerDoesNotAcceptUnexpectedUnrequiredProviderOutcome(t *testing.T) {
 	}
 }
 
-func waitForStatus(t *testing.T, manager *restjobs.LocalManager, id string, want restjobs.Status) restjobs.Snapshot {
+func waitForStatus(t *testing.T, manager restjobs.Store, id string, want restjobs.Status) restjobs.Snapshot {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
