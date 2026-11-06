@@ -524,8 +524,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	shutdownCtx, cancel := newShutdownContext(options.ShutdownTimeout)
 	defer cancel()
 	ready.Store(false)
-	if workersEnabled {
-		manager.Close()
+	var workerDone chan error
+	if coordinator != nil {
+		workerDone = make(chan error, 1)
+		go func() { workerDone <- coordinator.Shutdown(shutdownCtx) }()
 	}
 	cancelSweep()
 	sweepErr := waitForSweep(shutdownCtx, sweepDone)
@@ -543,8 +545,12 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		workerShutdownErr = httpShutdownErrors[1]
 	}
 	var workerErr error
-	if coordinator != nil {
-		workerErr = coordinator.Shutdown(shutdownCtx)
+	if workerDone != nil {
+		select {
+		case workerErr = <-workerDone:
+		case <-shutdownCtx.Done():
+			workerErr = shutdownCtx.Err()
+		}
 	}
 	closeStore()
 	if serveErr != nil {

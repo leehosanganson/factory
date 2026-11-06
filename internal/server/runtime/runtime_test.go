@@ -898,11 +898,149 @@ func readyPublisherForRuntimeTest() *readinessPublisher {
 	return publisher
 }
 
+func TestRunGracefulShutdownDrainsRunningJobBeforeDeadline(t *testing.T) {
+	config, key := runtimeFixture(t)
+	config.Limits.Workers = 1
+	listenerReady := make(chan net.Listener, 1)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctx, stopServer := context.WithCancel(context.Background())
+	defer stopServer()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{
+			ResultsBase: testResultsBase(t), ShutdownTimeout: time.Second,
+			Executor: runtimeExecutor(func(context.Context, restjobs.Snapshot) error {
+				close(started)
+				<-release
+				return nil
+			}),
+			Listen: func(network, address string) (net.Listener, error) {
+				listener, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					listenerReady <- listener
+				}
+				return listener, err
+			},
+		})
+	}()
+	var listener net.Listener
+	select {
+	case listener = <-listenerReady:
+	case err := <-done:
+		t.Fatalf("server exited before listener startup: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start a listener")
+	}
+	baseURL := "http://" + listener.Addr().String()
+	waitForStatus(t, baseURL+"/readyz", http.StatusOK)
+	submitRuntimeJob(t, baseURL, key)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("executor did not start")
+	}
+	stopServer()
+	select {
+	case err := <-done:
+		t.Fatalf("server stopped before running job could drain: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("graceful shutdown error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server did not finish draining before shared deadline")
+	}
+}
+
+func TestRunCancelsDrainingJobAtSharedShutdownDeadline(t *testing.T) {
+	config, key := runtimeFixture(t)
+	config.Limits.Workers = 1
+	listenerReady := make(chan net.Listener, 1)
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	ctx, stopServer := context.WithCancel(context.Background())
+	defer stopServer()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{
+			ResultsBase: testResultsBase(t), ShutdownTimeout: 100 * time.Millisecond,
+			Executor: runtimeExecutor(func(ctx context.Context, _ restjobs.Snapshot) error {
+				close(started)
+				<-ctx.Done()
+				close(canceled)
+				return ctx.Err()
+			}),
+			Listen: func(network, address string) (net.Listener, error) {
+				listener, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					listenerReady <- listener
+				}
+				return listener, err
+			},
+		})
+	}()
+	var listener net.Listener
+	select {
+	case listener = <-listenerReady:
+	case err := <-done:
+		t.Fatalf("server exited before listener startup: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start a listener")
+	}
+	baseURL := "http://" + listener.Addr().String()
+	waitForStatus(t, baseURL+"/readyz", http.StatusOK)
+	submitRuntimeJob(t, baseURL, key)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("executor did not start")
+	}
+	stopServer()
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("executor was not canceled at the shared shutdown deadline")
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("shutdown error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runtime did not return at the shutdown deadline")
+	}
+}
+
+func submitRuntimeJob(t *testing.T, baseURL, key string) {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs", strings.NewReader(`{"repository":"trusted","task":"drain runtime"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+key)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "drain-runtime")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("submit job: %v", err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("job submission status = %d, want accepted", response.StatusCode)
+	}
+}
+
 func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 	config, key := runtimeFixture(t)
 	listenerReady := make(chan net.Listener, 1)
 	var calls atomic.Int32
 	started := make(chan struct{})
+	release := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
@@ -914,8 +1052,12 @@ func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 					return errors.New("unexpected request")
 				}
 				close(started)
-				<-ctx.Done()
-				return ctx.Err()
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
 			}),
 			Listen: func(network, address string) (net.Listener, error) {
 				listener, err := net.Listen(network, "127.0.0.1:0")
@@ -1043,6 +1185,7 @@ func TestRunAuthenticatedSubmissionLifecycleAndShutdown(t *testing.T) {
 		t.Fatalf("history status=%d events=%+v", history.StatusCode, events)
 	}
 	cancel()
+	close(release)
 	select {
 	case err := <-done:
 		if err != nil {

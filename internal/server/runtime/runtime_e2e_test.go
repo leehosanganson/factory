@@ -46,7 +46,8 @@ func TestRESTServerJobListingProcessE2E(t *testing.T) {
 	config.Limits.TaskBytes = 128
 	harness := filepath.Join(t.TempDir(), "harness.sh")
 	holdStarted := filepath.Join(t.TempDir(), "hold-started")
-	script := fmt.Sprintf("#!/bin/sh\ncase \"$*\" in *hold-listing*) : > '%s'; trap 'exit 0' TERM; while :; do sleep 1; done ;; esac\nexit 1\n", holdStarted)
+	releaseHold := filepath.Join(t.TempDir(), "release-hold")
+	script := fmt.Sprintf("#!/bin/sh\ncase \"$*\" in *hold-listing*) : > '%s'; while [ ! -f '%s' ]; do sleep 0.05; done ;; esac\nexit 1\n", holdStarted, releaseHold)
 	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -173,6 +174,10 @@ func TestRESTServerJobListingProcessE2E(t *testing.T) {
 	if status, _ := getProcessJobResponse(t, client, baseURL, second.ID, apiKey); status.Status != restjobs.StatusRunning {
 		t.Fatalf("running job changed after listing: %+v", status)
 	}
+	if err := os.WriteFile(releaseHold, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitForProcessFailure(t, client, baseURL, second.ID, apiKey)
 	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -2064,6 +2069,20 @@ func TestRESTServerProcessRunsConcurrentSQLiteJobsThroughProvider(t *testing.T) 
 	if _, err := os.Stat(cancelStarted); err != nil {
 		t.Fatalf("cancellation workflow did not start: %v", err)
 	}
+	cancelRequest, err := http.NewRequest(http.MethodPost, baseURL+"/v1/jobs/"+canceled.ID+"/cancel", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelRequest.Header.Set("Authorization", "Bearer "+apiKey)
+	cancelResponse, err := client.Do(cancelRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelResponse.Body.Close()
+	if cancelResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("job cancellation status=%d, want accepted", cancelResponse.StatusCode)
+	}
+	waitForProcessCanceled(t, client, baseURL, canceled.ID, apiKey)
 	if err := child.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -3142,6 +3161,22 @@ func submitProcessJob(client *http.Client, baseURL, apiKey, alias, task, key str
 		return submittedProcessJob{}, err
 	}
 	return submittedProcessJob{ID: result.Job.ID, Replayed: result.Replayed, ErrorCode: result.Error.Code, StatusCode: resp.StatusCode}, nil
+}
+
+func waitForProcessCanceled(t *testing.T, client *http.Client, baseURL, id, apiKey string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		job := getProcessJob(t, client, baseURL, id, apiKey)
+		if job.Status.Terminal() {
+			if job.Status != restjobs.StatusCanceled || job.Provider != nil {
+				t.Fatalf("canceled workflow result=%+v", job)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not cancel before timeout", id)
 }
 
 func waitForProcessFailure(t *testing.T, client *http.Client, baseURL, id, apiKey string) {

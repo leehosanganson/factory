@@ -39,6 +39,26 @@ func (f executorFunc) Execute(ctx context.Context, job restjobs.Snapshot) error 
 	return f(ctx, job)
 }
 
+type claimGateManager struct {
+	restjobs.Manager
+	claimed chan struct{}
+	release chan struct{}
+}
+
+func (m *claimGateManager) WaitClaimAttempt(ctx context.Context) (restjobs.AttemptClaim, error) {
+	claim, err := m.Manager.WaitClaimAttempt(ctx)
+	if err != nil {
+		return claim, err
+	}
+	close(m.claimed)
+	select {
+	case <-m.release:
+		return claim, nil
+	case <-ctx.Done():
+		return restjobs.AttemptClaim{}, ctx.Err()
+	}
+}
+
 type attemptAwareExecutor struct {
 	manager *restjobs.LocalManager
 	attempt restjobs.AttemptHandle
@@ -260,12 +280,12 @@ func TestManagerConcurrencyLimitConstrainsCoordinator(t *testing.T) {
 		t.Fatal("manager allowed more than one concurrent claim")
 	case <-time.After(30 * time.Millisecond):
 	}
+	close(release)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := coordinator.Shutdown(ctx); err != nil {
 		t.Fatalf("Shutdown() error = %v", err)
 	}
-	close(release)
 }
 
 func TestSingleWorkerExecutesFIFO(t *testing.T) {
@@ -456,10 +476,14 @@ func TestRequestCancelCancelsOnlySelectedRunningExecutor(t *testing.T) {
 	release := make(chan struct{})
 	coordinator, err := New(manager, executorFunc(func(ctx context.Context, job restjobs.Snapshot) error {
 		started <- job.ID
-		<-ctx.Done()
-		canceled <- job.ID
+		if job.ID == first.ID {
+			<-ctx.Done()
+			canceled <- job.ID
+			<-release
+			return ctx.Err()
+		}
 		<-release
-		return ctx.Err()
+		return nil
 	}), CoordinatorConfig{Workers: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -485,6 +509,7 @@ func TestRequestCancelCancelsOnlySelectedRunningExecutor(t *testing.T) {
 	}
 	close(release)
 	waitForStatus(t, manager, first.ID, restjobs.StatusCanceled)
+	waitForStatus(t, manager, second.ID, restjobs.StatusSucceeded)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := coordinator.Shutdown(ctx); err != nil {
@@ -492,36 +517,207 @@ func TestRequestCancelCancelsOnlySelectedRunningExecutor(t *testing.T) {
 	}
 }
 
-func TestShutdownCancelsQueuedAndActiveJobs(t *testing.T) {
+func TestShutdownLetsRunningJobFinishAndCancelsQueuedJob(t *testing.T) {
 	manager := newTestManager(t, 3, 1)
 	active := admit(t, manager, "active")
 	queued := admit(t, manager, "queued")
 	started := make(chan struct{})
+	release := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Snapshot) error {
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		shutdownDone <- coordinator.Shutdown(ctx)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, _, err := manager.Admit("after-close", restjobs.Request{Repository: "repo", Task: "after-close"}); errors.Is(err, restjobs.ErrManagerClosed) {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("manager did not close admission: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got, _ := manager.Get(active.ID); got.Status != restjobs.StatusRunning {
+		t.Fatalf("active status during drain = %q, want running", got.Status)
+	}
+	if got, _ := manager.Get(queued.ID); got.Status != restjobs.StatusCanceled {
+		t.Fatalf("queued status = %q, want canceled", got.Status)
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown finished before running job: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if got, _ := manager.Get(active.ID); got.Status != restjobs.StatusSucceeded {
+		t.Fatalf("active status = %q, want succeeded", got.Status)
+	}
+}
+
+func TestShutdownTimeoutCancelsRunningJobAndLaterWaitFinishes(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "blocked")
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
 	coordinator, err := New(manager, executorFunc(func(ctx context.Context, _ restjobs.Snapshot) error {
 		close(started)
 		<-ctx.Done()
+		close(canceled)
+		<-release
 		return ctx.Err()
 	}), CoordinatorConfig{Workers: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	if err := coordinator.Shutdown(ctx); err != nil {
-		t.Fatalf("Shutdown() error = %v", err)
+	if err := coordinator.Shutdown(short); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown(short) error = %v, want deadline exceeded", err)
 	}
-	if got, _ := manager.Get(active.ID); got.Status != restjobs.StatusCanceled {
-		t.Fatalf("active status = %q, want canceled", got.Status)
+	<-canceled
+	if got, _ := manager.Get(job.ID); got.Status != restjobs.StatusRunning {
+		t.Fatalf("job status while canceled executor is finishing = %q, want running", got.Status)
 	}
-	if got, _ := manager.Get(queued.ID); got.Status != restjobs.StatusCanceled {
-		t.Fatalf("queued status = %q, want canceled", got.Status)
+	long, stop := context.WithTimeout(context.Background(), time.Second)
+	defer stop()
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- coordinator.Shutdown(long) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("later shutdown returned before worker finished: %v", err)
+	default:
+	}
+	close(release)
+	if err := <-waitDone; err != nil {
+		t.Fatalf("Shutdown(long) error = %v", err)
+	}
+	if got, _ := manager.Get(job.ID); got.Status != restjobs.StatusCanceled {
+		t.Fatalf("active status after shutdown = %q, want canceled", got.Status)
 	}
 }
 
-func TestShutdownWaitContextCanTimeOutThenWaitAgain(t *testing.T) {
+func TestShutdownWaitsForClaimToStartTransition(t *testing.T) {
 	manager := newTestManager(t, 1, 1)
-	job := admit(t, manager, "blocked")
+	job := admit(t, manager, "claim-start-boundary")
+	atBoundary := make(chan struct{})
+	releaseBoundary := make(chan struct{})
+	executorStarted := make(chan struct{})
+	releaseExecutor := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Snapshot) error {
+		close(executorStarted)
+		<-releaseExecutor
+		return nil
+	}), CoordinatorConfig{Workers: 1, beforeStart: func() {
+		close(atBoundary)
+		<-releaseBoundary
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-atBoundary
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		shutdownDone <- coordinator.Shutdown(ctx)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, _, err := manager.Admit("after-close", restjobs.Request{Repository: "repo", Task: "after-close"}); errors.Is(err, restjobs.ErrManagerClosed) {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("manager did not close admission: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned while claim-to-start transition was in flight: %v", err)
+	default:
+	}
+	close(releaseBoundary)
+	select {
+	case <-executorStarted:
+	case <-time.After(time.Second):
+		t.Fatal("executor did not start for a claim reserved before shutdown")
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("shutdown returned before in-flight executor finished: %v", err)
+	default:
+	}
+	close(releaseExecutor)
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if got, _ := manager.Get(job.ID); got.Status != restjobs.StatusSucceeded {
+		t.Fatalf("job status = %q, want succeeded", got.Status)
+	}
+}
+
+func TestShutdownCancelsClaimBeforeSynchronizedStartBoundary(t *testing.T) {
+	base := newTestManager(t, 1, 1)
+	job := admit(t, base, "claimed-not-started")
+	manager := &claimGateManager{Manager: base, claimed: make(chan struct{}), release: make(chan struct{})}
+	var executorCalls atomic.Int32
+	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Snapshot) error {
+		executorCalls.Add(1)
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-manager.claimed
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		shutdownDone <- coordinator.Shutdown(ctx)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, _, err := base.Admit("after-close", restjobs.Request{Repository: "repo", Task: "after-close"}); errors.Is(err, restjobs.ErrManagerClosed) {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("manager did not close admission: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(manager.release)
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+	if executorCalls.Load() != 0 {
+		t.Fatalf("executor calls = %d, want 0 for claim not yet started", executorCalls.Load())
+	}
+	if got, _ := base.Get(job.ID); got.Status != restjobs.StatusCanceled {
+		t.Fatalf("claimed job status = %q, want canceled", got.Status)
+	}
+}
+
+func TestConcurrentShutdownCallsWaitForSameWorkers(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	admit(t, manager, "concurrent-shutdown")
 	started := make(chan struct{})
 	release := make(chan struct{})
 	coordinator, err := New(manager, executorFunc(func(context.Context, restjobs.Snapshot) error {
@@ -533,19 +729,33 @@ func TestShutdownWaitContextCanTimeOutThenWaitAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-started
-	short, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	if err := coordinator.Shutdown(short); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Shutdown(short) error = %v, want deadline exceeded", err)
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			results <- coordinator.Shutdown(ctx)
+		}()
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, _, err := manager.Admit("after-close", restjobs.Request{Repository: "repo", Task: "after-close"}); errors.Is(err, restjobs.ErrManagerClosed) {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("manager did not close admission: %v", err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-results:
+		t.Fatalf("concurrent shutdown returned before worker finished: %v", err)
+	default:
 	}
 	close(release)
-	long, stop := context.WithTimeout(context.Background(), time.Second)
-	defer stop()
-	if err := coordinator.Shutdown(long); err != nil {
-		t.Fatalf("Shutdown(long) error = %v", err)
-	}
-	if got, _ := manager.Get(job.ID); got.Status != restjobs.StatusCanceled {
-		t.Fatalf("active status after shutdown = %q, want canceled", got.Status)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatalf("concurrent Shutdown() error = %v", err)
+		}
 	}
 }
 
