@@ -308,6 +308,14 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 			}
 			return
 		}
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "provider-recovery" {
+			if r.Method != http.MethodGet {
+				methodNotAllowed(w, http.MethodGet)
+				return
+			}
+			h.getProviderRecovery(w, parts[0])
+			return
+		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "issue-provenance" {
 			if r.Method != http.MethodGet {
 				methodNotAllowed(w, http.MethodGet)
@@ -933,6 +941,107 @@ func (h *Handler) getJobForPrincipal(w http.ResponseWriter, id, principalID stri
 type issueProvenanceResponse struct {
 	JobID      string                   `json:"job_id"`
 	Provenance restjobs.IssueProvenance `json:"issue_provenance"`
+}
+
+type providerRecoveryStore interface {
+	ReadProviderRecovery(string) (restjobs.ProviderRecoveryRead, error)
+}
+
+type providerRecoveryResponse struct {
+	JobID       string                       `json:"job_id"`
+	Status      string                       `json:"status"`
+	Attempt     providerRecoveryAttempt      `json:"attempt"`
+	Observation *providerRecoveryObservation `json:"observation,omitempty"`
+}
+
+type providerRecoveryAttempt struct {
+	Provider   string `json:"provider"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Commit     string `json:"commit"`
+	Generation int64  `json:"generation"`
+	Uncertain  bool   `json:"uncertain"`
+}
+
+type providerRecoveryObservation struct {
+	Outcome    providerRecoveryObservedOutcome `json:"outcome"`
+	ObservedAt time.Time                       `json:"observed_at"`
+}
+
+type providerRecoveryObservedOutcome struct {
+	Number int    `json:"number"`
+	State  string `json:"state"`
+}
+
+func (h *Handler) getProviderRecovery(w http.ResponseWriter, id string) {
+	store, ok := h.manager.(providerRecoveryStore)
+	if !ok || len(id) > 128 {
+		writeError(w, http.StatusConflict, "provider_recovery_unavailable", "Provider recovery details are unavailable or inapplicable.")
+		return
+	}
+	view, err := store.ReadProviderRecovery(id)
+	if errors.Is(err, restjobs.ErrNotFound) {
+		h.writeManagerError(w, err)
+		return
+	}
+	if err != nil {
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, restjobs.ErrProviderRecoveryUnavailable) || errors.Is(err, restjobs.ErrInvalidProviderRecovery) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, "provider_recovery_unavailable", "Provider recovery details are unavailable or inapplicable.")
+		return
+	}
+	snapshot, attempt := view.Snapshot, view.Attempt
+	if snapshot.Provider != nil || snapshot.Status != restjobs.StatusRunning && snapshot.Status != restjobs.StatusFailed || attempt.Provider != "github" || !safeProviderRepository(attempt.Repository) || len(attempt.Branch) > 256 || attempt.Branch != "factory/job/"+id || !safeProviderCommit(attempt.Commit) || attempt.Generation < 0 {
+		writeError(w, http.StatusConflict, "provider_recovery_unavailable", "Provider recovery details are unavailable or inapplicable.")
+		return
+	}
+	response := providerRecoveryResponse{
+		JobID:  id,
+		Status: "provider_outcome_unresolved",
+		Attempt: providerRecoveryAttempt{
+			Provider: attempt.Provider, Repository: attempt.Repository, Branch: attempt.Branch,
+			Commit: attempt.Commit, Generation: attempt.Generation, Uncertain: attempt.Uncertain,
+		},
+	}
+	if view.Observation != nil {
+		observation := *view.Observation
+		if observation.Outcome.Provider != attempt.Provider || observation.Outcome.Repository != attempt.Repository || observation.Outcome.Branch != attempt.Branch || observation.Outcome.Commit != attempt.Commit || observation.Outcome.Number <= 0 || observation.Outcome.State != "open" || observation.Outcome.URL != fmt.Sprintf("https://github.com/%s/pull/%d", attempt.Repository, observation.Outcome.Number) || observation.ObservedAt.IsZero() {
+			writeError(w, http.StatusConflict, "provider_recovery_unavailable", "Provider recovery details are unavailable or inapplicable.")
+			return
+		}
+		response.Observation = &providerRecoveryObservation{
+			Outcome:    providerRecoveryObservedOutcome{Number: observation.Outcome.Number, State: observation.Outcome.State},
+			ObservedAt: observation.ObservedAt,
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func safeProviderRepository(value string) bool {
+	parts := strings.Split(value, "/")
+	if len(value) > 256 || len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(value, "..") {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == '/') {
+			return false
+		}
+	}
+	return true
+}
+
+func safeProviderCommit(value string) bool {
+	if len(value) < 7 || len(value) > 64 {
+		return false
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'f' || r >= 'A' && r <= 'F' || r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) getIssueProvenanceForPrincipal(w http.ResponseWriter, id, principalID string) {

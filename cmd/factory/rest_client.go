@@ -26,6 +26,7 @@ func restClientHelp() []helpCommand {
 		{"factory rest issue --repository <alias> --issue-repository <owner/repo> [--confirm-version <sha256>] [--json] <issue-number>", "Preview a GitHub issue snapshot or confirm dispatch as a REST job."},
 		{"factory rest get [--json] <job-id>", "Inspect a remote job."},
 		{"factory rest issue-provenance [--json] <job-id>", "Inspect bounded issue provenance without task text."},
+		{"factory rest provider-recovery [--json] <job-id>", "Inspect unresolved provider attempt identity and any read-only observation."},
 		{"factory rest list [--limit <1..100>] [--after <cursor> --snapshot <sequence>] [--json]", "List retained remote jobs (operator listing)."},
 		{"factory rest list --mine [--limit <1..100>] [--cursor <opaque-cursor>] [--json]", "List jobs submitted by the authenticated principal."},
 		{"factory rest history [--json] <job-id>", "Inspect bounded remote job history."},
@@ -48,7 +49,7 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker is
 	}
 	command := args[0]
 	switch command {
-	case "submit", "issue", "issue-provenance", "get", "list", "history", "cancel", "operations", "disposition", "reconcile", "watch":
+	case "submit", "issue", "issue-provenance", "provider-recovery", "get", "list", "history", "cancel", "operations", "disposition", "reconcile", "watch":
 	default:
 		return fmt.Errorf("unknown REST client command %q (try factory rest help)", command)
 	}
@@ -112,6 +113,19 @@ func runRESTClientWithIssueDependencies(args []string, out io.Writer, tracker is
 			return err
 		}
 		return writeRESTResult(out, *jsonOutput, "issue_provenance", result, fmt.Sprintf("Issue provenance for job %s: %s#%d at version %s", result.JobID, result.Provenance.SourceRepository, result.Provenance.IssueNumber, result.Provenance.Version))
+	case "provider-recovery":
+		if flags.NArg() != 1 {
+			return errors.New("usage: factory rest provider-recovery [--json] <job-id>")
+		}
+		result, err := client.ProviderRecovery(ctx, flags.Arg(0))
+		if err != nil {
+			return err
+		}
+		text := fmt.Sprintf("Provider attempt for %s: %s %s, branch %s at %s (generation %d, uncertain: %t). Provider outcome remains unresolved.", result.JobID, result.Attempt.Provider, result.Attempt.Repository, result.Attempt.Branch, result.Attempt.Commit, result.Attempt.Generation, result.Attempt.Uncertain)
+		if result.Observation != nil {
+			text += fmt.Sprintf(" Read-only observation: PR #%d is %s as of %s; this does not prove the earlier write has stopped.", result.Observation.Outcome.Number, result.Observation.Outcome.State, result.Observation.ObservedAt.UTC().Format(time.RFC3339))
+		}
+		return writeRESTResult(out, *jsonOutput, "provider_recovery", result, text)
 	case "get":
 		if flags.NArg() != 1 {
 			return errors.New("usage: factory rest get [--json] <job-id>")

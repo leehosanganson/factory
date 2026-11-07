@@ -61,6 +61,43 @@ func TestRESTIssueProvenanceCommandUsesNarrowInspectionRoute(t *testing.T) {
 	}
 }
 
+func TestRESTProviderRecoveryCommandUsesReadOnlyRouteAndSafeOutput(t *testing.T) {
+	const token = "provider-recovery-cli-token"
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
+		}
+		_, _ = io.WriteString(w, `{"job_id":"job-42","status":"provider_outcome_unresolved","attempt":{"provider":"github","repository":"acme/widget","branch":"factory/job/job-42","commit":"abc1234","generation":2,"uncertain":true},"observation":{"outcome":{"number":42,"state":"open"},"observed_at":"2026-04-01T12:00:00Z"}}`)
+	}))
+	defer server.Close()
+	configPath := writeRESTClientTestConfig(t, server.URL, token)
+
+	var out bytes.Buffer
+	if err := runRESTClient([]string{"provider-recovery", "--json", "--config", configPath, "job-42"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"status":"provider_outcome_unresolved"`, `"uncertain":true`, `"generation":2`} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("recovery JSON omitted %s: %s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), token) || strings.Contains(out.String(), "task") || strings.Contains(out.String(), "url") {
+		t.Fatalf("recovery output included excluded fields: %s", out.String())
+	}
+	out.Reset()
+	if err := runRESTClient([]string{"provider-recovery", "--config", configPath, "job-42"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "outcome remains unresolved") || !strings.Contains(out.String(), "PR #42 is open") {
+		t.Fatalf("recovery text output = %s", out.String())
+	}
+	if len(requests) != 2 || requests[0] != "GET /v1/jobs/job-42/provider-recovery" || requests[1] != requests[0] {
+		t.Fatalf("requests = %v", requests)
+	}
+}
+
 func writeRESTClientTestConfig(t *testing.T, baseURL, token string) string {
 	t.Helper()
 	root := t.TempDir()

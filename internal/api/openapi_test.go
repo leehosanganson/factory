@@ -100,8 +100,8 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.13.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.13.0", document.Info.Version)
+	if document.Info.Version != "1.14.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.14.0", document.Info.Version)
 	}
 }
 
@@ -147,8 +147,8 @@ func TestThreadOpenAPIContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.13.0" {
-		t.Fatalf("version=%q want 1.13.0", document.Info.Version)
+	if document.Info.Version != "1.14.0" {
+		t.Fatalf("version=%q want 1.14.0", document.Info.Version)
 	}
 	for path, method := range map[string]string{"/v1/threads": "post", "/v1/threads/{id}": "get", "/v1/threads/{id}/jobs": "post", "/v1/threads/{id}/complete": "post", "/v1/notifications": "get"} {
 		var operation map[string]json.RawMessage
@@ -323,8 +323,8 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.13.0" {
-		t.Errorf("OpenAPI version = %q, want 1.13.0", document.Info.Version)
+	if document.Info.Version != "1.14.0" {
+		t.Errorf("OpenAPI version = %q, want 1.14.0", document.Info.Version)
 	}
 	for _, route := range []string{"/v1/schedules", "/v1/schedules/{id}"} {
 		if _, ok := document.Paths[route]; !ok {
@@ -471,6 +471,7 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"POST /v1/threads/{id}/complete":          "completeThread",
 		"GET /v1/jobs/{id}":                       "getJob",
 		"GET /v1/jobs/{id}/issue-provenance":      "getJobIssueProvenance",
+		"GET /v1/jobs/{id}/provider-recovery":     "getJobProviderRecovery",
 		"GET /v1/jobs/{id}/history":               "getJobHistory",
 		"GET /v1/jobs/{id}/events":                "streamJobEvents",
 		"POST /v1/jobs/{id}/cancel":               "cancelJob",

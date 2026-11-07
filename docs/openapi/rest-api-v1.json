@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.13.0",
+    "version": "1.14.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create persistent UTC cron schedules on SQLite or PostgreSQL; a bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
@@ -636,6 +636,29 @@
         }
       }
     },
+    "/v1/jobs/{id}/provider-recovery": {
+      "get": {
+        "operationId": "getJobProviderRecovery",
+        "summary": "Inspect unresolved provider recovery identity",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
+        "description": "Read-only operator view of persisted provider attempt identity and an optional stored provider observation. It reads the job, provider attempt, and observation only; it never calls a provider or changes job/provider state. A successful response always states provider_outcome_unresolved because an observation does not prove that the earlier provider write has stopped. The projection exposes only provider, repository, branch, commit, generation, uncertainty, and observation outcome number/state/time; it omits provider URL, credentials, paths, task text, and raw errors. Submitters receive a non-disclosing 404. Missing/invalid attempts and unsupported stores return a sanitized conflict; operational store read failures return a sanitized 503. Memory storage exposes the attempt while it remains in memory; the view is volatile across eviction and restart.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "responses": {
+          "200": { "description": "Bounded provider recovery view; outcome remains unresolved.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderRecoveryView" } } } },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "description": "Provider attempt details are absent, malformed, or unsupported by this store.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": {
+            "description": "The request used the wrong method; a sanitized ErrorEnvelope with code method_not_allowed is returned.",
+            "headers": { "Allow": { "description": "Allowed method.", "schema": { "type": "string", "enum": [ "GET" ] } } },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } }
+          }
+        }
+      }
+    },
     "/v1/jobs/{id}/history": {
       "get": {
         "operationId": "getJobHistory",
@@ -1255,6 +1278,48 @@
           "task": { "type": "string" },
           "issue": { "type": "integer", "format": "int64", "minimum": 1 },
           "issue_provenance": { "$ref": "#/components/schemas/IssueProvenance" }
+        }
+      },
+      "ProviderRecoveryView": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "job_id", "status", "attempt" ],
+        "properties": {
+          "job_id": { "type": "string" },
+          "status": { "type": "string", "enum": [ "provider_outcome_unresolved" ], "description": "A read-only observation cannot establish that the earlier provider write has stopped." },
+          "attempt": { "$ref": "#/components/schemas/ProviderRecoveryAttempt" },
+          "observation": { "$ref": "#/components/schemas/ProviderRecoveryObservation" }
+        }
+      },
+      "ProviderRecoveryAttempt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "provider", "repository", "branch", "commit", "generation", "uncertain" ],
+        "properties": {
+          "provider": { "type": "string", "enum": [ "github" ] },
+          "repository": { "type": "string" },
+          "branch": { "type": "string" },
+          "commit": { "type": "string", "pattern": "^[0-9a-fA-F]{7,64}$" },
+          "generation": { "type": "integer", "format": "int64", "minimum": 0 },
+          "uncertain": { "type": "boolean" }
+        }
+      },
+      "ProviderRecoveryObservation": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "outcome", "observed_at" ],
+        "properties": {
+          "outcome": { "$ref": "#/components/schemas/ProviderRecoveryObservedOutcome" },
+          "observed_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ProviderRecoveryObservedOutcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [ "number", "state" ],
+        "properties": {
+          "number": { "type": "integer", "minimum": 1 },
+          "state": { "type": "string", "enum": [ "open" ] }
         }
       },
       "JobIssueProvenance": {

@@ -88,10 +88,43 @@ type IssueProvenanceResult struct {
 	Provenance restjobs.IssueProvenance `json:"issue_provenance"`
 }
 
+type ProviderRecoveryResult struct {
+	JobID       string                       `json:"job_id"`
+	Status      string                       `json:"status"`
+	Attempt     ProviderRecoveryAttempt      `json:"attempt"`
+	Observation *ProviderRecoveryObservation `json:"observation,omitempty"`
+}
+
+type ProviderRecoveryAttempt struct {
+	Provider   string `json:"provider"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
+	Commit     string `json:"commit"`
+	Generation int64  `json:"generation"`
+	Uncertain  bool   `json:"uncertain"`
+}
+
+type ProviderRecoveryObservation struct {
+	Outcome    ProviderRecoveryObservedOutcome `json:"outcome"`
+	ObservedAt time.Time                       `json:"observed_at"`
+}
+
+type ProviderRecoveryObservedOutcome struct {
+	Number int    `json:"number"`
+	State  string `json:"state"`
+}
+
 // IssueProvenance returns only the bounded issue identity metadata for a job.
 func (c *Client) IssueProvenance(ctx context.Context, id string) (IssueProvenanceResult, error) {
 	var result IssueProvenanceResult
 	err := c.request(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(id)+"/issue-provenance", nil, http.StatusOK, decodeJSON(&result), nil)
+	return result, err
+}
+
+// ProviderRecovery reads bounded provider-attempt identity and any stored observation without mutating job or provider state.
+func (c *Client) ProviderRecovery(ctx context.Context, id string) (ProviderRecoveryResult, error) {
+	var result ProviderRecoveryResult
+	err := c.request(ctx, http.MethodGet, "/v1/jobs/"+url.PathEscape(id)+"/provider-recovery", nil, http.StatusOK, decodeJSON(&result), nil)
 	return result, err
 }
 

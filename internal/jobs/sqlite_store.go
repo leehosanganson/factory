@@ -1254,6 +1254,57 @@ func (s *SQLiteStore) RecoveryNeeded(id string) bool {
 	return needed
 }
 
+// ReadProviderRecovery returns job and provider evidence from one SQLite read
+// transaction. SQLite's transaction snapshot keeps the separate row reads
+// consistent while concurrent workers update the job.
+func (s *SQLiteStore) ReadProviderRecovery(id string) (ProviderRecoveryRead, error) {
+	if err := s.checkOpen(); err != nil {
+		return ProviderRecoveryRead{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sqliteBusyTimeout)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ProviderRecoveryRead{}, errors.New("SQLite job store unavailable")
+	}
+	defer tx.Rollback()
+	snapshot, err := scanSnapshot(tx.QueryRowContext(ctx, `SELECT j.id,j.request_json,j.status,j.created_at,j.updated_at,j.history_truncated,j.cancellation_requested,j.submitter,(SELECT provider_json FROM factory_job_provider_outcomes WHERE job_id=j.id),(SELECT evidence_json FROM factory_job_verification_evidence WHERE job_id=j.id) FROM factory_jobs j WHERE j.id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ProviderRecoveryRead{}, ErrNotFound
+	}
+	if err != nil {
+		return ProviderRecoveryRead{}, errors.New("read SQLite job")
+	}
+	if err := s.loadSnapshotSummariesFrom(ctx, tx, &snapshot); err != nil {
+		return ProviderRecoveryRead{}, err
+	}
+	var attemptJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=?`, id).Scan(&attemptJSON); errors.Is(err, sql.ErrNoRows) {
+		return ProviderRecoveryRead{}, ErrProviderRecoveryUnavailable
+	} else if err != nil {
+		return ProviderRecoveryRead{}, errors.New("read SQLite provider attempt")
+	}
+	var result ProviderRecoveryRead
+	result.Snapshot = snapshot
+	if json.Unmarshal([]byte(attemptJSON), &result.Attempt) != nil || validateProviderAttempt(result.Attempt) != nil || result.Attempt.Branch != "factory/job/"+id || !validCommitID(result.Attempt.Commit) {
+		return ProviderRecoveryRead{}, ErrInvalidProviderRecovery
+	}
+	var observationJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT observation_json FROM factory_job_provider_observations WHERE job_id=?`, id).Scan(&observationJSON); err == nil {
+		var observation ProviderObservation
+		if json.Unmarshal([]byte(observationJSON), &observation) != nil || validateProviderOutcome(observation.Outcome) != nil || observation.ObservedAt.IsZero() {
+			return ProviderRecoveryRead{}, ErrInvalidProviderRecovery
+		}
+		result.Observation = &observation
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return ProviderRecoveryRead{}, errors.New("read SQLite provider observation")
+	}
+	if err := tx.Commit(); err != nil {
+		return ProviderRecoveryRead{}, errors.New("read SQLite provider recovery")
+	}
+	return result, nil
+}
+
 func (s *SQLiteStore) ProviderAttempt(id string) (ProviderAttempt, error) {
 	if err := s.checkOpen(); err != nil {
 		return ProviderAttempt{}, err
@@ -1511,14 +1562,20 @@ func (s *SQLiteStore) GetForPrincipal(id, principalID string) (Snapshot, error) 
 }
 
 func (s *SQLiteStore) loadSnapshotSummaries(snapshot *Snapshot) error {
+	return s.loadSnapshotSummariesFrom(context.Background(), s.db, snapshot)
+}
+
+func (s *SQLiteStore) loadSnapshotSummariesFrom(ctx context.Context, queryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, snapshot *Snapshot) error {
 	var workerID, bootID sql.NullString
-	if err := s.db.QueryRow(`SELECT worker_id,boot_id FROM factory_worker_ownership WHERE job_id=?`, snapshot.ID).Scan(&workerID, &bootID); err == nil && workerID.Valid && bootID.Valid {
+	if err := queryer.QueryRowContext(ctx, `SELECT worker_id,boot_id FROM factory_worker_ownership WHERE job_id=?`, snapshot.ID).Scan(&workerID, &bootID); err == nil && workerID.Valid && bootID.Valid {
 		snapshot.Worker = &WorkerSummary{WorkerID: workerID.String, BootID: bootID.String}
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return errors.New("read SQLite worker identity")
 	}
 	var stage, state sql.NullString
-	if err := s.db.QueryRow(`SELECT stage,state FROM factory_job_progress WHERE job_id=?`, snapshot.ID).Scan(&stage, &state); err == nil && stage.Valid && state.Valid {
+	if err := queryer.QueryRowContext(ctx, `SELECT stage,state FROM factory_job_progress WHERE job_id=?`, snapshot.ID).Scan(&stage, &state); err == nil && stage.Valid && state.Valid {
 		progress := ProgressSummary{Stage: stage.String, State: state.String}
 		if validProgress(progress) {
 			snapshot.Progress = &progress

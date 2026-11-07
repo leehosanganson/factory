@@ -237,6 +237,53 @@ func (s *PostgresStore) MarkProviderAttemptUncertain(id string) error {
 	return s.markProviderUncertain(id, nil)
 }
 
+// ReadProviderRecovery returns job and provider evidence from one PostgreSQL
+// repeatable-read transaction, so all rows reflect the same database snapshot.
+func (s *PostgresStore) ReadProviderRecovery(id string) (ProviderRecoveryRead, error) {
+	if err := s.checkOpen(); err != nil {
+		return ProviderRecoveryRead{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	if err != nil {
+		return ProviderRecoveryRead{}, errors.New("PostgreSQL job store unavailable")
+	}
+	defer tx.Rollback()
+	snapshot, err := scanPostgresSnapshot(tx.QueryRowContext(ctx, pgSnapshotQuery()+`WHERE j.id=$1`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ProviderRecoveryRead{}, ErrNotFound
+	}
+	if err != nil {
+		return ProviderRecoveryRead{}, errors.New("read PostgreSQL job")
+	}
+	var attemptJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT attempt_json FROM factory_job_provider_attempts WHERE job_id=$1`, id).Scan(&attemptJSON); errors.Is(err, sql.ErrNoRows) {
+		return ProviderRecoveryRead{}, ErrProviderRecoveryUnavailable
+	} else if err != nil {
+		return ProviderRecoveryRead{}, errors.New("read PostgreSQL provider attempt")
+	}
+	var result ProviderRecoveryRead
+	result.Snapshot = snapshot
+	if json.Unmarshal([]byte(attemptJSON), &result.Attempt) != nil || validateProviderAttempt(result.Attempt) != nil || result.Attempt.Branch != "factory/job/"+id || !validCommitID(result.Attempt.Commit) {
+		return ProviderRecoveryRead{}, ErrInvalidProviderRecovery
+	}
+	var observationJSON string
+	if err := tx.QueryRowContext(ctx, `SELECT observation_json FROM factory_job_provider_observations WHERE job_id=$1`, id).Scan(&observationJSON); err == nil {
+		var observation ProviderObservation
+		if json.Unmarshal([]byte(observationJSON), &observation) != nil || validateProviderOutcome(observation.Outcome) != nil || observation.ObservedAt.IsZero() {
+			return ProviderRecoveryRead{}, ErrInvalidProviderRecovery
+		}
+		result.Observation = &observation
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return ProviderRecoveryRead{}, errors.New("read PostgreSQL provider observation")
+	}
+	if err := tx.Commit(); err != nil {
+		return ProviderRecoveryRead{}, errors.New("read PostgreSQL provider recovery")
+	}
+	return result, nil
+}
+
 // ProviderAttempt returns the durable provider attempt identity.
 func (s *PostgresStore) ProviderAttempt(id string) (ProviderAttempt, error) {
 	if err := s.checkOpen(); err != nil {

@@ -20,18 +20,20 @@ import (
 )
 
 var (
-	ErrInvalidInput        = errors.New("invalid job input")
-	ErrIdempotencyConflict = errors.New("idempotency key conflicts with an existing request")
-	ErrProvenanceConflict  = errors.New("issue provenance conflicts with an existing request")
-	ErrQueueFull           = errors.New("job queue is full")
-	ErrRegistryFull        = errors.New("job registry is full")
-	ErrNotFound            = errors.New("job not found")
-	ErrInvalidTransition   = errors.New("invalid job status transition")
-	ErrThreadClosed        = errors.New("Thread is completed")
-	ErrNoQueuedJobs        = errors.New("no queued jobs")
-	ErrNoWorkerSlots       = errors.New("no worker slots available")
-	ErrManagerClosed       = errors.New("job manager is closed")
-	ErrStaleAttempt        = errors.New("stale worker attempt")
+	ErrInvalidInput                = errors.New("invalid job input")
+	ErrIdempotencyConflict         = errors.New("idempotency key conflicts with an existing request")
+	ErrProvenanceConflict          = errors.New("issue provenance conflicts with an existing request")
+	ErrQueueFull                   = errors.New("job queue is full")
+	ErrRegistryFull                = errors.New("job registry is full")
+	ErrNotFound                    = errors.New("job not found")
+	ErrInvalidTransition           = errors.New("invalid job status transition")
+	ErrThreadClosed                = errors.New("Thread is completed")
+	ErrNoQueuedJobs                = errors.New("no queued jobs")
+	ErrNoWorkerSlots               = errors.New("no worker slots available")
+	ErrManagerClosed               = errors.New("job manager is closed")
+	ErrStaleAttempt                = errors.New("stale worker attempt")
+	ErrInvalidProviderRecovery     = errors.New("invalid provider recovery data")
+	ErrProviderRecoveryUnavailable = errors.New("provider recovery data is unavailable")
 )
 
 var ErrGitHubWebhookUnavailable = errors.New("GitHub issue webhook admission is unavailable for this store")
@@ -137,6 +139,21 @@ type ProviderAttempt struct {
 type ProviderObservation struct {
 	Outcome    ProviderOutcome `json:"outcome"`
 	ObservedAt time.Time       `json:"observed_at"`
+}
+
+// ProviderRecoveryRead is one consistent view of a job and its provider write
+// evidence. Observation is nil when no read-only provider observation exists.
+type ProviderRecoveryRead struct {
+	Snapshot    Snapshot
+	Attempt     ProviderAttempt
+	Observation *ProviderObservation
+}
+
+// ProviderRecoveryReader is an optional store capability for consistent
+// provider recovery reads. Stores that cannot provide an atomic view must not
+// implement it.
+type ProviderRecoveryReader interface {
+	ReadProviderRecovery(string) (ProviderRecoveryRead, error)
 }
 
 // ProviderOutcome is a validated provider-side PR result.
@@ -819,6 +836,21 @@ func (m *LocalManager) Get(id string) (Snapshot, error) {
 		return Snapshot{}, ErrNotFound
 	}
 	return cloneSnapshot(entry.snapshot), nil
+}
+
+// ReadProviderRecovery returns the snapshot and provider attempt under one
+// lock. The memory store does not retain provider observations.
+func (m *LocalManager) ReadProviderRecovery(id string) (ProviderRecoveryRead, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.jobs[id]
+	if entry == nil {
+		return ProviderRecoveryRead{}, ErrNotFound
+	}
+	if entry.providerAttempt == nil {
+		return ProviderRecoveryRead{}, ErrProviderRecoveryUnavailable
+	}
+	return ProviderRecoveryRead{Snapshot: cloneSnapshot(entry.snapshot), Attempt: *entry.providerAttempt}, nil
 }
 
 // GetForPrincipal returns only a job attributed to principalID. Missing and
