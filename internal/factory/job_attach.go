@@ -141,3 +141,57 @@ func AttachJob(ctx context.Context, store *JobStore, id string, out io.Writer) e
 		return fmt.Errorf("job %s ended with unexpected status %q", id, status)
 	}
 }
+
+// AttachImplementationJob follows an implementation job and prints its persisted
+// terminal outcome after the transcript. Canceling the observer still only
+// detaches it, and terminal job errors retain AttachJob's existing behavior.
+func AttachImplementationJob(ctx context.Context, store *JobStore, id string, out io.Writer) error {
+	attachErr := AttachJob(ctx, store, id, out)
+	if ctx.Err() != nil {
+		return attachErr
+	}
+	job, err := store.reconcileJob(id)
+	if err != nil {
+		return errors.Join(attachErr, err)
+	}
+	if job.Type != implementationJobType || !isTerminalStatus(job.Status) {
+		return attachErr
+	}
+	if err := writeImplementationJobSummary(out, job); err != nil {
+		return errors.Join(attachErr, err)
+	}
+	return attachErr
+}
+
+func writeImplementationJobSummary(out io.Writer, job JobRecord) error {
+	if _, err := fmt.Fprintf(out, "\nImplementation job summary\nWorkflow status: %s\n", job.Status); err != nil {
+		return err
+	}
+	publication := job.PublicationStatus
+	if !containsJobListValue("published, unpublished, no-op", publication) {
+		publication = "not recorded"
+	}
+	if _, err := fmt.Fprintf(out, "Publication status: %s\n", publication); err != nil {
+		return err
+	}
+
+	var next string
+	switch {
+	case job.Status == "interrupted":
+		next = fmt.Sprintf("Factory will not replay this job. Inspect `factory job get %s --details` and `factory job logs %s --session workflow`; review any retained worktree and branch shown in the details.", job.ID, job.ID)
+	case job.Status == "failed" || job.Status == "stopped" || job.Status == "cancelled":
+		next = fmt.Sprintf("Inspect `factory job get %s --details` and `factory job logs %s --session workflow`.", job.ID, job.ID)
+	case job.PublicationStatus == "published":
+		next = fmt.Sprintf("Inspect the recorded publication with `factory job get %s --details`.", job.ID)
+	case job.PublicationStatus == "unpublished":
+		next = fmt.Sprintf("Publication is incomplete. Inspect `factory job get %s --details` and `factory job logs %s --session workflow`; review the retained worktree and branch shown in the details before recovery.", job.ID, job.ID)
+	case job.PublicationStatus == "no-op":
+		next = fmt.Sprintf("No PR was created because there were no changes. Inspect `factory job get %s --details` and the retained worktree if needed.", job.ID)
+	case job.Status == "complete":
+		next = fmt.Sprintf("Inspect the completed result with `factory job get %s --details`.", job.ID)
+	default:
+		return nil
+	}
+	_, err := fmt.Fprintf(out, "Next: %s\n", next)
+	return err
+}
