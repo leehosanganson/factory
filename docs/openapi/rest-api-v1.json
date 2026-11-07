@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.14.0",
-    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create persistent UTC cron schedules on SQLite or PostgreSQL; a bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
+    "version": "1.15.0",
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create persistent UTC cron schedules on SQLite or PostgreSQL; operators can manage schedules across owners. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
     "/v1/webhooks/github/issues": {
@@ -88,8 +88,8 @@
     "/v1/schedules": {
       "get": {
         "operationId": "listSchedules",
-        "summary": "List the caller\u2019s schedules",
-        "description": "Returns all persistent schedules owned by the authenticated named submitter, including paused and removed tombstones. Active schedules are dispatched in bounded batches; the oldest capacity-blocked occurrence is reported as pending and later missed occurrences are represented by a bounded skipped summary. Operators and the legacy shared key cannot manage schedules. Requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required. There is no per-owner schedule cap.",
+        "summary": "List schedules",
+        "description": "Returns persistent schedules. Named submitters see schedules they own; named operators and the legacy shared operator credential see all schedules. Only submitters may create schedules. Schedule mutations retain the original creator and audit the authenticated actor. Requires SQLite or PostgreSQL.",
         "security": [
           {
             "bearerAuth": []
@@ -210,6 +210,28 @@
         }
       }
     },
+    "/v1/schedules/{id}/history": {
+      "get": {
+        "operationId": "getScheduleHistory",
+        "summary": "Read schedule mutation history",
+        "description": "Returns metadata-only append-only history for one schedule: schedule ID, immutable creator, authenticated actor, action, resulting revision, and timestamp. No schedule definition is included. Operators can read all schedules; submitters can read only their own. Missing and foreign submitter IDs both return 404. Pages default to 50 events, accept limit 1..100, and use after_revision for ascending revision continuation; next_revision is returned when has_more is true. Audit rows are never dropped. For schedules existing before the audit migration, history starts empty because historical actors cannot be reconstructed; only post-upgrade actions are recorded.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "$ref": "#/components/parameters/ScheduleId" },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "after_revision", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0 }, "description": "Return events with revision greater than this value." }
+        ],
+        "responses": {
+          "200": { "description": "Schedule audit history.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleHistory" } } } },
+          "400": { "description": "Invalid history query.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "405": { "description": "Only GET is supported." },
+          "500": { "description": "An unexpected store error occurred.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "503": { "description": "Durable storage is required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      }
+    },
     "/v1/schedules/{id}": {
       "parameters": [
         {
@@ -218,8 +240,8 @@
       ],
       "get": {
         "operationId": "getSchedule",
-        "summary": "Inspect an owned schedule",
-        "description": "Only the owning named submitter can inspect this schedule; missing and foreign IDs both return 404. ETag is the current strong revision tag.",
+        "summary": "Inspect a schedule",
+        "description": "Submitters can inspect only their own schedule. Operators can inspect any schedule. Missing and foreign submitter IDs both return 404. ETag is the current strong revision tag.",
         "security": [
           {
             "bearerAuth": []
@@ -266,8 +288,8 @@
       },
       "patch": {
         "operationId": "mutateSchedule",
-        "summary": "Edit, pause, or resume an owned schedule",
-        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Every successful user mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Mutation serializes on the schedule row with dispatch: if dispatch commits first, that old-revision occurrence remains immutable and the mutation proceeds when its If-Match revision is still current; cursor advancement does not change the user revision. If mutation commits first, the old occurrence is excluded. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
+        "summary": "Edit, pause, or resume a schedule",
+        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Submitters may mutate only their own schedules; operators may mutate any schedule. Successful mutations are recorded in schedule history with the immutable creator and authenticated actor. Every successful user mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Mutation serializes on the schedule row with dispatch: if dispatch commits first, that old-revision occurrence remains immutable and the mutation proceeds when its If-Match revision is still current; cursor advancement does not change the user revision. If mutation commits first, the old occurrence is excluded. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
         "security": [
           {
             "bearerAuth": []
@@ -344,8 +366,8 @@
       },
       "delete": {
         "operationId": "removeSchedule",
-        "summary": "Remove an owned schedule",
-        "description": "Requires a matching strong If-Match revision and an empty request body. Removal creates a retained terminal tombstone and prevents future occurrences. Previously admitted Jobs are unchanged; IDs are never reused.",
+        "summary": "Remove a schedule",
+        "description": "Submitters may remove only their own schedules; operators may remove any schedule. Successful removals are recorded in schedule history with the immutable creator and authenticated actor. Requires a matching strong If-Match revision and an empty request body. Removal creates a retained terminal tombstone and prevents future occurrences. Previously admitted Jobs are unchanged; IDs are never reused.",
         "security": [
           {
             "bearerAuth": []
@@ -996,6 +1018,22 @@
           "status": { "type": "string", "enum": [ "need_attention", "in_progress", "done" ], "description": "Aggregate projection from member Jobs; does not close the Thread." },
           "completed_at": { "type": "string", "format": "date-time", "description": "Present only after an explicit authenticated owner completion action." },
           "completed_by": { "type": "string", "description": "Authenticated principal that explicitly completed the Thread." }
+        }
+      },
+      "ScheduleAuditEvent": {
+        "type": "object", "required": [ "schedule_id", "creator", "actor", "action", "revision", "at" ],
+        "properties": {
+          "schedule_id": { "type": "string" }, "creator": { "type": "string" }, "actor": { "type": "string" },
+          "action": { "type": "string", "enum": [ "create", "update", "pause", "resume", "remove" ] },
+          "revision": { "type": "integer", "minimum": 1 }, "at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ScheduleHistory": {
+        "type": "object", "required": [ "events", "has_more" ],
+        "properties": {
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleAuditEvent" } },
+          "has_more": { "type": "boolean" },
+          "next_revision": { "type": "integer", "minimum": 1, "description": "Present when has_more is true; pass as after_revision to fetch the next page." }
         }
       },
       "ScheduleInput": {

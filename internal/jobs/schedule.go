@@ -46,12 +46,45 @@ type Schedule struct {
 	skippedCount        int64
 }
 
+const (
+	DefaultScheduleHistoryLimit = 50
+	MaxScheduleHistoryLimit     = 100
+)
+
 type ScheduleStore interface {
 	CreateSchedule(owner, key string, input ScheduleInput) (Schedule, bool, error)
 	GetSchedule(id string) (Schedule, error)
 	ListSchedules(owner string) ([]Schedule, error)
+	ListAllSchedules() ([]Schedule, error)
+	ListScheduleHistory(id, actor string, operator bool, afterRevision int64, limit int) (ScheduleAuditPage, error)
 	MutateSchedule(id, owner string, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error)
+	MutateScheduleAs(id, actor string, operator bool, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error)
 }
+
+type ScheduleAuditEvent struct {
+	ScheduleID string         `json:"schedule_id"`
+	Creator    string         `json:"creator"`
+	Actor      string         `json:"actor"`
+	Action     ScheduleAction `json:"action"`
+	Revision   int64          `json:"revision"`
+	At         time.Time      `json:"at"`
+}
+
+type ScheduleAuditPage struct {
+	Events       []ScheduleAuditEvent
+	HasMore      bool
+	NextRevision int64
+}
+
+type ScheduleAction string
+
+const (
+	ScheduleCreated       ScheduleAction = "create"
+	ScheduleUpdated       ScheduleAction = "update"
+	SchedulePauseAction   ScheduleAction = "pause"
+	ScheduleResumeAction  ScheduleAction = "resume"
+	ScheduleRemovedAction ScheduleAction = "remove"
+)
 
 type ScheduleDispatcher interface {
 	DispatchScheduleOccurrences(context.Context, time.Time, int) error
@@ -98,6 +131,21 @@ const (
 	ScheduleEdit   ScheduleMutation = "edit"
 	ScheduleRemove ScheduleMutation = "remove"
 )
+
+func scheduleAuditAction(mutation ScheduleMutation) ScheduleAction {
+	switch mutation {
+	case SchedulePause:
+		return SchedulePauseAction
+	case ScheduleResume:
+		return ScheduleResumeAction
+	case ScheduleEdit:
+		return ScheduleUpdated
+	case ScheduleRemove:
+		return ScheduleRemovedAction
+	default:
+		return ""
+	}
+}
 
 func ValidateScheduleCron(expression string) error {
 	if _, err := parseScheduleCron(expression); err != nil {

@@ -93,7 +93,7 @@ func newPrincipalTestHandler(t *testing.T, manager restjobs.Manager, principals 
 func principalRequest(handler http.Handler, method, path, body, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer "+token)
-	if method == http.MethodPost && (path == "/v1/jobs" || path == "/v1/threads") {
+	if method == http.MethodPost && (path == "/v1/jobs" || path == "/v1/threads" || path == "/v1/schedules") {
 		r.Header.Set("Idempotency-Key", "handler-principal-test-key")
 	}
 	if body != "" {

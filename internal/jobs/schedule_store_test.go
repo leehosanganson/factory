@@ -266,6 +266,58 @@ func TestSQLiteScheduleCreatesNextOccurrenceStrictlyAfterCreateTime(t *testing.T
 	}
 }
 
+func TestSQLiteScheduleHistoryOperationalOwnerLookupErrorIsNotNotFound(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "schedule-history-owner-error.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, _, err := store.CreateSchedule("alice", "history-owner-error", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`ALTER TABLE factory_schedules RENAME TO factory_schedules_original`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE VIEW factory_schedules AS SELECT owner FROM missing_schedule_table`); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = store.ListScheduleHistory(schedule.ID, "admin", true, 0, MaxScheduleHistoryLimit)
+	if err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("history error=%v; want operational error distinct from ErrNotFound", err)
+	}
+}
+
+func TestSQLiteScheduleAuditIsAtomicAndAppendOnly(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "schedule-audit-store.db")
+	store, err := OpenSQLiteStore(path, Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	created, replayed, err := store.CreateSchedule("alice", "audit-key", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "task"})
+	if err != nil || replayed {
+		t.Fatalf("create=(%+v,%t,%v)", created, replayed, err)
+	}
+	if _, replayed, err := store.CreateSchedule("alice", "audit-key", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "task"}); err != nil || !replayed {
+		t.Fatalf("replay=(%t,%v)", replayed, err)
+	}
+	if _, err := store.MutateSchedule(created.ID, "alice", 1, SchedulePause, nil); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.ListScheduleHistory(created.ID, "alice", false, 0, MaxScheduleHistoryLimit)
+	if err != nil || len(page.Events) != 2 || page.Events[0].Action != ScheduleCreated || page.Events[1].Action != SchedulePauseAction || page.HasMore {
+		t.Fatalf("page=%+v err=%v", page, err)
+	}
+	if _, err := store.db.Exec(`UPDATE factory_schedule_audit SET actor='changed' WHERE schedule_id=?`, created.ID); err == nil {
+		t.Fatal("audit update unexpectedly succeeded")
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_schedule_audit WHERE schedule_id=?`, created.ID); err == nil {
+		t.Fatal("audit delete unexpectedly succeeded")
+	}
+}
+
 func TestSQLiteScheduleDefinitionsPersistRevisionAndTombstone(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "schedules.db")
 	config := Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128}
