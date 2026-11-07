@@ -886,7 +886,7 @@ func RunJobWorker(id, root string) error {
 			publicationStatus, publicationSummary := result.Status, result.Message
 			if publishErr != nil {
 				publicationStatus, publicationSummary = "unpublished", publishErr.Error()
-				fmt.Fprintf(os.Stdout, "Workflow completed; PR publication did not complete.\n%s\n", publishErr)
+				fmt.Fprintf(os.Stdout, "Workflow completed; PR publication did not complete. Inspect `factory job get %s --details` for diagnostics and recovery details.\n", id)
 			} else if result.Message != "" {
 				fmt.Fprintln(os.Stdout, result.Message)
 			}

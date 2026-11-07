@@ -750,7 +750,7 @@ func runPipelineContextWithTerminalCheck(ctx context.Context, args []string, gat
 		if err != nil {
 			return err
 		}
-		return factory.AttachJob(ctx, store, id, out)
+		return factory.AttachImplementationJob(ctx, store, id, out)
 	})
 }
 

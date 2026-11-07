@@ -1765,8 +1765,8 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s command: %v\n%s", name, err, output)
 			}
-			if !strings.Contains(string(output), "Started pipeline job ") || !strings.Contains(string(output), "requirements completed") || !strings.Contains(string(output), "Published implementation PR") {
-				t.Fatalf("%s did not attach to the detached worker and publish its isolated branch: %q", name, output)
+			if !strings.Contains(string(output), "Started pipeline job ") || !strings.Contains(string(output), "requirements completed") || !strings.Contains(string(output), "Published implementation PR") || !strings.Contains(string(output), "Workflow status: complete") || !strings.Contains(string(output), "Publication status: published") || !strings.Contains(string(output), "factory job get ") {
+				t.Fatalf("%s did not attach and show the persisted published outcome: %q", name, output)
 			}
 			storeRoot, err := factory.JobStateRoot(state)
 			if err != nil {
@@ -1782,6 +1782,125 @@ func TestImplementDefaultsToAttachedImplementationJob(t *testing.T) {
 			}
 			if _, err := exec.Command("git", "--git-dir", remote, "show-ref", "--verify", "refs/heads/"+jobs[0].WorkBranch).CombinedOutput(); err != nil {
 				t.Fatalf("%s worker did not push its isolated branch %q: %v", name, jobs[0].WorkBranch, err)
+			}
+		})
+	}
+}
+
+func TestAttachedImplementSummarizesUnpublishedAndNoOpOutcomes(t *testing.T) {
+	for _, outcome := range []string{"unpublished", "no-op"} {
+		t.Run(outcome, func(t *testing.T) {
+			state := t.TempDir()
+			target := t.TempDir()
+			git := func(args ...string) {
+				t.Helper()
+				command := exec.Command("git", args...)
+				command.Dir = target
+				if output, err := command.CombinedOutput(); err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, output)
+				}
+			}
+			git("init", "-q", "-b", "main")
+			git("config", "user.name", "Factory Test")
+			git("config", "user.email", "factory-test@example.invalid")
+			if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			git("add", "tracked.txt")
+			git("commit", "-qm", "baseline")
+			remote := filepath.Join(t.TempDir(), "origin.git")
+			if output, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+				t.Fatalf("initialize origin: %v\n%s", err, output)
+			}
+			git("remote", "add", "origin", remote)
+
+			agent := filepath.Join(t.TempDir(), "fake-agent")
+			agentScript := `#!/bin/sh
+`
+			if outcome != "no-op" {
+				agentScript += `printf 'generated\n' > generated.txt
+`
+			}
+			agentScript += `case "$2" in *'Stage completed'*) echo PASS ;; *) echo agent-output ;; esac
+`
+			if err := os.WriteFile(agent, []byte(agentScript), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fakeBin := t.TempDir()
+			const providerErrorMarker = "FAKE_PROVIDER_FAILURE_296_UNIQUE"
+			ghScript := "#!/bin/sh\necho " + providerErrorMarker + " >&2\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte(ghScript), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			configHome := t.TempDir()
+			configDir := filepath.Join(configHome, "factory")
+			if err := os.MkdirAll(configDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			config := fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"5s"}`, agent, state)
+			if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(config), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			binary := filepath.Join(t.TempDir(), "factory")
+			projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+			if err != nil {
+				t.Fatal(err)
+			}
+			build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+			build.Dir = projectRoot
+			if output, err := build.CombinedOutput(); err != nil {
+				t.Fatalf("build factory: %v\n%s", err, output)
+			}
+			command := exec.Command(binary, "implement", "summarize", "attached", "outcome")
+			command.Dir = target
+			command.Env = append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("implement returned error: %v\noutput: %s", err, output)
+			}
+			text := string(output)
+			for _, want := range []string{"Workflow status: complete", "Publication status: " + outcome, "factory job get ", "retained worktree"} {
+				if !strings.Contains(text, want) {
+					t.Errorf("attached output omitted %q: %s", want, text)
+				}
+			}
+			if outcome == "no-op" && !strings.Contains(text, "No PR was created") {
+				t.Errorf("no-op output omitted publication explanation: %s", text)
+			}
+			if outcome == "unpublished" {
+				if strings.Contains(text, providerErrorMarker) {
+					t.Errorf("attached output leaked provider diagnostic: %s", text)
+				}
+				jobsRoot, err := factory.JobStateRoot(state)
+				if err != nil {
+					t.Fatal(err)
+				}
+				store, err := factory.NewJobStore(jobsRoot)
+				if err != nil {
+					t.Fatal(err)
+				}
+				jobs, err := store.ListJobs()
+				if err != nil || len(jobs) != 1 {
+					t.Fatalf("attached implementation jobs = %+v, err=%v", jobs, err)
+				}
+				job := jobs[0]
+				if strings.Contains(text, job.Worktree) {
+					t.Errorf("attached output leaked sensitive worktree path %q: %s", job.Worktree, text)
+				}
+				details := exec.Command(binary, "job", "get", job.ID, "--details")
+				details.Dir, details.Env = target, command.Env
+				detailsOutput, err := details.CombinedOutput()
+				if err != nil {
+					t.Fatalf("job get --details: %v\n%s", err, detailsOutput)
+				}
+				for _, want := range []string{providerErrorMarker, job.Worktree, "PR command:"} {
+					if !strings.Contains(string(detailsOutput), want) {
+						t.Errorf("job details omitted diagnostic/recovery data %q: %s", want, detailsOutput)
+					}
+				}
+				if artifact, err := os.ReadFile(filepath.Join(job.Worktree, "generated.txt")); err != nil || string(artifact) != "generated\n" {
+					t.Errorf("retained recovery artifact = %q, err=%v", artifact, err)
+				}
 			}
 		})
 	}
