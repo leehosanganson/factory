@@ -14,6 +14,54 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+func TestPostgresProviderRecoveryReadUsesOneConsistentSnapshot(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL provider recovery read coverage")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("provider-recovery-read", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	if err := store.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Uncertain = true
+	if err := store.FinishAttempt(claim.Attempt, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 42, URL: "https://github.com/acme/widget/pull/42", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ReadProviderRecovery(job.ID)
+	if err != nil || got.Snapshot.Status != StatusFailed || got.Snapshot.Provider != nil || got.Attempt != attempt || got.Observation == nil || got.Observation.Outcome != outcome || got.Observation.ObservedAt.IsZero() {
+		t.Fatalf("combined PostgreSQL recovery read=(%+v,%v), want unresolved failed snapshot and matching attempt/observation", got, err)
+	}
+}
+
 func TestPostgresStoreIntegration(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {

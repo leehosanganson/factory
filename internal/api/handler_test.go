@@ -638,6 +638,255 @@ func waitForTestCondition(t *testing.T, condition func() bool) {
 	t.Fatal("condition was not reached before timeout")
 }
 
+func TestProviderRecoveryViewIsOperatorOnlyReadOnlyAndRedacted(t *testing.T) {
+	databaseDir := t.TempDir()
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := restjobs.OpenSQLiteStore(databaseDir+"/jobs.db", managerConfig(4, 8, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	job, _, err := manager.AdmitAs("provider-view", "alice", restjobs.Request{Repository: "widget", Task: "secret task body"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := restjobs.ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	if err := manager.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Uncertain = true
+	if err := manager.FinishAttempt(claim.Attempt, restjobs.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	beforeHistory, err := manager.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSnapshot, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+	)
+	var providerCalls atomic.Int32
+	handler.config.ReconcileProvider = func(context.Context, string) error {
+		providerCalls.Add(1)
+		return errors.New("must not be called")
+	}
+	path := "/v1/jobs/" + job.ID + "/provider-recovery"
+	foreign := principalRequest(handler, http.MethodGet, path, "", namedPrincipalToken("alice"))
+	unknown := principalRequest(handler, http.MethodGet, "/v1/jobs/missing-job/provider-recovery", "", namedPrincipalToken("alice"))
+	if foreign.Code != http.StatusNotFound || foreign.Code != unknown.Code || foreign.Body.String() != unknown.Body.String() {
+		t.Fatalf("submitter recovery view disclosed foreign job: foreign=%d %s unknown=%d %s", foreign.Code, foreign.Body.String(), unknown.Code, unknown.Body.String())
+	}
+	for _, token := range []string{namedPrincipalToken("admin"), testAPIKey} {
+		response := principalRequest(handler, http.MethodGet, path, "", token)
+		if response.Code != http.StatusOK {
+			t.Fatalf("operator recovery view status=%d body=%s", response.Code, response.Body.String())
+		}
+		body := response.Body.String()
+		for _, want := range []string{`"status":"provider_outcome_unresolved"`, `"provider":"github"`, `"repository":"acme/widget"`, `"branch":"factory/job/` + job.ID, `"commit":"abc1234"`, `"generation":1`, `"uncertain":true`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("operator recovery view omitted %s: %s", want, body)
+			}
+		}
+		for _, secret := range []string{"secret task body", "task", "private", "error", "path", "url", "provider_recovery_unavailable"} {
+			if strings.Contains(strings.ToLower(body), strings.ToLower(secret)) {
+				t.Errorf("recovery view leaked %q: %s", secret, body)
+			}
+		}
+	}
+	if providerCalls.Load() != 0 {
+		t.Fatalf("read-only route called provider reconciliation %d times", providerCalls.Load())
+	}
+	after, err := manager.Get(job.ID)
+	if err != nil || after.Status != restjobs.StatusFailed || after.Provider != nil || !after.UpdatedAt.Equal(beforeSnapshot.UpdatedAt) {
+		t.Fatalf("recovery read mutated job: before=%+v after=%+v err=%v", beforeSnapshot, after, err)
+	}
+	afterHistory, err := manager.History(job.ID)
+	if err != nil || len(afterHistory.Events) != len(beforeHistory.Events) {
+		t.Fatalf("recovery read mutated history: before=%+v after=%+v err=%v", beforeHistory.Events, afterHistory.Events, err)
+	}
+	storedAttempt, err := manager.ProviderAttempt(job.ID)
+	if err != nil || storedAttempt != attempt {
+		t.Fatalf("recovery read mutated provider attempt: before=%+v after=%+v err=%v", attempt, storedAttempt, err)
+	}
+	if _, err := manager.ProviderObservation(job.ID); !errors.Is(err, restjobs.ErrInvalidTransition) {
+		t.Fatalf("recovery read created a provider observation: err=%v", err)
+	}
+}
+
+func TestProviderRecoveryViewObservationAndUnsupportedState(t *testing.T) {
+	databaseDir := t.TempDir()
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := restjobs.OpenSQLiteStore(databaseDir+"/jobs.db", managerConfig(4, 8, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Close()
+	withObservation, _, err := manager.Admit("provider-observed-view", restjobs.Request{Repository: "widget", Task: "private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := restjobs.ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + withObservation.ID, Commit: "abc1234"}
+	if err := manager.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Uncertain = true
+	if err := manager.FinishAttempt(claim.Attempt, restjobs.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	outcome := restjobs.ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 42, URL: "https://github.com/acme/widget/pull/42", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
+	if err := manager.ObserveProviderOutcome(withObservation.ID, outcome); err != nil {
+		t.Fatal(err)
+	}
+	storedObservation, err := manager.ProviderObservation(withObservation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeObservedHistory, err := manager.History(withObservation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withoutAttempt, _, err := manager.Admit("provider-no-attempt-view", restjobs.Request{Repository: "widget", Task: "private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, manager, func() bool { return true })
+	observed := request(handler, http.MethodGet, "/v1/jobs/"+withObservation.ID+"/provider-recovery", "", true)
+	if observed.Code != http.StatusOK {
+		t.Fatalf("observed recovery view status=%d body=%s", observed.Code, observed.Body.String())
+	}
+	for _, want := range []string{`"status":"provider_outcome_unresolved"`, `"number":42`, `"state":"open"`, `"observed_at":`} {
+		if !strings.Contains(observed.Body.String(), want) {
+			t.Errorf("observed recovery view omitted %s: %s", want, observed.Body.String())
+		}
+	}
+	if strings.Contains(observed.Body.String(), outcome.URL) || strings.Contains(observed.Body.String(), "private task") {
+		t.Fatalf("observed view exposed URL or task: %s", observed.Body.String())
+	}
+	afterObservation, err := manager.ProviderObservation(withObservation.ID)
+	if err != nil || afterObservation != storedObservation {
+		t.Fatalf("recovery view mutated observation: before=%+v after=%+v err=%v", storedObservation, afterObservation, err)
+	}
+	afterObservedHistory, err := manager.History(withObservation.ID)
+	if err != nil || len(afterObservedHistory.Events) != len(beforeObservedHistory.Events) {
+		t.Fatalf("recovery view mutated observation history: before=%+v after=%+v err=%v", beforeObservedHistory.Events, afterObservedHistory.Events, err)
+	}
+	for _, tc := range []struct {
+		id   string
+		want int
+	}{{withoutAttempt.ID, http.StatusConflict}, {"missing-job", http.StatusNotFound}} {
+		response := request(handler, http.MethodGet, "/v1/jobs/"+tc.id+"/provider-recovery", "", true)
+		if response.Code != tc.want {
+			t.Errorf("recovery view %s status=%d body=%s, want %d", tc.id, response.Code, response.Body.String(), tc.want)
+		}
+		if strings.Contains(response.Body.String(), "private task") || strings.Contains(response.Body.String(), "provider-attempt") {
+			t.Errorf("recovery error leaked internal data: %s", response.Body.String())
+		}
+	}
+}
+
+func TestProviderRecoveryViewIncludesExistingMemoryAttempt(t *testing.T) {
+	memory := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := memory.Admit("memory-view", restjobs.Request{Repository: "widget", Task: "secret task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := memory.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := restjobs.ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	if err := memory.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.FinishAttempt(claim.Attempt, restjobs.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	handler := newTestHandler(t, memory, func() bool { return true })
+	response := request(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/provider-recovery", "", true)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"repository":"acme/widget"`) || strings.Contains(response.Body.String(), "secret task") {
+		t.Fatalf("memory provider recovery status=%d body=%s, want bounded in-memory attempt view", response.Code, response.Body.String())
+	}
+}
+
+type malformedProviderRecoveryStore struct {
+	restjobs.Manager
+	view restjobs.ProviderRecoveryRead
+	err  error
+}
+
+func (s malformedProviderRecoveryStore) ReadProviderRecovery(string) (restjobs.ProviderRecoveryRead, error) {
+	return s.view, s.err
+}
+
+func TestProviderRecoveryViewFailsClosedOnMalformedAttemptOrObservation(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("malformed-provider-view", restjobs.Request{Repository: "widget", Task: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.ClaimNext(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(job.ID, restjobs.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	validAttempt := restjobs.ProviderAttempt{Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	for _, tc := range []struct {
+		name string
+		view restjobs.ProviderRecoveryRead
+		err  error
+	}{
+		{name: "invalid identity", view: restjobs.ProviderRecoveryRead{Snapshot: restjobs.Snapshot{ID: job.ID, Status: restjobs.StatusFailed}, Attempt: restjobs.ProviderAttempt{Provider: "github", Repository: "/private/credential/path", Branch: validAttempt.Branch, Commit: validAttempt.Commit}}},
+		{name: "mismatched observation", view: restjobs.ProviderRecoveryRead{Snapshot: restjobs.Snapshot{ID: job.ID, Status: restjobs.StatusFailed}, Attempt: validAttempt, Observation: &restjobs.ProviderObservation{Outcome: restjobs.ProviderOutcome{Provider: "github", Repository: "other/repo", Number: 42, URL: "https://github.com/other/repo/pull/42", Branch: validAttempt.Branch, Commit: validAttempt.Commit, State: "open"}, ObservedAt: time.Now()}}},
+		{name: "malformed combined read", view: restjobs.ProviderRecoveryRead{Snapshot: restjobs.Snapshot{ID: job.ID, Status: restjobs.StatusFailed}, Attempt: restjobs.ProviderAttempt{Provider: "github", Repository: "bad"}}},
+		{name: "combined read error", err: errors.New("secret database path and credential")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := malformedProviderRecoveryStore{Manager: manager, view: tc.view, err: tc.err}
+			handler := newTestHandler(t, store, func() bool { return true })
+			response := request(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/provider-recovery", "", true)
+			wantStatus := http.StatusConflict
+			if tc.name == "combined read error" {
+				wantStatus = http.StatusServiceUnavailable
+			}
+			if response.Code != wantStatus {
+				t.Fatalf("malformed recovery status=%d body=%s, want %d", response.Code, response.Body.String(), wantStatus)
+			}
+			if tc.name == "combined read error" && strings.Contains(response.Body.String(), `"secret`) {
+				t.Fatalf("operational recovery error exposed details: %s", response.Body.String())
+			}
+			for _, secret := range []string{"private", "credential", "secret database"} {
+				if strings.Contains(response.Body.String(), secret) {
+					t.Errorf("malformed recovery leaked %q: %s", secret, response.Body.String())
+				}
+			}
+		})
+	}
+}
+
 func TestJobEventStreamReplaysFromCursorForSQLiteStore(t *testing.T) {
 	databaseDir := t.TempDir()
 	if err := os.Chmod(databaseDir, 0o700); err != nil {

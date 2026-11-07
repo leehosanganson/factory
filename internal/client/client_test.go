@@ -31,6 +31,28 @@ func TestIssueProvenanceUsesScopedRouteAndDecodesOnlyProjection(t *testing.T) {
 	}
 }
 
+func TestProviderRecoveryUsesOperatorInspectionRouteAndBoundedDTO(t *testing.T) {
+	const token = "provider-recovery-token"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/jobs/job-42/provider-recovery" {
+			t.Errorf("request = %s %s, want provider recovery GET", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer "+token {
+			t.Errorf("authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"job_id":"job-42","status":"provider_outcome_unresolved","attempt":{"provider":"github","repository":"acme/widget","branch":"factory/job/job-42","commit":"abc1234","generation":2,"uncertain":true},"observation":{"outcome":{"number":42,"state":"open"},"observed_at":"2026-04-01T12:00:00Z"}}`))
+	}))
+	defer server.Close()
+
+	result, err := New(Config{BaseURL: server.URL, Token: token}).ProviderRecovery(context.Background(), "job-42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.JobID != "job-42" || result.Status != "provider_outcome_unresolved" || result.Attempt.Repository != "acme/widget" || result.Attempt.Generation != 2 || !result.Attempt.Uncertain || result.Observation == nil || result.Observation.Outcome.Number != 42 {
+		t.Fatalf("provider recovery result = %+v", result)
+	}
+}
+
 func TestListForPrincipalUsesOpaqueCursorAndDecodesSafePage(t *testing.T) {
 	const token = "submitter-list-token"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

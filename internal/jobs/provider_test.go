@@ -34,6 +34,66 @@ func TestLocalManagerRecordsProviderOutcomeBeforeTerminalSuccess(t *testing.T) {
 	}
 }
 
+func TestLocalManagerReadsProviderRecoveryEvidenceAtomically(t *testing.T) {
+	store, err := NewManager(testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	job, _, err := store.Admit("provider-recovery-read", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	if err := store.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ReadProviderRecovery(job.ID)
+	if err != nil || got.Snapshot.Status != StatusRunning || got.Attempt != attempt || got.Observation != nil {
+		t.Fatalf("combined memory recovery read=(%+v,%v), want running snapshot, attempt, no observation", got, err)
+	}
+}
+
+func TestSQLiteProviderRecoveryReadReturnsOneStoreView(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("provider-recovery-read", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := ProviderAttempt{Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget", Branch: "factory/job/" + job.ID, Commit: "abc1234"}
+	if err := store.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Uncertain = true
+	if err := store.FinishAttempt(claim.Attempt, StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	outcome := ProviderOutcome{Provider: "github", Repository: attempt.Repository, Number: 42, URL: "https://github.com/acme/widget/pull/42", Branch: attempt.Branch, Commit: attempt.Commit, State: "open"}
+	if err := store.ObserveProviderOutcome(job.ID, outcome); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.ReadProviderRecovery(job.ID)
+	if err != nil || got.Snapshot.Status != StatusFailed || got.Snapshot.Provider != nil || got.Attempt != attempt || got.Observation == nil || got.Observation.Outcome != outcome || got.Observation.ObservedAt.IsZero() {
+		t.Fatalf("combined SQLite recovery read=(%+v,%v), want unresolved failed snapshot and matching attempt/observation", got, err)
+	}
+}
+
 func TestSQLiteProviderObservationIsAtomicAndIdempotent(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())
