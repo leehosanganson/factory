@@ -1,12 +1,12 @@
-# Factory-unit MVP architecture
+# Factory Worker MVP architecture
 
 ## Status
 
-This document records the North Star target architecture and sequencing. Its Thread ingress, membership, status, notification, and user-completion details are specified in [the Thread model contract](thread-model.md). Some foundations now exist in the REST service: authenticated direct-request Thread creation, inspection, Job membership, derived status, owner inbox notifications, and explicit completion; the separate issue poller and optional GitHub `issues.labeled` webhook also admit work into the same Thread/Job lifecycle. These are foundations, not a North Star controller-managed Thread system: the REST service does not have the target controller layer that owns Thread state and orchestrates assignment, nor a registered Factory-unit execution API or multi-unit placement scheduler. The split Controller and Worker images are process roles, not registered Factory units. Factory-unit-level Job assignment, attempt ownership/fencing, and unit-aware recovery semantics remain unimplemented; existing REST worker/store ownership and recovery behavior is documented in [implemented features](../features/README.md). This document is not implementation or deployment authorization.
+This document records the target MVP architecture and delivery sequence; it is not a claim that these capabilities have shipped. The current REST service already has direct-request Threads, membership, derived status, owner inbox notifications, explicit completion, a separate issue poller, and one optional GitHub `issues.labeled` webhook. These are foundations, not the target controller-managed Thread system. The REST service does not yet provide controller-owned assignment, registered Factory Workers, or Worker placement. The split Controller and Worker images and separately launched `factory worker` processes are process roles, not registered Workers in a fleet. Current behavior is documented in [implemented features](../features/README.md).
 
 ## Product boundary
 
-Factory accepts bounded work under operator-controlled configuration and exposes an inspectable lifecycle. Users/operators are responsible for repository, model, and harness threat risk in their deployment. Factory does not provide or guarantee sandboxing, security isolation, or hostile-code containment. Operator-configured repository aliases, enabled harness profiles, credentials, and bounded job policy remain authoritative; request content cannot select arbitrary executables, host access, or credentials.
+Factory accepts bounded work under operator-controlled configuration and exposes an inspectable lifecycle. Each Worker uses its operator-configured default harness/profile; request content cannot select a harness, arbitrary executables, repositories, host access, or credentials. Users/operators are responsible for repository, model, and harness threat risk in their deployment. Factory does not provide or guarantee sandboxing, security isolation, or hostile-code containment.
 
 Factory preserves job correctness and lifecycle invariants such as authenticated ownership, no unsafe reassignment/replay, scoped data/artifact handling, and conservative provider-write recovery. Those controls do not constitute a security boundary. Factory does not merge, release, or deploy.
 
@@ -19,12 +19,12 @@ User / Webhook / Provider event
    Horizontally scaled controller replicas
    (one logical control plane)
        ├── Thread lifecycle and user notification
-       ├── simple job-to-unit scheduler
-       └── user pin or scheduler-selected unit
+       ├── simple Job-to-Worker scheduler
+       └── Auto or named-Worker routing
                 │
                 ▼
-          Factory unit / worker
-       (owns assigned job attempt)
+             Worker
+       (owns assigned Job attempt)
                 │
        local coordination adapter
        (simple first; replaceable)
@@ -42,17 +42,15 @@ Scheduled Task definition ──> standalone scheduled Job runs
 
 ### Controllers
 
-Users interact with the controller layer to submit work, choose whether to assign it or let the scheduler choose, and track Thread/Job outcomes. The initial horizontal scaling model is interchangeable replicas of one logical control plane using shared durable state; independently scaled controller microservices are not an initial requirement.
+Users interact with the controller layer to submit work and track Thread/Job outcomes. The MVP routing choices are **Auto** (the Controller selects an eligible Worker) or a **named Worker**. Agent routing is not part of this MVP. Auto and named-Worker selection do not let a request choose a harness, executable, repository, or credential.
 
-Controllers own Thread state, Job admission and inspection, user-facing status/notification, and assignment decisions. The first scheduler is simple: it honors a user-selected named Factory unit or selects an eligible unit according to configured capacity/availability. A manually pinned Job remains queued for that unit when it is unavailable or full. The controller does not silently move it; reassignment requires an explicit user or authorized controller action.
-
-The control-plane scheduler remains simple for the initial architecture. A future context-aware coordinator/orchestrator is an optional replacement behind the Factory-unit local coordination adapter, where it can coordinate local execution only; it cannot change unit placement.
+The initial horizontal scaling model is interchangeable replicas of one logical control plane using shared durable state; independently scaled controller microservices are not an initial requirement. Controllers own Thread state, Job admission and inspection, user-facing status/notification, and assignment decisions. A manually pinned Job remains queued for that Worker if it is unavailable or full; it does not silently fall back. The exact unavailable-Worker behavior and any explicit reassignment action must be settled before implementation. A later context-aware coordinator is not part of this MVP.
 
 ### Threads and Jobs
 
-A **Thread** is a user-facing work context, not an operating-system thread. A direct user request starts a Thread. Webhook and Git/provider or project-management events (for example GitHub Issues or Linear) also enter through adapters and create Threads. Jobs induced by a Thread belong to that Thread; a Thread may have one or more Jobs. See the [Thread model contract](thread-model.md) for ingress identity/deduplication, stable membership, the approved first-slice API boundary, concurrent status updates, and user completion semantics.
+A **Thread** is a user-facing work context, not an operating-system thread. A direct user request starts a Thread. Accepted events from multiple operator-configured webhook sources also create Threads through the shared authenticated ingress contract. Stable source event identity deduplicates retries; arbitrary user transforms are not supported. The authentication and event-envelope details remain open in #301. Jobs induced by a Thread belong to that Thread; a Thread may have one or more Jobs. See the [Thread model contract](thread-model.md) for ingress identity/deduplication, stable membership, current API scope, concurrent status updates, and user completion semantics.
 
-A **Scheduled Task** is a schedule definition. Each scheduled firing creates a standalone scheduled Job that is not attached to a Thread. Scheduled work uses the same controller admission, assignment, execution, and outcome lifecycle; its distinct membership rule does not create a second execution queue.
+A **Scheduled Task** is a schedule definition. Each scheduled firing creates a standalone scheduled Job that is not attached to a Thread. Scheduled work uses the same controller admission, assignment, execution, and outcome lifecycle; its distinct membership rule does not create a second execution queue. The current REST API already persists schedules and dispatches occurrences with strict five-field UTC cron. Its schedule routes are named-submitter-only, and no schedule UI exists; the target operator workbench requires operators to manage all schedules, including those created by submitters, so backend authorization must be aligned while preserving creator attribution.
 
 Thread status summarizes its Jobs and does not directly mutate their lifecycle:
 
@@ -62,34 +60,37 @@ Thread status summarizes its Jobs and does not directly mutate their lifecycle:
 
 The controller uses a deterministic classifier/reducer over explicit Job states/events, rather than an unconstrained model decision. When a Thread becomes Done, the controller notifies the user. Done does not close the Thread: the user explicitly marks it completed at the controller, which closes it. If the user adds a Job before closing the Thread, its status is recomputed and can return to In Progress or Need Attention. Scheduled Jobs and Tasks do not acquire Thread membership through status aggregation.
 
-Webhook/provider adapters must preserve source identity and deduplicate/reconcile event delivery before admission. Exact identity, repeated-event, and Thread reuse rules are specified in [#301](https://github.com/leehosanganson/factory/issues/301); they must not silently append unrelated source events to an existing user Thread.
+The target generic webhook is one shared authenticated inbound contract for multiple configured sources. It maps accepted events into canonical Thread/Job admission, deduplicates by stable source event identity, and does not allow arbitrary user transforms. Its authentication and event-envelope details remain open in [#301](https://github.com/leehosanganson/factory/issues/301). It must not silently append unrelated source events to an existing user Thread. The shipped GitHub `issues.labeled` webhook is one narrower adapter, not this general contract.
 
-### Factory units and execution
+### Worker registration and execution
 
-A **Factory unit** is a registered execution service, distinct from a controller, a worker process, a Job, a harness, or an agent role. Each Job attempt has one assigned Factory unit at a time; a unit may own multiple concurrent attempts within separately configured capacity limits. Authenticated unit identity and durable attempt ownership are required; a missed heartbeat, lease expiry, or unit restart alone does not authorize reassignment or replay.
+A **Worker** is a registered Factory execution service, distinct from a Controller, an individual process, a Job, or a harness. Each Job attempt has one assigned Worker at a time; a Worker may own multiple concurrent attempts within operator-configured capacity limits. Authenticated Worker identity and durable attempt ownership are required; a missed heartbeat, lease expiry, or restart alone does not authorize reassignment or replay. Worker registration records identity and operator-approved configuration. It does not provision a host, install Factory, or install a harness.
 
-Each unit exposes a **local coordination adapter**. The first implementation can be simple and deterministic. Its interface may later select a context-aware coordinator/orchestrator for work local to that unit. It cannot change a Job's assigned unit, select an unconfigured repository or harness, obtain credentials outside operator configuration, or override bounded job policy. A unit-local coordinator does not schedule across the fleet.
+Each Worker exposes a **local coordination adapter**. The first implementation is simple and deterministic. It cannot change a Job's assigned Worker, select an unconfigured repository or harness, obtain credentials outside operator configuration, or override bounded job policy. A local adapter does not schedule across the fleet; more capable coordination is outside this MVP.
 
-The initial Factory-unit MVP runs **one harness execution context per Job**. A harness controls its own internal agent topology; Factory does not assume one agent per harness. Later, an explicit adapter capability may coordinate multiple harnesses for one Job, but those harnesses remain on the same Factory unit that owns the Job. That later capability requires defined subtask ownership, separate workspaces/artifacts, concurrency bounds, and trusted integration semantics before it is enabled.
+Each Worker uses its operator-configured default harness/profile for a Job. A request cannot choose among profiles. The initial MVP runs one harness execution context per Job. Any internal agent topology belongs to that harness and is not exposed as a Factory routing target. Multi-harness execution for one Job is outside this MVP and requires a separate design and acceptance criteria.
 
-Agent-to-agent communication is optional and may be harness-native or use a future bounded protocol. Kitsume may provide optional memory/communication integration; it is not required by the MVP and is not the authority for Factory Threads, Jobs, assignments, attempts, or outcomes.
+The term **mailbox** is informal shorthand for the Worker-to-local-harness interface. It is not a separate messaging protocol or a required MVP component. Kitsume and agent-to-agent communication are not required and do not own Factory Threads, Jobs, assignments, attempts, or outcomes.
 
 Provider configuration may be optional, as it is in current deployments. When configured, provider PR creation/update and durable outcome recording are required for a Job to succeed; PR publication is a human-review handoff, not a correctness verdict or merge authorization.
 
 ## Pilot shape
 
-The provisional first pilot uses one controller service (which may have horizontally scalable replicas), PostgreSQL, and at least two independently registered Factory units on one host. It runs two independent small test-backed Jobs concurrently, one harness per Job, assigned to distinct units in an operator-approved fixture repository. The starting limits in issue #299 are validation targets, not capacity or enforcement guarantees until implemented and measured.
+The provisional first pilot uses one controller service (which may have horizontally scalable replicas), PostgreSQL, and at least two independently registered Workers on one host. It runs two independent small test-backed Jobs concurrently, one harness per Job, assigned to distinct Workers in an operator-approved fixture repository. The starting limits in issue #299 are validation targets, not capacity or enforcement guarantees until implemented and measured.
 
-This is a one-host development/validation topology, not a production HA, fleet coordinator, remote placement, or sandbox claim. Users/operators accept the consequences of running their configured repositories and harnesses with the unit account's available authority. Kubernetes remains a later deployment option, not a substitute for job ownership or recovery semantics.
+This is a one-host development/validation topology, not a production HA, fleet coordinator, remote placement, or sandbox claim. Users/operators accept the consequences of running their configured repositories and harnesses with the Worker account's available authority. Kubernetes remains a later deployment option, not a substitute for job ownership or recovery semantics.
 
-## Delivery sequence and gates
+## MVP delivery sequence and gates
 
-1. Implement authenticated Factory-unit identity, durable attempt ownership/fencing, and conservative recovery/cancellation/drain (#248, #259, #260). Current runtime behavior and the isolated PostgreSQL protocol remain distinct from those future guarantees.
-2. Implement attempt/job-scoped data integrity and safe serialized provider operations (#261), including stale-output rejection and ambiguous-write handling. These protect lifecycle and publication correctness; they do not provide sandboxing.
-3. Implement the controller-level Thread lifecycle, ingress distinctions, Job membership, status reducer/notification, and explicit user completion action (#301).
-4. Register Factory units and add the simple scheduler plus local coordination adapter; start with named-unit pinning or eligible-unit selection and one harness per Job (#297).
-5. Add durable role-addressed handoffs only if needed by multi-agent coordination; keep the protocol optional and separate from Thread status, ordinary job lifecycle events, and Kitsume (#298).
-6. Run the measured one-host multi-container pilot with two concurrent single-harness Jobs (#299).
-7. Consider same-unit multi-harness orchestration, more capable context-aware coordinators, additional ingress adapters, and Kubernetes only as separate later capabilities with their own acceptance criteria.
+The target MVP is Auto or named-Worker routing, operator-configured default harness per Worker, user-facing operator/developer workbench, recurring schedules, and authenticated multi-source webhook admission into the canonical Thread/Job lifecycle. This sequence is a dependency order, not a release commitment:
+
+1. Complete the Worker identity, durable attempt ownership/fencing, cancellation/drain, conservative recovery, data-integrity, and provider-write safety gates (#248–#261). These correctness controls do not provide sandboxing.
+2. Complete the target Thread lifecycle and shared authenticated multi-source webhook contract (#301). Preserve the already shipped Thread API and GitHub `issues.labeled` adapter (#306) as narrower existing behavior. Before generic webhook implementation, settle its authentication and event envelope; map configured sources into canonical Thread/Job admission, dedupe by stable source-event identity, and do not allow arbitrary transforms. Schedules create standalone Jobs.
+3. Register/configure Workers and implement durable Auto or named-Worker assignment, capacity, and the operator-configured default harness/profile (#297). No Agent routing or remote host/harness provisioning.
+4. Align recurring schedule management, dispatch, and authorization with the operator-only workbench. Persistent five-field UTC cron and dispatch already exist in the REST API; current schedule routes are named-submitter-only and there is no schedule UI (#332, #333, #339). Operators must be able to manage all schedules while preserving creator attribution. The target UI must not duplicate backend schedule ownership or semantics.
+5. Deliver the operator/developer workbench for Threads, Jobs, Workers, schedules, and configured webhook sources/events after the required APIs are available (#358). It may register/configure Worker identities but does not install software or provision compute.
+6. Run the measured one-host pilot with two concurrent single-harness Jobs (#299).
+
+Before implementation, settle and document the webhook authentication and event-envelope contract, Worker registration trust/capacity model, and behavior for unavailable pinned Workers. Do not choose provider-specific webhook formats or silently infer fallback behavior in this roadmap. Durable role-addressed handoffs (#298), multi-harness execution, richer coordinators, and Kubernetes are outside this MVP and need separate acceptance criteria.
 
 Every stage remains subject to user scope, human approval for ambiguous work, and the current implementation facts. Successful harness execution or PR creation is not an independent correctness verdict.
