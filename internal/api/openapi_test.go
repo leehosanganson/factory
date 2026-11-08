@@ -100,8 +100,8 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.15.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.15.0", document.Info.Version)
+	if document.Info.Version != "1.16.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.16.0", document.Info.Version)
 	}
 }
 
@@ -147,8 +147,8 @@ func TestThreadOpenAPIContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.15.0" {
-		t.Fatalf("version=%q want 1.15.0", document.Info.Version)
+	if document.Info.Version != "1.16.0" {
+		t.Fatalf("version=%q want 1.16.0", document.Info.Version)
 	}
 	for path, method := range map[string]string{"/v1/threads": "post", "/v1/threads/{id}": "get", "/v1/threads/{id}/jobs": "post", "/v1/threads/{id}/complete": "post", "/v1/notifications": "get"} {
 		var operation map[string]json.RawMessage
@@ -323,15 +323,15 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.15.0" {
-		t.Errorf("OpenAPI version = %q, want 1.15.0", document.Info.Version)
+	if document.Info.Version != "1.16.0" {
+		t.Errorf("OpenAPI version = %q, want 1.16.0", document.Info.Version)
 	}
-	for _, route := range []string{"/v1/schedules", "/v1/schedules/{id}", "/v1/schedules/{id}/history"} {
+	for _, route := range []string{"/v1/schedules", "/v1/schedules/{id}", "/v1/schedules/{id}/history", "/v1/schedules/{id}/runs"} {
 		if _, ok := document.Paths[route]; !ok {
 			t.Errorf("OpenAPI spec is missing %s", route)
 		}
 	}
-	for _, name := range []string{"ScheduleInput", "Schedule", "ScheduleList", "ScheduleMutation", "ScheduleAuditEvent", "ScheduleHistory"} {
+	for _, name := range []string{"ScheduleInput", "Schedule", "ScheduleList", "ScheduleMutation", "ScheduleAuditEvent", "ScheduleHistory", "ScheduleRun", "ScheduleRunPage"} {
 		if _, ok := document.Components.Schemas[name]; !ok {
 			t.Errorf("OpenAPI spec is missing %s schema", name)
 		}
@@ -347,6 +347,10 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 		if _, exists := scheduleHistory.Responses[status]; !exists {
 			t.Errorf("schedule history route is missing documented HTTP %s response", status)
 		}
+	}
+	runsRoute := document.Paths["/v1/schedules/{id}/runs"].Get
+	if !strings.Contains(runsRoute.Description, "task text") || !strings.Contains(runsRoute.Description, "retained") || len(runsRoute.Parameters) != 3 {
+		t.Errorf("schedule runs route omits retention, privacy, or pagination contract: %+v", runsRoute)
 	}
 	provenanceRoute, ok := document.Paths["/v1/jobs/{id}/issue-provenance"]
 	if !ok {
@@ -475,6 +479,7 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"GET /v1/schedules":                       "listSchedules",
 		"POST /v1/schedules":                      "createSchedule",
 		"GET /v1/schedules/{id}":                  "getSchedule",
+		"GET /v1/schedules/{id}/runs":             "listScheduleRuns",
 		"GET /v1/schedules/{id}/history":          "getScheduleHistory",
 		"PATCH /v1/schedules/{id}":                "mutateSchedule",
 		"DELETE /v1/schedules/{id}":               "removeSchedule",

@@ -298,6 +298,9 @@ func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID 
 	if err != nil {
 		return Snapshot{}, false, err
 	}
+	if err := validatePublicAdmissionKey(key); err != nil {
+		return Snapshot{}, false, err
+	}
 	principalID, err = normalizePrincipalID(principalID)
 	if err != nil {
 		return Snapshot{}, false, err

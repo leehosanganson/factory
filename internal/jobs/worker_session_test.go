@@ -373,6 +373,12 @@ func TestSQLiteScheduleDispatchMigrationBackfillsOldScheduleRows(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO factory_schedules(id,owner,cron,repository,task,status,revision,created_at,updated_at) VALUES('old-schedule','alice','* * * * *','widget','task','active',3,?,?)`, created, created); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,submitter) VALUES('legacy-schedule-job','{"repository":"widget","task":"old"}','queued',?,?,1,'alice')`, created, created); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO factory_job_idempotency(principal_id,key,job_id,request_json) VALUES('alice',?,'legacy-schedule-job','{"repository":"widget","task":"old"}')`, "schedule:old-schedule:3:"+created); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -388,6 +394,14 @@ func TestSQLiteScheduleDispatchMigrationBackfillsOldScheduleRows(t *testing.T) {
 	var auditRows int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_schedule_audit WHERE schedule_id='old-schedule'`).Scan(&auditRows); err != nil || auditRows != 0 {
 		t.Fatalf("pre-upgrade schedule audit rows=%d err=%v; want empty history", auditRows, err)
+	}
+	var runRows int
+	if err := store.db.QueryRow(`SELECT count(*) FROM factory_schedule_runs WHERE schedule_id='old-schedule'`).Scan(&runRows); err != nil || runRows != 0 {
+		t.Fatalf("pre-upgrade schedule run provenance rows=%d err=%v; want no backfill", runRows, err)
+	}
+	legacyRuns, err := store.ListScheduleRuns("old-schedule", "alice", false, 0, 10)
+	if err != nil || len(legacyRuns.Runs) != 0 {
+		t.Fatalf("historical matching idempotency key produced schedule runs=%+v err=%v; want no backfill", legacyRuns, err)
 	}
 	history, err := store.ListScheduleHistory("old-schedule", "admin", true, 0, MaxScheduleHistoryLimit)
 	if err != nil || len(history.Events) != 0 {
@@ -467,8 +481,8 @@ func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	}
 	defer store.CloseStore()
 	var version int
-	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 22 {
-		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 22", version, err)
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 23 {
+		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 23", version, err)
 	}
 	var retainedAudit int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
@@ -521,6 +535,12 @@ func TestPostgresScheduleAuditMigrationLeavesLegacyHistoryEmpty(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO factory_schedules(id,owner,cron,repository,task,status,revision,created_at,updated_at) VALUES('legacy-schedule','alice','* * * * *','widget','schedule task','active',3,$1,$1)`, createdAt); err != nil {
 		t.Fatalf("seed pre-upgrade PostgreSQL schedule: %v", err)
 	}
+	if _, err := db.Exec(`INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,submitter) VALUES('legacy-schedule-job','{"repository":"widget","task":"old"}','queued',$1,$1,1,'alice')`, createdAt); err != nil {
+		t.Fatalf("seed historical PostgreSQL schedule Job: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO factory_job_idempotency(principal_id,key,job_id,request_json) VALUES('alice',$1,'legacy-schedule-job','{"repository":"widget","task":"old"}')`, "schedule:legacy-schedule:3:2025-05-06T07:08:09Z"); err != nil {
+		t.Fatalf("seed historical PostgreSQL schedule key: %v", err)
+	}
 	store, err := NewPostgresStore(db, testConfig())
 	if err != nil {
 		t.Fatal(err)
@@ -529,6 +549,14 @@ func TestPostgresScheduleAuditMigrationLeavesLegacyHistoryEmpty(t *testing.T) {
 	var auditRows int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_schedule_audit WHERE schedule_id='legacy-schedule'`).Scan(&auditRows); err != nil || auditRows != 0 {
 		t.Fatalf("pre-upgrade PostgreSQL schedule audit rows=%d err=%v; want empty history", auditRows, err)
+	}
+	var runRows int
+	if err := db.QueryRow(`SELECT count(*) FROM factory_schedule_runs WHERE schedule_id='legacy-schedule'`).Scan(&runRows); err != nil || runRows != 0 {
+		t.Fatalf("pre-upgrade PostgreSQL schedule run provenance rows=%d err=%v; want no backfill", runRows, err)
+	}
+	legacyRuns, err := store.ListScheduleRuns("legacy-schedule", "alice", false, 0, 10)
+	if err != nil || len(legacyRuns.Runs) != 0 {
+		t.Fatalf("historical matching idempotency key produced PostgreSQL schedule runs=%+v err=%v; want no backfill", legacyRuns, err)
 	}
 	if _, err := store.MutateScheduleAs("legacy-schedule", "admin", true, 3, SchedulePause, nil); err != nil {
 		t.Fatalf("mutate pre-upgrade PostgreSQL schedule after upgrade: %v", err)
@@ -607,8 +635,8 @@ func TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.CloseStore() })
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 19 {
-		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 19", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 20 {
+		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 20", version, err)
 	}
 	var retainedAudit int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {

@@ -118,6 +118,41 @@ func TestLocalThreadCompletionRaceWithMemberAdmission(t *testing.T) {
 	}
 }
 
+func TestThreadAdmissionRejectsReservedScheduleNamespace(t *testing.T) {
+	manager := testManager(t, testConfig())
+	defer manager.Close()
+
+	for _, admit := range []struct {
+		name string
+		call func() error
+	}{
+		{
+			name: "thread",
+			call: func() error {
+				_, _, err := manager.AdmitThreadAs("schedule:spoofed:1:2026-01-01T00:00:00Z", "alice", Request{Repository: "widget", Task: "spoof schedule run"})
+				return err
+			},
+		},
+		{
+			name: "thread job",
+			call: func() error {
+				thread, _, err := manager.AdmitThreadAs("thread", "alice", Request{Repository: "widget", Task: "initial"})
+				if err != nil {
+					return err
+				}
+				_, _, _, err = manager.AdmitThreadJobAs(thread.Thread.ID, "schedule:spoofed:1:2026-01-01T00:00:00Z", "alice", Request{Repository: "widget", Task: "spoof schedule run"})
+				return err
+			},
+		},
+	} {
+		t.Run(admit.name, func(t *testing.T) {
+			if err := admit.call(); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("reserved schedule key error=%v, want ErrInvalidInput", err)
+			}
+		})
+	}
+}
+
 func TestAdmitThreadJobAsAddsOrderedMembersAndReplaysWithinThread(t *testing.T) {
 	manager := testManager(t, testConfig())
 	created, _, err := manager.AdmitThreadAs("thread-create", "alice", Request{Repository: "widget", Task: "initial"})

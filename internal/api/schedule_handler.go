@@ -16,6 +16,15 @@ import (
 	restserver "github.com/leehosanganson/factory/internal/server"
 )
 
+type scheduleRunResponse struct {
+	OccurrenceAt time.Time       `json:"occurrence_at"`
+	JobID        string          `json:"job_id"`
+	Status       restjobs.Status `json:"status"`
+	CreatedAt    time.Time       `json:"created_at"`
+	UpdatedAt    time.Time       `json:"updated_at"`
+	JobURL       string          `json:"job_url"`
+}
+
 type scheduleResponse struct {
 	ID                string                               `json:"id"`
 	Owner             string                               `json:"owner"`
@@ -90,6 +99,43 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
 }
+func (h *Handler) handleScheduleRuns(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
+	if (caller.Role != "submitter" && caller.Role != "operator") || id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
+	query, err := parseScheduleRunsQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	store, ok := h.scheduleStore(w)
+	if !ok {
+		return
+	}
+	page, err := store.ListScheduleRuns(id, caller.ID, caller.Role == "operator", query.beforeSequence, query.limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	runs := make([]scheduleRunResponse, 0, len(page.Runs))
+	for _, run := range page.Runs {
+		runs = append(runs, scheduleRunResponse{
+			OccurrenceAt: run.OccurrenceAt, JobID: run.JobID, Status: run.Status,
+			CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt, JobURL: "/v1/jobs/" + run.JobID,
+		})
+	}
+	response := struct {
+		Runs       []scheduleRunResponse `json:"runs"`
+		HasMore    bool                  `json:"has_more"`
+		NextBefore uint64                `json:"next_before_sequence,omitempty"`
+	}{Runs: runs, HasMore: page.HasMore}
+	if page.HasMore {
+		response.NextBefore = page.NextBefore
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
 func (h *Handler) handleScheduleHistory(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
 	if (caller.Role != "submitter" && caller.Role != "operator") || id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
@@ -123,6 +169,39 @@ func (h *Handler) handleScheduleHistory(w http.ResponseWriter, r *http.Request, 
 type scheduleHistoryQuery struct {
 	afterRevision int64
 	limit         int
+}
+
+type scheduleRunsQuery struct {
+	beforeSequence uint64
+	limit          int
+}
+
+func parseScheduleRunsQuery(r *http.Request) (scheduleRunsQuery, error) {
+	query := scheduleRunsQuery{limit: restjobs.DefaultScheduleHistoryLimit}
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return scheduleRunsQuery{}, restjobs.ErrInvalidInput
+	}
+	for key, entries := range values {
+		if (key != "before_sequence" && key != "limit") || len(entries) != 1 {
+			return scheduleRunsQuery{}, restjobs.ErrInvalidInput
+		}
+	}
+	if value, exists := values["before_sequence"]; exists {
+		parsed, parseErr := strconv.ParseUint(value[0], 10, 64)
+		if parseErr != nil || parsed == 0 || parsed > 1<<63-1 || strconv.FormatUint(parsed, 10) != value[0] {
+			return scheduleRunsQuery{}, restjobs.ErrInvalidInput
+		}
+		query.beforeSequence = parsed
+	}
+	if value, exists := values["limit"]; exists {
+		parsed, parseErr := strconv.Atoi(value[0])
+		if parseErr != nil || parsed < 1 || parsed > restjobs.MaxScheduleHistoryLimit {
+			return scheduleRunsQuery{}, restjobs.ErrInvalidInput
+		}
+		query.limit = parsed
+	}
+	return query, nil
 }
 
 func parseScheduleHistoryQuery(r *http.Request) (scheduleHistoryQuery, error) {

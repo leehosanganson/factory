@@ -476,6 +476,9 @@ func admitSQLiteScheduleJob(ctx context.Context, tx *sql.Tx, config Config, sche
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(principal_id,key,job_id,request_json) VALUES(?,?,?,?)`, schedule.Owner, key, id, string(encoded)); err != nil {
 		return errors.New("persist SQLite scheduled Job identity")
 	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_schedule_runs(schedule_id,occurrence_at,schedule_revision,job_id) VALUES(?,?,?,?)`, schedule.ID, occurrence.UTC().Format(time.RFC3339Nano), schedule.Revision, id); err != nil {
+		return errors.New("persist SQLite schedule run provenance")
+	}
 	if err := insertEvent(ctx, tx, id, "queued", "Job admitted", now, config.MaxEventsPerJob); err != nil {
 		return errors.New("persist SQLite scheduled Job history")
 	}
@@ -516,6 +519,9 @@ func admitPostgresScheduleJob(ctx context.Context, tx *sql.Tx, config Config, sc
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_job_idempotency(principal_id,key,job_id,request_json) VALUES($1,$2,$3,$4)`, schedule.Owner, key, id, string(encoded)); err != nil {
 		return errors.New("persist PostgreSQL scheduled Job identity")
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_schedule_runs(schedule_id,occurrence_at,schedule_revision,job_id) VALUES($1,$2,$3,$4)`, schedule.ID, occurrence.UTC(), schedule.Revision, id); err != nil {
+		return errors.New("persist PostgreSQL schedule run provenance")
 	}
 	if err := insertPostgresEvent(ctx, tx, id, "queued", "Job admitted", config.MaxEventsPerJob); err != nil {
 		return errors.New("persist PostgreSQL scheduled Job history")

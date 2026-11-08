@@ -286,6 +286,8 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		parts := strings.Split(tail, "/")
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "history" {
 			h.handleScheduleHistory(w, r, parts[0], caller)
+		} else if len(parts) == 2 && parts[0] != "" && parts[1] == "runs" {
+			h.handleScheduleRuns(w, r, parts[0], caller)
 		} else if len(parts) == 1 && parts[0] != "" {
 			h.handleSchedule(w, r, parts[0], caller)
 		} else {
@@ -406,7 +408,7 @@ func operatorScheduleRoute(path, method string) bool {
 	if len(parts) == 1 && parts[0] != "" {
 		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
 	}
-	return len(parts) == 2 && parts[0] != "" && parts[1] == "history" && method == http.MethodGet
+	return len(parts) == 2 && parts[0] != "" && parts[1] == "history" && method == http.MethodGet || len(parts) == 2 && parts[0] != "" && parts[1] == "runs" && method == http.MethodGet
 }
 
 func submitterRoute(path, method string) bool {
@@ -416,7 +418,7 @@ func submitterRoute(path, method string) bool {
 	if strings.HasPrefix(path, "/v1/schedules/") {
 		tail := strings.TrimPrefix(path, "/v1/schedules/")
 		parts := strings.Split(tail, "/")
-		return len(parts) == 1 && parts[0] != "" && (method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete) || len(parts) == 2 && parts[0] != "" && parts[1] == "history" && method == http.MethodGet
+		return len(parts) == 1 && parts[0] != "" && (method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete) || len(parts) == 2 && parts[0] != "" && (parts[1] == "history" || parts[1] == "runs") && method == http.MethodGet
 	}
 	if path == "/v1/notifications" {
 		return method == http.MethodGet
