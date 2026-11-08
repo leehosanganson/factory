@@ -44,6 +44,30 @@ func testWebHandler(t *testing.T) http.Handler {
 	return New(api, "admin")
 }
 
+func TestDashboardThreadMutationControlsAndStableRetryKey(t *testing.T) {
+	handler := testWebHandler(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard JavaScript status=%d", response.Code)
+	}
+	for _, want := range []string{
+		`threadAppendAttempt = { thread: currentThread, fingerprint, key: crypto.randomUUID() }`,
+		`threadAppendAttempt.fingerprint !== fingerprint`,
+		`threadMutationPending) return`,
+		`threadAppendAttempt.key`,
+		`threadClosed(error)`,
+		`await inspectThread(threadID);`,
+		`byId("thread-controls").classList.toggle("hidden", Boolean(thread.completed_at))`,
+		`/v1/threads/${encodeURIComponent(threadID)}/jobs`,
+		`/v1/threads/${encodeURIComponent(threadID)}/complete`,
+	} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Errorf("dashboard JavaScript missing Thread mutation behavior %q", want)
+		}
+	}
+}
+
 func TestDashboardScheduleViewRendersBoundedScheduleSummaries(t *testing.T) {
 	handler := testWebHandler(t)
 	request := httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil)
@@ -111,7 +135,7 @@ func TestDashboardAssetsAreEmbeddedAndHardened(t *testing.T) {
 			t.Errorf("GET %s status=%d body=%q", path, recorder.Code, recorder.Body.String())
 		}
 		if path == "/" {
-			for _, want := range []string{`id="thread-form"`, `id="thread-repository"`, `id="thread-task"`, `id="thread-result"`} {
+			for _, want := range []string{`id="thread-form"`, `id="thread-repository"`, `id="thread-task"`, `id="thread-result"`, `id="thread-append-form"`, `id="thread-complete"`} {
 				if !strings.Contains(recorder.Body.String(), want) {
 					t.Errorf("dashboard HTML missing Thread UI element %s", want)
 				}
@@ -213,6 +237,59 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 	if inspectResponse.Code != http.StatusOK || !strings.Contains(inspectResponse.Body.String(), created.Job.ID) || strings.Contains(inspectResponse.Body.String(), "safe thread task") {
 		t.Fatalf("Thread inspect status=%d body=%s", inspectResponse.Code, inspectResponse.Body.String())
 	}
+	appendRequest := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"private follow-up task"}`))
+	appendRequest.Host = "factory.example"
+	appendRequest.Header.Set("Origin", "https://factory.example")
+	appendRequest.Header.Set("Content-Type", "application/json")
+	appendRequest.Header.Set("Idempotency-Key", "web-thread-append")
+	appendRequest.Header.Set("X-CSRF-Token", sessionData.CSRF)
+	appendRequest.AddCookie(cookie)
+	appendResponse := httptest.NewRecorder()
+	handler.ServeHTTP(appendResponse, appendRequest)
+	if appendResponse.Code != http.StatusAccepted || strings.Contains(appendResponse.Body.String(), "private follow-up task") || strings.Contains(appendResponse.Body.String(), `"request"`) || strings.Contains(appendResponse.Body.String(), `"provider"`) {
+		t.Fatalf("Thread append status=%d body=%s", appendResponse.Code, appendResponse.Body.String())
+	}
+	var appended struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+		Job struct {
+			ID string `json:"id"`
+		} `json:"job"`
+		Replayed bool `json:"replayed"`
+	}
+	if err := json.Unmarshal(appendResponse.Body.Bytes(), &appended); err != nil || appended.Thread.ID != created.Thread.ID || appended.Job.ID == "" || appended.Replayed {
+		t.Fatalf("Thread append response=%s err=%v", appendResponse.Body.String(), err)
+	}
+	appendRetry := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"private follow-up task"}`))
+	appendRetry.Host = "factory.example"
+	appendRetry.Header = appendRequest.Header.Clone()
+	appendRetry.AddCookie(cookie)
+	appendRetryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(appendRetryResponse, appendRetry)
+	if appendRetryResponse.Code != http.StatusAccepted || !strings.Contains(appendRetryResponse.Body.String(), appended.Job.ID) || !strings.Contains(appendRetryResponse.Body.String(), `"replayed":true`) {
+		t.Fatalf("Thread append retry status=%d body=%s", appendRetryResponse.Code, appendRetryResponse.Body.String())
+	}
+	completeRequest := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads/"+created.Thread.ID+"/complete", nil)
+	completeRequest.Host = "factory.example"
+	completeRequest.Header.Set("Origin", "https://factory.example")
+	completeRequest.Header.Set("X-CSRF-Token", sessionData.CSRF)
+	completeRequest.AddCookie(cookie)
+	completeResponse := httptest.NewRecorder()
+	handler.ServeHTTP(completeResponse, completeRequest)
+	if completeResponse.Code != http.StatusOK || strings.Contains(completeResponse.Body.String(), `"completed_by"`) || strings.Contains(completeResponse.Body.String(), `"provider"`) || !strings.Contains(completeResponse.Body.String(), `"completed_at"`) {
+		t.Fatalf("Thread completion status=%d body=%s", completeResponse.Code, completeResponse.Body.String())
+	}
+	closedAppend := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"after close"}`))
+	closedAppend.Host = appendRequest.Host
+	closedAppend.Header = appendRequest.Header.Clone()
+	closedAppend.Header.Set("Idempotency-Key", "web-thread-closed-append")
+	closedAppend.AddCookie(cookie)
+	closedResponse := httptest.NewRecorder()
+	handler.ServeHTTP(closedResponse, closedAppend)
+	if closedResponse.Code != http.StatusConflict || !strings.Contains(closedResponse.Body.String(), "thread_closed") {
+		t.Fatalf("closed Thread append status=%d body=%s", closedResponse.Code, closedResponse.Body.String())
+	}
 	retry := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads", strings.NewReader(`{"repository":"widget","task":"safe thread task"}`))
 	retry.Host = "factory.example"
 	retry.Header.Set("Origin", "https://factory.example")
@@ -255,7 +332,7 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 		method string
 		path   string
 		want   int
-	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusNotFound}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
+	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusNotFound}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/jobs?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
 		proxyRequest := httptest.NewRequest(tc.method, tc.path, nil)
 		proxyRequest.Host = "factory.example"
 		proxyRequest.Header.Set("Origin", "https://factory.example")

@@ -32,6 +32,12 @@ type dashboardThreadDetailResponse struct {
 	Jobs   []dashboardThreadJobResponse `json:"jobs"`
 }
 
+type dashboardThreadAppendResponse struct {
+	Thread   dashboardThreadResponse    `json:"thread"`
+	Job      dashboardThreadJobResponse `json:"job"`
+	Replayed bool                       `json:"replayed"`
+}
+
 func projectDashboardThread(thread restjobs.Thread) dashboardThreadResponse {
 	return dashboardThreadResponse{
 		ID: thread.ID, Status: thread.Status, CreatedAt: thread.CreatedAt, UpdatedAt: thread.UpdatedAt,

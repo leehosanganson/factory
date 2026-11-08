@@ -3,7 +3,10 @@
   let csrf = "";
   let selected = "";
   let currentThread = "";
+  let currentThreadStatus = "";
   let threadAttempt = null;
+  let threadAppendAttempt = null;
+  let threadMutationPending = false;
   let stream = null;
   let refreshTimer = null;
   let pollingTimer = null;
@@ -16,8 +19,15 @@
     const response = await fetch(`/ui/api${path}`, { ...options, headers, credentials: "same-origin", cache: "no-store" });
     if (!response.ok) {
       let message = `Request failed (${response.status}).`;
-      try { const body = await response.json(); if (body.message) message = body.message; } catch (_) {}
-      throw new Error(message);
+      let code = "";
+      try {
+        const body = await response.json();
+        if (body.message) message = body.message;
+        if (body.error && body.error.code) { code = body.error.code; message = body.error.message || message; }
+      } catch (_) {}
+      const error = new Error(message);
+      error.code = code;
+      throw error;
     }
     return response.status === 204 ? null : response.json();
   };
@@ -171,9 +181,15 @@
   async function inspectThread(id) {
     try {
       const result = await api(`/v1/threads/${encodeURIComponent(id)}`);
+      if (id !== currentThread) return;
       const panel = byId("thread-result"); panel.replaceChildren();
       const thread = result.thread;
+      currentThreadStatus = thread.completed_at ? "completed" : thread.status;
       panel.append(node("h3", `Thread ${thread.id}`), node("span", thread.status, "status " + thread.status));
+      if (thread.completed_at) panel.append(node("p", `Completed ${new Date(thread.completed_at).toLocaleString()}`, "job-meta"));
+      byId("thread-controls").classList.toggle("hidden", Boolean(thread.completed_at));
+      byId("thread-append-submit").disabled = threadMutationPending || Boolean(thread.completed_at);
+      byId("thread-complete").disabled = threadMutationPending || Boolean(thread.completed_at);
       for (const job of result.jobs || []) {
         const row = node("article", undefined, "thread-job");
         row.append(node("strong", `Job ${job.id}`), node("span", job.status, "status " + job.status));
@@ -182,6 +198,11 @@
       }
       showNotice("");
     } catch (error) { showNotice(error.message); }
+  }
+  function threadClosed(error) { return error.code === "thread_closed"; }
+  async function refreshClosedThread(id) {
+    await inspectThread(id);
+    showNotice("This Thread is already completed. Its current state has been refreshed.");
   }
   function update() { if (selected) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { refreshJobs(); }, 200); } }
   byId("login-form").addEventListener("submit", async (event) => {
@@ -210,6 +231,8 @@
     try {
       const response = await api("/v1/threads", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": threadAttempt.key }, body: fingerprint });
       currentThread = response.thread.id;
+      currentThreadStatus = response.thread.completed_at ? "completed" : response.thread.status;
+      threadAppendAttempt = null;
       threadAttempt = null;
       event.currentTarget.reset();
       byId("thread-result").replaceChildren();
@@ -217,9 +240,63 @@
       await inspectThread(currentThread);
     } catch (error) { showNotice(error.message); }
   });
+  byId("thread-append-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!currentThread || currentThreadStatus === "completed" || threadMutationPending) return;
+    showNotice("");
+    const form = new FormData(event.currentTarget);
+    const input = { repository: String(form.get("repository") || "").trim(), task: String(form.get("task") || "") };
+    const fingerprint = JSON.stringify(input);
+    if (!threadAppendAttempt || threadAppendAttempt.thread !== currentThread || threadAppendAttempt.fingerprint !== fingerprint) {
+      threadAppendAttempt = { thread: currentThread, fingerprint, key: crypto.randomUUID() };
+    }
+    const threadID = currentThread;
+    threadMutationPending = true;
+    byId("thread-append-submit").disabled = true;
+    byId("thread-complete").disabled = true;
+    try {
+      const response = await api(`/v1/threads/${encodeURIComponent(threadID)}/jobs`, { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": threadAppendAttempt.key }, body: fingerprint });
+      if (currentThread === threadID) {
+        threadAppendAttempt = null;
+        event.currentTarget.reset();
+        showNotice(response.replayed ? `Job ${response.job.id} was already appended to Thread ${threadID}.` : `Job ${response.job.id} appended to Thread ${threadID}.`);
+      }
+      await inspectThread(threadID);
+    } catch (error) {
+      if (threadClosed(error)) await refreshClosedThread(threadID);
+      else showNotice(error.message);
+    } finally {
+      threadMutationPending = false;
+      if (currentThread === threadID) {
+        byId("thread-append-submit").disabled = currentThreadStatus === "completed";
+        byId("thread-complete").disabled = currentThreadStatus === "completed";
+      }
+    }
+  });
+  byId("thread-complete").addEventListener("click", async () => {
+    if (!currentThread || currentThreadStatus === "completed" || threadMutationPending) return;
+    const threadID = currentThread;
+    threadMutationPending = true;
+    byId("thread-append-submit").disabled = true;
+    byId("thread-complete").disabled = true;
+    try {
+      await api(`/v1/threads/${encodeURIComponent(threadID)}/complete`, { method: "POST" });
+      if (currentThread === threadID) showNotice(`Thread ${threadID} completed.`);
+      await inspectThread(threadID);
+    } catch (error) {
+      if (threadClosed(error)) await refreshClosedThread(threadID);
+      else showNotice(error.message);
+    } finally {
+      threadMutationPending = false;
+      if (currentThread === threadID) {
+        byId("thread-append-submit").disabled = currentThreadStatus === "completed";
+        byId("thread-complete").disabled = currentThreadStatus === "completed";
+      }
+    }
+  });
   byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); if (currentThread) inspectThread(currentThread); });
   byId("logout").addEventListener("click", async () => {
-    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; currentThread = ""; threadAttempt = null; byId("thread-result").replaceChildren(); byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; byId("detail").classList.add("hidden"); }
+    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; currentThread = ""; currentThreadStatus = ""; threadAttempt = null; threadAppendAttempt = null; threadMutationPending = false; byId("thread-result").replaceChildren(); byId("thread-controls").classList.add("hidden"); byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; byId("detail").classList.add("hidden"); }
   });
   fetch("/ui/session", { credentials: "same-origin", cache: "no-store" }).then((response) => response.json()).then((session) => { if (session.authenticated) authenticated(session); }).catch(() => {});
 })();
