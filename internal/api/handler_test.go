@@ -516,7 +516,7 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		t.Fatalf("trusted principal admission status=%d body=%s", response.Code, response.Body.String())
 	}
 
-	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra"} {
+	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeAsDashboardOperator(response, request)
@@ -537,12 +537,116 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		t.Errorf("dashboard accepted schedule mutation status=%d", response.Code)
 	}
 
+	request = httptest.NewRequest(http.MethodGet, "/v1/threads/one", nil)
+	response = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Errorf("dashboard unexpected Thread detail status=%d", response.Code)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/v1/threads/one?include=private", nil)
+	response = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Errorf("dashboard accepted Thread query status=%d", response.Code)
+	}
+
 	request = httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"widget","task":"trusted frontend"}`))
 	request.URL.RawPath = "/v1%2Fjobs"
 	response = httptest.NewRecorder()
 	handler.ServeAsDashboardOperator(response, request)
 	if response.Code != http.StatusNotFound {
 		t.Errorf("dashboard accepted escaped API path status=%d", response.Code)
+	}
+}
+
+func TestDashboardThreadCreateAndInspectUseSafeProjection(t *testing.T) {
+	manager := newTestManager(t, managerConfig(8, 8, 16))
+	handler := newTestHandler(t, manager, func() bool { return true })
+	handler.config.DashboardOperatorID = "admin"
+
+	create := func(key string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/threads", strings.NewReader(`{"repository":"widget","task":"sentinel private task"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", key)
+		response := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(response, request)
+		return response
+	}
+	first := create("dashboard-thread-create")
+	if first.Code != http.StatusAccepted {
+		t.Fatalf("dashboard Thread create status=%d body=%s", first.Code, first.Body.String())
+	}
+	var created struct {
+		Thread dashboardThreadResponse    `json:"thread"`
+		Job    dashboardThreadJobResponse `json:"job"`
+		Replay bool                       `json:"replayed"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Thread.ID == "" || created.Job.ID == "" || created.Replay {
+		t.Fatalf("dashboard Thread create response=%+v", created)
+	}
+	for _, forbidden := range []string{"sentinel private task", "request", "provider", "submitted_by", "job_ids", "completed_by", "links"} {
+		if strings.Contains(first.Body.String(), forbidden) {
+			t.Errorf("dashboard Thread create exposed %q: %s", forbidden, first.Body.String())
+		}
+	}
+	replay := create("dashboard-thread-create")
+	if replay.Code != http.StatusAccepted || !strings.Contains(replay.Body.String(), `"replayed":true`) || !strings.Contains(replay.Body.String(), created.Thread.ID) {
+		t.Fatalf("dashboard Thread idempotent replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	for _, forbidden := range []string{"sentinel private task", "sentinel provider", "sentinel repository", "sentinel.invalid"} {
+		if strings.Contains(replay.Body.String(), forbidden) {
+			t.Errorf("dashboard Thread idempotent replay exposed %q: %s", forbidden, replay.Body.String())
+		}
+	}
+
+	inspect := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(inspect, httptest.NewRequest(http.MethodGet, "/v1/threads/"+created.Thread.ID, nil))
+	if inspect.Code != http.StatusOK || !strings.Contains(inspect.Body.String(), created.Job.ID) {
+		t.Fatalf("dashboard Thread inspect status=%d body=%s", inspect.Code, inspect.Body.String())
+	}
+	for _, forbidden := range []string{"sentinel private task", "request", "provider", "submitted_by", "job_ids", "completed_by"} {
+		if strings.Contains(inspect.Body.String(), forbidden) {
+			t.Errorf("dashboard Thread inspect exposed %q: %s", forbidden, inspect.Body.String())
+		}
+	}
+	for _, allowed := range []string{`"id"`, `"status"`, `"created_at"`, `"updated_at"`, `"jobs"`} {
+		if !strings.Contains(inspect.Body.String(), allowed) {
+			t.Errorf("dashboard Thread inspect omitted allowlisted field %s: %s", allowed, inspect.Body.String())
+		}
+	}
+	other, _, err := manager.AdmitThreadAs("submitted-thread", "alice", restjobs.Request{Repository: "widget", Task: "another private sentinel"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorInspect := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(operatorInspect, httptest.NewRequest(http.MethodGet, "/v1/threads/"+other.Thread.ID, nil))
+	if operatorInspect.Code != http.StatusOK || !strings.Contains(operatorInspect.Body.String(), other.Jobs[0].ID) || strings.Contains(operatorInspect.Body.String(), "another private sentinel") {
+		t.Fatalf("dashboard operator inspection of another Thread status=%d body=%s", operatorInspect.Code, operatorInspect.Body.String())
+	}
+
+	missing := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(missing, httptest.NewRequest(http.MethodGet, "/v1/threads/missing", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("dashboard inspect missing Thread status=%d", missing.Code)
+	}
+}
+
+func TestDashboardThreadProjectionDropsTaskAndProviderFields(t *testing.T) {
+	job := restjobs.Snapshot{
+		ID: "job-id", Request: restjobs.Request{Repository: "private/repository", Task: "sentinel task"},
+		Provider: &restjobs.ProviderOutcome{Provider: "sentinel provider", Repository: "sentinel repository", URL: "https://sentinel.invalid/pull/1"},
+	}
+	encoded, err := json.Marshal(projectDashboardThreadJob(job))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"sentinel task", "sentinel provider", "sentinel repository", "sentinel.invalid", "request", "provider"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Errorf("Thread Job projection exposed %q: %s", forbidden, encoded)
+		}
 	}
 }
 
