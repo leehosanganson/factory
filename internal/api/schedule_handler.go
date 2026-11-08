@@ -25,6 +25,19 @@ type scheduleRunResponse struct {
 	JobURL       string          `json:"job_url"`
 }
 
+const dashboardScheduleLimit = 20
+
+type dashboardScheduleResponse struct {
+	ID        string                               `json:"id"`
+	Cron      string                               `json:"cron"`
+	Status    restjobs.ScheduleStatus              `json:"status"`
+	Revision  int64                                `json:"revision"`
+	Pending   *time.Time                           `json:"pending_occurrence_at,omitempty"`
+	Skipped   *restjobs.SkippedScheduleOccurrences `json:"skipped_occurrences,omitempty"`
+	CreatedAt time.Time                            `json:"created_at"`
+	UpdatedAt time.Time                            `json:"updated_at"`
+}
+
 type scheduleResponse struct {
 	ID                string                               `json:"id"`
 	Owner             string                               `json:"owner"`
@@ -46,6 +59,68 @@ func scheduleView(schedule restjobs.Schedule) scheduleResponse {
 		CreatedAt: schedule.CreatedAt, UpdatedAt: schedule.UpdatedAt,
 		PendingOccurrence: schedule.PendingOccurrence(), Skipped: schedule.SkippedOccurrences(),
 	}
+}
+
+func (h *Handler) handleDashboardScheduleList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	if r.URL.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	store, ok := h.scheduleStore(w)
+	if !ok {
+		return
+	}
+	schedules, err := store.ListRecentSchedules(dashboardScheduleLimit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	response := make([]dashboardScheduleResponse, 0, len(schedules))
+	for _, schedule := range schedules {
+		response = append(response, dashboardScheduleResponse{
+			ID: schedule.ID, Cron: schedule.Cron, Status: schedule.Status, Revision: schedule.Revision,
+			Pending: schedule.PendingOccurrence(), Skipped: schedule.SkippedOccurrences(),
+			CreatedAt: schedule.CreatedAt, UpdatedAt: schedule.UpdatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Schedules []dashboardScheduleResponse `json:"schedules"`
+	}{response})
+}
+
+func (h *Handler) handleDashboardScheduleRuns(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
+	query, err := parseScheduleRunsQuery(r)
+	if err != nil || query.limit > 5 || query.beforeSequence != 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	store, ok := h.scheduleStore(w)
+	if !ok {
+		return
+	}
+	page, err := store.ListScheduleRuns(id, h.config.DashboardOperatorID, true, query.beforeSequence, query.limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	runs := make([]scheduleRunResponse, 0, len(page.Runs))
+	for _, run := range page.Runs {
+		runs = append(runs, scheduleRunResponse{
+			OccurrenceAt: run.OccurrenceAt, JobID: run.JobID, Status: run.Status,
+			CreatedAt: run.CreatedAt, UpdatedAt: run.UpdatedAt, JobURL: "/v1/jobs/" + run.JobID,
+		})
+	}
+	writeJSON(w, http.StatusOK, struct {
+		Runs []scheduleRunResponse `json:"runs"`
+	}{runs})
 }
 
 func (h *Handler) scheduleStore(w http.ResponseWriter) (restjobs.ScheduleStore, bool) {

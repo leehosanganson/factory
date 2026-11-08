@@ -5,6 +5,9 @@
   let stream = null;
   let refreshTimer = null;
   let pollingTimer = null;
+  let schedulesRefreshing = false;
+  let scheduleRefreshPending = false;
+  let scheduleRefreshGeneration = 0;
   const api = async (path, options = {}) => {
     const headers = new Headers(options.headers || {});
     if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", csrf);
@@ -24,7 +27,8 @@
     byId("dashboard").classList.remove("hidden");
     byId("logout").classList.remove("hidden");
     refreshJobs();
-    if (!pollingTimer) pollingTimer = setInterval(() => { if (!byId("dashboard").classList.contains("hidden")) refreshJobs(); }, 10000);
+    refreshSchedules();
+    if (!pollingTimer) pollingTimer = setInterval(() => { if (!byId("dashboard").classList.contains("hidden")) { refreshJobs(); refreshSchedules(); } }, 10000);
   };
   async function refreshJobs() {
     byId("loading").textContent = "Refreshing…";
@@ -51,6 +55,71 @@
       byId("loading").textContent = "";
       if (selected) await inspect(selected, false);
     } catch (error) { byId("loading").textContent = ""; showNotice(error.message); }
+  }
+  async function refreshSchedules() {
+    if (schedulesRefreshing) { scheduleRefreshPending = true; return; }
+    schedulesRefreshing = true;
+    const generation = ++scheduleRefreshGeneration;
+    const isCurrent = () => generation === scheduleRefreshGeneration && !byId("dashboard").classList.contains("hidden");
+    const loading = byId("schedule-loading");
+    loading.textContent = "Refreshing…";
+    try {
+      const page = await api("/v1/schedules");
+      if (!isCurrent()) return;
+      const schedules = page.schedules || [];
+      const list = byId("schedule-list"); list.replaceChildren();
+      if (schedules.length === 0) {
+        list.append(node("p", "No schedules are configured.", "empty"));
+      } else {
+        const rows = await Promise.all(schedules.map(async (schedule) => {
+          let runs = [];
+          try {
+            const runPage = await api(`/v1/schedules/${encodeURIComponent(schedule.id)}/runs?limit=5`);
+            runs = runPage.runs || [];
+          } catch (error) { if (isCurrent()) showNotice(error.message); }
+          return { schedule, runs };
+        }));
+        if (!isCurrent()) return;
+        for (const { schedule, runs } of rows) {
+          const card = node("article", undefined, "schedule-row");
+          const heading = node("div", undefined, "schedule-heading");
+          heading.append(node("h3", schedule.id), node("span", schedule.status, "status " + schedule.status));
+          card.append(heading);
+          const detail = node("p", undefined, "schedule-meta");
+          detail.append(node("span", `UTC · ${schedule.cron}`, "schedule-cron"));
+          card.append(detail);
+          if (schedule.pending_occurrence_at) card.append(node("p", `Pending occurrence: ${new Date(schedule.pending_occurrence_at).toISOString()}`, "schedule-summary"));
+          if (schedule.skipped_occurrences) {
+            const skipped = schedule.skipped_occurrences;
+            card.append(node("p", `Skipped ${skipped.count} occurrence${skipped.count === 1 ? "" : "s"} · ${new Date(skipped.first_at).toISOString()} to ${new Date(skipped.last_at).toISOString()}`, "schedule-summary"));
+          }
+          card.append(node("h4", "Recent runs", "schedule-runs-title"));
+          if (runs.length === 0) card.append(node("p", "No retained runs.", "muted"));
+          else {
+            const runList = node("ul", undefined, "schedule-runs");
+            for (const run of runs.slice(0, 5)) {
+              const item = node("li");
+              const time = node("span", new Date(run.occurrence_at).toISOString(), "schedule-run-time");
+              const status = node("span", run.status, "status " + run.status);
+              const link = node("a", `Job ${run.job_id}`, "schedule-run-link");
+              link.href = `#job-${encodeURIComponent(run.job_id)}`;
+              link.addEventListener("click", (event) => { event.preventDefault(); inspect(run.job_id); });
+              item.append(time, status, link); runList.append(item);
+            }
+            card.append(runList);
+          }
+          list.append(card);
+        }
+      }
+      loading.textContent = "";
+    } catch (error) { if (isCurrent()) { loading.textContent = ""; showNotice(error.message); } }
+    finally {
+      schedulesRefreshing = false;
+      if (scheduleRefreshPending) {
+        scheduleRefreshPending = false;
+        if (!byId("dashboard").classList.contains("hidden")) refreshSchedules();
+      }
+    }
   }
   async function inspect(id, scroll = true) {
     const changedSelection = selected !== id;
@@ -114,9 +183,9 @@
       event.currentTarget.reset(); showNotice(`Job ${response.job.id} admitted.`); await refreshJobs(); await inspect(response.job.id);
     } catch (error) { showNotice(error.message); }
   });
-  byId("refresh").addEventListener("click", refreshJobs);
+  byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); });
   byId("logout").addEventListener("click", async () => {
-    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("detail").classList.add("hidden"); }
+    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; byId("detail").classList.add("hidden"); }
   });
   fetch("/ui/session", { credentials: "same-origin", cache: "no-store" }).then((response) => response.json()).then((session) => { if (session.authenticated) authenticated(session); }).catch(() => {});
 })();

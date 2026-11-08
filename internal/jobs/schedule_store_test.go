@@ -8,6 +8,33 @@ import (
 	"time"
 )
 
+func TestSQLiteListRecentSchedulesIsBoundedAndStableOrdered(t *testing.T) {
+	store, err := OpenSQLiteServerStore(filepath.Join(privateSQLiteDir(t), "recent-schedules.db"), Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	first, _, err := store.CreateSchedule("alice", "recent-one", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.CreateSchedule("bob", "recent-two", ScheduleInput{Cron: "*/2 * * * *", Repository: "widget", Task: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recent, err := store.ListRecentSchedules(1)
+	if err != nil || len(recent) != 1 || recent[0].ID != second.ID {
+		t.Fatalf("recent schedules=%+v err=%v, want newest %s", recent, err, second.ID)
+	}
+	all, err := store.ListRecentSchedules(2)
+	if err != nil || len(all) != 2 || all[0].ID != first.ID || all[1].ID != second.ID {
+		t.Fatalf("recent schedules=%+v err=%v, want stable creation order", all, err)
+	}
+	if _, err := store.ListRecentSchedules(0); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid limit error=%v", err)
+	}
+}
+
 func TestSQLiteScheduleOccurrenceAdmissionRetainsPendingAndSkipsLaterOccurrences(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "schedule-occurrences.db")
 	config := Config{QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128}

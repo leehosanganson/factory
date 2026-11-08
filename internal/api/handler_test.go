@@ -516,7 +516,7 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		t.Fatalf("trusted principal admission status=%d body=%s", response.Code, response.Body.String())
 	}
 
-	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra"} {
+	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeAsDashboardOperator(response, request)
@@ -524,6 +524,19 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 			t.Errorf("dashboard exposed non-allowlisted path %s status=%d", path, response.Code)
 		}
 	}
+	request = httptest.NewRequest(http.MethodGet, "/v1/schedules", nil)
+	response = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"durable_store_required"`) {
+		t.Fatalf("dashboard schedule list status=%d body=%s", response.Code, response.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{}`))
+	response = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Errorf("dashboard accepted schedule mutation status=%d", response.Code)
+	}
+
 	request = httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"widget","task":"trusted frontend"}`))
 	request.URL.RawPath = "/v1%2Fjobs"
 	response = httptest.NewRecorder()

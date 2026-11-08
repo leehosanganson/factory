@@ -106,6 +106,35 @@ func (s *SQLiteStore) ListSchedules(owner string) ([]Schedule, error) {
 	}
 	return result, nil
 }
+func (s *SQLiteStore) ListRecentSchedules(limit int) ([]Schedule, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	if limit < 1 || limit > 100 {
+		return nil, ErrInvalidInput
+	}
+	rows, err := s.db.Query(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,pending_occurrence_at,skipped_revision,skipped_first_at,skipped_last_at,skipped_count FROM (SELECT * FROM factory_schedules ORDER BY created_at DESC,id DESC LIMIT ?) ORDER BY created_at,id`, limit)
+	if err != nil {
+		return nil, errors.New("list recent SQLite schedules")
+	}
+	defer rows.Close()
+	var result []Schedule
+	for rows.Next() {
+		schedule, scanErr := scanSQLiteSchedule(rows)
+		if scanErr != nil {
+			return nil, errors.New("read recent SQLite schedules")
+		}
+		result = append(result, schedule)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, errors.New("read recent SQLite schedules")
+	}
+	if result == nil {
+		result = []Schedule{}
+	}
+	return result, nil
+}
+
 func (s *SQLiteStore) ListAllSchedules() ([]Schedule, error) {
 	if err := s.checkOpen(); err != nil {
 		return nil, err

@@ -140,19 +140,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveHTTP(w, r, nil)
 }
 
-// ServeAsDashboardOperator serves only the narrow job routes exposed by the
-// embedded UI, for the named operator selected by server configuration.
+// ServeAsDashboardOperator serves only the narrow read-only schedule and job
+// routes exposed by the embedded UI, plus its existing job actions.
 func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Request) {
 	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || !dashboardRoute(r.URL.Path, r.Method) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
+	r = r.WithContext(context.WithValue(r.Context(), dashboardOperatorContextKey{}, true))
 	h.serveHTTP(w, r, &restserver.Principal{ID: h.config.DashboardOperatorID, Role: "operator"})
 }
 
+type dashboardOperatorContextKey struct{}
+
+func isDashboardOperator(r *http.Request) bool {
+	value, _ := r.Context().Value(dashboardOperatorContextKey{}).(bool)
+	return value
+}
+
 func dashboardRoute(path, method string) bool {
-	if isSchedulesPath(path) {
-		return false
+	if path == "/v1/schedules" {
+		return method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/v1/schedules/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/v1/schedules/"), "/")
+		return len(parts) == 2 && parts[0] != "" && parts[1] == "runs" && method == http.MethodGet
 	}
 	if path == "/v1/jobs" {
 		return method == http.MethodGet || method == http.MethodPost
@@ -276,6 +288,10 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		}
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	case path == "/v1/schedules":
+		if isDashboardOperator(r) {
+			h.handleDashboardScheduleList(w, r)
+			return
+		}
 		if caller.Role == "operator" && r.Method != http.MethodGet {
 			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 			return
@@ -284,6 +300,14 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	case strings.HasPrefix(path, "/v1/schedules/"):
 		tail := strings.TrimPrefix(path, "/v1/schedules/")
 		parts := strings.Split(tail, "/")
+		if isDashboardOperator(r) {
+			if len(parts) != 2 || parts[0] == "" || parts[1] != "runs" {
+				writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+				return
+			}
+			h.handleDashboardScheduleRuns(w, r, parts[0])
+			return
+		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "history" {
 			h.handleScheduleHistory(w, r, parts[0], caller)
 		} else if len(parts) == 2 && parts[0] != "" && parts[1] == "runs" {

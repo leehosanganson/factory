@@ -56,6 +56,7 @@ type ScheduleStore interface {
 	GetSchedule(id string) (Schedule, error)
 	ListSchedules(owner string) ([]Schedule, error)
 	ListAllSchedules() ([]Schedule, error)
+	ListRecentSchedules(limit int) ([]Schedule, error)
 	ListScheduleHistory(id, actor string, operator bool, afterRevision int64, limit int) (ScheduleAuditPage, error)
 	ListScheduleRuns(id, actor string, operator bool, beforeSequence uint64, limit int) (ScheduleRunPage, error)
 	MutateSchedule(id, owner string, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error)
