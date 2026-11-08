@@ -2,6 +2,8 @@
   const byId = (id) => document.getElementById(id);
   let csrf = "";
   let selected = "";
+  let currentThread = "";
+  let threadAttempt = null;
   let stream = null;
   let refreshTimer = null;
   let pollingTimer = null;
@@ -28,6 +30,7 @@
     byId("logout").classList.remove("hidden");
     refreshJobs();
     refreshSchedules();
+    if (currentThread) inspectThread(currentThread);
     if (!pollingTimer) pollingTimer = setInterval(() => { if (!byId("dashboard").classList.contains("hidden")) { refreshJobs(); refreshSchedules(); } }, 10000);
   };
   async function refreshJobs() {
@@ -165,6 +168,21 @@
       if (["succeeded", "failed", "canceled"].includes(job.status) && stream) { stream.close(); stream = null; }
     } catch (error) { showNotice(error.message); }
   }
+  async function inspectThread(id) {
+    try {
+      const result = await api(`/v1/threads/${encodeURIComponent(id)}`);
+      const panel = byId("thread-result"); panel.replaceChildren();
+      const thread = result.thread;
+      panel.append(node("h3", `Thread ${thread.id}`), node("span", thread.status, "status " + thread.status));
+      for (const job of result.jobs || []) {
+        const row = node("article", undefined, "thread-job");
+        row.append(node("strong", `Job ${job.id}`), node("span", job.status, "status " + job.status));
+        row.append(node("span", `Created ${new Date(job.created_at).toLocaleString()} · Updated ${new Date(job.updated_at).toLocaleString()}`, "job-meta"));
+        panel.append(row);
+      }
+      showNotice("");
+    } catch (error) { showNotice(error.message); }
+  }
   function update() { if (selected) { clearTimeout(refreshTimer); refreshTimer = setTimeout(() => { refreshJobs(); }, 200); } }
   byId("login-form").addEventListener("submit", async (event) => {
     event.preventDefault(); byId("login-error").textContent = "";
@@ -183,9 +201,25 @@
       event.currentTarget.reset(); showNotice(`Job ${response.job.id} admitted.`); await refreshJobs(); await inspect(response.job.id);
     } catch (error) { showNotice(error.message); }
   });
-  byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); });
+  byId("thread-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); showNotice("");
+    const form = new FormData(event.currentTarget);
+    const input = { repository: String(form.get("repository") || "").trim(), task: String(form.get("task") || "") };
+    const fingerprint = JSON.stringify(input);
+    if (!threadAttempt || threadAttempt.fingerprint !== fingerprint) threadAttempt = { fingerprint, key: crypto.randomUUID() };
+    try {
+      const response = await api("/v1/threads", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": threadAttempt.key }, body: fingerprint });
+      currentThread = response.thread.id;
+      threadAttempt = null;
+      event.currentTarget.reset();
+      byId("thread-result").replaceChildren();
+      showNotice(`Thread ${response.thread.id} created with Job ${response.job.id}.`);
+      await inspectThread(currentThread);
+    } catch (error) { showNotice(error.message); }
+  });
+  byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); if (currentThread) inspectThread(currentThread); });
   byId("logout").addEventListener("click", async () => {
-    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; byId("detail").classList.add("hidden"); }
+    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; currentThread = ""; threadAttempt = null; byId("thread-result").replaceChildren(); byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; byId("detail").classList.add("hidden"); }
   });
   fetch("/ui/session", { credentials: "same-origin", cache: "no-store" }).then((response) => response.json()).then((session) => { if (session.authenticated) authenticated(session); }).catch(() => {});
 })();

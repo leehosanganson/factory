@@ -33,6 +33,16 @@
           <div id="job-list" class="job-list" aria-live="polite"><p class="muted">Loading jobs…</p></div>
         </section>
       </div>
+      <section class="panel threads-panel" aria-labelledby="threads-title">
+        <h2 id="threads-title">Start a Thread</h2>
+        <p class="muted">Create a Thread with its first Job, then inspect it here. Thread IDs stay in this page only.</p>
+        <form id="thread-form" class="thread-form">
+          <label for="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxlength="64" required autocomplete="off">
+          <label for="thread-task">Task</label><textarea id="thread-task" name="task" rows="4" maxlength="262144" required></textarea>
+          <button type="submit">Create Thread</button>
+        </form>
+        <div id="thread-result" class="thread-result" aria-live="polite"></div>
+      </section>
       <section class="panel schedules-panel" aria-labelledby="schedules-title">
         <div class="section-heading"><h2 id="schedules-title">Schedules</h2><span id="schedule-loading" class="muted" role="status"></span></div>
         <p class="muted">Read-only view of scheduled work. Times are UTC.</p>

@@ -140,10 +140,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveHTTP(w, r, nil)
 }
 
-// ServeAsDashboardOperator serves only the narrow read-only schedule and job
-// routes exposed by the embedded UI, plus its existing job actions.
+// ServeAsDashboardOperator serves the allowlisted embedded dashboard routes.
 func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Request) {
-	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || !dashboardRoute(r.URL.Path, r.Method) {
+	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || isThreadsPath(r.URL.Path) && r.URL.RawQuery != "" || !dashboardRoute(r.URL.Path, r.Method) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -168,6 +167,13 @@ func dashboardRoute(path, method string) bool {
 	}
 	if path == "/v1/jobs" {
 		return method == http.MethodGet || method == http.MethodPost
+	}
+	if path == "/v1/threads" {
+		return method == http.MethodPost
+	}
+	if strings.HasPrefix(path, "/v1/threads/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/v1/threads/"), "/")
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
 	}
 	if !strings.HasPrefix(path, "/v1/jobs/") {
 		return false
@@ -267,7 +273,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 				methodNotAllowed(w, http.MethodGet)
 				return
 			}
-			h.getThread(w, parts[0], caller)
+			h.getThread(w, r, parts[0], caller)
 			return
 		}
 		if len(parts) == 2 && parts[0] != "" && parts[1] == "jobs" {
@@ -750,6 +756,12 @@ func (h *Handler) createThread(w http.ResponseWriter, r *http.Request, caller re
 		return
 	}
 	id := snapshot.Thread.ID
+	if isDashboardOperator(r) {
+		writeJSON(w, http.StatusAccepted, dashboardThreadCreateResponse{
+			Thread: projectDashboardThread(snapshot.Thread), Job: projectDashboardThreadJob(snapshot.Jobs[0]), Replayed: replayed,
+		})
+		return
+	}
 	writeJSON(w, http.StatusAccepted, struct {
 		Thread   restjobs.Thread   `json:"thread"`
 		Job      restjobs.Snapshot `json:"job"`
@@ -763,7 +775,7 @@ type threadLinksDTO struct {
 	Job  string `json:"job"`
 }
 
-func (h *Handler) getThread(w http.ResponseWriter, id string, caller restserver.Principal) {
+func (h *Handler) getThread(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
 	threadStore, ok := h.manager.(restjobs.ThreadStore)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "thread_unavailable", "Thread operations are unavailable.")
@@ -778,6 +790,12 @@ func (h *Handler) getThread(w http.ResponseWriter, id string, caller restserver.
 	}
 	if err != nil {
 		h.writeManagerError(w, err)
+		return
+	}
+	if isDashboardOperator(r) {
+		writeJSON(w, http.StatusOK, dashboardThreadDetailResponse{
+			Thread: projectDashboardThread(snapshot.Thread), Jobs: projectDashboardThreadJobs(snapshot.Jobs),
+		})
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)

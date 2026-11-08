@@ -175,7 +175,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
-	if r.URL.EscapedPath() != r.URL.Path || r.URL.RawQuery != "" && !dashboardProxyQueryAllowed(r.URL.Path, r.Method) {
+	if r.URL.EscapedPath() != r.URL.Path || !dashboardProxyAllowed(r.URL.Path, r.Method) || r.URL.RawQuery != "" && !dashboardProxyQueryAllowed(r.URL.Path, r.Method) || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -196,18 +196,36 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
 	h.api.ServeAsDashboardOperator(w, r)
 }
 
-func dashboardProxyQueryAllowed(path, method string) bool {
-	if method != http.MethodGet {
-		return false
+func dashboardProxyAllowed(path, method string) bool {
+	if path == "/ui/api/v1/threads" {
+		return method == http.MethodPost
+	}
+	if strings.HasPrefix(path, "/ui/api/v1/threads/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/threads/"), "/")
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
 	}
 	if path == "/ui/api/v1/jobs" {
-		return true
+		return method == http.MethodGet || method == http.MethodPost
 	}
-	if !strings.HasPrefix(path, "/ui/api/v1/schedules/") {
-		return false
+	if strings.HasPrefix(path, "/ui/api/v1/jobs/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/jobs/"), "/")
+		if len(parts) == 1 && parts[0] != "" {
+			return method == http.MethodGet
+		}
+		return len(parts) == 2 && parts[0] != "" && ((parts[1] == "history" || parts[1] == "events") && method == http.MethodGet || parts[1] == "cancel" && method == http.MethodPost)
 	}
-	parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")
-	return len(parts) == 2 && parts[0] != "" && parts[1] == "runs"
+	if path == "/ui/api/v1/schedules" {
+		return method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/ui/api/v1/schedules/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")
+		return len(parts) == 2 && parts[0] != "" && parts[1] == "runs" && method == http.MethodGet
+	}
+	return false
+}
+
+func dashboardProxyQueryAllowed(path, method string) bool {
+	return method == http.MethodGet && (path == "/ui/api/v1/jobs" || strings.HasPrefix(path, "/ui/api/v1/schedules/") && dashboardProxyAllowed(path, method))
 }
 
 func (h *Handler) getSession(r *http.Request) (session, bool) {
