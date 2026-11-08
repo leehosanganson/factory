@@ -309,6 +309,9 @@ func (s *SQLiteStore) AdmitAs(key, principalID string, request Request) (Snapsho
 	if err != nil {
 		return Snapshot{}, false, err
 	}
+	if err := validatePublicAdmissionKey(key); err != nil {
+		return Snapshot{}, false, err
+	}
 	principalID, err = normalizePrincipalID(principalID)
 	if err != nil {
 		return Snapshot{}, false, err
@@ -444,6 +447,9 @@ func (s *SQLiteStore) AdmitAs(key, principalID string, request Request) (Snapsho
 func (s *SQLiteStore) AdmitThreadAs(idempotencyKey, principalID string, request Request) (ThreadSnapshot, bool, error) {
 	key, normalized, err := normalizeAdmission(idempotencyKey, request, s.config.MaxTaskBytes)
 	if err != nil {
+		return ThreadSnapshot{}, false, err
+	}
+	if err := validatePublicAdmissionKey(key); err != nil {
 		return ThreadSnapshot{}, false, err
 	}
 	if normalized.Issue != nil || normalized.IssueProvenance != nil {

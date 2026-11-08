@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -130,6 +131,136 @@ func TestScheduleAPIExposesOnlyBoundedOwnedDispatchSummary(t *testing.T) {
 	list := principalRequest(handler, http.MethodGet, "/v1/schedules", "", namedPrincipalToken("alice"))
 	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"pending_occurrence_at"`) || !strings.Contains(list.Body.String(), `"skipped_occurrences"`) {
 		t.Fatalf("owned schedule list status=%d body=%s", list.Code, list.Body.String())
+	}
+}
+
+func TestScheduleRunsExposeRetainedJobsWithOwnerFilteringAndPagination(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-runs.db"), restjobs.Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	// Use the normal authenticated create route to set its required idempotency key.
+	create := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"private scheduled task"}`))
+	create.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	create.Header.Set("Idempotency-Key", "runs-create")
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var body struct {
+		Schedule struct {
+			ID string `json:"id"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	schedule, err := store.GetSchedule(body.Schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := schedule.NextOccurrence()
+	if err := store.DispatchScheduleOccurrences(context.Background(), first, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), first.Add(time.Minute), 1); err != nil {
+		t.Fatal(err)
+	}
+	// A definition edit changes only future occurrences, not Jobs already admitted.
+	if _, err := store.MutateSchedule(schedule.ID, "alice", schedule.Revision, restjobs.ScheduleEdit, &restjobs.ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "replacement task"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.ListScheduleRuns(schedule.ID, "alice", false, 0, 1); err != nil {
+		t.Fatalf("store runs: %v", err)
+	}
+	firstPage := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?limit=1", "", namedPrincipalToken("alice"))
+	if firstPage.Code != http.StatusOK {
+		t.Fatalf("runs status=%d body=%s", firstPage.Code, firstPage.Body.String())
+	}
+	var page struct {
+		Runs []struct {
+			Occurrence time.Time       `json:"occurrence_at"`
+			JobID      string          `json:"job_id"`
+			Status     restjobs.Status `json:"status"`
+			Link       string          `json:"job_url"`
+		} `json:"runs"`
+		HasMore    bool   `json:"has_more"`
+		NextBefore uint64 `json:"next_before_sequence"`
+	}
+	if err := json.Unmarshal(firstPage.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Runs) != 1 || !page.HasMore || page.NextBefore == 0 || page.Runs[0].Status != restjobs.StatusQueued || page.Runs[0].Link != "/v1/jobs/"+page.Runs[0].JobID || !page.Runs[0].Occurrence.Equal(first.Add(time.Minute)) {
+		t.Fatalf("first runs page=%+v body=%s", page, firstPage.Body.String())
+	}
+	if strings.Contains(firstPage.Body.String(), "private scheduled task") || strings.Contains(firstPage.Body.String(), "replacement task") {
+		t.Fatalf("run listing exposed schedule task text: %s", firstPage.Body.String())
+	}
+	job, err := store.Get(page.Runs[0].JobID)
+	if err != nil || job.Request.Task != "private scheduled task" || job.Status != restjobs.StatusQueued {
+		t.Fatalf("admitted Job changed with schedule edit: job=%+v err=%v", job, err)
+	}
+	claimed, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed.Job.Status != restjobs.StatusRunning {
+		t.Fatalf("claimed scheduled Job status=%s", claimed.Job.Status)
+	}
+	for _, mutation := range []restjobs.ScheduleMutation{restjobs.SchedulePause, restjobs.ScheduleResume, restjobs.ScheduleRemove} {
+		current, err := store.GetSchedule(schedule.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.MutateSchedule(schedule.ID, "alice", current.Revision, mutation, nil); err != nil {
+			t.Fatalf("%s schedule: %v", mutation, err)
+		}
+	}
+	running, err := store.Get(claimed.Job.ID)
+	if err != nil || running.Status != restjobs.StatusRunning || running.Request.Task != "private scheduled task" {
+		t.Fatalf("schedule mutations altered admitted running Job: job=%+v err=%v", running, err)
+	}
+	if err := store.FinishAttempt(claimed.Attempt, restjobs.StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs", "", namedPrincipalToken("alice"))
+	if lifecycle.Code != http.StatusOK || !strings.Contains(lifecycle.Body.String(), `"status":"succeeded"`) {
+		t.Fatalf("run listing did not show canonical Job lifecycle update: status=%d body=%s", lifecycle.Code, lifecycle.Body.String())
+	}
+	older := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?limit=1&before_sequence="+strconv.FormatUint(page.NextBefore, 10), "", namedPrincipalToken("alice"))
+	if older.Code != http.StatusOK || !strings.Contains(older.Body.String(), `"has_more":false`) || !strings.Contains(older.Body.String(), `"occurrence_at":"`+first.Format(time.RFC3339)+`"`) {
+		t.Fatalf("older runs page status=%d body=%s", older.Code, older.Body.String())
+	}
+	for _, token := range []string{namedPrincipalToken("bob"), namedPrincipalToken("admin"), testAPIKey} {
+		foreign := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs", "", token)
+		want := http.StatusNotFound
+		if token == namedPrincipalToken("admin") || token == testAPIKey {
+			want = http.StatusOK
+		}
+		if foreign.Code != want {
+			t.Errorf("runs token=%q status=%d body=%s want=%d", token, foreign.Code, foreign.Body.String(), want)
+		}
+	}
+	invalid := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?limit=101", "", namedPrincipalToken("alice"))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit status=%d body=%s", invalid.Code, invalid.Body.String())
+	}
+	invalidSequence := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?before_sequence=9223372036854775808", "", namedPrincipalToken("alice"))
+	if invalidSequence.Code != http.StatusBadRequest {
+		t.Fatalf("out-of-range before_sequence status=%d body=%s", invalidSequence.Code, invalidSequence.Body.String())
+	}
+	maxSequence := principalRequest(handler, http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?before_sequence=9223372036854775807", "", namedPrincipalToken("alice"))
+	if maxSequence.Code != http.StatusOK {
+		t.Fatalf("max signed before_sequence status=%d body=%s", maxSequence.Code, maxSequence.Body.String())
 	}
 }
 

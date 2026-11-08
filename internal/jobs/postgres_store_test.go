@@ -778,6 +778,125 @@ func TestPostgresScheduleDispatchRetryAfterLostCommitResponseDoesNotDuplicate(t 
 	}
 }
 
+func TestPostgresScheduleRunMappingRecordsRevisionAndOccurrence(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule run mapping test")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, _, err := store.CreateSchedule("alice", "schedule-run-mapping", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "scheduled work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if err := store.DispatchScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatal(err)
+	}
+	var mappedSchedule string
+	var mappedOccurrence time.Time
+	var mappedRevision int64
+	var jobID string
+	if err := store.db.QueryRow(`SELECT schedule_id,occurrence_at,schedule_revision,job_id FROM factory_schedule_runs WHERE schedule_id=$1`, schedule.ID).Scan(&mappedSchedule, &mappedOccurrence, &mappedRevision, &jobID); err != nil {
+		t.Fatal(err)
+	}
+	if mappedSchedule != schedule.ID || !mappedOccurrence.Equal(occurrence) || mappedRevision != schedule.Revision {
+		t.Fatalf("mapping=(%s,%s,%d), want (%s,%s,%d)", mappedSchedule, mappedOccurrence, mappedRevision, schedule.ID, occurrence, schedule.Revision)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_schedules WHERE id=$1`, schedule.ID); err == nil {
+		t.Fatal("schedule deletion succeeded while run provenance references it; want default restrict")
+	}
+	page, err := store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 1 || page.Runs[0].JobID != jobID {
+		t.Fatalf("schedule runs=(%+v,%v), want mapping-backed canonical Job", page, err)
+	}
+}
+
+func TestPostgresScheduleRunsAssociateOnlyRetainedAdmittedJobs(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule runs test")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, _, err := store.CreateSchedule("alice", "schedule-runs", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "scheduled work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	forgedJob, _, err := store.AdmitAs("forged-before-schedule", "alice", Request{Repository: "widget", Task: "forged scheduled work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE factory_job_idempotency SET key=$1 WHERE principal_id=$2 AND job_id=$3`, scheduleOccurrenceKey(schedule.ID, schedule.Revision, occurrence.Add(-time.Minute)), "alice", forgedJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 0 {
+		t.Fatalf("runs before dispatcher admission=(%+v,%v), want none despite matching key", page, err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 1 || !page.Runs[0].OccurrenceAt.Equal(occurrence) {
+		t.Fatalf("scheduled runs=(%+v,%v)", page, err)
+	}
+	var mappedSchedule string
+	var mappedOccurrence time.Time
+	var mappedRevision int64
+	if err := store.db.QueryRow(`SELECT schedule_id,occurrence_at,schedule_revision FROM factory_schedule_runs WHERE job_id=$1`, page.Runs[0].JobID).Scan(&mappedSchedule, &mappedOccurrence, &mappedRevision); err != nil {
+		t.Fatal(err)
+	}
+	if mappedSchedule != schedule.ID || !mappedOccurrence.Equal(occurrence) || mappedRevision != schedule.Revision {
+		t.Fatalf("schedule run mapping=(%s,%s,%d), want (%s,%s,%d)", mappedSchedule, mappedOccurrence, mappedRevision, schedule.ID, occurrence, schedule.Revision)
+	}
+	if _, err := store.ListScheduleRuns(schedule.ID, "bob", false, 0, 10); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("foreign schedule runs error=%v, want not found", err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_job_idempotency WHERE principal_id=$1 AND job_id=$2`, "alice", page.Runs[0].JobID); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 1 {
+		t.Fatalf("run without idempotency identity=(%+v,%v), want mapping-backed run", page, err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_job_events WHERE job_id=$1`, page.Runs[0].JobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_jobs WHERE id=$1`, page.Runs[0].JobID); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 0 {
+		t.Fatalf("run after canonical Job deletion=(%+v,%v), want empty after provenance cascade", page, err)
+	}
+}
+
 func TestPostgresScheduleRegistryFullRetainsPendingOccurrence(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {

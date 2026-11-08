@@ -120,6 +120,62 @@ func TestSQLiteScheduleOccurrenceAdmissionRetainsPendingAndSkipsLaterOccurrences
 	}
 }
 
+func TestSQLiteScheduleRunsIgnorePublicKeysInReservedNamespace(t *testing.T) {
+	store, err := OpenSQLiteServerStore(filepath.Join(privateSQLiteDir(t), "schedule-runs-reserved-key.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	schedule, _, err := store.CreateSchedule("alice", "create", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "scheduled work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if _, _, err := store.AdmitAs(scheduleOccurrenceKey(schedule.ID, schedule.Revision, occurrence), "alice", Request{Repository: "widget", Task: "spoofed standalone work"}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("standalone reserved-key admission error=%v, want ErrInvalidInput", err)
+	}
+	// Simulate a historical or forged row inserted before namespace reservation
+	// was enforced. A matching key must not establish schedule provenance.
+	forgedJob, _, err := store.Admit("forged-unreserved-key", Request{Repository: "widget", Task: "forged scheduled work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`UPDATE factory_job_idempotency SET key=? WHERE principal_id=? AND job_id=?`, scheduleOccurrenceKey(schedule.ID, schedule.Revision, occurrence.Add(-time.Minute)), "alice", forgedJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 0 {
+		t.Fatalf("runs before dispatcher admission=(%+v,%v), want none despite matching key", page, err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatalf("dispatch scheduled occurrence after rejected spoof: %v", err)
+	}
+	page, err = store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 1 {
+		t.Fatalf("schedule runs=(%+v,%v), want one dispatcher-admitted run", page, err)
+	}
+	job, err := store.Get(page.Runs[0].JobID)
+	if err != nil || job.Request.Task != "scheduled work" || job.ID == forgedJob.ID {
+		t.Fatalf("dispatcher run Job=(%+v,%v), want only dispatcher-admitted request", job, err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_schedules WHERE id=?`, schedule.ID); err == nil {
+		t.Fatal("schedule deletion succeeded while run provenance references it; want default restrict")
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_job_events WHERE job_id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_job_idempotency WHERE job_id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`DELETE FROM factory_jobs WHERE id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	page, err = store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 0 {
+		t.Fatalf("runs after canonical Job deletion=(%+v,%v), want empty after provenance cascade", page, err)
+	}
+}
+
 func TestSQLiteScheduleDispatchLimitProcessesDifferentDueSchedulesOnce(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "schedule-batch.db"), Config{QueueCapacity: 4, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 8, MaxTaskBytes: 128})
 	if err != nil {

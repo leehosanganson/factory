@@ -20,6 +20,9 @@ func (s *PostgresStore) AdmitIssuePollerThread(ctx context.Context, key, princip
 	if err != nil {
 		return ThreadSnapshot{}, false, err
 	}
+	if err := validatePublicAdmissionKey(key); err != nil {
+		return ThreadSnapshot{}, false, err
+	}
 	principalID, err = normalizePrincipalID(principalID)
 	if err != nil || principalID != "github-issue-poller" {
 		return ThreadSnapshot{}, false, ErrInvalidInput

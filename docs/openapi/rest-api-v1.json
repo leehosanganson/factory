@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.15.0",
+    "version": "1.16.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create persistent UTC cron schedules on SQLite or PostgreSQL; operators can manage schedules across owners. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
@@ -207,6 +207,28 @@
           "405": {
             "description": "Only GET and POST are supported."
           }
+        }
+      }
+    },
+    "/v1/schedules/{id}/runs": {
+      "get": {
+        "operationId": "listScheduleRuns",
+        "summary": "List retained Jobs admitted by a schedule",
+        "description": "Returns recent admitted and still-retained Jobs for one schedule, newest admission first. Operators can inspect any schedule; submitters can inspect only their own, with foreign and unknown IDs both returning 404. Each item includes the UTC occurrence time, canonical Job ID/status/timestamps, and a link to canonical Job detail. This listing never includes task text. The store associates occurrences through explicit durable schedule-run provenance written atomically with dispatch; a matching idempotency key alone does not establish provenance. Only admitted Jobs whose canonical records remain retained are listed. Jobs remain canonical and can be inspected under the normal Job visibility rules. Pages default to 50, accept limit 1..100, and use before_sequence for descending admission-sequence continuation. Requires SQLite or PostgreSQL.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "$ref": "#/components/parameters/ScheduleId" },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "before_sequence", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1 }, "description": "Return older admitted Jobs with an immutable admission sequence less than this value." }
+        ],
+        "responses": {
+          "200": { "description": "A bounded page of retained scheduled Jobs.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ScheduleRunPage" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "description": "Durable storage is required.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "405": { "description": "Only GET is supported." }
         }
       }
     },
@@ -1026,6 +1048,23 @@
           "schedule_id": { "type": "string" }, "creator": { "type": "string" }, "actor": { "type": "string" },
           "action": { "type": "string", "enum": [ "create", "update", "pause", "resume", "remove" ] },
           "revision": { "type": "integer", "minimum": 1 }, "at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ScheduleRun": {
+        "type": "object", "required": [ "occurrence_at", "job_id", "status", "created_at", "updated_at", "job_url" ],
+        "properties": {
+          "occurrence_at": { "type": "string", "format": "date-time", "description": "UTC schedule occurrence admitted as this canonical Job." },
+          "job_id": { "type": "string" }, "status": { "type": "string", "enum": [ "queued", "running", "succeeded", "failed", "canceled" ] },
+          "created_at": { "type": "string", "format": "date-time" }, "updated_at": { "type": "string", "format": "date-time" },
+          "job_url": { "type": "string", "description": "Relative link to canonical Job detail; task text is not repeated in this listing." }
+        }
+      },
+      "ScheduleRunPage": {
+        "type": "object", "required": [ "runs", "has_more" ],
+        "properties": {
+          "runs": { "type": "array", "items": { "$ref": "#/components/schemas/ScheduleRun" } },
+          "has_more": { "type": "boolean" },
+          "next_before_sequence": { "type": "integer", "minimum": 1, "description": "Present when has_more is true; pass as before_sequence to fetch older Jobs." }
         }
       },
       "ScheduleHistory": {

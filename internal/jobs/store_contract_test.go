@@ -72,6 +72,38 @@ func setListTestCreatedAt(t *testing.T, store Store, ids ...string) {
 
 func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 	t.Helper()
+	t.Run("public admission rejects the reserved schedule namespace", func(t *testing.T) {
+		store := newStore(t)
+		defer func() {
+			switch typed := store.(type) {
+			case *SQLiteStore:
+				_ = typed.CloseStore()
+			case *PostgresStore:
+				_ = typed.CloseStore()
+			default:
+				store.Close()
+			}
+		}()
+		const reservedKey = "schedule:spoofed:1:2026-01-01T00:00:00Z"
+		request := Request{Repository: "widget", Task: "spoof schedule run"}
+		if _, _, err := store.AdmitAs(reservedKey, "alice", request); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("standalone Job admission error=%v, want ErrInvalidInput", err)
+		}
+		threadStore, ok := store.(ThreadStore)
+		if !ok {
+			t.Fatalf("Store %T does not implement ThreadStore", store)
+		}
+		if _, _, err := threadStore.AdmitThreadAs(reservedKey, "alice", request); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("Thread admission error=%v, want ErrInvalidInput", err)
+		}
+		thread, _, err := threadStore.AdmitThreadAs("regular-thread-key", "alice", request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := threadStore.AdmitThreadJobAs(thread.Thread.ID, reservedKey, "alice", request); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("Thread Job admission error=%v, want ErrInvalidInput", err)
+		}
+	})
 	t.Run("expired attempt leases block renewal and finishing without reclaiming work", func(t *testing.T) {
 		store := newStore(t)
 		job, _, err := store.Admit("expired-attempt", Request{Repository: "widget", Task: "expired worker cannot revive lease"})

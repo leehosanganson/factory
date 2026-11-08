@@ -14,7 +14,7 @@ import (
 // and Thread creation.
 func (m *LocalManager) AdmitThreadJobAs(threadID, idempotencyKey, principalID string, request Request) (ThreadSnapshot, Snapshot, bool, error) {
 	key, normalized, err := normalizeAdmission(idempotencyKey, request, m.config.MaxTaskBytes)
-	if err != nil || normalized.Issue != nil || normalized.IssueProvenance != nil {
+	if err != nil || validatePublicAdmissionKey(key) != nil || normalized.Issue != nil || normalized.IssueProvenance != nil {
 		return ThreadSnapshot{}, Snapshot{}, false, ErrInvalidInput
 	}
 	principalID, err = normalizePrincipalID(principalID)
@@ -318,7 +318,7 @@ func addThreadJobPostgres(ctx context.Context, db *sql.DB, config Config, thread
 
 func normalizeThreadJobAdmission(config Config, threadID, key, principalID string, request Request) (string, Request, error) {
 	key, normalized, err := normalizeAdmission(key, request, config.MaxTaskBytes)
-	if err != nil || normalized.Issue != nil || normalized.IssueProvenance != nil || threadID == "" {
+	if err != nil || validatePublicAdmissionKey(key) != nil || normalized.Issue != nil || normalized.IssueProvenance != nil || threadID == "" {
 		return "", Request{}, ErrInvalidInput
 	}
 	principalID, err = normalizePrincipalID(principalID)

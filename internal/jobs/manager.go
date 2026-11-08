@@ -514,6 +514,9 @@ func (m *LocalManager) AdmitAs(idempotencyKey, principalID string, request Reque
 	if err != nil {
 		return Snapshot{}, false, err
 	}
+	if err := validatePublicAdmissionKey(key); err != nil {
+		return Snapshot{}, false, err
+	}
 	principalID, err = normalizePrincipalID(principalID)
 	if err != nil {
 		return Snapshot{}, false, err
@@ -1616,6 +1619,13 @@ func normalizePrincipalID(principalID string) (string, error) {
 		return "", ErrInvalidInput
 	}
 	return principalID, nil
+}
+
+func validatePublicAdmissionKey(key string) error {
+	if strings.HasPrefix(strings.TrimSpace(key), "schedule:") {
+		return ErrInvalidInput
+	}
+	return nil
 }
 
 func normalizeAdmission(key string, request Request, maxTaskBytes int) (string, Request, error) {

@@ -57,6 +57,7 @@ type ScheduleStore interface {
 	ListSchedules(owner string) ([]Schedule, error)
 	ListAllSchedules() ([]Schedule, error)
 	ListScheduleHistory(id, actor string, operator bool, afterRevision int64, limit int) (ScheduleAuditPage, error)
+	ListScheduleRuns(id, actor string, operator bool, beforeSequence uint64, limit int) (ScheduleRunPage, error)
 	MutateSchedule(id, owner string, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error)
 	MutateScheduleAs(id, actor string, operator bool, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error)
 }
@@ -74,6 +75,21 @@ type ScheduleAuditPage struct {
 	Events       []ScheduleAuditEvent
 	HasMore      bool
 	NextRevision int64
+}
+
+type ScheduleRun struct {
+	OccurrenceAt time.Time `json:"occurrence_at"`
+	JobID        string    `json:"job_id"`
+	Status       Status    `json:"status"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Sequence     uint64    `json:"-"`
+}
+
+type ScheduleRunPage struct {
+	Runs       []ScheduleRun
+	HasMore    bool
+	NextBefore uint64
 }
 
 type ScheduleAction string
@@ -131,6 +147,22 @@ const (
 	ScheduleEdit   ScheduleMutation = "edit"
 	ScheduleRemove ScheduleMutation = "remove"
 )
+
+func scanScheduleRun(occurrence, id string, status Status, created, updated string, sequence uint64) (ScheduleRun, error) {
+	occurrenceAt, err := time.Parse(time.RFC3339Nano, occurrence)
+	if err != nil {
+		return ScheduleRun{}, ErrInvalidInput
+	}
+	createdAt, err := time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return ScheduleRun{}, ErrInvalidInput
+	}
+	updatedAt, err := time.Parse(time.RFC3339Nano, updated)
+	if err != nil {
+		return ScheduleRun{}, ErrInvalidInput
+	}
+	return ScheduleRun{OccurrenceAt: occurrenceAt.UTC(), JobID: id, Status: status, CreatedAt: createdAt.UTC(), UpdatedAt: updatedAt.UTC(), Sequence: sequence}, nil
+}
 
 func scheduleAuditAction(mutation ScheduleMutation) ScheduleAction {
 	switch mutation {

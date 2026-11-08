@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -177,6 +178,63 @@ func (s *PostgresStore) ListScheduleHistory(id, actor string, operator bool, aft
 		page.HasMore = true
 		page.Events = result[:limit]
 		page.NextRevision = page.Events[len(page.Events)-1].Revision
+	}
+	return page, nil
+}
+
+func (s *PostgresStore) ListScheduleRuns(id, actor string, operator bool, beforeSequence uint64, limit int) (ScheduleRunPage, error) {
+	if err := s.checkOpen(); err != nil {
+		return ScheduleRunPage{}, err
+	}
+	if limit < 1 || limit > MaxScheduleHistoryLimit {
+		return ScheduleRunPage{}, ErrInvalidInput
+	}
+	var owner string
+	if err := s.db.QueryRow(`SELECT owner FROM factory_schedules WHERE id=$1`, id).Scan(&owner); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ScheduleRunPage{}, ErrNotFound
+		}
+		return ScheduleRunPage{}, errors.New("read PostgreSQL schedule owner")
+	}
+	if !operator && owner != actor {
+		return ScheduleRunPage{}, ErrNotFound
+	}
+	query := `SELECT r.occurrence_at,j.id,j.status,j.created_at,j.updated_at,j.queue_sequence FROM factory_schedule_runs r JOIN factory_jobs j ON j.id=r.job_id WHERE r.schedule_id=$1 AND j.submitter=$2`
+	args := []any{id, owner}
+	if beforeSequence > 0 {
+		query += ` AND j.queue_sequence<$3`
+		args = append(args, beforeSequence)
+	}
+	query += ` ORDER BY j.queue_sequence DESC LIMIT $` + strconv.Itoa(len(args)+1)
+	args = append(args, limit+1)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return ScheduleRunPage{}, errors.New("read PostgreSQL schedule runs")
+	}
+	defer rows.Close()
+	result := make([]ScheduleRun, 0, limit+1)
+	for rows.Next() {
+		var occurrence, created, updated time.Time
+		var jobID string
+		var status Status
+		var sequence uint64
+		if err := rows.Scan(&occurrence, &jobID, &status, &created, &updated, &sequence); err != nil {
+			return ScheduleRunPage{}, errors.New("read PostgreSQL schedule runs")
+		}
+		run, err := scanScheduleRun(occurrence.UTC().Format(time.RFC3339Nano), jobID, status, created.UTC().Format(time.RFC3339Nano), updated.UTC().Format(time.RFC3339Nano), sequence)
+		if err != nil {
+			return ScheduleRunPage{}, errors.New("decode PostgreSQL schedule occurrence")
+		}
+		result = append(result, run)
+	}
+	if err := rows.Err(); err != nil {
+		return ScheduleRunPage{}, errors.New("read PostgreSQL schedule runs")
+	}
+	page := ScheduleRunPage{Runs: result}
+	if len(result) > limit {
+		page.HasMore = true
+		page.Runs = result[:limit]
+		page.NextBefore = page.Runs[len(page.Runs)-1].Sequence
 	}
 	return page, nil
 }

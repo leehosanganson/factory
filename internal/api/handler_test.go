@@ -279,6 +279,34 @@ func TestCreateAndInspectThreadEnforcesAuthOwnershipAndIdempotency(t *testing.T)
 	}
 }
 
+func TestPublicAdmissionRejectsReservedScheduleKeys(t *testing.T) {
+	manager := newTestManager(t, managerConfig(8, 16, 8))
+	handler := newPrincipalTestHandler(t, manager, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true})
+	const reservedKey = "schedule:spoofed:1:2026-01-01T00:00:00Z"
+	post := func(path, key string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"repository":"widget","task":"spoof schedule run"}`))
+		req.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Idempotency-Key", key)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	if response := post("/v1/jobs", reservedKey); response.Code != http.StatusBadRequest {
+		t.Fatalf("standalone scheduled-namespace status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	if response := post("/v1/threads", reservedKey); response.Code != http.StatusBadRequest {
+		t.Fatalf("Thread scheduled-namespace status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+	thread, _, err := manager.AdmitThreadAs("regular-thread-key", "alice", restjobs.Request{Repository: "widget", Task: "initial"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := post("/v1/threads/"+thread.Thread.ID+"/jobs", reservedKey); response.Code != http.StatusBadRequest {
+		t.Fatalf("Thread Job scheduled-namespace status=%d body=%s, want 400", response.Code, response.Body.String())
+	}
+}
+
 func TestCompleteThreadRequiresOwnershipAndIsBodylessIdempotent(t *testing.T) {
 	manager := newTestManager(t, managerConfig(16, 32, 8))
 	handler := newPrincipalTestHandler(t, manager,

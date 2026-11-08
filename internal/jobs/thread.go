@@ -97,6 +97,9 @@ func (m *LocalManager) AdmitThreadAs(idempotencyKey, principalID string, request
 	if err != nil {
 		return ThreadSnapshot{}, false, err
 	}
+	if err := validatePublicAdmissionKey(key); err != nil {
+		return ThreadSnapshot{}, false, err
+	}
 	if normalized.Issue != nil || normalized.IssueProvenance != nil {
 		return ThreadSnapshot{}, false, ErrInvalidInput
 	}
