@@ -224,7 +224,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	}
 
 	path := r.URL.Path
-	if caller.Role == "submitter" && !submitterRoute(path, r.Method) {
+	if caller.Role == "submitter" && !submitterRoute(path, r.Method) || caller.Role == "operator" && strings.HasPrefix(path, "/v1/schedules") && !operatorScheduleRoute(path, r.Method) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -276,9 +276,21 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		}
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 	case path == "/v1/schedules":
+		if caller.Role == "operator" && r.Method != http.MethodGet {
+			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+			return
+		}
 		h.handleSchedules(w, r, caller)
 	case strings.HasPrefix(path, "/v1/schedules/"):
-		h.handleSchedule(w, r, strings.TrimPrefix(path, "/v1/schedules/"), caller)
+		tail := strings.TrimPrefix(path, "/v1/schedules/")
+		parts := strings.Split(tail, "/")
+		if len(parts) == 2 && parts[0] != "" && parts[1] == "history" {
+			h.handleScheduleHistory(w, r, parts[0], caller)
+		} else if len(parts) == 1 && parts[0] != "" {
+			h.handleSchedule(w, r, parts[0], caller)
+		} else {
+			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		}
 	case path == "/v1/jobs":
 		if r.Method == http.MethodGet {
 			if caller.Role == "submitter" {
@@ -382,13 +394,29 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	}
 }
 
+func operatorScheduleRoute(path, method string) bool {
+	if path == "/v1/schedules" {
+		return method == http.MethodGet
+	}
+	if !strings.HasPrefix(path, "/v1/schedules/") {
+		return false
+	}
+	tail := strings.TrimPrefix(path, "/v1/schedules/")
+	parts := strings.Split(tail, "/")
+	if len(parts) == 1 && parts[0] != "" {
+		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+	}
+	return len(parts) == 2 && parts[0] != "" && parts[1] == "history" && method == http.MethodGet
+}
+
 func submitterRoute(path, method string) bool {
 	if path == "/v1/schedules" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/v1/schedules/") {
 		tail := strings.TrimPrefix(path, "/v1/schedules/")
-		return tail != "" && !strings.Contains(tail, "/") && (method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete)
+		parts := strings.Split(tail, "/")
+		return len(parts) == 1 && parts[0] != "" && (method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete) || len(parts) == 2 && parts[0] != "" && parts[1] == "history" && method == http.MethodGet
 	}
 	if path == "/v1/notifications" {
 		return method == http.MethodGet

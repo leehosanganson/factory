@@ -67,6 +67,9 @@ func (s *PostgresStore) CreateSchedule(owner, key string, input ScheduleInput) (
 	if _, err = tx.Exec(`INSERT INTO factory_schedule_idempotency(owner,idempotency_key,schedule_id,request_json) VALUES($1,$2,$3,$4)`, owner, key, id, string(request)); err != nil {
 		return Schedule{}, false, errors.New("record PostgreSQL schedule idempotency")
 	}
+	if _, err = tx.Exec(`INSERT INTO factory_schedule_audit(schedule_id,revision,creator,actor,action,occurred_at) VALUES($1,$2,$3,$3,$4,$5)`, id, schedule.Revision, owner, ScheduleCreated, now); err != nil {
+		return Schedule{}, false, errors.New("record PostgreSQL schedule creation audit")
+	}
 	if err = tx.Commit(); err != nil {
 		return Schedule{}, false, errors.New("commit PostgreSQL schedule")
 	}
@@ -107,8 +110,83 @@ func (s *PostgresStore) ListSchedules(owner string) ([]Schedule, error) {
 	}
 	return result, nil
 }
+func (s *PostgresStore) ListAllSchedules() ([]Schedule, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.Query(`SELECT id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,pending_occurrence_at,skipped_revision,skipped_first_at,skipped_last_at,skipped_count FROM factory_schedules ORDER BY created_at,id`)
+	if err != nil {
+		return nil, errors.New("list all PostgreSQL schedules")
+	}
+	defer rows.Close()
+	var result []Schedule
+	for rows.Next() {
+		schedule, scanErr := scanPostgresSchedule(rows)
+		if scanErr != nil {
+			return nil, errors.New("read all PostgreSQL schedules")
+		}
+		result = append(result, schedule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, errors.New("read all PostgreSQL schedules")
+	}
+	if result == nil {
+		result = []Schedule{}
+	}
+	return result, nil
+}
+
+func (s *PostgresStore) ListScheduleHistory(id, actor string, operator bool, afterRevision int64, limit int) (ScheduleAuditPage, error) {
+	if err := s.checkOpen(); err != nil {
+		return ScheduleAuditPage{}, err
+	}
+	if afterRevision < 0 || limit < 1 || limit > MaxScheduleHistoryLimit {
+		return ScheduleAuditPage{}, ErrInvalidInput
+	}
+	var owner string
+	if err := s.db.QueryRow(`SELECT owner FROM factory_schedules WHERE id=$1`, id).Scan(&owner); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ScheduleAuditPage{}, ErrNotFound
+		}
+		return ScheduleAuditPage{}, errors.New("read PostgreSQL schedule owner")
+	}
+	if !operator && owner != actor {
+		return ScheduleAuditPage{}, ErrNotFound
+	}
+	rows, err := s.db.Query(`SELECT schedule_id,creator,actor,action,revision,occurred_at FROM factory_schedule_audit WHERE schedule_id=$1 AND revision>$2 ORDER BY revision LIMIT $3`, id, afterRevision, limit+1)
+	if err != nil {
+		return ScheduleAuditPage{}, errors.New("read PostgreSQL schedule history")
+	}
+	defer rows.Close()
+	result := make([]ScheduleAuditEvent, 0, limit+1)
+	for rows.Next() {
+		var event ScheduleAuditEvent
+		var action string
+		if err := rows.Scan(&event.ScheduleID, &event.Creator, &event.Actor, &action, &event.Revision, &event.At); err != nil {
+			return ScheduleAuditPage{}, errors.New("read PostgreSQL schedule history")
+		}
+		event.Action = ScheduleAction(action)
+		event.At = event.At.UTC()
+		result = append(result, event)
+	}
+	if err := rows.Err(); err != nil {
+		return ScheduleAuditPage{}, errors.New("read PostgreSQL schedule history")
+	}
+	page := ScheduleAuditPage{Events: result}
+	if len(result) > limit {
+		page.HasMore = true
+		page.Events = result[:limit]
+		page.NextRevision = page.Events[len(page.Events)-1].Revision
+	}
+	return page, nil
+}
+
 func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error) {
-	owner, err := normalizePrincipalID(owner)
+	return s.MutateScheduleAs(id, owner, false, revision, mutation, input)
+}
+
+func (s *PostgresStore) MutateScheduleAs(id, actor string, operator bool, revision int64, mutation ScheduleMutation, input *ScheduleInput) (Schedule, error) {
+	owner, err := normalizePrincipalID(actor)
 	if err != nil {
 		return Schedule{}, ErrNotFound
 	}
@@ -144,7 +222,7 @@ func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutatio
 	if err != nil {
 		return Schedule{}, errors.New("lock PostgreSQL schedule mutation")
 	}
-	if schedule.Owner != owner {
+	if !operator && schedule.Owner != owner {
 		return Schedule{}, ErrNotFound
 	}
 	if schedule.Revision != revision {
@@ -187,9 +265,9 @@ func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutatio
 	}
 	var result sql.Result
 	if mutation == ScheduleEdit {
-		result, err = tx.Exec(`UPDATE factory_schedules SET cron=$1,repository=$2,task=$3,status=$4,revision=$5,updated_at=$6,next_occurrence_at=$7,pending_occurrence_at=NULL,skipped_revision=$5,skipped_first_at=NULL,skipped_last_at=NULL,skipped_count=0 WHERE id=$8 AND owner=$9 AND revision=$10`, schedule.Cron, schedule.Repository, schedule.Task, schedule.Status, schedule.Revision, schedule.UpdatedAt, schedule.nextOccurrenceAt, id, owner, revision)
+		result, err = tx.Exec(`UPDATE factory_schedules SET cron=$1,repository=$2,task=$3,status=$4,revision=$5,updated_at=$6,next_occurrence_at=$7,pending_occurrence_at=NULL,skipped_revision=$5,skipped_first_at=NULL,skipped_last_at=NULL,skipped_count=0 WHERE id=$8 AND owner=$9 AND revision=$10`, schedule.Cron, schedule.Repository, schedule.Task, schedule.Status, schedule.Revision, schedule.UpdatedAt, schedule.nextOccurrenceAt, id, schedule.Owner, revision)
 	} else {
-		result, err = tx.Exec(`UPDATE factory_schedules SET status=$1,revision=$2,updated_at=$3,next_occurrence_at=$4,pending_occurrence_at=NULL,skipped_revision=$2,skipped_first_at=NULL,skipped_last_at=NULL,skipped_count=0 WHERE id=$5 AND owner=$6 AND revision=$7`, schedule.Status, schedule.Revision, schedule.UpdatedAt, schedule.nextOccurrenceAt, id, owner, revision)
+		result, err = tx.Exec(`UPDATE factory_schedules SET status=$1,revision=$2,updated_at=$3,next_occurrence_at=$4,pending_occurrence_at=NULL,skipped_revision=$2,skipped_first_at=NULL,skipped_last_at=NULL,skipped_count=0 WHERE id=$5 AND owner=$6 AND revision=$7`, schedule.Status, schedule.Revision, schedule.UpdatedAt, schedule.nextOccurrenceAt, id, schedule.Owner, revision)
 	}
 	if err != nil {
 		return Schedule{}, errors.New("update PostgreSQL schedule")
@@ -197,6 +275,9 @@ func (s *PostgresStore) MutateSchedule(id, owner string, revision int64, mutatio
 	n, _ := result.RowsAffected()
 	if n != 1 {
 		return Schedule{}, ErrScheduleConflict
+	}
+	if _, err = tx.Exec(`INSERT INTO factory_schedule_audit(schedule_id,revision,creator,actor,action,occurred_at) VALUES($1,$2,$3,$4,$5,$6)`, id, schedule.Revision, schedule.Owner, owner, scheduleAuditAction(mutation), schedule.UpdatedAt); err != nil {
+		return Schedule{}, errors.New("record PostgreSQL schedule mutation audit")
 	}
 	if err = tx.Commit(); err != nil {
 		return Schedule{}, errors.New("commit PostgreSQL schedule")

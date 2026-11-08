@@ -8,7 +8,7 @@ This section describes implemented behavior, distinct from the remaining target 
 - [Detached jobs](jobs.md) — durable lifecycle for detached implementation, tidy, and monitor jobs.
 - [PR monitor](monitor.md) — detached, guarded maintenance of an existing open pull request.
 - [Issue work intake and tracking](work.md) — local work commands do not start an autonomous worker; this feature is separate from the REST issue poller.
-- [REST job server](rest-server.md) — current authenticated job execution, persistent submitter-owned UTC cron schedules and occurrence dispatch, persistence modes, provider PR writes, readiness, graceful runtime lifecycle, and local-only read-only configuration preflight.
+- [REST job server](rest-server.md) — current authenticated job execution, persistent UTC cron schedules, operator-wide schedule management/audit, post-upgrade-only history for existing schedules, bounded history pages, and occurrence dispatch, persistence modes, provider PR writes, readiness, graceful runtime lifecycle, and local-only read-only configuration preflight.
 - [REST server configuration](rest-server-config.md) — strict server JSON, memory/SQLite/PostgreSQL selection, worker-mode settings, and operational limits.
 - [PostgreSQL Store](postgres-store.md) — PostgreSQL-backed REST persistence and shared-store behavior.
 - [REST worker process](rest-worker.md) — separate PostgreSQL worker and workers-disabled API control-plane operation.

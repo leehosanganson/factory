@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -47,7 +48,11 @@ func (h *Handler) scheduleStore(w http.ResponseWriter) (restjobs.ScheduleStore, 
 	return store, true
 }
 func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller restserver.Principal) {
-	if caller.Role != "submitter" {
+	if caller.Role != "submitter" && caller.Role != "operator" {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
+	if caller.Role != "submitter" && r.Method != http.MethodGet {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -57,7 +62,13 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 	}
 	switch r.Method {
 	case http.MethodGet:
-		schedules, err := store.ListSchedules(caller.ID)
+		var schedules []restjobs.Schedule
+		var err error
+		if caller.Role == "operator" {
+			schedules, err = store.ListAllSchedules()
+		} else {
+			schedules, err = store.ListSchedules(caller.ID)
+		}
 		if err != nil {
 			h.writeManagerError(w, err)
 			return
@@ -70,13 +81,80 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 			Schedules []scheduleResponse `json:"schedules"`
 		}{response})
 	case http.MethodPost:
+		if caller.Role != "submitter" {
+			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+			return
+		}
 		h.createSchedule(w, r, caller, store)
 	default:
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
 }
+func (h *Handler) handleScheduleHistory(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
+	if (caller.Role != "submitter" && caller.Role != "operator") || id == "" || strings.Contains(id, "/") {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
+	query, err := parseScheduleHistoryQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	store, ok := h.scheduleStore(w)
+	if !ok {
+		return
+	}
+	page, err := store.ListScheduleHistory(id, caller.ID, caller.Role == "operator", query.afterRevision, query.limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	response := struct {
+		Events       []restjobs.ScheduleAuditEvent `json:"events"`
+		HasMore      bool                          `json:"has_more"`
+		NextRevision int64                         `json:"next_revision,omitempty"`
+	}{Events: page.Events, HasMore: page.HasMore}
+	if page.HasMore {
+		response.NextRevision = page.NextRevision
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+type scheduleHistoryQuery struct {
+	afterRevision int64
+	limit         int
+}
+
+func parseScheduleHistoryQuery(r *http.Request) (scheduleHistoryQuery, error) {
+	query := scheduleHistoryQuery{limit: restjobs.DefaultScheduleHistoryLimit}
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return scheduleHistoryQuery{}, restjobs.ErrInvalidInput
+	}
+	for key, entries := range values {
+		if (key != "after_revision" && key != "limit") || len(entries) != 1 {
+			return scheduleHistoryQuery{}, restjobs.ErrInvalidInput
+		}
+	}
+	if value, exists := values["after_revision"]; exists {
+		parsed, parseErr := strconv.ParseInt(value[0], 10, 64)
+		if parseErr != nil || parsed < 0 || strconv.FormatInt(parsed, 10) != value[0] {
+			return scheduleHistoryQuery{}, restjobs.ErrInvalidInput
+		}
+		query.afterRevision = parsed
+	}
+	if value, exists := values["limit"]; exists {
+		parsed, parseErr := strconv.Atoi(value[0])
+		if parseErr != nil || parsed < 1 || parsed > restjobs.MaxScheduleHistoryLimit {
+			return scheduleHistoryQuery{}, restjobs.ErrInvalidInput
+		}
+		query.limit = parsed
+	}
+	return query, nil
+}
+
 func (h *Handler) handleSchedule(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
-	if caller.Role != "submitter" || id == "" || strings.Contains(id, "/") {
+	if (caller.Role != "submitter" && caller.Role != "operator") || id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -86,8 +164,12 @@ func (h *Handler) handleSchedule(w http.ResponseWriter, r *http.Request, id stri
 	}
 	switch r.Method {
 	case http.MethodGet:
+		if strings.HasSuffix(id, "/history") {
+			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+			return
+		}
 		schedule, err := store.GetSchedule(id)
-		if err != nil || schedule.Owner != caller.ID {
+		if err != nil || caller.Role != "operator" && schedule.Owner != caller.ID {
 			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 			return
 		}
@@ -97,6 +179,8 @@ func (h *Handler) handleSchedule(w http.ResponseWriter, r *http.Request, id stri
 		h.mutateSchedule(w, r, id, caller, store)
 	case http.MethodDelete:
 		h.removeSchedule(w, r, id, caller, store)
+	case http.MethodOptions:
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch+", "+http.MethodDelete)
 	default:
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch+", "+http.MethodDelete)
 	}
@@ -174,7 +258,7 @@ func (h *Handler) mutateSchedule(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 		return
 	}
-	schedule, err := store.MutateSchedule(id, caller.ID, revision, mutation, input)
+	schedule, err := store.MutateScheduleAs(id, caller.ID, caller.Role == "operator", revision, mutation, input)
 	if err != nil {
 		h.writeManagerError(w, err)
 		return
@@ -191,7 +275,7 @@ func (h *Handler) removeSchedule(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 		return
 	}
-	schedule, err := store.MutateSchedule(id, caller.ID, revision, restjobs.ScheduleRemove, nil)
+	schedule, err := store.MutateScheduleAs(id, caller.ID, caller.Role == "operator", revision, restjobs.ScheduleRemove, nil)
 	if err != nil {
 		h.writeManagerError(w, err)
 		return

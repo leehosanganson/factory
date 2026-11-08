@@ -385,6 +385,21 @@ func TestSQLiteScheduleDispatchMigrationBackfillsOldScheduleRows(t *testing.T) {
 	if err != nil || !schedule.NextOccurrence().After(schedule.UpdatedAt) {
 		t.Fatalf("upgraded schedule=(%+v,%v)", schedule, err)
 	}
+	var auditRows int
+	if err := store.db.QueryRow(`SELECT count(*) FROM factory_schedule_audit WHERE schedule_id='old-schedule'`).Scan(&auditRows); err != nil || auditRows != 0 {
+		t.Fatalf("pre-upgrade schedule audit rows=%d err=%v; want empty history", auditRows, err)
+	}
+	history, err := store.ListScheduleHistory("old-schedule", "admin", true, 0, MaxScheduleHistoryLimit)
+	if err != nil || len(history.Events) != 0 {
+		t.Fatalf("pre-upgrade schedule history=%+v err=%v; history must begin after upgrade", history, err)
+	}
+	if _, err := store.MutateScheduleAs("old-schedule", "admin", true, 3, SchedulePause, nil); err != nil {
+		t.Fatalf("mutate pre-upgrade schedule after upgrade: %v", err)
+	}
+	history, err = store.ListScheduleHistory("old-schedule", "admin", true, 0, MaxScheduleHistoryLimit)
+	if err != nil || len(history.Events) != 1 || history.Events[0].Revision != 4 || history.Events[0].Actor != "admin" || history.Events[0].Action != SchedulePauseAction {
+		t.Fatalf("post-upgrade schedule history=%+v err=%v; expected only the committed post-upgrade action", history, err)
+	}
 }
 
 func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
@@ -452,8 +467,8 @@ func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	}
 	defer store.CloseStore()
 	var version int
-	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 21 {
-		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 21", version, err)
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 22 {
+		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 22", version, err)
 	}
 	var retainedAudit int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
@@ -466,6 +481,61 @@ func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	body := sha256.Sum256([]byte("pre-v15 SQLite webhook"))
 	if _, replay, err := store.AdmitGitHubIssueWebhook(context.Background(), "post-upgrade-delivery", fmt.Sprintf("%x", body), "issue-owner", Request{Repository: "widget", Task: "migrated webhook"}, IntakeOwner{}); !errors.Is(err, ErrGitHubWebhookUnavailable) || replay {
 		t.Fatalf("webhook admission against migrated SQLite schema: replay=%v err=%v, want unavailable", replay, err)
+	}
+}
+
+func TestPostgresScheduleAuditMigrationLeavesLegacyHistoryEmpty(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule audit migration integration")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	files, err := postgresMigrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE factory_rest_schema_migrations (version integer PRIMARY KEY, name text NOT NULL, applied_at timestamptz NOT NULL DEFAULT clock_timestamp())`); err != nil {
+		t.Fatal(err)
+	}
+	for index, name := range files[:len(files)-1] {
+		payload, err := postgresMigrationFiles.ReadFile("postgres_migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(payload)); err != nil {
+			t.Fatalf("apply PostgreSQL migration %s: %v", name, err)
+		}
+		if _, err := db.Exec(`INSERT INTO factory_rest_schema_migrations(version,name) VALUES($1,$2)`, index+1, name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const createdAt = "2025-05-06T07:08:09Z"
+	if _, err := db.Exec(`INSERT INTO factory_schedules(id,owner,cron,repository,task,status,revision,created_at,updated_at) VALUES('legacy-schedule','alice','* * * * *','widget','schedule task','active',3,$1,$1)`, createdAt); err != nil {
+		t.Fatalf("seed pre-upgrade PostgreSQL schedule: %v", err)
+	}
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.CloseStore() })
+	var auditRows int
+	if err := db.QueryRow(`SELECT count(*) FROM factory_schedule_audit WHERE schedule_id='legacy-schedule'`).Scan(&auditRows); err != nil || auditRows != 0 {
+		t.Fatalf("pre-upgrade PostgreSQL schedule audit rows=%d err=%v; want empty history", auditRows, err)
+	}
+	if _, err := store.MutateScheduleAs("legacy-schedule", "admin", true, 3, SchedulePause, nil); err != nil {
+		t.Fatalf("mutate pre-upgrade PostgreSQL schedule after upgrade: %v", err)
+	}
+	history, err := store.ListScheduleHistory("legacy-schedule", "admin", true, 0, MaxScheduleHistoryLimit)
+	if err != nil || len(history.Events) != 1 || history.Events[0].Revision != 4 || history.Events[0].Actor != "admin" || history.Events[0].Action != SchedulePauseAction {
+		t.Fatalf("post-upgrade PostgreSQL schedule history=%+v err=%v; expected only the committed post-upgrade action", history, err)
 	}
 }
 
@@ -537,8 +607,8 @@ func TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.CloseStore() })
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 18 {
-		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 18", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 19 {
+		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 19", version, err)
 	}
 	var retainedAudit int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {

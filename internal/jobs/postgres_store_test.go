@@ -864,6 +864,17 @@ func TestPostgresScheduleStorePersistsAndEnforcesRevision(t *testing.T) {
 	if got, err := store.GetSchedule(created.ID); err != nil || got.Status != SchedulePaused {
 		t.Fatalf("read schedule=(%+v,%v)", got, err)
 	}
+	page, err := store.ListScheduleHistory(created.ID, "admin", true, 0, MaxScheduleHistoryLimit)
+	if err != nil || len(page.Events) != 2 || page.Events[0].Action != ScheduleCreated || page.Events[1].Action != SchedulePauseAction || page.Events[1].Actor != "alice" {
+		t.Fatalf("schedule audit=(%+v,%v)", page, err)
+	}
+	if _, err := store.MutateScheduleAs(created.ID, "operator-one", true, 2, ScheduleResume, nil); err != nil {
+		t.Fatalf("operator resume=%v", err)
+	}
+	page, err = store.ListScheduleHistory(created.ID, "admin", true, 0, MaxScheduleHistoryLimit)
+	if err != nil || len(page.Events) != 3 || page.Events[2].Actor != "operator-one" || page.Events[2].Creator != "alice" {
+		t.Fatalf("operator audit=(%+v,%v)", page, err)
+	}
 }
 
 func TestPostgresScheduleOccurrenceAdmissionIsAtomicAcrossIndependentStores(t *testing.T) {

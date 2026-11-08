@@ -3,6 +3,7 @@ package restapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -49,8 +50,12 @@ func TestScheduleRoutesRequireDurableStoreAndNamedSubmitter(t *testing.T) {
 			{http.MethodDelete, "/v1/schedules/schedule-id", ""},
 		} {
 			got := principalRequest(handler, tc.method, tc.path, tc.body, token)
-			if got.Code != http.StatusNotFound {
-				t.Errorf("principal %q %s %s status=%d body=%s; want 404", token, tc.method, tc.path, got.Code, got.Body.String())
+			want := http.StatusNotFound
+			if tc.method == http.MethodGet && (tc.path == "/v1/schedules" || tc.path == "/v1/schedules/schedule-id") || tc.method == http.MethodPatch || tc.method == http.MethodDelete {
+				want = http.StatusServiceUnavailable
+			}
+			if got.Code != want {
+				t.Errorf("principal %q %s %s status=%d body=%s; want %d", token, tc.method, tc.path, got.Code, got.Body.String(), want)
 			}
 		}
 	}
@@ -128,6 +133,198 @@ func TestScheduleAPIExposesOnlyBoundedOwnedDispatchSummary(t *testing.T) {
 	}
 }
 
+func TestScheduleHistoryPaginationIsOrderedBoundedAndMetadataOnly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-pages.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	createRequest := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"private task text"}`))
+	createRequest.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	createRequest.Header.Set("Content-Type", "application/json")
+	createRequest.Header.Set("Idempotency-Key", "schedule-page-create")
+	create := httptest.NewRecorder()
+	handler.ServeHTTP(create, createRequest)
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", create.Code, create.Body.String())
+	}
+	var created struct {
+		Schedule restjobs.Schedule `json:"schedule"`
+	}
+	if err := json.Unmarshal(create.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	id := created.Schedule.ID
+	for revision := int64(1); revision <= 3; revision++ {
+		mutation := restjobs.SchedulePause
+		if revision == 2 {
+			mutation = restjobs.ScheduleResume
+		}
+		if _, err := store.MutateScheduleAs(id, "admin", true, revision, mutation, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id+"/history?limit=2", "", namedPrincipalToken("admin"))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first page status=%d body=%s", first.Code, first.Body.String())
+	}
+	var firstPage struct {
+		Events       []restjobs.ScheduleAuditEvent `json:"events"`
+		HasMore      bool                          `json:"has_more"`
+		NextRevision int64                         `json:"next_revision"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(firstPage.Events) != 2 || !firstPage.HasMore || firstPage.NextRevision != 2 {
+		t.Fatalf("first page=%+v", firstPage)
+	}
+	if strings.Contains(first.Body.String(), "private task text") {
+		t.Fatalf("history leaked schedule definition: %s", first.Body.String())
+	}
+	second := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id+"/history?after_revision=2&limit=2", "", namedPrincipalToken("admin"))
+	var secondPage struct {
+		Events  []restjobs.ScheduleAuditEvent `json:"events"`
+		HasMore bool                          `json:"has_more"`
+	}
+	if second.Code != http.StatusOK || json.Unmarshal(second.Body.Bytes(), &secondPage) != nil || len(secondPage.Events) != 2 || secondPage.Events[0].Revision != 3 || secondPage.Events[1].Revision != 4 || secondPage.HasMore {
+		t.Fatalf("second page status=%d body=%s page=%+v", second.Code, second.Body.String(), secondPage)
+	}
+	for _, query := range []string{"?limit=0", "?limit=101", "?after_revision=-1", "?limit=1&limit=2", "?unknown=1"} {
+		got := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id+"/history"+query, "", namedPrincipalToken("admin"))
+		if got.Code != http.StatusBadRequest {
+			t.Errorf("query %s status=%d body=%s", query, got.Code, got.Body.String())
+		}
+	}
+}
+
+type scheduleHistoryErrorStore struct {
+	restjobs.Manager
+	restjobs.ScheduleStore
+}
+
+func (s scheduleHistoryErrorStore) ListScheduleHistory(string, string, bool, int64, int) (restjobs.ScheduleAuditPage, error) {
+	return restjobs.ScheduleAuditPage{}, errors.New("database error with private details")
+}
+
+func TestScheduleHistoryOperationalStoreErrorReturnsInternalError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-history-error.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	created, _, err := store.CreateSchedule("alice", "history-error", restjobs.ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newPrincipalTestHandler(t, scheduleHistoryErrorStore{Manager: store, ScheduleStore: store}, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	got := principalRequest(handler, http.MethodGet, "/v1/schedules/"+created.ID+"/history", "", namedPrincipalToken("admin"))
+	if got.Code != http.StatusInternalServerError {
+		t.Fatalf("history status=%d body=%s; want internal error for store failure", got.Code, got.Body.String())
+	}
+	if !strings.Contains(got.Body.String(), `"code":"internal_error"`) || strings.Contains(got.Body.String(), "private details") {
+		t.Fatalf("history response did not safely map store error: %s", got.Body.String())
+	}
+}
+
+func TestScheduleOperatorAuditAndOwnerHistory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-audit.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true}, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	create := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"private task text"}`))
+	create.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	create.Header.Set("Content-Type", "application/json")
+	create.Header.Set("Idempotency-Key", "audit-create")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var body struct {
+		Schedule restjobs.Schedule `json:"schedule"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	id := body.Schedule.ID
+	list := principalRequest(handler, http.MethodGet, "/v1/schedules", "", namedPrincipalToken("admin"))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), id) {
+		t.Fatalf("operator list status=%d body=%s", list.Code, list.Body.String())
+	}
+	mutate := httptest.NewRequest(http.MethodPatch, "/v1/schedules/"+id, strings.NewReader(`{"action":"pause"}`))
+	mutate.Header.Set("Authorization", "Bearer "+namedPrincipalToken("admin"))
+	mutate.Header.Set("Content-Type", "application/json")
+	mutate.Header.Set("If-Match", `"1"`)
+	mutated := httptest.NewRecorder()
+	handler.ServeHTTP(mutated, mutate)
+	if mutated.Code != http.StatusOK || mutated.Header().Get("ETag") != `"2"` {
+		t.Fatalf("operator mutate status=%d body=%s", mutated.Code, mutated.Body.String())
+	}
+	for _, principal := range []string{"admin", "alice"} {
+		history := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id+"/history", "", namedPrincipalToken(principal))
+		if history.Code != http.StatusOK {
+			t.Fatalf("%s history status=%d body=%s", principal, history.Code, history.Body.String())
+		}
+		for _, expected := range []string{`"creator":"alice"`, `"actor":"alice"`, `"action":"create"`, `"revision":1`, `"actor":"admin"`, `"action":"pause"`, `"revision":2`} {
+			if !strings.Contains(history.Body.String(), expected) {
+				t.Errorf("history lacks %s: %s", expected, history.Body.String())
+			}
+		}
+		if strings.Contains(history.Body.String(), "private task text") {
+			t.Errorf("history leaked schedule definition: %s", history.Body.String())
+		}
+	}
+	if got := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id+"/history", "", namedPrincipalToken("bob")); got.Code != http.StatusNotFound {
+		t.Fatalf("foreign history status=%d body=%s", got.Code, got.Body.String())
+	}
+	if got := principalRequest(handler, http.MethodGet, "/v1/schedules/does-not-exist/history", "", namedPrincipalToken("admin")); got.Code != http.StatusNotFound {
+		t.Fatalf("missing history status=%d body=%s", got.Code, got.Body.String())
+	}
+	before, err := store.ListScheduleHistory(id, "admin", true, 0, restjobs.MaxScheduleHistoryLimit)
+	if err != nil || len(before.Events) != 2 {
+		t.Fatalf("history before replay: page=%+v err=%v", before, err)
+	}
+	replayReq := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"private task text"}`))
+	replayReq.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	replayReq.Header.Set("Content-Type", "application/json")
+	replayReq.Header.Set("Idempotency-Key", "audit-create")
+	replay := httptest.NewRecorder()
+	handler.ServeHTTP(replay, replayReq)
+	if replay.Code != http.StatusOK {
+		t.Fatalf("idempotency replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	afterReplay, err := store.ListScheduleHistory(id, "admin", true, 0, restjobs.MaxScheduleHistoryLimit)
+	if err != nil || len(afterReplay.Events) != len(before.Events) {
+		t.Fatalf("replay changed audit: page=%+v err=%v", afterReplay, err)
+	}
+	if _, err := store.MutateScheduleAs(id, "admin", true, 1, restjobs.ScheduleResume, nil); err == nil {
+		t.Fatal("stale operator mutation unexpectedly succeeded")
+	}
+	afterStale, err := store.ListScheduleHistory(id, "admin", true, 0, restjobs.MaxScheduleHistoryLimit)
+	if err != nil || len(afterStale.Events) != len(before.Events) {
+		t.Fatalf("stale mutation changed audit: page=%+v err=%v", afterStale, err)
+	}
+	if got := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("alice")); got.Code != http.StatusOK {
+		t.Fatalf("submitter self-service broke: status=%d body=%s", got.Code, got.Body.String())
+	}
+}
+
 func TestSQLiteScheduleAPIOwnershipIdempotencyAndRevision(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -171,9 +368,20 @@ func TestSQLiteScheduleAPIOwnershipIdempotencyAndRevision(t *testing.T) {
 		{http.MethodDelete, "/v1/schedules/" + id, ""},
 	} {
 		for _, token := range []string{namedPrincipalToken("admin"), testAPIKey} {
+			if token == testAPIKey && (tc.method == http.MethodPatch || tc.method == http.MethodDelete) {
+				continue
+			}
 			got := principalRequest(handler, tc.method, tc.path, tc.body, token)
-			if got.Code != http.StatusNotFound {
-				t.Errorf("principal %q %s %s status=%d body=%s; want 404", token, tc.method, tc.path, got.Code, got.Body.String())
+			want := http.StatusNotFound
+			if (token == namedPrincipalToken("admin") || token == testAPIKey) && (tc.method == http.MethodGet && (tc.path == "/v1/schedules" || tc.path == "/v1/schedules/"+id)) || token == namedPrincipalToken("admin") && (tc.method == http.MethodPatch || tc.method == http.MethodDelete) {
+				if tc.method == http.MethodPatch || tc.method == http.MethodDelete {
+					want = http.StatusPreconditionRequired
+				} else {
+					want = http.StatusOK
+				}
+			}
+			if got.Code != want {
+				t.Errorf("principal %q %s %s status=%d body=%s; want %d", token, tc.method, tc.path, got.Code, got.Body.String(), want)
 			}
 		}
 	}
@@ -185,10 +393,15 @@ func TestSQLiteScheduleAPIOwnershipIdempotencyAndRevision(t *testing.T) {
 	if replay.Code != http.StatusOK {
 		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
 	}
+	for _, tc := range []struct{ method, path string }{{http.MethodPost, "/v1/schedules"}} {
+		if got := principalRequest(handler, tc.method, tc.path, `{"action":"pause"}`, namedPrincipalToken("admin")); got.Code != http.StatusNotFound {
+			t.Errorf("operator self-service route %s %s status=%d", tc.method, tc.path, got.Code)
+		}
+	}
 	if foreign := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("bob")); foreign.Code != http.StatusNotFound {
 		t.Fatalf("foreign schedule status=%d body=%s", foreign.Code, foreign.Body.String())
 	}
-	if operator := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("admin")); operator.Code != http.StatusNotFound {
+	if operator := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("admin")); operator.Code != http.StatusOK {
 		t.Fatalf("operator schedule status=%d", operator.Code)
 	}
 	mutate := func(revision, body string) *httptest.ResponseRecorder {
