@@ -100,8 +100,8 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.16.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.16.0", document.Info.Version)
+	if document.Info.Version != "1.17.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.17.0", document.Info.Version)
 	}
 }
 
@@ -147,8 +147,8 @@ func TestThreadOpenAPIContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.16.0" {
-		t.Fatalf("version=%q want 1.16.0", document.Info.Version)
+	if document.Info.Version != "1.17.0" {
+		t.Fatalf("version=%q want 1.17.0", document.Info.Version)
 	}
 	for path, method := range map[string]string{"/v1/threads": "post", "/v1/threads/{id}": "get", "/v1/threads/{id}/jobs": "post", "/v1/threads/{id}/complete": "post", "/v1/notifications": "get"} {
 		var operation map[string]json.RawMessage
@@ -311,6 +311,9 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 					} `json:"content"`
 				} `json:"responses"`
 			} `json:"get"`
+			Post struct {
+				Description string `json:"description"`
+			} `json:"post"`
 		} `json:"paths"`
 		Components struct {
 			Schemas map[string]struct {
@@ -323,13 +326,23 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.16.0" {
-		t.Errorf("OpenAPI version = %q, want 1.16.0", document.Info.Version)
+	if document.Info.Version != "1.17.0" {
+		t.Errorf("OpenAPI version = %q, want 1.17.0", document.Info.Version)
 	}
 	for _, route := range []string{"/v1/schedules", "/v1/schedules/{id}", "/v1/schedules/{id}/history", "/v1/schedules/{id}/runs"} {
 		if _, ok := document.Paths[route]; !ok {
 			t.Errorf("OpenAPI spec is missing %s", route)
 		}
+	}
+	for name, description := range map[string]string{"list": document.Paths["/v1/schedules"].Get.Description, "create": document.Paths["/v1/schedules"].Post.Description} {
+		for _, phrase := range []string{"named operator", "legacy shared"} {
+			if !strings.Contains(description, phrase) {
+				t.Errorf("schedule %s OpenAPI description omits %q: %s", name, phrase, description)
+			}
+		}
+	}
+	if !strings.Contains(document.Paths["/v1/schedules"].Post.Description, "principal ID as schedule owner") || !strings.Contains(document.Paths["/v1/schedules"].Post.Description, "scoped to the caller's principal") {
+		t.Errorf("schedule create OpenAPI description omits owner or idempotency identity: %s", document.Paths["/v1/schedules"].Post.Description)
 	}
 	for _, name := range []string{"ScheduleInput", "Schedule", "ScheduleList", "ScheduleMutation", "ScheduleAuditEvent", "ScheduleHistory", "ScheduleRun", "ScheduleRunPage"} {
 		if _, ok := document.Components.Schemas[name]; !ok {

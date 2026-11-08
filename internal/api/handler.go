@@ -242,7 +242,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	}
 
 	path := r.URL.Path
-	if caller.Role == "submitter" && !submitterRoute(path, r.Method) || caller.Role == "operator" && strings.HasPrefix(path, "/v1/schedules") && !operatorScheduleRoute(path, r.Method) {
+	if caller.Role == "submitter" && !submitterRoute(path, r.Method) || caller.Role == "operator" && strings.HasPrefix(path, "/v1/schedules") && !operatorScheduleRoute(path) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -296,10 +296,6 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	case path == "/v1/schedules":
 		if isDashboardOperator(r) {
 			h.handleDashboardScheduleList(w, r)
-			return
-		}
-		if caller.Role == "operator" && r.Method != http.MethodGet {
-			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 			return
 		}
 		h.handleSchedules(w, r, caller)
@@ -426,9 +422,9 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	}
 }
 
-func operatorScheduleRoute(path, method string) bool {
+func operatorScheduleRoute(path string) bool {
 	if path == "/v1/schedules" {
-		return method == http.MethodGet
+		return true
 	}
 	if !strings.HasPrefix(path, "/v1/schedules/") {
 		return false
@@ -436,9 +432,9 @@ func operatorScheduleRoute(path, method string) bool {
 	tail := strings.TrimPrefix(path, "/v1/schedules/")
 	parts := strings.Split(tail, "/")
 	if len(parts) == 1 && parts[0] != "" {
-		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+		return true
 	}
-	return len(parts) == 2 && parts[0] != "" && parts[1] == "history" && method == http.MethodGet || len(parts) == 2 && parts[0] != "" && parts[1] == "runs" && method == http.MethodGet
+	return len(parts) == 2 && parts[0] != "" && (parts[1] == "history" || parts[1] == "runs")
 }
 
 func submitterRoute(path, method string) bool {

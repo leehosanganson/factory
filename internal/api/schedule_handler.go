@@ -132,11 +132,7 @@ func (h *Handler) scheduleStore(w http.ResponseWriter) (restjobs.ScheduleStore, 
 	return store, true
 }
 func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller restserver.Principal) {
-	if caller.Role != "submitter" && caller.Role != "operator" {
-		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
-		return
-	}
-	if caller.Role != "submitter" && r.Method != http.MethodGet {
+	if caller.Role != "submitter" && caller.Role != "operator" || r.Method == http.MethodPost && caller.ID == "legacy-shared" {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -165,7 +161,7 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 			Schedules []scheduleResponse `json:"schedules"`
 		}{response})
 	case http.MethodPost:
-		if caller.Role != "submitter" {
+		if caller.Role != "submitter" && (caller.Role != "operator" || caller.ID == "legacy-shared") {
 			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 			return
 		}
@@ -175,6 +171,10 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 	}
 }
 func (h *Handler) handleScheduleRuns(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if (caller.Role != "submitter" && caller.Role != "operator") || id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
@@ -212,6 +212,10 @@ func (h *Handler) handleScheduleRuns(w http.ResponseWriter, r *http.Request, id 
 }
 
 func (h *Handler) handleScheduleHistory(w http.ResponseWriter, r *http.Request, id string, caller restserver.Principal) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w, http.MethodGet)
+		return
+	}
 	if (caller.Role != "submitter" && caller.Role != "operator") || id == "" || strings.Contains(id, "/") {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
