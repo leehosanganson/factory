@@ -951,6 +951,45 @@ func TestPostgresScheduleRegistryFullRetainsPendingOccurrence(t *testing.T) {
 	}
 }
 
+func TestPostgresListRecentSchedulesIsBoundedAndStableOrdered(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL schedule integration tests")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	first, _, err := store.CreateSchedule("alice", "recent-one", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.CreateSchedule("bob", "recent-two", ScheduleInput{Cron: "*/2 * * * *", Repository: "widget", Task: "private"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recent, err := store.ListRecentSchedules(1)
+	if err != nil || len(recent) != 1 || recent[0].ID != second.ID {
+		t.Fatalf("recent schedules=%+v err=%v, want newest %s", recent, err, second.ID)
+	}
+	all, err := store.ListRecentSchedules(2)
+	if err != nil || len(all) != 2 || all[0].ID != first.ID || all[1].ID != second.ID {
+		t.Fatalf("recent schedules=%+v err=%v, want stable creation order", all, err)
+	}
+	if _, err := store.ListRecentSchedules(0); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("invalid limit error=%v", err)
+	}
+}
+
 func TestPostgresScheduleStorePersistsAndEnforcesRevision(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {

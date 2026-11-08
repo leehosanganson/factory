@@ -175,7 +175,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
-	if r.URL.EscapedPath() != r.URL.Path || r.URL.RawQuery != "" && !(r.URL.Path == "/ui/api/v1/jobs" && r.Method == http.MethodGet) {
+	if r.URL.EscapedPath() != r.URL.Path || r.URL.RawQuery != "" && !dashboardProxyQueryAllowed(r.URL.Path, r.Method) {
 		http.NotFound(w, r)
 		return
 	}
@@ -194,6 +194,20 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
 	r.URL.Path = path
 	r.URL.RawPath = ""
 	h.api.ServeAsDashboardOperator(w, r)
+}
+
+func dashboardProxyQueryAllowed(path, method string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	if path == "/ui/api/v1/jobs" {
+		return true
+	}
+	if !strings.HasPrefix(path, "/ui/api/v1/schedules/") {
+		return false
+	}
+	parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")
+	return len(parts) == 2 && parts[0] != "" && parts[1] == "runs"
 }
 
 func (h *Handler) getSession(r *http.Request) (session, bool) {

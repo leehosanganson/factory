@@ -44,6 +44,42 @@ func testWebHandler(t *testing.T) http.Handler {
 	return New(api, "admin")
 }
 
+func TestDashboardScheduleViewRendersBoundedScheduleSummaries(t *testing.T) {
+	handler := testWebHandler(t)
+	request := httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard JavaScript status=%d", response.Code)
+	}
+	for _, want := range []string{
+		`api("/v1/schedules")`,
+		"/v1/schedules/${encodeURIComponent(schedule.id)}/runs?limit=5",
+		`pending_occurrence_at`,
+		`skipped_occurrences`,
+		`schedule-run-link`,
+		`new Date(schedule.pending_occurrence_at).toISOString()`,
+		`refreshSchedules();`,
+		`if (schedulesRefreshing) { scheduleRefreshPending = true; return; }`,
+		`const generation = ++scheduleRefreshGeneration;`,
+		`if (!isCurrent()) return;`,
+		`schedulesRefreshing = false;`,
+		`generation === scheduleRefreshGeneration && !byId("dashboard").classList.contains("hidden")`,
+		`if (scheduleRefreshPending) {`,
+		`if (!byId("dashboard").classList.contains("hidden")) refreshSchedules();`,
+		` scheduleRefreshGeneration++; scheduleRefreshPending = false;`,
+		`if (!byId("dashboard").classList.contains("hidden")) { refreshJobs(); refreshSchedules(); }`,
+		`byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); });`,
+	} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Errorf("dashboard JavaScript missing schedule behavior %q", want)
+		}
+	}
+	if strings.Contains(response.Body.String(), `schedule.task`) {
+		t.Fatal("dashboard JavaScript reads schedule task text")
+	}
+}
+
 func TestDashboardSelectedJobScrollRespectsReducedMotionPreference(t *testing.T) {
 	handler := testWebHandler(t)
 	request := httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil)
@@ -124,6 +160,23 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 	if response.Code != http.StatusAccepted || strings.Contains(response.Body.String(), "web-test-token") {
 		t.Fatalf("CSRF-authenticated admission status=%d body=%s", response.Code, response.Body.String())
 	}
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		want   int
+	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusNotFound}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}} {
+		proxyRequest := httptest.NewRequest(tc.method, tc.path, nil)
+		proxyRequest.Host = "factory.example"
+		proxyRequest.Header.Set("Origin", "https://factory.example")
+		proxyRequest.Header.Set("X-CSRF-Token", sessionData.CSRF)
+		proxyRequest.AddCookie(cookie)
+		proxyResponse := httptest.NewRecorder()
+		handler.ServeHTTP(proxyResponse, proxyRequest)
+		if proxyResponse.Code != tc.want {
+			t.Errorf("proxy %s %s status=%d body=%s; want %d", tc.method, tc.path, proxyResponse.Code, proxyResponse.Body.String(), tc.want)
+		}
+	}
 }
 
 func TestDashboardRejectsLoginWithoutOriginAndDisallowsQuerySecrets(t *testing.T) {
@@ -155,13 +208,30 @@ func TestDashboardRequiresConfiguredNamedOperatorAndScopesProxy(t *testing.T) {
 			t.Fatalf("non-configured-operator login token rejected with status=%d", response.Code)
 		}
 	}
-	for _, path := range []string{"/ui/api/v1/operations", "/ui/api/v1/jobs/one/reconcile", "/ui/api/v1/jobs/one/events/anything", "/ui/api/v1/jobs/one?cursor=secret"} {
+	for _, path := range []string{"/ui/api/v1/operations", "/ui/api/v1/jobs/one/reconcile", "/ui/api/v1/jobs/one/events/anything", "/ui/api/v1/jobs/one?cursor=secret", "/ui/api/v1/schedules/one/history", "/ui/api/v1/schedules/one/runs/extra"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.AddCookie(&http.Cookie{Name: cookieName, Value: "forged"})
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, request)
 		if recorder.Code != http.StatusUnauthorized && recorder.Code != http.StatusNotFound {
 			t.Errorf("untrusted proxy path %s status=%d", path, recorder.Code)
+		}
+	}
+	for _, tc := range []struct {
+		method string
+		path   string
+		query  string
+	}{{http.MethodPost, "/ui/api/v1/schedules", ""}, {http.MethodGet, "/ui/api/v1/schedules/one/runs", "before_sequence=2"}} {
+		path := tc.path
+		if tc.query != "" {
+			path += "?" + tc.query
+		}
+		request := httptest.NewRequest(tc.method, path, nil)
+		request.AddCookie(&http.Cookie{Name: cookieName, Value: "forged"})
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized && recorder.Code != http.StatusNotFound {
+			t.Errorf("restricted proxy route %s %s status=%d", tc.method, tc.path, recorder.Code)
 		}
 	}
 }

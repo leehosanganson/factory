@@ -134,6 +134,67 @@ func TestScheduleAPIExposesOnlyBoundedOwnedDispatchSummary(t *testing.T) {
 	}
 }
 
+func TestDashboardScheduleProjectionOmitsTaskAndBoundsRuns(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "dashboard-schedules.db"), restjobs.Config{QueueCapacity: 16, MaxConcurrentJobs: 2, MaxRecords: 20, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	handler.config.DashboardOperatorID = "admin"
+	create := principalRequest(handler, http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"dashboard private task"}`, namedPrincipalToken("admin"))
+	if create.Code != http.StatusNotFound {
+		t.Fatalf("named operator unexpectedly created schedule: %d %s", create.Code, create.Body.String())
+	}
+	// Seed through the store because dashboard operator routes are read-only.
+	schedule, _, err := store.CreateSchedule("alice", "dashboard-seed", restjobs.ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "dashboard private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := schedule.NextOccurrence()
+	if err := store.DispatchScheduleOccurrences(context.Background(), first, 1); err != nil {
+		t.Fatal(err)
+	}
+	list := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(list, httptest.NewRequest(http.MethodGet, "/v1/schedules", nil))
+	if list.Code != http.StatusOK || strings.Contains(list.Body.String(), "dashboard private task") || strings.Contains(list.Body.String(), `"owner"`) || strings.Contains(list.Body.String(), `"repository"`) {
+		t.Fatalf("dashboard schedule projection status=%d body=%s", list.Code, list.Body.String())
+	}
+	if !strings.Contains(list.Body.String(), `"cron":"* * * * *"`) || !strings.Contains(list.Body.String(), `"status":"active"`) {
+		t.Fatalf("dashboard schedule projection lacks status/cron: %s", list.Body.String())
+	}
+	for i := range 15 {
+		key := "dashboard-overdue-" + strconv.Itoa(i)
+		if _, _, err := store.Admit(key, restjobs.Request{Repository: "widget", Task: "fill queue"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), first.Add(3*time.Minute), 1); err != nil {
+		t.Fatal(err)
+	}
+	list = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(list, httptest.NewRequest(http.MethodGet, "/v1/schedules", nil))
+	if !strings.Contains(list.Body.String(), `"skipped_occurrences"`) {
+		t.Fatalf("dashboard schedule projection lacks skipped summary: %s", list.Body.String())
+	}
+	runs := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(runs, httptest.NewRequest(http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?limit=5", nil))
+	if runs.Code != http.StatusOK || strings.Contains(runs.Body.String(), "dashboard private task") || !strings.Contains(runs.Body.String(), `"job_url":"/v1/jobs/`) {
+		t.Fatalf("dashboard run projection status=%d body=%s", runs.Code, runs.Body.String())
+	}
+	for _, query := range []string{"limit=6", "before_sequence=2", "limit=5&unexpected=1"} {
+		tooMany := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(tooMany, httptest.NewRequest(http.MethodGet, "/v1/schedules/"+schedule.ID+"/runs?"+query, nil))
+		if tooMany.Code != http.StatusBadRequest {
+			t.Errorf("dashboard accepted run query %q: status=%d body=%s", query, tooMany.Code, tooMany.Body.String())
+		}
+	}
+}
+
 func TestScheduleRunsExposeRetainedJobsWithOwnerFilteringAndPagination(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
