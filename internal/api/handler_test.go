@@ -503,7 +503,7 @@ func TestThreadRouteValidationAndUnsupportedStore(t *testing.T) {
 }
 
 func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T) {
-	manager := newTestManager(t, managerConfig(2, 2, 8))
+	manager := newTestManager(t, managerConfig(4, 100, 8))
 	handler := newTestHandler(t, manager, func() bool { return true })
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/jobs", strings.NewReader(`{"repository":"widget","task":"trusted frontend"}`))
@@ -523,6 +523,59 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		if response.Code != http.StatusNotFound {
 			t.Errorf("dashboard exposed non-allowlisted path %s status=%d", path, response.Code)
 		}
+	}
+	created, _, err := manager.AdmitThreadAs("dashboard-thread", "admin", restjobs.Request{Repository: "widget", Task: "private append seed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, _, err := manager.AdmitThreadAs("foreign-dashboard-thread", "alice", restjobs.Request{Repository: "widget", Task: "foreign owner task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"jobs", "complete"} {
+		method := http.MethodPost
+		body := ""
+		if suffix == "jobs" {
+			body = `{"repository":"widget","task":"foreign append"}`
+		}
+		foreignRequest := httptest.NewRequest(method, "/v1/threads/"+foreign.Thread.ID+"/"+suffix, strings.NewReader(body))
+		if suffix == "jobs" {
+			foreignRequest.Header.Set("Content-Type", "application/json")
+			foreignRequest.Header.Set("Idempotency-Key", "foreign-dashboard-append")
+		}
+		foreignResponse := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(foreignResponse, foreignRequest)
+		if foreignResponse.Code != http.StatusNotFound {
+			t.Errorf("dashboard operator %s foreign Thread status=%d body=%s, want non-disclosing 404", suffix, foreignResponse.Code, foreignResponse.Body.String())
+		}
+	}
+	appendRequest := httptest.NewRequest(http.MethodPost, "/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"private append task"}`))
+	appendRequest.Header.Set("Content-Type", "application/json")
+	appendRequest.Header.Set("Idempotency-Key", "dashboard-append")
+	appendResponse := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(appendResponse, appendRequest)
+	if appendResponse.Code != http.StatusAccepted || strings.Contains(appendResponse.Body.String(), "private append task") || strings.Contains(appendResponse.Body.String(), `"request"`) || strings.Contains(appendResponse.Body.String(), `"provider"`) {
+		t.Fatalf("dashboard append status=%d body=%s", appendResponse.Code, appendResponse.Body.String())
+	}
+	appendReplay := httptest.NewRequest(http.MethodPost, "/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(`{"repository":"widget","task":"private append task"}`))
+	appendReplay.Header.Set("Content-Type", "application/json")
+	appendReplay.Header.Set("Idempotency-Key", "dashboard-append")
+	appendReplayResponse := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(appendReplayResponse, appendReplay)
+	if appendReplayResponse.Code != http.StatusAccepted || !strings.Contains(appendReplayResponse.Body.String(), `"replayed":true`) || strings.Contains(appendReplayResponse.Body.String(), `"provider"`) {
+		t.Fatalf("dashboard append replay status=%d body=%s", appendReplayResponse.Code, appendReplayResponse.Body.String())
+	}
+	completeRequest := httptest.NewRequest(http.MethodPost, "/v1/threads/"+created.Thread.ID+"/complete", nil)
+	completeResponse := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(completeResponse, completeRequest)
+	if completeResponse.Code != http.StatusOK || !strings.Contains(completeResponse.Body.String(), `"completed_at"`) || strings.Contains(completeResponse.Body.String(), `"completed_by"`) || strings.Contains(completeResponse.Body.String(), `"provider"`) {
+		t.Fatalf("dashboard completion status=%d body=%s", completeResponse.Code, completeResponse.Body.String())
+	}
+	request = httptest.NewRequest(http.MethodGet, "/v1/threads/"+created.Thread.ID, nil)
+	response = httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(response, request)
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), "private append seed") || strings.Contains(response.Body.String(), "private append task") || strings.Contains(response.Body.String(), `"provider"`) {
+		t.Fatalf("dashboard Thread detail status=%d body=%s", response.Code, response.Body.String())
 	}
 	request = httptest.NewRequest(http.MethodGet, "/v1/schedules", nil)
 	response = httptest.NewRecorder()

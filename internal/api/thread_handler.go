@@ -73,6 +73,10 @@ func (h *Handler) completeThread(w http.ResponseWriter, r *http.Request, threadI
 		}
 		return
 	}
+	if isDashboardOperator(r) {
+		writeJSON(w, http.StatusOK, dashboardThreadResponse{ID: snapshot.Thread.ID, Status: snapshot.Thread.Status, CreatedAt: snapshot.Thread.CreatedAt, UpdatedAt: snapshot.Thread.UpdatedAt, Completed: snapshot.Thread.CompletedAt})
+		return
+	}
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
@@ -148,6 +152,10 @@ func (h *Handler) addThreadJob(w http.ResponseWriter, r *http.Request, threadID 
 	snapshot, job, replayed, err := threadStore.AdmitThreadJobAs(threadID, keys[0], principalID, request)
 	if err != nil {
 		h.writeManagerError(w, err)
+		return
+	}
+	if isDashboardOperator(r) {
+		writeJSON(w, http.StatusAccepted, dashboardThreadAppendResponse{Thread: projectDashboardThread(snapshot.Thread), Job: projectDashboardThreadJob(job), Replayed: replayed})
 		return
 	}
 	writeJSON(w, http.StatusAccepted, addThreadJobResponse{Thread: snapshot.Thread, Job: job, Replayed: replayed})

@@ -42,6 +42,15 @@
           <button type="submit">Create Thread</button>
         </form>
         <div id="thread-result" class="thread-result" aria-live="polite"></div>
+        <section id="thread-controls" class="thread-controls hidden" aria-label="Current Thread actions">
+          <h3>Continue this Thread</h3>
+          <form id="thread-append-form" class="thread-form">
+            <label for="thread-append-repository">Repository alias</label><input id="thread-append-repository" name="repository" maxlength="64" required autocomplete="off">
+            <label for="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows="3" maxlength="262144" required></textarea>
+            <button id="thread-append-submit" type="submit">Append Job</button>
+          </form>
+          <button id="thread-complete" class="danger" type="button">Complete Thread</button>
+        </section>
       </section>
       <section class="panel schedules-panel" aria-labelledby="schedules-title">
         <div class="section-heading"><h2 id="schedules-title">Schedules</h2><span id="schedule-loading" class="muted" role="status"></span></div>

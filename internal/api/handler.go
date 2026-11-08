@@ -173,7 +173,8 @@ func dashboardRoute(path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/v1/threads/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/v1/threads/"), "/")
-		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+		return (len(parts) == 1 && parts[0] != "" && method == http.MethodGet) ||
+			(len(parts) == 2 && parts[0] != "" && (parts[1] == "jobs" || parts[1] == "complete") && method == http.MethodPost)
 	}
 	if !strings.HasPrefix(path, "/v1/jobs/") {
 		return false
