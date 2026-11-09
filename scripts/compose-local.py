@@ -111,6 +111,7 @@ def create(directory: Path) -> None:
             "dsn": f"postgres://factory:{postgres_password}@postgres:5432/factory?sslmode=disable",
         },
         "workers_enabled": False,
+        "web_ui": {"enabled": True, "operator_id": "local-operator"},
         "limits": limits(),
     }
     try:
