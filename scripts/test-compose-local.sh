@@ -13,6 +13,13 @@ fail() {
   exit 1
 }
 
+if ! command -v openssl >/dev/null 2>&1; then
+  fail 'OpenSSL 1.1.1 or newer is required by the dashboard smoke test; install or upgrade OpenSSL before running this test.'
+fi
+if ! openssl version 2>/dev/null | python3 -c 'import re, sys; output = sys.stdin.readline(); match = re.match(r"^OpenSSL (\d+)\.(\d+)\.(\d+)(?:[+a-zA-Z0-9.-]*)?(?:\s|$)", output); sys.exit(0 if match and tuple(map(int, match.groups())) >= (1, 1, 1) else 1)'; then
+  fail 'OpenSSL 1.1.1 or newer is required by the dashboard smoke test; the installed version could not be verified as compatible.'
+fi
+
 python3 - <<'PY'
 import os
 import subprocess
@@ -39,7 +46,42 @@ generated=0
 if [ ! -e .local/factory-compose ] && [ ! -L .local/factory-compose ]; then
   python3 scripts/compose-local.py
   generated=1
-elif [ ! -f .local/factory-compose/worker.json ]; then
+fi
+python3 - <<'PY'
+import json
+from pathlib import Path
+import stat
+import sys
+
+config_dir = Path('.local/factory-compose')
+config_path = config_dir / 'server.json'
+message = (
+    'The Compose dashboard smoke test requires the current private '
+    '.local/factory-compose/server.json to set web_ui.enabled to true and '
+    'web_ui.operator_id to "local-operator" (the generated dashboard token principal). '
+    'Edit that file in place; do not regenerate or overwrite existing credentials. '
+    'Keep the directory mode 0700 and server.json mode 0600. For an already provisioned '
+    'setup, stop Compose, back up the config, generated files, and any needed volume data, '
+    'then deliberately remove only this Compose project’s factory-config volume so the '
+    'updated config can be provisioned. Preserve the generated credential directory and '
+    'postgres-data volume, then restart with the documented Compose command.'
+)
+try:
+    directory_info = config_dir.lstat()
+    file_info = config_path.lstat()
+    if not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode) or stat.S_IMODE(directory_info.st_mode) != 0o700:
+        raise ValueError('configuration directory is not private')
+    if not stat.S_ISREG(file_info.st_mode) or stat.S_ISLNK(file_info.st_mode) or stat.S_IMODE(file_info.st_mode) != 0o600:
+        raise ValueError('server.json is not a private regular file')
+    config = json.loads(config_path.read_text())
+    web_ui = config.get('web_ui') if isinstance(config, dict) else None
+    if not isinstance(web_ui, dict) or web_ui.get('enabled') is not True or web_ui.get('operator_id') != 'local-operator':
+        raise ValueError('dashboard settings are missing or incompatible')
+except (OSError, ValueError, json.JSONDecodeError):
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+PY
+if [ ! -f .local/factory-compose/worker.json ]; then
   python3 scripts/compose-local.py --worker-config-only
 fi
 harness_dir=$(mktemp -d "${TMPDIR:-/tmp}/factory-compose-harness-$project_suffix.XXXXXX")
@@ -62,6 +104,7 @@ config = json.loads(config_path.read_text())
 assert config['listen_address'] == '0.0.0.0:8080'
 assert 'execution' in config and config['execution']['mode'] == 'local'
 assert config['workers_enabled'] is False
+assert config['web_ui'] == {'enabled': True, 'operator_id': 'local-operator'}
 assert config['persistence']['backend'] == 'postgres'
 worker = json.loads((root / 'worker.json').read_text())
 assert worker['limits'] == config.get('limits', {
@@ -498,15 +541,140 @@ while time.monotonic() < deadline:
 assert job['status'] == 'succeeded', f'worker job ended as {job["status"]}: {job}'
 job_id = os.environ['FACTORY_COMPOSE_JOB_ID']
 assert job['request']['task'] == 'compose fixture: create the expected worker result'
-result = subprocess.run(
-    ['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-worker-1', 'find', '/var/lib/factory/state', '-path', f'*/results/{job_id}/worktree/compose-worker-result.txt', '-type', 'f'],
+results = subprocess.run(
+    ['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-worker-1', 'find', '/var/lib/factory/state', '-path', f'*/results/{job_id}/attempts/*/worktree/compose-worker-result.txt', '-type', 'f'],
     check=True, capture_output=True, text=True,
-).stdout.strip()
-assert result, 'worker did not retain the expected fixture result in its state volume'
+).stdout.splitlines()
+assert len(results) == 1, f'expected one fixture result in the retained job attempt, found {len(results)}'
+result = results[0]
 content = subprocess.run(
     ['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-worker-1', 'cat', result],
     check=True, capture_output=True, text=True,
 ).stdout
 assert content == 'compose worker fixture completed\n', f'unexpected fixture result: {content!r}'
 PY
-printf '%s\n' 'Compose smoke passed: default job queued; profile worker completed the fixture job.'
+# Exercise the embedded dashboard through a test-only loopback HTTPS reverse proxy.
+# The proxy is not part of the Compose product stack and forwards only these test routes.
+python3 - <<'PY'
+import http.client
+import http.server
+import json
+import os
+from pathlib import Path
+import re
+import ssl
+import subprocess
+import tempfile
+import threading
+import time
+from http.cookiejar import CookieJar
+from urllib.error import HTTPError
+from urllib.parse import urlencode, urlsplit
+from urllib.request import HTTPCookieProcessor, HTTPSHandler, Request, build_opener
+
+api_port = int(urlsplit(os.environ['FACTORY_COMPOSE_API_BASE']).port)
+class DashboardProxy(http.server.BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def forward(self):
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        allowed = (
+            self.command == 'GET' and path in ('/', '/ui/session', '/ui/assets/dashboard.css', '/ui/assets/dashboard.js') and not parsed.query
+            or self.command == 'GET' and path == '/ui/api/v1/jobs' and parsed.query in ('', 'limit=100')
+            or self.command == 'POST' and path in ('/ui/login', '/ui/logout', '/ui/api/v1/jobs') and not parsed.query
+            or self.command == 'GET' and re.fullmatch(r'/ui/api/v1/jobs/[A-Za-z0-9_-]+', path) and not parsed.query
+        )
+        if not allowed:
+            self.send_error(404)
+            return
+        body = self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        headers = {key: value for key, value in self.headers.items() if key.lower() not in ('connection', 'transfer-encoding')}
+        upstream = http.client.HTTPConnection('127.0.0.1', api_port, timeout=10)
+        try:
+            upstream.request(self.command, self.path, body=body, headers=headers)
+            response = upstream.getresponse()
+            payload = response.read()
+            self.send_response(response.status)
+            for key, value in response.getheaders():
+                if key.lower() not in ('connection', 'transfer-encoding', 'date', 'server'):
+                    self.send_header(key, value)
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        finally:
+            upstream.close()
+    do_GET = forward
+    do_POST = forward
+    def log_message(self, *_args):
+        pass
+
+proxy = http.server.ThreadingHTTPServer(('127.0.0.1', 0), DashboardProxy)
+proxy.daemon_threads = True
+with tempfile.TemporaryDirectory(prefix='factory-compose-dashboard-tls-') as cert_dir:
+    cert = Path(cert_dir) / 'proxy.pem'
+    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(cert), '-out', str(cert), '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    cert.chmod(0o600)
+    server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_tls.load_cert_chain(cert)
+    proxy.socket = server_tls.wrap_socket(proxy.socket, server_side=True)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    base = f'https://localhost:{proxy.server_port}'
+    client_tls = ssl.create_default_context(cafile=str(cert))
+    jar = CookieJar()
+    client = build_opener(HTTPSHandler(context=client_tls), HTTPCookieProcessor(jar))
+    origin = base
+    operator_token = Path('.local/factory-compose/operator-token').read_text().strip()
+    try:
+        with client.open(base + '/', timeout=10) as response:
+            assert response.status == 200 and 'Factory' in response.read().decode()
+        for asset in ('/ui/assets/dashboard.css', '/ui/assets/dashboard.js'):
+            with client.open(base + asset, timeout=10) as response:
+                assert response.status == 200 and response.read(), f'dashboard asset unavailable: {asset}'
+        login_request = Request(base + '/ui/login', data=urlencode({'token': operator_token}).encode(), headers={'Content-Type': 'application/x-www-form-urlencoded', 'Origin': origin}, method='POST')
+        with client.open(login_request, timeout=10) as response:
+            login = json.load(response)
+        assert login.get('authenticated') is True and login.get('csrf'), f'dashboard login failed: {login}'
+        cookie = next(cookie for cookie in jar if cookie.name == 'factory_operator_session')
+        assert cookie.secure, 'dashboard session cookie was not marked Secure'
+        with client.open(base + '/ui/session', timeout=10) as response:
+            session = json.load(response)
+        assert session.get('authenticated') is True and session.get('csrf') == login['csrf']
+        csrf = session['csrf']
+        with client.open(base + '/ui/api/v1/jobs?limit=100', timeout=10) as response:
+            assert 'jobs' in json.load(response)
+        subprocess.run(['docker', 'compose', '-f', 'docker-compose.yml', '--profile', 'worker', 'stop', 'worker'], check=True, stdout=subprocess.DEVNULL)
+        request = Request(base + '/ui/api/v1/jobs', data=json.dumps({'repository': 'local', 'task': 'compose fixture: create the expected worker result'}).encode(), headers={'Origin': origin, 'X-CSRF-Token': csrf, 'Content-Type': 'application/json', 'Idempotency-Key': 'compose-dashboard-worker-fixture'}, method='POST')
+        with client.open(request, timeout=10) as response:
+            job_id = json.load(response)['job']['id']
+        subprocess.run(['docker', 'compose', '-f', 'docker-compose.yml', '--profile', 'worker', 'up', '-d', '--wait', 'worker'], check=True)
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            with client.open(base + f'/ui/api/v1/jobs/{job_id}', timeout=10) as response:
+                job = json.load(response)
+            if job['status'] in ('succeeded', 'failed', 'canceled'):
+                break
+            time.sleep(0.25)
+        assert job['status'] == 'succeeded', f'dashboard job ended as {job["status"]}: {job}'
+        results = subprocess.run(['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-worker-1', 'find', '/var/lib/factory/state', '-path', f'*/results/{job_id}/attempts/*/worktree/compose-worker-result.txt', '-type', 'f'], check=True, capture_output=True, text=True).stdout.splitlines()
+        assert len(results) == 1, f'expected one dashboard job artifact, found {len(results)}'
+        result = subprocess.run(['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-worker-1', 'cat', results[0]], check=True, capture_output=True, text=True).stdout
+        assert result == 'compose worker fixture completed\n', f'unexpected dashboard job result: {result!r}'
+        logout = Request(base + '/ui/logout', data=b'', headers={'Origin': origin, 'X-CSRF-Token': csrf}, method='POST')
+        with client.open(logout, timeout=10) as response:
+            assert response.status == 200
+        with client.open(base + '/ui/session', timeout=10) as response:
+            assert json.load(response).get('authenticated') is False, 'logout did not invalidate session'
+        stale = Request(base + f'/ui/api/v1/jobs/{job_id}', headers={'Cookie': f'{cookie.name}={cookie.value}'})
+        try:
+            client.open(stale, timeout=10)
+        except HTTPError as error:
+            assert error.code == 401, f'stale session cookie returned HTTP {error.code}, want 401'
+        else:
+            raise AssertionError('logout left the previous dashboard session authorized')
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+        thread.join(timeout=5)
+PY
+printf '%s\n' 'Compose smoke passed: direct API fixture and HTTPS-proxied dashboard job completed through the profile Worker.'
