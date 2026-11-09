@@ -186,9 +186,9 @@ grep -Fxq 'run_full=true' "$missing_sha_output" || fail 'missing SHA did not def
 grep -Fxq 'run_macos=true' "$missing_sha_output" || fail 'missing SHA did not default to macOS CI'
 
 validator_succeeds() {
-  local full=$1 macos=$2 build=$3 mac=$4 image=$5 postgres=$6
+  local full=$1 macos=$2 build=$3 mac=$4 image=$5 postgres=$6 browser=${7:-$6}
   RUN_FULL=$full RUN_MACOS=$macos CLASSIFY_RESULT=success ATTRIBUTION_RESULT=success \
-    BUILD_RESULT=$build MACOS_RESULT=$mac IMAGE_RESULT=$image POSTGRES_RESULT=$postgres \
+    BUILD_RESULT=$build MACOS_RESULT=$mac IMAGE_RESULT=$image POSTGRES_RESULT=$postgres DASHBOARD_E2E_RESULT=$browser \
     "$validator"
 }
 validator_fails() {
@@ -202,6 +202,7 @@ validator_succeeds true true success success success success
 validator_fails true false success cancelled success success
 validator_fails true true success abandoned success success
 validator_fails true true success success success missing
+validator_fails true true success success success success failure
 validator_fails false true success skipped skipped skipped
 validator_fails true false success success success success
 validator_fails invalid true success success success success
@@ -210,11 +211,11 @@ validator_fails true true failure success success success
 validator_fails true true success failure success success
 validator_succeeds false false skipped skipped skipped skipped
 if RUN_FULL=false RUN_MACOS=false CLASSIFY_RESULT=failure ATTRIBUTION_RESULT=success \
-  BUILD_RESULT=skipped MACOS_RESULT=skipped IMAGE_RESULT=skipped POSTGRES_RESULT=skipped "$validator" >/dev/null 2>&1; then
+  BUILD_RESULT=skipped MACOS_RESULT=skipped IMAGE_RESULT=skipped POSTGRES_RESULT=skipped DASHBOARD_E2E_RESULT=skipped "$validator" >/dev/null 2>&1; then
   fail 'aggregate accepted classifier failure'
 fi
 if RUN_FULL=false RUN_MACOS=false CLASSIFY_RESULT=success ATTRIBUTION_RESULT=failure \
-  BUILD_RESULT=skipped MACOS_RESULT=skipped IMAGE_RESULT=skipped POSTGRES_RESULT=skipped "$validator" >/dev/null 2>&1; then
+  BUILD_RESULT=skipped MACOS_RESULT=skipped IMAGE_RESULT=skipped POSTGRES_RESULT=skipped DASHBOARD_E2E_RESULT=skipped "$validator" >/dev/null 2>&1; then
   fail 'aggregate accepted attribution failure'
 fi
 
@@ -231,6 +232,8 @@ for required in \
   "if: always() && needs.classify.outputs.run_full != 'false'" \
   "if: always() && needs.classify.outputs.run_macos != 'false'" \
   '  linux-build:' \
+  '  dashboard-browser-e2e:' \
+  'run: make test-dashboard-e2e' \
   'run: .github/workflows/test-ci-change-classifier.sh' \
   '  macos-build:' \
   '  ci-result:' \
@@ -250,7 +253,9 @@ for required in \
   'test "$BUILD_RESULT" = success' \
   'test "$MACOS_RESULT" = success' \
   'test "$IMAGE_RESULT" = success' \
-  'test "$POSTGRES_RESULT" = success'; do
+  'test "$POSTGRES_RESULT" = success' \
+  'test "$DASHBOARD_E2E_RESULT" = skipped' \
+  'test "$DASHBOARD_E2E_RESULT" = success'; do
   grep -Fq -- "$required" "$validator" || fail "aggregate validator is missing contract: $required"
 done
 

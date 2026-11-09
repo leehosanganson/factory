@@ -1,4 +1,4 @@
-.PHONY: build frontend-build frontend-check container-build test test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
+.PHONY: build frontend-build frontend-check test-dashboard-e2e container-build test test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
@@ -10,6 +10,11 @@ frontend-build:
 
 frontend-check:
 	@set -eu; output="$$(mktemp -d)"; trap 'rm -rf "$$output"' EXIT; npm ci --prefix frontend; FACTORY_ASSET_OUT_DIR="$$output" npm run build --prefix frontend; for file in index.html dashboard.css dashboard.js; do cmp "internal/web/assets/$$file" "$$output/$$file"; done; test "$$(find "$$output" -type f | wc -l)" -eq 3
+
+test-dashboard-e2e: build
+	npm ci --prefix frontend
+	npm exec --prefix frontend -- playwright install $(PLAYWRIGHT_INSTALL_FLAGS) chromium
+	npm run test:e2e --prefix frontend
 
 container-build:
 	version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev); \
@@ -59,6 +64,7 @@ help:
 		build 'Compile the Factory CLI' \
 		frontend-build 'Compile React dashboard assets into the embedded Go asset directory' \
 		frontend-check 'Build React dashboard assets and verify the checked-in assets are current' \
+		test-dashboard-e2e 'Run the authenticated operator dashboard browser test' \
 		container-build 'Build the REST controller and worker images' \
 		test 'Run all Go tests' \
 		test-compose-local 'Build and smoke test the local Compose API control plane' \
