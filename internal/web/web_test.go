@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,6 +18,15 @@ import (
 )
 
 func testWebHandler(t *testing.T) http.Handler {
+	t.Helper()
+	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testWebHandlerWithManager(t, manager)
+}
+
+func testWebHandlerWithManager(t *testing.T, manager restjobs.Manager) http.Handler {
 	t.Helper()
 	keyPath := t.TempDir() + "/key"
 	if err := os.WriteFile(keyPath, []byte("legacy-web-test-token"), 0o600); err != nil {
@@ -33,10 +43,6 @@ func testWebHandler(t *testing.T) http.Handler {
 		t.Fatal(err)
 	}
 	key := resolver.APIKey()
-	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 8})
-	if err != nil {
-		t.Fatal(err)
-	}
 	api, err := restapi.New(manager, key, restapi.Config{MaxRequestBodyBytes: 4096, MaxTaskBytes: 2048, RepositoryAliases: map[string]struct{}{"widget": {}}, DashboardOperatorID: "admin", Ready: func() bool { return true }})
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +84,16 @@ func TestDashboardScheduleViewRendersBoundedScheduleSummaries(t *testing.T) {
 	}
 	for _, want := range []string{
 		`api("/v1/schedules")`,
+		`byId("schedule-form").addEventListener("submit"`,
+		`Idempotency-Key": scheduleAttempt.key`,
+		`if (!scheduleAttempt || scheduleAttempt.fingerprint !== fingerprint)`,
+		`scheduleAttempt = { fingerprint, key: crypto.randomUUID() }`,
+		`scheduleMutationPending) return`,
+		`scheduleForm.reset(); scheduleAttempt = null;`,
+		`api("/v1/schedules", { method: "POST"`,
+		`if (scheduleMutationPending) return;`,
+		`byId("schedule-submit").disabled = true;`,
+		`byId("schedule-submit").disabled = false;`,
 		`api("/v1/threads", { method: "POST"`,
 		`inspectThread(currentThread)`,
 		`threadAttempt.fingerprint !== fingerprint`,
@@ -105,6 +121,98 @@ func TestDashboardScheduleViewRendersBoundedScheduleSummaries(t *testing.T) {
 	}
 	if strings.Contains(response.Body.String(), `schedule.task`) {
 		t.Fatal("dashboard JavaScript reads schedule task text")
+	}
+}
+
+func TestDashboardScheduleCreateUsesSameOriginCSRFAndIdempotency(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "dashboard.db"), restjobs.Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := testWebHandlerWithManager(t, store)
+
+	login := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader(url.Values{"token": {"web-test-token"}}.Encode()))
+	login.Host = "factory.example"
+	login.Header.Set("Origin", "https://factory.example")
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, login)
+	if loginResponse.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", loginResponse.Code, loginResponse.Body.String())
+	}
+	cookie := loginResponse.Result().Cookies()[0]
+	var sessionData struct {
+		CSRF string `json:"csrf"`
+	}
+	if err := json.Unmarshal(loginResponse.Body.Bytes(), &sessionData); err != nil || sessionData.CSRF == "" {
+		t.Fatalf("login response=%s err=%v", loginResponse.Body.String(), err)
+	}
+
+	create := func(key, task string, csrf, origin string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/ui/api/v1/schedules", strings.NewReader(`{"cron":"*/5 * * * *","repository":"widget","task":"`+task+`"}`))
+		request.Host = "factory.example"
+		request.Header.Set("Origin", origin)
+		request.Header.Set("X-CSRF-Token", csrf)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", key)
+		request.AddCookie(cookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if rejected := create("schedule-no-csrf", "private scheduled task", "", "https://factory.example"); rejected.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+	if rejected := create("schedule-wrong-origin", "private scheduled task", sessionData.CSRF, "https://evil.example"); rejected.Code != http.StatusForbidden {
+		t.Fatalf("wrong Origin status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+	first := create("dashboard-create-retry", "private scheduled task", sessionData.CSRF, "https://factory.example")
+	if first.Code != http.StatusCreated || strings.Contains(first.Body.String(), "private scheduled task") || strings.Contains(first.Body.String(), `"task"`) || strings.Contains(first.Body.String(), `"repository"`) || strings.Contains(first.Body.String(), `"owner"`) {
+		t.Fatalf("create status=%d body=%s", first.Code, first.Body.String())
+	}
+	var created struct {
+		Schedule struct {
+			ID string `json:"id"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil || created.Schedule.ID == "" {
+		t.Fatalf("create response=%s err=%v", first.Body.String(), err)
+	}
+	stored, err := store.GetSchedule(created.Schedule.ID)
+	if err != nil || stored.Owner != "admin" || stored.Task != "private scheduled task" {
+		t.Fatalf("stored schedule=%+v err=%v", stored, err)
+	}
+	replay := create("dashboard-create-retry", "private scheduled task", sessionData.CSRF, "https://factory.example")
+	if replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), created.Schedule.ID) || !strings.Contains(replay.Body.String(), `"replayed":true`) || strings.Contains(replay.Body.String(), "private scheduled task") {
+		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		request := httptest.NewRequest(method, "/ui/api/v1/schedules/"+created.Schedule.ID, nil)
+		request.AddCookie(cookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusNotFound {
+			t.Errorf("%s schedule status=%d body=%s", method, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestDashboardScheduleFormStatesUTCRecurrenceRules(t *testing.T) {
+	handler := testWebHandler(t)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard HTML status=%d", response.Code)
+	}
+	for _, want := range []string{`id="schedule-form"`, `id="schedule-cron"`, `id="schedule-repository"`, `id="schedule-task"`, "Five fields; UTC; one-minute minimum recurrence."} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Errorf("dashboard HTML lacks schedule form content %q", want)
+		}
 	}
 }
 
@@ -332,7 +440,7 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 		method string
 		path   string
 		want   int
-	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusNotFound}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/jobs?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
+	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/jobs?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
 		proxyRequest := httptest.NewRequest(tc.method, tc.path, nil)
 		proxyRequest.Host = "factory.example"
 		proxyRequest.Header.Set("Origin", "https://factory.example")
@@ -388,7 +496,7 @@ func TestDashboardRequiresConfiguredNamedOperatorAndScopesProxy(t *testing.T) {
 		method string
 		path   string
 		query  string
-	}{{http.MethodPost, "/ui/api/v1/schedules", ""}, {http.MethodGet, "/ui/api/v1/schedules/one/runs", "before_sequence=2"}} {
+	}{{http.MethodPatch, "/ui/api/v1/schedules/one", ""}, {http.MethodDelete, "/ui/api/v1/schedules/one", ""}, {http.MethodGet, "/ui/api/v1/schedules/one/runs", "before_sequence=2"}} {
 		path := tc.path
 		if tc.query != "" {
 			path += "?" + tc.query

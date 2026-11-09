@@ -13,6 +13,8 @@
   let schedulesRefreshing = false;
   let scheduleRefreshPending = false;
   let scheduleRefreshGeneration = 0;
+  let scheduleAttempt = null;
+  let scheduleMutationPending = false;
   const api = async (path, options = {}) => {
     const headers = new Headers(options.headers || {});
     if (options.method && options.method !== "GET") headers.set("X-CSRF-Token", csrf);
@@ -240,6 +242,35 @@
       await inspectThread(currentThread);
     } catch (error) { showNotice(error.message); }
   });
+  byId("schedule-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (scheduleMutationPending) return;
+    showNotice("");
+    const scheduleForm = event.currentTarget;
+    const form = new FormData(scheduleForm);
+    const input = {
+      cron: String(form.get("cron") || "").trim(),
+      repository: String(form.get("repository") || "").trim(),
+      task: String(form.get("task") || ""),
+    };
+    const fingerprint = JSON.stringify(input);
+    if (!scheduleAttempt || scheduleAttempt.fingerprint !== fingerprint) {
+      scheduleAttempt = { fingerprint, key: crypto.randomUUID() };
+    }
+    scheduleMutationPending = true;
+    byId("schedule-submit").disabled = true;
+    try {
+      const response = await api("/v1/schedules", { method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": scheduleAttempt.key }, body: fingerprint });
+      scheduleForm.reset(); scheduleAttempt = null;
+      showNotice(response.replayed ? `Schedule ${response.schedule.id} was already created.` : `Schedule ${response.schedule.id} created.`);
+      await refreshSchedules();
+    } catch (error) {
+      showNotice(error.message);
+    } finally {
+      scheduleMutationPending = false;
+      byId("schedule-submit").disabled = false;
+    }
+  });
   byId("thread-append-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (!currentThread || currentThreadStatus === "completed" || threadMutationPending) return;
@@ -296,7 +327,7 @@
   });
   byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); if (currentThread) inspectThread(currentThread); });
   byId("logout").addEventListener("click", async () => {
-    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; currentThread = ""; currentThreadStatus = ""; threadAttempt = null; threadAppendAttempt = null; threadMutationPending = false; byId("thread-result").replaceChildren(); byId("thread-controls").classList.add("hidden"); byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; byId("detail").classList.add("hidden"); }
+    try { await fetch("/ui/logout", { method: "POST", credentials: "same-origin", headers: { "X-CSRF-Token": csrf }, cache: "no-store" }); } finally { if (stream) stream.close(); if (pollingTimer) clearInterval(pollingTimer); pollingTimer = null; csrf = ""; selected = ""; currentThread = ""; currentThreadStatus = ""; threadAttempt = null; threadAppendAttempt = null; threadMutationPending = false; byId("thread-result").replaceChildren(); byId("thread-controls").classList.add("hidden"); byId("dashboard").classList.add("hidden"); byId("login-panel").classList.remove("hidden"); byId("logout").classList.add("hidden"); byId("schedule-loading").textContent = ""; byId("schedule-list").replaceChildren(); scheduleRefreshGeneration++; scheduleRefreshPending = false; scheduleAttempt = null; scheduleMutationPending = false; byId("schedule-form").reset(); byId("schedule-submit").disabled = false; byId("detail").classList.add("hidden"); }
   });
   fetch("/ui/session", { credentials: "same-origin", cache: "no-store" }).then((response) => response.json()).then((session) => { if (session.authenticated) authenticated(session); }).catch(() => {});
 })();

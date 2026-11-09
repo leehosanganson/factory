@@ -62,8 +62,8 @@ func scheduleView(schedule restjobs.Schedule) scheduleResponse {
 }
 
 func (h *Handler) handleDashboardScheduleList(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w, http.MethodGet)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 		return
 	}
 	if r.URL.RawQuery != "" {
@@ -72,6 +72,10 @@ func (h *Handler) handleDashboardScheduleList(w http.ResponseWriter, r *http.Req
 	}
 	store, ok := h.scheduleStore(w)
 	if !ok {
+		return
+	}
+	if r.Method == http.MethodPost {
+		h.createSchedule(w, r, restserver.Principal{ID: h.config.DashboardOperatorID, Role: "operator"}, store, true)
 		return
 	}
 	schedules, err := store.ListRecentSchedules(dashboardScheduleLimit)
@@ -165,7 +169,7 @@ func (h *Handler) handleSchedules(w http.ResponseWriter, r *http.Request, caller
 			writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 			return
 		}
-		h.createSchedule(w, r, caller, store)
+		h.createSchedule(w, r, caller, store, false)
 	default:
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 	}
@@ -343,7 +347,7 @@ func (h *Handler) handleSchedule(w http.ResponseWriter, r *http.Request, id stri
 		methodNotAllowed(w, http.MethodGet+", "+http.MethodPatch+", "+http.MethodDelete)
 	}
 }
-func (h *Handler) createSchedule(w http.ResponseWriter, r *http.Request, caller restserver.Principal, store restjobs.ScheduleStore) {
+func (h *Handler) createSchedule(w http.ResponseWriter, r *http.Request, caller restserver.Principal, store restjobs.ScheduleStore, dashboard bool) {
 	keys := r.Header.Values("Idempotency-Key")
 	if len(keys) != 1 || strings.TrimSpace(keys[0]) == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
@@ -374,6 +378,18 @@ func (h *Handler) createSchedule(w http.ResponseWriter, r *http.Request, caller 
 	status := http.StatusCreated
 	if replayed {
 		status = http.StatusOK
+	}
+	if dashboard {
+		projected := dashboardScheduleResponse{
+			ID: schedule.ID, Cron: schedule.Cron, Status: schedule.Status, Revision: schedule.Revision,
+			Pending: schedule.PendingOccurrence(), Skipped: schedule.SkippedOccurrences(),
+			CreatedAt: schedule.CreatedAt, UpdatedAt: schedule.UpdatedAt,
+		}
+		writeJSON(w, status, struct {
+			Schedule dashboardScheduleResponse `json:"schedule"`
+			Replayed bool                      `json:"replayed"`
+		}{projected, replayed})
+		return
 	}
 	writeJSON(w, status, struct {
 		Schedule scheduleResponse `json:"schedule"`

@@ -216,7 +216,7 @@ func dashboardProxyAllowed(path, method string) bool {
 		return len(parts) == 2 && parts[0] != "" && ((parts[1] == "history" || parts[1] == "events") && method == http.MethodGet || parts[1] == "cancel" && method == http.MethodPost)
 	}
 	if path == "/ui/api/v1/schedules" {
-		return method == http.MethodGet
+		return method == http.MethodGet || method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/ui/api/v1/schedules/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")

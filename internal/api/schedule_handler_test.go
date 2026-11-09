@@ -180,6 +180,67 @@ func TestScheduleAPIExposesOnlyBoundedOwnedDispatchSummary(t *testing.T) {
 	}
 }
 
+func TestDashboardScheduleCreateUsesSQLiteAndSafeProjection(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "dashboard-create.db"), restjobs.Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	handler.config.DashboardOperatorID = "admin"
+
+	create := func(key string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"*/5 * * * *","repository":"widget","task":"private dashboard schedule task"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", key)
+		response := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(response, request)
+		return response
+	}
+	first := create("dashboard-schedule-create")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("dashboard schedule create status=%d body=%s", first.Code, first.Body.String())
+	}
+	for _, forbidden := range []string{"private dashboard schedule task", `"task"`, `"repository"`, `"owner"`} {
+		if strings.Contains(first.Body.String(), forbidden) {
+			t.Errorf("dashboard create exposed %q: %s", forbidden, first.Body.String())
+		}
+	}
+	var response struct {
+		Schedule struct {
+			ID string `json:"id"`
+		} `json:"schedule"`
+		Replayed bool `json:"replayed"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &response); err != nil || response.Schedule.ID == "" || response.Replayed {
+		t.Fatalf("dashboard create response=%s err=%v", first.Body.String(), err)
+	}
+	stored, err := store.GetSchedule(response.Schedule.ID)
+	if err != nil || stored.Owner != "admin" || stored.Task != "private dashboard schedule task" || stored.Repository != "widget" {
+		t.Fatalf("stored dashboard schedule=%+v err=%v", stored, err)
+	}
+	history, err := store.ListScheduleHistory(response.Schedule.ID, "admin", true, 0, restjobs.DefaultScheduleHistoryLimit)
+	if err != nil || len(history.Events) != 1 || history.Events[0].Creator != "admin" || history.Events[0].Actor != "admin" || history.Events[0].Action != restjobs.ScheduleCreated {
+		t.Fatalf("dashboard schedule audit history=%+v err=%v", history, err)
+	}
+	replay := create("dashboard-schedule-create")
+	if replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), `"replayed":true`) || !strings.Contains(replay.Body.String(), response.Schedule.ID) || strings.Contains(replay.Body.String(), "private dashboard schedule task") {
+		t.Fatalf("dashboard schedule replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
+		request := httptest.NewRequest(method, "/v1/schedules/"+response.Schedule.ID, nil)
+		blocked := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(blocked, request)
+		if blocked.Code != http.StatusNotFound {
+			t.Errorf("dashboard %s schedule status=%d body=%s", method, blocked.Code, blocked.Body.String())
+		}
+	}
+}
+
 func TestDashboardScheduleProjectionOmitsTaskAndBoundsRuns(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -196,15 +257,27 @@ func TestDashboardScheduleProjectionOmitsTaskAndBoundsRuns(t *testing.T) {
 	if create.Code != http.StatusCreated {
 		t.Fatalf("named operator create status=%d body=%s", create.Code, create.Body.String())
 	}
-	// The dashboard operator proxy remains read-only for schedules.
-	schedule, _, err := store.CreateSchedule("alice", "dashboard-seed", restjobs.ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "dashboard private task"})
+	// Create a second schedule through the dashboard-only handler and verify its
+	// response remains limited to the existing redacted schedule projection.
+	dashboardCreateRequest := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"dashboard task"}`))
+	dashboardCreateRequest.Header.Set("Content-Type", "application/json")
+	dashboardCreateRequest.Header.Set("Idempotency-Key", "dashboard-seed-create")
+	dashboardCreate := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(dashboardCreate, dashboardCreateRequest)
+	if dashboardCreate.Code != http.StatusCreated || strings.Contains(dashboardCreate.Body.String(), "dashboard task") || strings.Contains(dashboardCreate.Body.String(), `"repository"`) || strings.Contains(dashboardCreate.Body.String(), `"owner"`) {
+		t.Fatalf("dashboard schedule create status=%d body=%s", dashboardCreate.Code, dashboardCreate.Body.String())
+	}
+	var created struct {
+		Schedule struct {
+			ID string `json:"id"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal(dashboardCreate.Body.Bytes(), &created); err != nil || created.Schedule.ID == "" {
+		t.Fatalf("dashboard schedule create response=%s err=%v", dashboardCreate.Body.String(), err)
+	}
+	schedule, err := store.GetSchedule(created.Schedule.ID)
 	if err != nil {
 		t.Fatal(err)
-	}
-	dashboardCreate := httptest.NewRecorder()
-	handler.ServeAsDashboardOperator(dashboardCreate, httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"dashboard task"}`)))
-	if dashboardCreate.Code != http.StatusNotFound {
-		t.Fatalf("dashboard operator route allowed schedule creation: status=%d body=%s", dashboardCreate.Code, dashboardCreate.Body.String())
 	}
 	first := schedule.NextOccurrence()
 	if err := store.DispatchScheduleOccurrences(context.Background(), first, 1); err != nil {
@@ -572,11 +645,14 @@ func TestNamedOperatorsCanCreateOwnedSchedulesWithScopedIdempotency(t *testing.T
 	if legacy.Code != http.StatusNotFound {
 		t.Fatalf("legacy shared key created schedule: status=%d body=%s", legacy.Code, legacy.Body.String())
 	}
+	dashboardRequest := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"dashboard task"}`))
+	dashboardRequest.Header.Set("Content-Type", "application/json")
+	dashboardRequest.Header.Set("Idempotency-Key", "dashboard-operator-create")
 	dashboard := httptest.NewRecorder()
 	handler.config.DashboardOperatorID = "admin"
-	handler.ServeAsDashboardOperator(dashboard, httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"dashboard task"}`)))
-	if dashboard.Code != http.StatusNotFound {
-		t.Fatalf("dashboard operator route allowed schedule creation: status=%d body=%s", dashboard.Code, dashboard.Body.String())
+	handler.ServeAsDashboardOperator(dashboard, dashboardRequest)
+	if dashboard.Code != http.StatusCreated || strings.Contains(dashboard.Body.String(), "dashboard task") || strings.Contains(dashboard.Body.String(), `"repository"`) || strings.Contains(dashboard.Body.String(), `"owner"`) {
+		t.Fatalf("dashboard operator schedule create status=%d body=%s", dashboard.Code, dashboard.Body.String())
 	}
 }
 
