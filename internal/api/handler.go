@@ -159,7 +159,7 @@ func isDashboardOperator(r *http.Request) bool {
 
 func dashboardRoute(path, method string) bool {
 	if path == "/v1/schedules" {
-		return method == http.MethodGet
+		return method == http.MethodGet || method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/v1/schedules/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/v1/schedules/"), "/")

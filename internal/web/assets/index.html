@@ -54,7 +54,13 @@
       </section>
       <section class="panel schedules-panel" aria-labelledby="schedules-title">
         <div class="section-heading"><h2 id="schedules-title">Schedules</h2><span id="schedule-loading" class="muted" role="status"></span></div>
-        <p class="muted">Read-only view of scheduled work. Times are UTC.</p>
+        <p class="muted">Schedule tasks run on their cron times. Cron uses UTC and supports one-minute minimum recurrence.</p>
+        <form id="schedule-form" class="schedule-form">
+          <label for="schedule-cron">Cron (UTC)</label><input id="schedule-cron" name="cron" maxlength="128" required autocomplete="off" placeholder="0 9 * * 1-5"><span class="muted">Five fields; UTC; one-minute minimum recurrence.</span>
+          <label for="schedule-repository">Repository alias</label><input id="schedule-repository" name="repository" maxlength="64" required autocomplete="off">
+          <label for="schedule-task">Task</label><textarea id="schedule-task" name="task" rows="4" maxlength="262144" required></textarea>
+          <button id="schedule-submit" type="submit">Create schedule</button>
+        </form>
         <div id="schedule-list" class="schedule-list" aria-live="polite"><p class="muted">Loading schedules…</p></div>
       </section>
       <section id="detail" class="panel detail hidden" aria-labelledby="detail-title" aria-live="polite"></section>

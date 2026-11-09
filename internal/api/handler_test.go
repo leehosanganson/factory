@@ -586,8 +586,8 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 	request = httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{}`))
 	response = httptest.NewRecorder()
 	handler.ServeAsDashboardOperator(response, request)
-	if response.Code != http.StatusNotFound {
-		t.Errorf("dashboard accepted schedule mutation status=%d", response.Code)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"durable_store_required"`) {
+		t.Errorf("dashboard schedule create without durable store status=%d body=%s", response.Code, response.Body.String())
 	}
 
 	request = httptest.NewRequest(http.MethodGet, "/v1/threads/one", nil)
