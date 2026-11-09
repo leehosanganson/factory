@@ -16,6 +16,11 @@ coverage.txt
 
 # Dependency and workspace artifacts
 /frontend/node_modules/
+/frontend/.playwright-runtime/
+/frontend/e2e/.pytest_cache/
+/frontend/test-results/
+/frontend/playwright-report/
+/frontend/playwright/.cache/
 /vendor/
 go.work
 go.work.sum

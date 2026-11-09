@@ -9,6 +9,7 @@ set -euo pipefail
 : "${MACOS_RESULT:?MACOS_RESULT is required}"
 : "${IMAGE_RESULT:?IMAGE_RESULT is required}"
 : "${POSTGRES_RESULT:?POSTGRES_RESULT is required}"
+: "${DASHBOARD_E2E_RESULT:?DASHBOARD_E2E_RESULT is required}"
 
 test "$CLASSIFY_RESULT" = success
 test "$ATTRIBUTION_RESULT" = success
@@ -21,10 +22,12 @@ if [[ $RUN_FULL == false ]]; then
   test "$MACOS_RESULT" = skipped
   test "$IMAGE_RESULT" = skipped
   test "$POSTGRES_RESULT" = skipped
+  test "$DASHBOARD_E2E_RESULT" = skipped
 else
   test "$BUILD_RESULT" = success
   test "$IMAGE_RESULT" = success
   test "$POSTGRES_RESULT" = success
+  test "$DASHBOARD_E2E_RESULT" = success
   if [[ $RUN_MACOS == false ]]; then
     test "$MACOS_RESULT" = skipped
   else
