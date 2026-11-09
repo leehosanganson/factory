@@ -40,7 +40,7 @@ See the [primary Factory-to-Pi workflow](docs/features/primary-workflow.md) for 
 
 ## Build and verify
 
-Go 1.26.3 or later is required. Linux and macOS are supported. The Makefile provides `make build`, `make test`, `make fmt`, `make vet`, `make clean`, and `make help` (which lists the targets and their descriptions).
+Go 1.26.3 or later is required. Linux and macOS are supported. The Makefile provides `make build`, `make test`, `make fmt`, `make vet`, `make clean`, and `make help` (which lists the targets and their descriptions). The embedded React dashboard assets are checked in, so normal Go builds need no Node.js; dashboard source changes require Node.js 24 and npm 11, then `make frontend-build` to regenerate the assets or `make frontend-check` to verify they are current.
 
 ```sh
 make build

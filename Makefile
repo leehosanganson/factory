@@ -1,8 +1,15 @@
-.PHONY: build container-build test test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
+.PHONY: build frontend-build frontend-check container-build test test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
 	go build -o bin/factory ./cmd/factory
+
+frontend-build:
+	npm ci --prefix frontend
+	npm run build --prefix frontend
+
+frontend-check:
+	@set -eu; output="$$(mktemp -d)"; trap 'rm -rf "$$output"' EXIT; npm ci --prefix frontend; FACTORY_ASSET_OUT_DIR="$$output" npm run build --prefix frontend; for file in index.html dashboard.css dashboard.js; do cmp "internal/web/assets/$$file" "$$output/$$file"; done; test "$$(find "$$output" -type f | wc -l)" -eq 3
 
 container-build:
 	version=$$(git describe --tags --always --dirty 2>/dev/null || echo dev); \
@@ -50,6 +57,8 @@ clean:
 help:
 	@printf '%-8s %s\n' \
 		build 'Compile the Factory CLI' \
+		frontend-build 'Compile React dashboard assets into the embedded Go asset directory' \
+		frontend-check 'Build React dashboard assets and verify the checked-in assets are current' \
 		container-build 'Build the REST controller and worker images' \
 		test 'Run all Go tests' \
 		test-compose-local 'Build and smoke test the local Compose API control plane' \

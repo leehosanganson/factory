@@ -15,6 +15,7 @@ coverage.txt
 /.local/
 
 # Dependency and workspace artifacts
+/frontend/node_modules/
 /vendor/
 go.work
 go.work.sum

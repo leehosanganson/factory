@@ -53,6 +53,16 @@ jobs:
       - name: Test CI change classifier
         run: .github/workflows/test-ci-change-classifier.sh
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify embedded dashboard assets are current
+        run: make frontend-check
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
