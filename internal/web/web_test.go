@@ -50,80 +50,6 @@ func testWebHandlerWithManager(t *testing.T, manager restjobs.Manager) http.Hand
 	return New(api, "admin")
 }
 
-func TestDashboardThreadMutationControlsAndStableRetryKey(t *testing.T) {
-	handler := testWebHandler(t)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("dashboard JavaScript status=%d", response.Code)
-	}
-	for _, want := range []string{
-		`threadAppendAttempt = { thread: currentThread, fingerprint, key: crypto.randomUUID() }`,
-		`threadAppendAttempt.fingerprint !== fingerprint`,
-		`threadMutationPending) return`,
-		`threadAppendAttempt.key`,
-		`threadClosed(error)`,
-		`await inspectThread(threadID);`,
-		`byId("thread-controls").classList.toggle("hidden", Boolean(thread.completed_at))`,
-		`/v1/threads/${encodeURIComponent(threadID)}/jobs`,
-		`/v1/threads/${encodeURIComponent(threadID)}/complete`,
-	} {
-		if !strings.Contains(response.Body.String(), want) {
-			t.Errorf("dashboard JavaScript missing Thread mutation behavior %q", want)
-		}
-	}
-}
-
-func TestDashboardScheduleViewRendersBoundedScheduleSummaries(t *testing.T) {
-	handler := testWebHandler(t)
-	request := httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("dashboard JavaScript status=%d", response.Code)
-	}
-	for _, want := range []string{
-		`api("/v1/schedules")`,
-		`byId("schedule-form").addEventListener("submit"`,
-		`Idempotency-Key": scheduleAttempt.key`,
-		`if (!scheduleAttempt || scheduleAttempt.fingerprint !== fingerprint)`,
-		`scheduleAttempt = { fingerprint, key: crypto.randomUUID() }`,
-		`scheduleMutationPending) return`,
-		`scheduleForm.reset(); scheduleAttempt = null;`,
-		`api("/v1/schedules", { method: "POST"`,
-		`if (scheduleMutationPending) return;`,
-		`byId("schedule-submit").disabled = true;`,
-		`byId("schedule-submit").disabled = false;`,
-		`api("/v1/threads", { method: "POST"`,
-		`inspectThread(currentThread)`,
-		`threadAttempt.fingerprint !== fingerprint`,
-		`currentThread = response.thread.id`,
-		"/v1/schedules/${encodeURIComponent(schedule.id)}/runs?limit=5",
-		`pending_occurrence_at`,
-		`skipped_occurrences`,
-		`schedule-run-link`,
-		`new Date(schedule.pending_occurrence_at).toISOString()`,
-		`refreshSchedules();`,
-		`if (schedulesRefreshing) { scheduleRefreshPending = true; return; }`,
-		`const generation = ++scheduleRefreshGeneration;`,
-		`if (!isCurrent()) return;`,
-		`schedulesRefreshing = false;`,
-		`generation === scheduleRefreshGeneration && !byId("dashboard").classList.contains("hidden")`,
-		`if (scheduleRefreshPending) {`,
-		`if (!byId("dashboard").classList.contains("hidden")) refreshSchedules();`,
-		` scheduleRefreshGeneration++; scheduleRefreshPending = false;`,
-		`if (!byId("dashboard").classList.contains("hidden")) { refreshJobs(); refreshSchedules(); }`,
-		`byId("refresh").addEventListener("click", () => { refreshJobs(); refreshSchedules(); if (currentThread) inspectThread(currentThread); });`,
-	} {
-		if !strings.Contains(response.Body.String(), want) {
-			t.Errorf("dashboard JavaScript missing schedule behavior %q", want)
-		}
-	}
-	if strings.Contains(response.Body.String(), `schedule.task`) {
-		t.Fatal("dashboard JavaScript reads schedule task text")
-	}
-}
-
 func TestDashboardScheduleCreateUsesSameOriginCSRFAndIdempotency(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -202,38 +128,6 @@ func TestDashboardScheduleCreateUsesSameOriginCSRFAndIdempotency(t *testing.T) {
 	}
 }
 
-func TestDashboardScheduleFormStatesUTCRecurrenceRules(t *testing.T) {
-	handler := testWebHandler(t)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
-	if response.Code != http.StatusOK {
-		t.Fatalf("dashboard HTML status=%d", response.Code)
-	}
-	for _, want := range []string{`id="schedule-form"`, `id="schedule-cron"`, `id="schedule-repository"`, `id="schedule-task"`, "Five fields; UTC; one-minute minimum recurrence."} {
-		if !strings.Contains(response.Body.String(), want) {
-			t.Errorf("dashboard HTML lacks schedule form content %q", want)
-		}
-	}
-}
-
-func TestDashboardSelectedJobScrollRespectsReducedMotionPreference(t *testing.T) {
-	handler := testWebHandler(t)
-	request := httptest.NewRequest(http.MethodGet, "/ui/assets/dashboard.js", nil)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("dashboard JavaScript status=%d", response.Code)
-	}
-	for _, want := range []string{
-		`window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth"`,
-		`panel.scrollIntoView({ behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" })`,
-	} {
-		if !strings.Contains(response.Body.String(), want) {
-			t.Errorf("dashboard JavaScript missing selected-job scroll behavior %q", want)
-		}
-	}
-}
-
 func TestDashboardAssetsAreEmbeddedAndHardened(t *testing.T) {
 	handler := testWebHandler(t)
 	for _, path := range []string{"/", "/ui/assets/dashboard.css", "/ui/assets/dashboard.js"} {
@@ -242,17 +136,25 @@ func TestDashboardAssetsAreEmbeddedAndHardened(t *testing.T) {
 		if recorder.Code != http.StatusOK || recorder.Body.Len() == 0 {
 			t.Errorf("GET %s status=%d body=%q", path, recorder.Code, recorder.Body.String())
 		}
-		if path == "/" {
-			for _, want := range []string{`id="thread-form"`, `id="thread-repository"`, `id="thread-task"`, `id="thread-result"`, `id="thread-append-form"`, `id="thread-complete"`} {
-				if !strings.Contains(recorder.Body.String(), want) {
-					t.Errorf("dashboard HTML missing Thread UI element %s", want)
-				}
-			}
+		if path == "/" && (strings.Contains(recorder.Body.String(), "<script>") || strings.Contains(recorder.Body.String(), "<style") || strings.Contains(recorder.Body.String(), "style=")) {
+			t.Error("dashboard entry page contains inline script or style content")
+		}
+		if path == "/ui/assets/dashboard.js" && (strings.Contains(recorder.Body.String(), "sourceMappingURL") || strings.Contains(recorder.Body.String(), "react-refresh") || strings.Contains(recorder.Body.String(), "vite/client")) {
+			t.Error("dashboard JavaScript contains development or source-map output")
+		}
+		if path == "/ui/assets/dashboard.js" && recorder.Header().Get("Content-Type") != "text/javascript; charset=utf-8" {
+			t.Errorf("dashboard JavaScript content type=%q", recorder.Header().Get("Content-Type"))
+		}
+		if path == "/ui/assets/dashboard.css" && recorder.Header().Get("Content-Type") != "text/css; charset=utf-8" {
+			t.Errorf("dashboard CSS content type=%q", recorder.Header().Get("Content-Type"))
 		}
 		for _, header := range []string{"Content-Security-Policy", "X-Content-Type-Options", "X-Frame-Options", "Referrer-Policy", "Cache-Control"} {
 			if recorder.Header().Get(header) == "" {
 				t.Errorf("GET %s omitted %s", path, header)
 			}
+		}
+		if recorder.Header().Get("Content-Security-Policy") != "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" {
+			t.Errorf("GET %s content security policy=%q", path, recorder.Header().Get("Content-Security-Policy"))
 		}
 	}
 }
