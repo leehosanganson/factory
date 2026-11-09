@@ -18,6 +18,45 @@ import (
 	restserver "github.com/leehosanganson/factory/internal/server"
 )
 
+func TestNamedOperatorKnownScheduleRoutesReturnMethodNotAllowed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "operator-methods.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+
+	for _, tc := range []struct {
+		method string
+		path   string
+		status int
+		allow  string
+	}{
+		{method: http.MethodPut, path: "/v1/schedules", status: http.StatusMethodNotAllowed, allow: "GET, POST"},
+		{method: http.MethodPut, path: "/v1/schedules/schedule-id", status: http.StatusMethodNotAllowed, allow: "GET, PATCH, DELETE"},
+		{method: http.MethodPut, path: "/v1/schedules/schedule-id/history", status: http.StatusMethodNotAllowed, allow: http.MethodGet},
+		{method: http.MethodPut, path: "/v1/schedules/schedule-id/runs", status: http.StatusMethodNotAllowed, allow: http.MethodGet},
+		{method: http.MethodPut, path: "/v1/schedules/schedule-id/unknown", status: http.StatusNotFound},
+	} {
+		response := principalRequest(handler, tc.method, tc.path, "", namedPrincipalToken("admin"))
+		if response.Code != tc.status {
+			t.Errorf("%s %s status=%d body=%s; want %d", tc.method, tc.path, response.Code, response.Body.String(), tc.status)
+		}
+		if got := response.Header().Get("Allow"); got != tc.allow {
+			t.Errorf("%s %s Allow=%q; want %q", tc.method, tc.path, got, tc.allow)
+		}
+	}
+
+	legacyCreate := principalRequest(handler, http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"task"}`, testAPIKey)
+	if legacyCreate.Code != http.StatusNotFound {
+		t.Errorf("legacy shared schedule create status=%d body=%s; want 404", legacyCreate.Code, legacyCreate.Body.String())
+	}
+}
+
 func TestScheduleRoutesRequireDurableStoreAndNamedSubmitter(t *testing.T) {
 	memory := newTestManager(t, managerConfig(4, 4, 4))
 	handler := newPrincipalTestHandler(t, memory,
@@ -42,7 +81,7 @@ func TestScheduleRoutesRequireDurableStoreAndNamedSubmitter(t *testing.T) {
 			assertError(t, w, http.StatusServiceUnavailable, "durable_store_required")
 		})
 	}
-	for _, token := range []string{namedPrincipalToken("admin"), testAPIKey} {
+	for _, token := range []string{namedPrincipalToken("admin")} {
 		for _, tc := range []struct{ method, path, body string }{
 			{http.MethodGet, "/v1/schedules", ""},
 			{http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"task"}`},
@@ -55,10 +94,17 @@ func TestScheduleRoutesRequireDurableStoreAndNamedSubmitter(t *testing.T) {
 			if tc.method == http.MethodGet && (tc.path == "/v1/schedules" || tc.path == "/v1/schedules/schedule-id") || tc.method == http.MethodPatch || tc.method == http.MethodDelete {
 				want = http.StatusServiceUnavailable
 			}
+			if token == namedPrincipalToken("admin") && tc.method == http.MethodPost {
+				want = http.StatusServiceUnavailable
+			}
 			if got.Code != want {
 				t.Errorf("principal %q %s %s status=%d body=%s; want %d", token, tc.method, tc.path, got.Code, got.Body.String(), want)
 			}
 		}
+	}
+	legacyCreate := principalRequest(handler, http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"task"}`, testAPIKey)
+	if legacyCreate.Code != http.StatusNotFound {
+		t.Errorf("legacy shared credential schedule create status=%d body=%s; want 404", legacyCreate.Code, legacyCreate.Body.String())
 	}
 }
 
@@ -147,13 +193,18 @@ func TestDashboardScheduleProjectionOmitsTaskAndBoundsRuns(t *testing.T) {
 	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
 	handler.config.DashboardOperatorID = "admin"
 	create := principalRequest(handler, http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"dashboard private task"}`, namedPrincipalToken("admin"))
-	if create.Code != http.StatusNotFound {
-		t.Fatalf("named operator unexpectedly created schedule: %d %s", create.Code, create.Body.String())
+	if create.Code != http.StatusCreated {
+		t.Fatalf("named operator create status=%d body=%s", create.Code, create.Body.String())
 	}
-	// Seed through the store because dashboard operator routes are read-only.
+	// The dashboard operator proxy remains read-only for schedules.
 	schedule, _, err := store.CreateSchedule("alice", "dashboard-seed", restjobs.ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "dashboard private task"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	dashboardCreate := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(dashboardCreate, httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"dashboard task"}`)))
+	if dashboardCreate.Code != http.StatusNotFound {
+		t.Fatalf("dashboard operator route allowed schedule creation: status=%d body=%s", dashboardCreate.Code, dashboardCreate.Body.String())
 	}
 	first := schedule.NextOccurrence()
 	if err := store.DispatchScheduleOccurrences(context.Background(), first, 1); err != nil {
@@ -428,6 +479,107 @@ func TestScheduleHistoryOperationalStoreErrorReturnsInternalError(t *testing.T) 
 	}
 }
 
+func TestNamedOperatorsCanCreateOwnedSchedulesWithScopedIdempotency(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "operator-schedules.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+		restserver.PrincipalConfig{ID: "second-admin", Role: "operator", Enabled: true},
+	)
+	create := func(principal, task string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"`+task+`"}`))
+		r.Header.Set("Authorization", "Bearer "+namedPrincipalToken(principal))
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Idempotency-Key", "operator-schedule")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	first := create("admin", "operator task")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("operator create status=%d body=%s", first.Code, first.Body.String())
+	}
+	var created struct {
+		Schedule restjobs.Schedule `json:"schedule"`
+		Replayed bool              `json:"replayed"`
+	}
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Schedule.Owner != "admin" || created.Replayed {
+		t.Fatalf("created schedule=%+v replay=%t", created.Schedule, created.Replayed)
+	}
+	schedule, err := store.GetSchedule(created.Schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), schedule.NextOccurrence(), 1); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := store.ListScheduleRuns(created.Schedule.ID, "admin", true, 0, 50)
+	if err != nil || len(runs.Runs) != 1 {
+		t.Fatalf("operator schedule runs=%+v err=%v", runs, err)
+	}
+	job, err := store.Get(runs.Runs[0].JobID)
+	if err != nil || job.Submitter != "admin" {
+		t.Fatalf("scheduled job owner=%q err=%v; want admin", job.Submitter, err)
+	}
+	if replay := create("admin", "operator task"); replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), `"replayed":true`) {
+		t.Fatalf("same-operator replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	if conflict := create("admin", "changed task"); conflict.Code != http.StatusConflict {
+		t.Fatalf("same-operator payload conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+	second := create("second-admin", "operator task")
+	if second.Code != http.StatusCreated {
+		t.Fatalf("second operator create status=%d body=%s", second.Code, second.Body.String())
+	}
+	var secondCreated struct {
+		Schedule restjobs.Schedule `json:"schedule"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondCreated); err != nil {
+		t.Fatal(err)
+	}
+	if secondCreated.Schedule.ID == created.Schedule.ID || secondCreated.Schedule.Owner != "second-admin" {
+		t.Fatalf("idempotency key crossed operator namespaces: first=%+v second=%+v", created.Schedule, secondCreated.Schedule)
+	}
+	get := principalRequest(handler, http.MethodGet, "/v1/schedules/"+created.Schedule.ID, "", namedPrincipalToken("admin"))
+	if get.Code != http.StatusOK || !strings.Contains(get.Body.String(), `"owner":"admin"`) {
+		t.Fatalf("operator get status=%d body=%s", get.Code, get.Body.String())
+	}
+	mutate := httptest.NewRequest(http.MethodPatch, "/v1/schedules/"+created.Schedule.ID, strings.NewReader(`{"action":"pause"}`))
+	mutate.Header.Set("Authorization", "Bearer "+namedPrincipalToken("second-admin"))
+	mutate.Header.Set("Content-Type", "application/json")
+	mutate.Header.Set("If-Match", `"1"`)
+	mutated := httptest.NewRecorder()
+	handler.ServeHTTP(mutated, mutate)
+	if mutated.Code != http.StatusOK {
+		t.Fatalf("second operator mutation status=%d body=%s", mutated.Code, mutated.Body.String())
+	}
+	history := principalRequest(handler, http.MethodGet, "/v1/schedules/"+created.Schedule.ID+"/history", "", namedPrincipalToken("admin"))
+	if history.Code != http.StatusOK || !strings.Contains(history.Body.String(), `"creator":"admin"`) || !strings.Contains(history.Body.String(), `"actor":"admin"`) || !strings.Contains(history.Body.String(), `"action":"create"`) || !strings.Contains(history.Body.String(), `"actor":"second-admin"`) || !strings.Contains(history.Body.String(), `"action":"pause"`) {
+		t.Fatalf("operator audit history status=%d body=%s", history.Code, history.Body.String())
+	}
+	legacy := principalRequest(handler, http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"legacy task"}`, testAPIKey)
+	if legacy.Code != http.StatusNotFound {
+		t.Fatalf("legacy shared key created schedule: status=%d body=%s", legacy.Code, legacy.Body.String())
+	}
+	dashboard := httptest.NewRecorder()
+	handler.config.DashboardOperatorID = "admin"
+	handler.ServeAsDashboardOperator(dashboard, httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"* * * * *","repository":"widget","task":"dashboard task"}`)))
+	if dashboard.Code != http.StatusNotFound {
+		t.Fatalf("dashboard operator route allowed schedule creation: status=%d body=%s", dashboard.Code, dashboard.Body.String())
+	}
+}
+
 func TestScheduleOperatorAuditAndOwnerHistory(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -554,13 +706,12 @@ func TestSQLiteScheduleAPIOwnershipIdempotencyAndRevision(t *testing.T) {
 	id := response.Schedule.ID
 	for _, tc := range []struct{ method, path, body string }{
 		{http.MethodGet, "/v1/schedules", ""},
-		{http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"task"}`},
 		{http.MethodGet, "/v1/schedules/" + id, ""},
 		{http.MethodPatch, "/v1/schedules/" + id, `{"action":"pause"}`},
 		{http.MethodDelete, "/v1/schedules/" + id, ""},
 	} {
 		for _, token := range []string{namedPrincipalToken("admin"), testAPIKey} {
-			if token == testAPIKey && (tc.method == http.MethodPatch || tc.method == http.MethodDelete) {
+			if token == testAPIKey && (tc.method == http.MethodPatch || tc.method == http.MethodDelete || tc.method == http.MethodGet) {
 				continue
 			}
 			got := principalRequest(handler, tc.method, tc.path, tc.body, token)
@@ -586,7 +737,7 @@ func TestSQLiteScheduleAPIOwnershipIdempotencyAndRevision(t *testing.T) {
 		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
 	}
 	for _, tc := range []struct{ method, path string }{{http.MethodPost, "/v1/schedules"}} {
-		if got := principalRequest(handler, tc.method, tc.path, `{"action":"pause"}`, namedPrincipalToken("admin")); got.Code != http.StatusNotFound {
+		if got := principalRequest(handler, tc.method, tc.path, `{"cron":"* * * * *","repository":"widget","task":"operator task"}`, namedPrincipalToken("admin")); got.Code != http.StatusCreated {
 			t.Errorf("operator self-service route %s %s status=%d", tc.method, tc.path, got.Code)
 		}
 	}

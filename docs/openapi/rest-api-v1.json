@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.16.0",
-    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create persistent UTC cron schedules on SQLite or PostgreSQL; operators can manage schedules across owners. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
+    "version": "1.17.0",
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create schedules they own, and named operators can create schedules attributed to their own principal identity and manage schedules across owners. The legacy shared operator credential retains schedule list/get/mutate access but cannot create schedules. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
     "/v1/webhooks/github/issues": {
@@ -89,7 +89,7 @@
       "get": {
         "operationId": "listSchedules",
         "summary": "List schedules",
-        "description": "Returns persistent schedules. Named submitters see schedules they own; named operators and the legacy shared operator credential see all schedules. Only submitters may create schedules. Schedule mutations retain the original creator and audit the authenticated actor. Requires SQLite or PostgreSQL.",
+        "description": "Returns persistent schedules. Named submitters see schedules they own; named operators and the legacy shared operator credential see all schedules. Named submitters and named operators may create schedules; each schedule is owned by the caller's principal ID. The legacy shared operator credential cannot create schedules. Schedule mutations retain the original creator and audit the authenticated actor. Requires SQLite or PostgreSQL.",
         "security": [
           {
             "bearerAuth": []
@@ -133,7 +133,7 @@
       "post": {
         "operationId": "createSchedule",
         "summary": "Create a recurring schedule",
-        "description": "Creates an active persistent schedule. Idempotency-Key is required and scoped to the named submitter; matching retries return the original schedule and changed requests conflict. The body accepts only cron, repository, and task. Cron uses exactly five fields (minute hour day-of-month month day-of-week), UTC only, DOM/DOW OR when both are restricted, and one-minute minimum granularity. Occurrences start at the next matching UTC minute strictly after creation. A bounded server dispatcher admits due occurrences as standalone Jobs. The oldest due occurrence remains pending if queue or retained-record capacity is full, while later missed occurrences are summarized as skipped. Dispatch requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required.",
+        "description": "Creates an active persistent schedule for a named submitter or named operator, using the authenticated principal ID as schedule owner, immutable creator, and create-audit actor. Scheduled Jobs are later attributed to that owner. The legacy shared operator credential cannot create schedules. Idempotency-Key is required and scoped to the caller's principal; matching retries return the original schedule and changed requests conflict. The body accepts only cron, repository, and task. Cron uses exactly five fields (minute hour day-of-month month day-of-week), UTC only, DOM/DOW OR when both are restricted, and one-minute minimum granularity. Occurrences start at the next matching UTC minute strictly after creation. A bounded server dispatcher admits due occurrences as standalone Jobs. The oldest due occurrence remains pending if queue or retained-record capacity is full, while later missed occurrences are summarized as skipped. Dispatch requires SQLite or PostgreSQL; memory mode returns 503 durable_store_required.",
         "security": [
           {
             "bearerAuth": []
@@ -214,7 +214,7 @@
       "get": {
         "operationId": "listScheduleRuns",
         "summary": "List retained Jobs admitted by a schedule",
-        "description": "Returns recent admitted and still-retained Jobs for one schedule, newest admission first. Operators can inspect any schedule; submitters can inspect only their own, with foreign and unknown IDs both returning 404. Each item includes the UTC occurrence time, canonical Job ID/status/timestamps, and a link to canonical Job detail. This listing never includes task text. The store associates occurrences through explicit durable schedule-run provenance written atomically with dispatch; a matching idempotency key alone does not establish provenance. Only admitted Jobs whose canonical records remain retained are listed. Jobs remain canonical and can be inspected under the normal Job visibility rules. Pages default to 50, accept limit 1..100, and use before_sequence for descending admission-sequence continuation. Requires SQLite or PostgreSQL.",
+        "description": "Returns recent admitted and still-retained Jobs for one schedule, newest admission first. Named operators and the legacy shared operator credential can inspect any schedule; submitters can inspect only their own, with foreign and unknown IDs both returning 404. Each item includes the UTC occurrence time, canonical Job ID/status/timestamps, and a link to canonical Job detail. This listing never includes task text. The store associates occurrences through explicit durable schedule-run provenance written atomically with dispatch; a matching idempotency key alone does not establish provenance. Only admitted Jobs whose canonical records remain retained are listed. Jobs remain canonical and can be inspected under the normal Job visibility rules. Pages default to 50, accept limit 1..100, and use before_sequence for descending admission-sequence continuation. Requires SQLite or PostgreSQL.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "$ref": "#/components/parameters/ScheduleId" },
@@ -236,7 +236,7 @@
       "get": {
         "operationId": "getScheduleHistory",
         "summary": "Read schedule mutation history",
-        "description": "Returns metadata-only append-only history for one schedule: schedule ID, immutable creator, authenticated actor, action, resulting revision, and timestamp. No schedule definition is included. Operators can read all schedules; submitters can read only their own. Missing and foreign submitter IDs both return 404. Pages default to 50 events, accept limit 1..100, and use after_revision for ascending revision continuation; next_revision is returned when has_more is true. Audit rows are never dropped. For schedules existing before the audit migration, history starts empty because historical actors cannot be reconstructed; only post-upgrade actions are recorded.",
+        "description": "Returns metadata-only append-only history for one schedule: schedule ID, immutable creator, authenticated actor, action, resulting revision, and timestamp. No schedule definition is included. Named operators and the legacy shared operator credential can read all schedules; submitters can read only their own. Missing and foreign submitter IDs both return 404. Pages default to 50 events, accept limit 1..100, and use after_revision for ascending revision continuation; next_revision is returned when has_more is true. Audit rows are never dropped. For schedules existing before the audit migration, history starts empty because historical actors cannot be reconstructed; only post-upgrade actions are recorded.",
         "security": [ { "bearerAuth": [] } ],
         "parameters": [
           { "$ref": "#/components/parameters/ScheduleId" },
@@ -263,7 +263,7 @@
       "get": {
         "operationId": "getSchedule",
         "summary": "Inspect a schedule",
-        "description": "Submitters can inspect only their own schedule. Operators can inspect any schedule. Missing and foreign submitter IDs both return 404. ETag is the current strong revision tag.",
+        "description": "Submitters can inspect only their own schedule. Named operators and the legacy shared operator credential can inspect any schedule. Missing and foreign submitter IDs both return 404. ETag is the current strong revision tag.",
         "security": [
           {
             "bearerAuth": []
@@ -311,7 +311,7 @@
       "patch": {
         "operationId": "mutateSchedule",
         "summary": "Edit, pause, or resume a schedule",
-        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Submitters may mutate only their own schedules; operators may mutate any schedule. Successful mutations are recorded in schedule history with the immutable creator and authenticated actor. Every successful user mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Mutation serializes on the schedule row with dispatch: if dispatch commits first, that old-revision occurrence remains immutable and the mutation proceeds when its If-Match revision is still current; cursor advancement does not change the user revision. If mutation commits first, the old occurrence is excluded. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
+        "description": "Requires exactly one matching strong If-Match revision, formatted as a quoted integer ETag. Submitters may mutate only their own schedules; named operators and the legacy shared operator credential may mutate any schedule. Successful mutations are recorded in schedule history with the immutable creator and authenticated actor. Every successful user mutation increments the revision; stale revisions return 409 revision_conflict. PATCH action is pause or resume, or edit with the replacement cron, repository, and task. Mutation serializes on the schedule row with dispatch: if dispatch commits first, that old-revision occurrence remains immutable and the mutation proceeds when its If-Match revision is still current; cursor advancement does not change the user revision. If mutation commits first, the old occurrence is excluded. Resume and edit restart from the next matching UTC minute strictly after the mutation.",
         "security": [
           {
             "bearerAuth": []
@@ -389,7 +389,7 @@
       "delete": {
         "operationId": "removeSchedule",
         "summary": "Remove a schedule",
-        "description": "Submitters may remove only their own schedules; operators may remove any schedule. Successful removals are recorded in schedule history with the immutable creator and authenticated actor. Requires a matching strong If-Match revision and an empty request body. Removal creates a retained terminal tombstone and prevents future occurrences. Previously admitted Jobs are unchanged; IDs are never reused.",
+        "description": "Submitters may remove only their own schedules; named operators and the legacy shared operator credential may remove any schedule. Successful removals are recorded in schedule history with the immutable creator and authenticated actor. Requires a matching strong If-Match revision and an empty request body. Removal creates a retained terminal tombstone and prevents future occurrences. Previously admitted Jobs are unchanged; IDs are never reused.",
         "security": [
           {
             "bearerAuth": []
