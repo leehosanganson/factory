@@ -236,27 +236,27 @@ type restWatchExecutor struct {
 	calls            atomic.Int32
 }
 
-func (e *restWatchExecutor) Execute(ctx context.Context, _ restjobs.Snapshot) error {
-	return errors.New("Coordinator bypassed attempt-aware watch execution")
-}
-
-func (e *restWatchExecutor) ExecuteWithAttempt(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) error {
+func (e *restWatchExecutor) Execute(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) restworker.ExecutionResult {
 	e.calls.Add(1)
 	if attempt.JobID != job.ID {
-		return errors.New("watch executor received mismatched attempt")
+		return restworker.ExecutionResult{Err: errors.New("watch executor received mismatched attempt")}
 	}
 	if e.emitPrivateEvent {
 		if err := e.manager.AddEventForAttempt(attempt, "cancel_requested", "PRIVATE_EVENT /PRIVATE_WORKSPACE PRIVATE_PROVIDER_TOKEN"); err != nil {
-			return err
+			return restworker.ExecutionResult{Err: err}
 		}
 	}
 	close(e.started)
 	select {
 	case <-e.releaseCh:
-		return nil
+		return restworker.ExecutionResult{}
 	case <-ctx.Done():
-		return ctx.Err()
+		return restworker.ExecutionResult{Err: ctx.Err()}
 	}
+}
+
+func (*restWatchExecutor) Complete(context.Context, restjobs.Snapshot, restjobs.AttemptHandle, restworker.ExecutionResult) error {
+	return nil
 }
 
 func (e *restWatchExecutor) release() { e.releaseOnce.Do(func() { close(e.releaseCh) }) }

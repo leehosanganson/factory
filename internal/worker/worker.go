@@ -1,5 +1,5 @@
-// Package restworker coordinates bounded execution of jobs admitted by
-// restjobs. It owns no admission or persistence policy.
+// Package restworker coordinates bounded, attempt-fenced execution of jobs
+// admitted by restjobs. It owns no admission, lease, or persistence policy.
 package restworker
 
 import (
@@ -16,25 +16,23 @@ var ErrInvalidConfig = errors.New("invalid restworker configuration")
 
 const attemptHeartbeatInterval = 5 * time.Second
 
-// Executor runs one claimed job. Implementations should honor ctx cancellation.
-type Executor interface {
-	Execute(ctx context.Context, job restjobs.Snapshot) error
-}
-type ResultExecutor interface {
-	ExecuteWithResult(ctx context.Context, job restjobs.Snapshot) (*restjobs.ProviderOutcome, error)
-}
-type AttemptResultExecutor interface {
-	ExecuteWithAttemptResult(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) (*restjobs.ProviderOutcome, error)
+// ExecutionResult reports side effects and errors from one attempt.
+type ExecutionResult struct {
+	ProviderOutcome                *restjobs.ProviderOutcome
+	ProviderOutcomeRequired        bool
+	ProviderWriteMayHaveDispatched bool
+	Err                            error
 }
 
-type ProviderOutcomeExecutor interface{ RequiresProviderOutcome() bool }
-type CancellationOutcomeExecutor interface{ CancellationOutcome(string) restjobs.Status }
-type ResultCompletionExecutor interface {
-	CompleteResult(context.Context, restjobs.Snapshot) error
+// Executor runs one claimed attempt and completes it after Coordinator persists
+// any provider outcome. Implementations should honor ctx cancellation.
+type Executor interface {
+	Execute(context.Context, restjobs.Snapshot, restjobs.AttemptHandle) ExecutionResult
+	Complete(context.Context, restjobs.Snapshot, restjobs.AttemptHandle, ExecutionResult) error
 }
 
 // CoordinatorConfig selects the maximum number of executor goroutines. The
-// manager independently enforces its own MaxConcurrentJobs bound.
+// store independently enforces its own MaxConcurrentJobs bound.
 type CoordinatorConfig struct {
 	Workers  int
 	WorkerID string
@@ -43,9 +41,23 @@ type CoordinatorConfig struct {
 	beforeStart func()
 }
 
-// Coordinator dispatches manager claims to a fixed set of workers.
+// workerLifecycleStore is the attempt-fenced job lifecycle used by Coordinator.
+// Admission, inspection beyond Get, recovery, and persistence policy remain
+// owned by the store; optional attempt identity recording is a separate
+// capability.
+type workerLifecycleStore interface {
+	WaitClaimAttempt(context.Context) (restjobs.AttemptClaim, error)
+	HeartbeatAttempt(restjobs.AttemptHandle) error
+	Get(string) (restjobs.Snapshot, error)
+	RecordProviderOutcomeForAttempt(restjobs.AttemptHandle, restjobs.ProviderOutcome) error
+	FinishAttempt(restjobs.AttemptHandle, restjobs.Status) error
+	Cancel(string) (restjobs.Snapshot, error)
+	Close()
+}
+
+// Coordinator dispatches attempt-fenced job claims to a fixed set of workers.
 type Coordinator struct {
-	manager  restjobs.Manager
+	store    workerLifecycleStore
 	executor Executor
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -80,9 +92,9 @@ func defaultCoordinatorIdentity(value, fallback string) string {
 	return value
 }
 
-func New(manager restjobs.Manager, executor Executor, config CoordinatorConfig) (*Coordinator, error) {
-	if manager == nil || executor == nil || config.Workers < 1 || !validCoordinatorIdentity(config.WorkerID) || !validCoordinatorIdentity(config.BootID) {
-		return nil, fmt.Errorf("%w: manager, executor, and positive worker count are required", ErrInvalidConfig)
+func New(store workerLifecycleStore, executor Executor, config CoordinatorConfig) (*Coordinator, error) {
+	if store == nil || executor == nil || config.Workers < 1 || !validCoordinatorIdentity(config.WorkerID) || !validCoordinatorIdentity(config.BootID) {
+		return nil, fmt.Errorf("%w: store, executor, and positive worker count are required", ErrInvalidConfig)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	workerID, bootID := config.WorkerID, config.BootID
@@ -93,7 +105,7 @@ func New(manager restjobs.Manager, executor Executor, config CoordinatorConfig) 
 		bootID = "boot-local"
 	}
 	coordinator := &Coordinator{
-		manager: manager, executor: executor, ctx: ctx, cancel: cancel,
+		store: store, executor: executor, ctx: ctx, cancel: cancel,
 		done: make(chan struct{}), startsDone: make(chan struct{}), jobs: make(map[string]context.CancelFunc), workerID: workerID, bootID: bootID,
 		beforeStart: config.beforeStart,
 	}
@@ -121,7 +133,7 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		c.stopped = true
 		c.closeStartsDoneIfReady()
 		c.mu.Unlock()
-		c.manager.Close()
+		c.store.Close()
 	})
 	select {
 	case <-c.startsDone:
@@ -141,7 +153,7 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 func (c *Coordinator) RequestCancel(id string) (restjobs.Snapshot, error) {
 	c.jobsMu.Lock()
 	defer c.jobsMu.Unlock()
-	snapshot, err := c.manager.Cancel(id)
+	snapshot, err := c.store.Cancel(id)
 	if err != nil {
 		return restjobs.Snapshot{}, err
 	}
@@ -162,26 +174,27 @@ func (c *Coordinator) worker() {
 		if stopped {
 			return
 		}
-		claim, err := c.manager.WaitClaimAttempt(c.ctx)
+		claim, err := c.store.WaitClaimAttempt(c.ctx)
 		if err != nil {
 			if errors.Is(err, restjobs.ErrManagerClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			// An unexpected manager error is terminal for this worker. Retrying
-			// could create an unbounded error loop against a broken manager.
+			// An unexpected store error is terminal for this worker. Retrying
+			// could create an unbounded error loop against a broken store.
 			return
 		}
+		hasClaimIdentity := claim.Attempt.WorkerID != "" && claim.Attempt.BootID != ""
 		claim.Attempt.WorkerID = defaultCoordinatorIdentity(claim.Attempt.WorkerID, c.workerID)
 		claim.Attempt.BootID = defaultCoordinatorIdentity(claim.Attempt.BootID, c.bootID)
-		if _, ok := c.manager.(*restjobs.PostgresStore); !ok {
-			if identityStore, ok := c.manager.(restjobs.AttemptIdentityStore); ok {
+		if !hasClaimIdentity {
+			if identityStore, ok := c.store.(restjobs.AttemptIdentityStore); ok {
 				_ = identityStore.SetAttemptIdentity(claim.Attempt)
 			}
 		}
 		if !c.claimExecutionStart() {
 			// Shutdown won the synchronized claim-to-start boundary. The executor
 			// has not received this claim, so ending it here is safe.
-			_ = c.manager.FinishAttempt(claim.Attempt, restjobs.StatusCanceled)
+			_ = c.store.FinishAttempt(claim.Attempt, restjobs.StatusCanceled)
 			return
 		}
 		if c.beforeStart != nil {
@@ -229,11 +242,11 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 			case <-jobCtx.Done():
 				return
 			case <-ticker.C:
-				if err := c.manager.HeartbeatAttempt(attempt); err != nil {
+				if err := c.store.HeartbeatAttempt(attempt); err != nil {
 					cancel()
 					return
 				}
-				if current, err := c.manager.Get(job.ID); err != nil || current.CancellationRequested {
+				if current, err := c.store.Get(job.ID); err != nil || current.CancellationRequested {
 					cancel()
 					return
 				}
@@ -242,7 +255,7 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 	}()
 	c.jobsMu.Lock()
 	c.jobs[job.ID] = cancel
-	current, err := c.manager.Get(job.ID)
+	current, err := c.store.Get(job.ID)
 	if job.CancellationRequested || (err == nil && current.CancellationRequested) {
 		cancel()
 	}
@@ -255,7 +268,8 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 		<-heartbeatDone
 	}()
 	status := restjobs.StatusFailed
-	requiresProviderOutcome := false
+	var result ExecutionResult
+	panicOccurred := false
 	var startOnce sync.Once
 	startExecutor := func() bool {
 		started := false
@@ -269,89 +283,48 @@ func (c *Coordinator) execute(job restjobs.Snapshot, attempt restjobs.AttemptHan
 	func() {
 		defer func() {
 			if recover() != nil {
+				panicOccurred = true
 				status = restjobs.StatusFailed
 			}
 		}()
-		if required, ok := c.executor.(ProviderOutcomeExecutor); ok && required.RequiresProviderOutcome() {
-			requiresProviderOutcome = true
-			var outcome *restjobs.ProviderOutcome
-			var err error
-			executor, ok := c.executor.(AttemptResultExecutor)
-			if !ok {
-				return
-			}
-			if !startExecutor() {
-				return
-			}
-			outcome, err = executor.ExecuteWithAttemptResult(jobCtx, job, attempt)
-			if err != nil {
-				return
-			}
-			if outcome == nil {
-				return
-			}
-			if c.manager.RecordProviderOutcomeForAttempt(attempt, *outcome) != nil {
-				return
-			}
-			job.Provider = outcome
-			if completion, ok := c.executor.(ResultCompletionExecutor); ok && completion.CompleteResult(jobCtx, job) != nil {
-				return
-			}
-			status = restjobs.StatusSucceeded
+		if !startExecutor() {
 			return
 		}
-		if executor, ok := c.executor.(AttemptResultExecutor); ok {
-			if !startExecutor() {
-				return
-			}
-			outcome, err := executor.ExecuteWithAttemptResult(jobCtx, job, attempt)
-			if err == nil && outcome == nil {
-				status = restjobs.StatusSucceeded
-			}
+		result = c.executor.Execute(jobCtx, job, attempt)
+		if result.Err != nil {
 			return
 		}
-		if executor, ok := c.executor.(ResultExecutor); ok {
-			if !startExecutor() {
-				return
-			}
-			outcome, err := executor.ExecuteWithResult(jobCtx, job)
-			if err == nil && outcome == nil {
-				status = restjobs.StatusSucceeded
-			}
+		if result.ProviderOutcomeRequired && result.ProviderOutcome == nil {
 			return
 		}
-		if executor, ok := c.executor.(interface {
-			ExecuteWithAttempt(context.Context, restjobs.Snapshot, restjobs.AttemptHandle) error
-		}); ok {
-			if !startExecutor() {
-				return
-			}
-			if err := executor.ExecuteWithAttempt(jobCtx, job, attempt); err == nil {
-				status = restjobs.StatusSucceeded
-			}
-		} else {
-			if !startExecutor() {
-				return
-			}
-			if err := c.executor.Execute(jobCtx, job); err == nil {
-				status = restjobs.StatusSucceeded
-			}
+		if result.ProviderOutcome != nil && !result.ProviderOutcomeRequired {
+			return
 		}
+		if result.ProviderOutcome != nil {
+			if c.store.RecordProviderOutcomeForAttempt(attempt, *result.ProviderOutcome) != nil {
+				return
+			}
+			job.Provider = result.ProviderOutcome
+		}
+		if c.executor.Complete(jobCtx, job, attempt, result) != nil {
+			return
+		}
+		status = restjobs.StatusSucceeded
 	}()
 	c.jobsMu.Lock()
 	defer c.jobsMu.Unlock()
 	if jobCtx.Err() != nil {
-		current, err := c.manager.Get(job.ID)
+		current, err := c.store.Get(job.ID)
 		requested := err == nil && current.CancellationRequested
-		if requiresProviderOutcome && status != restjobs.StatusSucceeded && (requested || c.ctx.Err() != nil) {
-			if outcome, ok := c.executor.(CancellationOutcomeExecutor); ok {
-				status = outcome.CancellationOutcome(job.ID)
+		if (requested || c.ctx.Err() != nil) && !panicOccurred && result.ProviderOutcome == nil {
+			if result.ProviderWriteMayHaveDispatched {
+				status = restjobs.StatusFailed
+			} else {
+				status = restjobs.StatusCanceled
 			}
-		} else if !requiresProviderOutcome && (requested || c.ctx.Err() != nil) {
-			status = restjobs.StatusCanceled
 		}
 	}
 	// Finish is the sole terminal transition. Executor errors and panic values
 	// are intentionally excluded from history to avoid leaking raw output.
-	_ = c.manager.FinishAttempt(attempt, status)
+	_ = c.store.FinishAttempt(attempt, status)
 }

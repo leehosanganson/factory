@@ -27,14 +27,17 @@ import (
 	"github.com/leehosanganson/factory/internal/jobs"
 	"github.com/leehosanganson/factory/internal/provider"
 	"github.com/leehosanganson/factory/internal/server"
-	"github.com/leehosanganson/factory/internal/worker"
+	restworker "github.com/leehosanganson/factory/internal/worker"
 	"github.com/leehosanganson/factory/internal/workspace"
 )
 
 type runtimeExecutor func(context.Context, restjobs.Snapshot) error
 
-func (f runtimeExecutor) Execute(ctx context.Context, request restjobs.Snapshot) error {
-	return f(ctx, request)
+func (f runtimeExecutor) Execute(ctx context.Context, request restjobs.Snapshot, _ restjobs.AttemptHandle) restworker.ExecutionResult {
+	return restworker.ExecutionResult{Err: f(ctx, request)}
+}
+func (runtimeExecutor) Complete(context.Context, restjobs.Snapshot, restjobs.AttemptHandle, restworker.ExecutionResult) error {
+	return nil
 }
 
 type scheduleDispatchProbe struct {

@@ -221,17 +221,6 @@ func (f testJobReconciler) Reconcile(ctx context.Context, request restprovider.P
 	return f(ctx, request)
 }
 
-func TestFactoryExecutorCancellationOutcomePreservesUncertainProviderAttempt(t *testing.T) {
-	executor := &FactoryExecutor{providerAttempts: make(map[string]bool)}
-	if got := executor.CancellationOutcome("before-attempt"); got != restjobs.StatusCanceled {
-		t.Fatalf("cancellation before provider attempt = %q, want canceled", got)
-	}
-	executor.providerAttempts["uncertain-attempt"] = true
-	if got := executor.CancellationOutcome("uncertain-attempt"); got != restjobs.StatusFailed {
-		t.Fatalf("cancellation after provider attempt = %q, want failed for operator investigation", got)
-	}
-}
-
 func TestFactoryExecutorAndWorkerPersistUncertainProviderAttempt(t *testing.T) {
 	databaseDir, err := os.MkdirTemp(t.TempDir(), "sqlite-")
 	if err != nil {
@@ -330,7 +319,7 @@ func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t 
 	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
 		return restprovider.Outcome{}, nil
 	})
-	if err := executor.CompleteResult(context.Background(), executorJob("protect provider side effect")); err == nil {
+	if err := executor.Complete(context.Background(), executorJob("protect provider side effect"), executorAttempt(), ExecutionResult{}); err == nil {
 		t.Fatal("provider-configured job marked complete without persisted outcome")
 	}
 	if manager.markedID != "" {
@@ -338,7 +327,7 @@ func TestProviderExecutionCannotMarkWorkspaceCompleteBeforeOutcomePersistence(t 
 	}
 	job := executorJob("complete after durable provider outcome")
 	job.Provider = &restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: "factory/job/01234567-89ab-4cde-8fab-0123456789ab", Commit: "abc123", State: "open"}
-	if err := executor.CompleteResult(context.Background(), job); err != nil {
+	if err := executor.Complete(context.Background(), job, executorAttempt(), ExecutionResult{ProviderOutcome: job.Provider, ProviderOutcomeRequired: true}); err != nil {
 		t.Fatal(err)
 	}
 	if manager.markedID != "" {
@@ -472,6 +461,14 @@ func executorAttempt() restjobs.AttemptHandle {
 	return restjobs.AttemptHandle{JobID: executorJobID, Generation: 1, OwnerToken: strings.Repeat("a", 64)}
 }
 
+func executeFactoryForTest(executor *FactoryExecutor, ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle) error {
+	result := executor.Execute(ctx, job, attempt)
+	if result.Err != nil {
+		return result.Err
+	}
+	return executor.Complete(ctx, job, attempt, result)
+}
+
 func TestFactoryExecutorRejectsProviderExecutionWithoutAttemptBeforeSideEffects(t *testing.T) {
 	agent := &executorTestAgent{}
 	executor, workspace, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
@@ -481,25 +478,21 @@ func TestFactoryExecutorRejectsProviderExecutionWithoutAttemptBeforeSideEffects(
 		return restprovider.Outcome{}, nil
 	})
 
-	if _, err := executor.ExecuteWithResult(context.Background(), executorJob("must not start")); !errors.Is(err, errExecutionFailed) {
-		t.Fatalf("ExecuteWithResult() error = %v, want execution failure", err)
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("must not start"), restjobs.AttemptHandle{}); !errors.Is(err, errExecutionFailed) {
+		t.Fatalf("Execute() error = %v, want execution failure", err)
 	}
 	if len(agent.calls) != 0 || workspace.createdID != "" || providerCalls != 0 {
 		t.Fatalf("provider execution without attempt caused side effects: stages=%v workspace=%q provider calls=%d", agent.calls, workspace.createdID, providerCalls)
 	}
 }
 
-func TestFactoryExecutorLegacyEntriesRejectPersistenceWithoutAttemptBeforeSideEffects(t *testing.T) {
+func TestFactoryExecutorRejectsAttemptScopedExecutionWithoutAttemptBeforeSideEffects(t *testing.T) {
 	for _, entry := range []struct {
 		name string
 		run  func(*FactoryExecutor) error
 	}{
 		{name: "Execute", run: func(executor *FactoryExecutor) error {
-			return executor.Execute(context.Background(), executorJob("must not start"))
-		}},
-		{name: "ExecuteWithResult", run: func(executor *FactoryExecutor) error {
-			_, err := executor.ExecuteWithResult(context.Background(), executorJob("must not start"))
-			return err
+			return executeFactoryForTest(executor, context.Background(), executorJob("must not start"), restjobs.AttemptHandle{})
 		}},
 	} {
 		t.Run(entry.name, func(t *testing.T) {
@@ -511,7 +504,7 @@ func TestFactoryExecutorLegacyEntriesRejectPersistenceWithoutAttemptBeforeSideEf
 				return nil
 			}
 			if err := entry.run(executor); !errors.Is(err, errExecutionFailed) {
-				t.Fatalf("legacy direct entry error = %v, want execution failure", err)
+				t.Fatalf("attempt-scoped entry error = %v, want execution failure", err)
 			}
 			if len(agent.calls) != 0 || workspace.createdID != "" || callbacks != 0 {
 				t.Fatalf("legacy entry caused workflow side effects: stages=%v workspace=%q persistence callbacks=%d", agent.calls, workspace.createdID, callbacks)
@@ -597,7 +590,7 @@ func TestFactoryExecutorRejectsUncapturableSourceBeforeWorkspaceOrWorkflow(t *te
 	agent := &executorTestAgent{}
 	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
 	manager.captureErr = errors.New("unsupported source")
-	if err := executor.Execute(context.Background(), executorJob("do not run")); !errors.Is(err, errExecutionFailed) {
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("do not run"), restjobs.AttemptHandle{}); !errors.Is(err, errExecutionFailed) {
 		t.Fatalf("Execute() error = %v, want sanitized execution failure", err)
 	}
 	if manager.createdID != "" || len(agent.calls) != 0 {
@@ -625,7 +618,7 @@ func TestFactoryExecutorRunsStagesAndChecksBeforeMarkingSuccessWithoutPublishing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("implement feature"), executorAttempt()); err != nil {
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("implement feature"), executorAttempt()); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got, want := strings.Join(agent.calls, ","), "requirements,implement,review,document"; got != want {
@@ -658,8 +651,8 @@ func TestFactoryExecutorRecordsNoConfiguredCheckLimitation(t *testing.T) {
 		evidence = recorded
 		return nil
 	}
-	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("do work"), executorAttempt()); err != nil {
-		t.Fatalf("ExecuteWithAttempt() error = %v", err)
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("do work"), executorAttempt()); err != nil {
+		t.Fatalf("Execute() error = %v", err)
 	}
 	if len(evidence.Checks) != 0 || len(evidence.Limitations) != 2 || evidence.Limitations[0] != restjobs.LimitationAgentNotVerdict || evidence.Limitations[1] != restjobs.LimitationNoChecksConfigured {
 		t.Fatalf("no-check verification evidence = %+v", evidence)
@@ -691,7 +684,7 @@ func TestFactoryExecutorRetainsWorkspaceUnmarkedOnStageOrCheckFailure(t *testing
 				evidence = recorded
 				return nil
 			}
-			err := executor.ExecuteWithAttempt(context.Background(), executorJob("do work"), executorAttempt())
+			err := executeFactoryForTest(executor, context.Background(), executorJob("do work"), executorAttempt())
 			if !errors.Is(err, errExecutionFailed) || strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "private") {
 				t.Fatalf("Execute() error = %v, want sanitized failure", err)
 			}
@@ -727,7 +720,7 @@ func TestFactoryExecutorBoundsCombinedStageAndCheckFilesAndRecordsTruncation(t *
 		observed = append(observed, event)
 		return nil
 	})
-	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("sensitive user task"), executorAttempt()); err != nil {
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("sensitive user task"), executorAttempt()); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got := strings.Join(agent.calls, ","); got != "requirements,implement,review,document" {
@@ -822,7 +815,7 @@ func TestFactoryExecutorUsesConfiguredSharedOutputLimitAndDrainsStagesAndChecks(
 	agent := &executorTestAgent{outputBytes: 2}
 	const configuredLimit = 64
 	executor, manager, _ := newExecutorFixture(t, "5s", configuredLimit, agent, []string{checkOne}, []string{checkTwo})
-	if err := executor.Execute(context.Background(), executorJob("capture shared output")); err != nil {
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("capture shared output"), restjobs.AttemptHandle{}); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got := strings.Join(agent.calls, ","); got != "requirements,implement,review,document" {
@@ -849,7 +842,7 @@ func TestFactoryExecutorUsesOneDeadlineForWorkspaceAndAllStages(t *testing.T) {
 			return restworkspace.Workspace{}, ctx.Err()
 		}
 		started := time.Now()
-		err := executor.Execute(context.Background(), executorJob("wait"))
+		err := executeFactoryForTest(executor, context.Background(), executorJob("wait"), restjobs.AttemptHandle{})
 		if !errors.Is(err, errExecutionFailed) || time.Since(started) < 15*time.Millisecond || manager.markedID != "" {
 			t.Fatalf("workspace timeout result=%v elapsed=%s marked=%q", err, time.Since(started), manager.markedID)
 		}
@@ -857,7 +850,7 @@ func TestFactoryExecutorUsesOneDeadlineForWorkspaceAndAllStages(t *testing.T) {
 	t.Run("stage execution", func(t *testing.T) {
 		agent := &executorTestAgent{block: true}
 		executor, manager, _ := newExecutorFixture(t, "100ms", restJobOutputLimit, agent)
-		if err := executor.Execute(context.Background(), executorJob("wait")); !errors.Is(err, errExecutionFailed) {
+		if err := executeFactoryForTest(executor, context.Background(), executorJob("wait"), restjobs.AttemptHandle{}); !errors.Is(err, errExecutionFailed) {
 			t.Fatalf("Execute() error = %v, want sanitized timeout", err)
 		}
 		if manager.markedID != "" || len(agent.calls) != 1 {
@@ -876,7 +869,9 @@ func TestFactoryExecutorRepositoryValidationUsesJobContext(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- executor.Execute(ctx, executorJob("cancel root validation")) }()
+	go func() {
+		done <- executeFactoryForTest(executor, ctx, executorJob("cancel root validation"), restjobs.AttemptHandle{})
+	}()
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -966,7 +961,7 @@ func TestFactoryExecutorRejectsUntrustedAliasAndNonExactCheckoutBeforeWorkspace(
 		if job.Request.Repository == "trusted" {
 			executor.server.Repositories["trusted"] = filepath.Dir(repo)
 		}
-		if err := executor.Execute(context.Background(), job); !errors.Is(err, errExecutionFailed) {
+		if err := executeFactoryForTest(executor, context.Background(), job, restjobs.AttemptHandle{}); !errors.Is(err, errExecutionFailed) {
 			t.Fatalf("Execute(%q) error = %v, want sanitized rejection", job.Request.Repository, err)
 		}
 		if manager.createdID != "" {
@@ -1008,7 +1003,7 @@ func TestFactoryExecutorPassesOnlyAllowlistedEnvironmentToHarness(t *testing.T) 
 	executor.agent = func(config workflow.Config, env []string, output io.Writer) workflow.Agent {
 		return workflow.Runner{Config: config, Env: env, OutputWriter: output}
 	}
-	if err := executor.Execute(context.Background(), executorJob("check environment")); err != nil {
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("check environment"), restjobs.AttemptHandle{}); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	got, err := os.ReadFile(envFile)
@@ -1084,7 +1079,7 @@ func TestFactoryExecutorMarksARealWorkspaceOnlyAfterCompleteWorkflow(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := executor.Execute(context.Background(), executorJob("real worktree")); err != nil {
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("real worktree"), restjobs.AttemptHandle{}); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	stageData, err := os.ReadFile(stageFile)
@@ -1100,8 +1095,8 @@ func TestFactoryExecutorSuccessDoesNotDependOnAttemptCleanupMarker(t *testing.T)
 	agent := &executorTestAgent{}
 	executor, manager, _ := newExecutorFixture(t, "1s", restJobOutputLimit, agent)
 	manager.markErr = errors.New("marker filesystem detail")
-	if err := executor.ExecuteWithAttempt(context.Background(), executorJob("complete work"), executorAttempt()); err != nil {
-		t.Fatalf("ExecuteWithAttempt() failed due to cleanup marker: %v", err)
+	if err := executeFactoryForTest(executor, context.Background(), executorJob("complete work"), executorAttempt()); err != nil {
+		t.Fatalf("attempt execution failed due to cleanup marker: %v", err)
 	}
 	if manager.markedID != "" {
 		t.Fatalf("attempt workspace unexpectedly got a cleanup marker: %q", manager.markedID)
