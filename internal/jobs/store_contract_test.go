@@ -104,6 +104,50 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 			t.Fatalf("Thread Job admission error=%v, want ErrInvalidInput", err)
 		}
 	})
+	t.Run("Thread member admission is ordered, idempotent, and owner-scoped", func(t *testing.T) {
+		store := newStore(t)
+		threadStore, ok := store.(ThreadStore)
+		if !ok {
+			t.Fatalf("Store %T does not implement ThreadStore", store)
+		}
+
+		created, replay, err := threadStore.AdmitThreadAs("thread-contract", "alice", Request{Repository: "widget", Task: "initial work"})
+		if err != nil || replay {
+			t.Fatalf("initial Thread admission=(%+v,%t,%v), want a new Thread", created, replay, err)
+		}
+		_, first, replay, err := threadStore.AdmitThreadJobAs(created.Thread.ID, "member-one", "alice", Request{Repository: "widget", Task: "first follow-up"})
+		if err != nil || replay {
+			t.Fatalf("first member admission=(%+v,%t,%v), want a new member", first, replay, err)
+		}
+		_, second, replay, err := threadStore.AdmitThreadJobAs(created.Thread.ID, "member-two", "alice", Request{Repository: "widget", Task: "second follow-up"})
+		if err != nil || replay {
+			t.Fatalf("second member admission=(%+v,%t,%v), want a new member", second, replay, err)
+		}
+
+		snapshot, replayed, replay, err := threadStore.AdmitThreadJobAs(created.Thread.ID, "member-one", "alice", Request{Repository: "widget", Task: "first follow-up"})
+		if err != nil || !replay || replayed.ID != first.ID {
+			t.Fatalf("same-key member replay=(%+v,%t,%v), want existing first member", replayed, replay, err)
+		}
+		wantIDs := []string{created.Jobs[0].ID, first.ID, second.ID}
+		if len(snapshot.Thread.JobIDs) != len(wantIDs) || len(snapshot.Jobs) != len(wantIDs) {
+			t.Fatalf("Thread membership after replay=(%+v,%+v), want %d ordered members", snapshot.Thread.JobIDs, snapshot.Jobs, len(wantIDs))
+		}
+		for i, wantID := range wantIDs {
+			if snapshot.Thread.JobIDs[i] != wantID || snapshot.Jobs[i].ID != wantID {
+				t.Fatalf("Thread member at position %d: job_ids=%q Jobs=%q, want %q", i, snapshot.Thread.JobIDs[i], snapshot.Jobs[i].ID, wantID)
+			}
+		}
+
+		if _, _, _, err := threadStore.AdmitThreadJobAs(created.Thread.ID, "foreign-member", "bob", Request{Repository: "widget", Task: "foreign follow-up"}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("foreign member admission error=%v, want ErrNotFound", err)
+		}
+		if _, err := threadStore.CompleteThreadAs(created.Thread.ID, "alice"); err != nil {
+			t.Fatalf("complete Thread: %v", err)
+		}
+		if _, _, _, err := threadStore.AdmitThreadJobAs(created.Thread.ID, "after-completion", "alice", Request{Repository: "widget", Task: "late follow-up"}); !errors.Is(err, ErrThreadClosed) {
+			t.Fatalf("new member after completion error=%v, want ErrThreadClosed", err)
+		}
+	})
 	t.Run("expired attempt leases block renewal and finishing without reclaiming work", func(t *testing.T) {
 		store := newStore(t)
 		job, _, err := store.Admit("expired-attempt", Request{Repository: "widget", Task: "expired worker cannot revive lease"})
