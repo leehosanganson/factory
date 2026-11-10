@@ -13,7 +13,6 @@ import (
 	"github.com/leehosanganson/factory/internal/provider"
 	"github.com/leehosanganson/factory/internal/server"
 	"github.com/leehosanganson/factory/internal/worker"
-	"github.com/leehosanganson/factory/internal/workflow"
 	"github.com/leehosanganson/factory/internal/workspace"
 )
 
@@ -72,17 +71,7 @@ func RunWorker(ctx context.Context, config restserver.Config) error {
 		}
 		workspaces[alias] = workspace
 	}
-	workflowConfig := workflow.DefaultConfig()
-	workflowConfig.AutoPublish = false
-	workflowConfig.WorktreeParent = ""
-	workflowConfig.PipelineChecks = cloneVerificationChecks(config.VerificationChecks)
-	if config.ParallelSubtasks != nil && config.ParallelSubtasks.Enabled {
-		maxConcurrency := 4
-		if config.ParallelSubtasks.MaxConcurrency != nil {
-			maxConcurrency = *config.ParallelSubtasks.MaxConcurrency
-		}
-		workflowConfig.ParallelImplementation = &workflow.ParallelImplementationConfig{Enabled: true, MaxConcurrency: maxConcurrency}
-	}
+	workflowConfig := newWorkflowConfig(config)
 	executor, err := restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
 		Server: config, Workflow: workflowConfig, Workspaces: workspaces, Provider: publisher,
 		RecordProviderAttempt:        store.RecordProviderAttemptForAttempt,

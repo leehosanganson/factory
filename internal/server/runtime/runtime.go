@@ -188,17 +188,7 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 			workspaceManagers[alias] = workspace
 		}
 	}
-	workflowConfig := workflow.DefaultConfig()
-	workflowConfig.AutoPublish = false
-	workflowConfig.WorktreeParent = ""
-	workflowConfig.PipelineChecks = cloneVerificationChecks(config.VerificationChecks)
-	if config.ParallelSubtasks != nil && config.ParallelSubtasks.Enabled {
-		maxConcurrency := 4
-		if config.ParallelSubtasks.MaxConcurrency != nil {
-			maxConcurrency = *config.ParallelSubtasks.MaxConcurrency
-		}
-		workflowConfig.ParallelImplementation = &workflow.ParallelImplementationConfig{Enabled: true, MaxConcurrency: maxConcurrency}
-	}
+	workflowConfig := newWorkflowConfig(config)
 	executor := options.Executor
 	if workersEnabled && executor == nil {
 		executor, err = restworker.NewFactoryExecutorContext(ctx, restworker.FactoryExecutorConfig{
@@ -659,6 +649,21 @@ func waitForSweep(ctx context.Context, done <-chan struct{}) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func newWorkflowConfig(config restserver.Config) workflow.Config {
+	workflowConfig := workflow.DefaultConfig()
+	workflowConfig.AutoPublish = false
+	workflowConfig.WorktreeParent = ""
+	workflowConfig.PipelineChecks = cloneVerificationChecks(config.VerificationChecks)
+	if config.ParallelSubtasks != nil && config.ParallelSubtasks.Enabled {
+		maxConcurrency := 4
+		if config.ParallelSubtasks.MaxConcurrency != nil {
+			maxConcurrency = *config.ParallelSubtasks.MaxConcurrency
+		}
+		workflowConfig.ParallelImplementation = &workflow.ParallelImplementationConfig{Enabled: true, MaxConcurrency: maxConcurrency}
+	}
+	return workflowConfig
 }
 
 func cloneVerificationChecks(checks [][]string) [][]string {
