@@ -24,6 +24,7 @@ The REST server supports volatile memory mode and optional SQLite or PostgreSQL 
 - [Contributing](CONTRIBUTING.md) — branch naming and pull request conventions.
 - [GitHub issues](https://github.com/leehosanganson/factory/issues) — categorized, actionable product follow-ups and tracked work.
 - [Roadmap](docs/roadmap/roadmap.md) — unified product direction and later possibilities.
+- [Codebase intuitiveness scorecard](docs/maintainability/intuitiveness-scorecard.md) — repeatable evaluator rubric and comparison protocol, with the [baseline](docs/maintainability/assessments/2026-11-10-1e5832e.md), [iteration 1](docs/maintainability/assessments/2026-11-10-iteration-1-api-event-stream.md), and [iteration 2](docs/maintainability/assessments/2026-11-10-iteration-2-runtime-workflow-config.md) assessments.
 - [Factory-unit MVP architecture](docs/roadmap/factory-unit-mvp.md) — target controller, Thread, Job, Factory-unit, scheduler, and harness boundaries; not shipped behavior.
 - [Thread model](docs/roadmap/thread-model.md) — target ingress, Job membership, aggregate status, notification, and explicit user completion rules.
 - [Issue context integration](docs/roadmap/rest-job-lifecycle.md) — broader issue-intake direction beyond the implemented poller.
