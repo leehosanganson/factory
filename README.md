@@ -1,68 +1,43 @@
 # Factory
 
-Factory is a Go service and CLI for agent-driven repository jobs. Its product direction is one RESTful job service: accept a bounded request, run the configured workflow, verify the result, and create or update a pull request through the configured code-repository provider. Factory does not merge, release, or deploy.
+Factory runs agent-driven engineering workflows in a local Git checkout. Give it a bounded task; it runs requirements, implementation, review, and documentation, then runs the checks you configured. It can hand the result to GitHub as a pull request. This gives you one place to start work and inspect its changes and check results.
 
-The REST server supports volatile memory mode and optional SQLite or PostgreSQL persistence, with optional GitHub PR publication and authenticated, no-replay recovery actions for eligible durable jobs. Eligible SQLite or PostgreSQL jobs interrupted while running and without a persisted provider attempt or outcome can receive a failed/canceled disposition. Interrupted or failed jobs with a persisted provider attempt and retained workspace can undergo read-only provider observation when a worker-enabled runtime is available. An observed PR does not establish success because an earlier provider write may still complete. A dedicated `factory issue-poller` process admits allowlisted GitHub issues into the same PostgreSQL job queue. SQLite-only portable recovery bundles pair a stopped-server database snapshot with retained job workspaces; they do not replay work or preserve external provider state. Bundle verification is not a production restore drill. See the [REST server operations guide](docs/features/rest-server-operations.md) for current behavior and limits, and the [REST job contract](docs/roadmap/rest-api-contract.md) for remaining target-MVP requirements. The [GitHub App live-provider test guide](docs/features/github-app-live-test.md) describes the separately gated opt-in sandbox workflow.
+Factory does not guarantee correctness, merge pull requests, or release or deploy software. Its local processes run with your account's authority: a worktree, shell, or container is not a security sandbox. Only use it with repositories and tools you trust.
 
-## Documentation
+## Run a local coding task
 
-- [Implemented features](docs/features/README.md) — current CLI and REST server capabilities.
-- [Primary Factory-to-Pi workflow](docs/features/primary-workflow.md) — setup, implementation, detached-job handoff, and recovery.
-- [REST server operations](docs/features/rest-server-operations.md) — health/readiness, backup/restore, restart recovery, limits, and trusted-network operations.
-- [REST operator dashboard](docs/features/rest-web-ui.md) — optional embedded dashboard and control-plane container image.
-- [Local Compose API control plane](docs/features/compose-local-control-plane.md) — PostgreSQL-backed local API setup, private generated config, and default/opt-in worker profiles.
-- [REST job client](docs/features/rest-client.md) — separate protected client configuration and remote job commands.
-- [Autonomous GitHub issue poller](docs/features/issue-poller.md) — dedicated PostgreSQL-backed admission into the shared REST job queue.
-- [GitHub issue webhook](docs/features/github-issue-webhook.md) — optional HMAC-authenticated PostgreSQL `issues.labeled` admission into the existing Thread/Job lifecycle.
-- [GitHub issue intake ownership](docs/features/intake-owner.md) — system-enforced PostgreSQL ownership for exact source/label pairs.
-- [Supervised systemd deployment](docs/features/rest-server-systemd.md) — a single-host service-user unit and lifecycle walkthrough.
-- [Manual GitHub App live-provider test](docs/features/github-app-live-test.md) — opt-in validation against a protected disposable sandbox.
-- [REST job contract](docs/roadmap/rest-api-contract.md) — target request-to-PR lifecycle, persistence modes, and delivery gates.
-- [Agent guidance](AGENTS.md) — repository workflow and verification conventions.
-- [Factory operating skill](.agents/skills/factory/SKILL.md) — agent workflow guidance and intended product direction.
-- [Documentation skill](.agents/skills/documentation/SKILL.md) — documentation conventions.
-- [Contributing](CONTRIBUTING.md) — branch naming and pull request conventions.
-- [GitHub issues](https://github.com/leehosanganson/factory/issues) — categorized, actionable product follow-ups and tracked work.
-- [Roadmap](docs/roadmap/roadmap.md) — unified product direction and later possibilities.
-- [Factory-unit MVP architecture](docs/roadmap/factory-unit-mvp.md) — target controller, Thread, Job, Factory-unit, scheduler, and harness boundaries; not shipped behavior.
-- [Thread model](docs/roadmap/thread-model.md) — target ingress, Job membership, aggregate status, notification, and explicit user completion rules.
-- [Issue context integration](docs/roadmap/rest-job-lifecycle.md) — broader issue-intake direction beyond the implemented poller.
+Install and configure Factory's agent (Pi by default), then run these commands from the repository you want to change, on a named Git branch. See the [setup guide](docs/features/primary-workflow.md#check-setup-and-verification) for configuration details.
 
-## Issue tracking
+```sh
+factory doctor
+factory implement "Add input validation; test empty and malformed values"
+```
 
-Actionable product follow-ups and categorized usability findings are tracked in [GitHub Issues](https://github.com/leehosanganson/factory/issues).
+Factory runs the workflow in a separate worktree. When automatic publication is enabled (the default), it runs the configured `pipeline_checks`; configure checks that the project supports. Doctor checks local configuration and required executables, but does not run your checks or inspect the target checkout.
 
-## First task: run a local coding job
+By default, Factory attempts to commit, push, and create a GitHub pull request after successful workflow stages and checks. Automatic publication also requires `gh`, an `origin` remote, and a clean starting checkout. Use `factory implement --detach "..."` to return immediately and inspect the job with `factory job list` and `factory job get <job-id>`. Review the diff and check evidence yourself. A pull request is a handoff for human review, not proof that the change is correct or permission to merge.
 
-For a bounded task in a repository you trust, use `factory doctor` to check local setup, then run `factory implement "<task with acceptance criteria>"` from the target Git checkout on a named branch. Automatic PR publication also requires `gh`, an `origin` remote, and a clean checkout; configure project-appropriate `pipeline_checks` before relying on the result. Factory runs the task in a separate worktree and attempts a PR handoff, but does not merge or guarantee correctness. This local CLI workflow is separate from the configured REST job service described below.
+See [the primary workflow guide](docs/features/primary-workflow.md) for setup, checks, detached jobs, publication, and recovery details.
 
-See the [primary Factory-to-Pi workflow](docs/features/primary-workflow.md) for setup, checks, job handoff, and recovery guidance.
+## REST job service
 
-## Build and verify
+Factory also has a separate mode: `factory server` runs a local REST job service, and `factory rest` submits or inspects jobs on that service. It is distinct from the local `factory implement` workflow above. The server has its own configuration, authentication, persistence, and provider settings; it can use volatile memory or configured SQLite/PostgreSQL storage. See [REST server operations](docs/features/rest-server-operations.md) for current behavior and limits, and the [REST job contract](docs/roadmap/rest-api-contract.md) for target requirements.
 
-Go 1.26.3 or later is required. Linux and macOS are supported. The Makefile provides `make build`, `make test`, `make fmt`, `make vet`, `make clean`, and `make help` (which lists the targets and their descriptions). The embedded React dashboard assets are checked in, so normal Go builds need no Node.js; dashboard source changes require Node.js 24 and npm 11, then `make frontend-build` to regenerate the assets or `make frontend-check` to verify they are current.
+## Build and test
+
+Factory is a Go CLI. Go 1.26.3 or later is required; Linux and macOS are supported. Build and check it with:
 
 ```sh
 make build
-./bin/factory help
 make test
 make vet
 ```
 
-The binary is written to `./bin/factory`. Configuration and state are stored outside the target repository by default; see [`config.json.example`](config.json.example) and the [feature documentation](docs/features/README.md). The optional CLI setting `detached_job_max_concurrency` caps active detached implementation, tidy, and monitor jobs sharing state (1–64); omission preserves unlimited admission. The separate `factory issue-poller` process admits allowlisted GitHub issues into the canonical PostgreSQL REST job Store; see the [poller guide](docs/features/issue-poller.md). It is separate from `parallel_implementation.max_concurrency`, which controls subtasks within one implementation workflow. CI check selection is defined in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/classify-ci-changes.sh`](.github/workflows/classify-ci-changes.sh); pushes to `main` run the full Linux and macOS checks. Releases are created separately from explicit stable version tags; merging to `main` does not itself publish a release.
+The binary is written to `./bin/factory`. See [Contributing](CONTRIBUTING.md) for contribution guidance.
 
-## Local REST server
+## Documentation
 
-The current server accepts authenticated job requests, executes configured workflows with the server account's available authority in per-job workspaces, and exposes status, bounded history, safe workflow progress, and structured verification evidence with explicit limitations. Job inspection includes the confirmed PR identity/URL when configured; it never exposes raw logs, check output, or host paths. It supports volatile in-memory state or configured SQLite/PostgreSQL persistence; provider publication is optional to configure, but PR create/update and outcome recording are required for Job success when GitHub is configured. PostgreSQL can be shared between an API control plane with `workers_enabled: false` and separately launched `factory worker` processes. Existing all-in-one server behavior remains the default; separate PostgreSQL workers do not provide the future controller Thread model, simple scheduler, or unit-local coordinator adapter described in [Factory-unit MVP architecture](docs/roadmap/factory-unit-mvp.md). An optional embedded operator dashboard is served from that same API listener and authenticates only through a configured named operator; it is disabled by default. It can create and inspect a Thread using a safe dashboard-only response projection, then append Jobs to or complete its current Thread; it has no Thread list. The dashboard can also create persistent schedules and inspect redacted schedule/run summaries; it does not edit or remove schedules. Schedule behavior uses the existing API's UTC cron validation and requires SQLite or PostgreSQL persistence. The dedicated `factory issue-poller` can admit allowlisted GitHub issues into that same PostgreSQL job store. An optional GitHub `issues.labeled` webhook can admit configured issue events through the REST control plane into the same Thread/Job lifecycle using PostgreSQL storage. The webhook and issue poller use a shared database registry to enforce one adapter owner per exact source/label pair. See [GitHub issue intake ownership](docs/features/intake-owner.md) for registration and safe transfer limits. See [GitHub issue webhook](docs/features/github-issue-webhook.md), [REST operator dashboard](docs/features/rest-web-ui.md), [PostgreSQL Store](docs/features/postgres-store.md), [REST worker process](docs/features/rest-worker.md), and the [issue poller guide](docs/features/issue-poller.md). `make container-build` builds `factory-controller:local` (also tagged `factory-web:local`) and `factory-worker:local` from one shared build-stage executable. The static, non-root Controller image defaults to `/factory server --config /etc/factory/server.json`, requires PostgreSQL persistence with `workers_enabled: false`, and contains no Git. The non-root Worker image includes Git and defaults to `/factory worker --config /etc/factory/worker.json`. Image-role checks prevent accidental use of the other role's command/config path; these checks are operational guardrails, not security boundaries. Running the executable without an image role preserves regular CLI behavior and all-in-one server defaults. The optional local Compose setup uses the Controller image and publishes the API only on host loopback. Its default profile is workers-disabled, so jobs remain queued unless an operator starts the opt-in `worker` profile; that profile runs the Worker image against the shared PostgreSQL store. See the [local Compose control-plane guide](docs/features/compose-local-control-plane.md) for secret-safe setup and smoke testing. SQLite remains single-server storage. See [REST server operations](docs/features/rest-server-operations.md) for readiness, backup/restore, restart recovery, and capacity guidance.
-
-```sh
-factory server doctor --config /absolute/path/to/server.json
-factory server --config /absolute/path/to/server.json
-factory rest help
-```
-
-Run `factory server doctor --config /absolute/path/to/server.json` for a local-only, read-only preflight of strict configuration and local prerequisites. It does not test provider reachability or PostgreSQL connectivity, open/create SQLite, start a listener, or run the workflow. See [REST job server](docs/features/rest-server.md) for current setup and limits. Do not expose the service beyond a trusted network without appropriate authentication and network controls. Factory does not provide or guarantee sandboxing, security isolation, or protection from repository/model/harness behavior; users/operators own those risks. Repositories, enabled harness profiles, credentials, and bounded job policy remain operator-configured; request data cannot select arbitrary configured executables, repositories, or credentials. Actual process access to network and local authority remains dependent on the execution account and deployment environment.
-
-### PostgreSQL ownership protocol tests
-
-The PostgreSQL Store, worker, ownership, and issue-poller integration tests require PostgreSQL 18. With Docker Compose available, run `make test-postgres`; this starts the disposable service defined in [`docker-compose.postgres-test.yml`](docker-compose.postgres-test.yml), waits for readiness, and runs the focused integration suite. Stop it with `make test-postgres-down`. The service binds only to loopback on a dynamically assigned host port; `make test-postgres` discovers the published port before running tests. It stores data in a dedicated named test volume; `make test-postgres-down` removes the container and that volume/data. This test service is not a production persistence backend; it supports tests of PostgreSQL runtime integration against disposable PostgreSQL 18.
+- [Implemented features](docs/features/README.md) — current CLI and REST service behavior.
+- [Primary workflow](docs/features/primary-workflow.md) — local setup, implementation, checks, and recovery.
+- [REST server operations](docs/features/rest-server-operations.md) — setup, persistence, and operational limits.
+- [Roadmap](docs/roadmap/roadmap.md) — product direction, separate from shipped behavior.
