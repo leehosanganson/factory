@@ -37,6 +37,9 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         allowed = (
             self.command == "GET" and path in ("/", "/ui", "/ui/", "/ui/session", "/ui/assets/dashboard.css", "/ui/assets/dashboard.js") and not parsed.query
             or self.command == "GET" and path == "/ui/api/v1/jobs" and parsed.query == "limit=100"
+            or self.command == "POST" and path == "/ui/api/v1/threads" and not parsed.query
+            or self.command == "GET" and path == "/ui/api/v1/threads" and parsed.query == "limit=50"
+            or self.command == "GET" and re.fullmatch(r"/ui/api/v1/threads/[A-Za-z0-9_-]+", path) and not parsed.query
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/jobs/[A-Za-z0-9_-]+/(history|events)", path) and not parsed.query
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/jobs/[A-Za-z0-9_-]+", path) and not parsed.query
             or self.command == "POST" and path in ("/ui/login", "/ui/logout", "/ui/api/v1/jobs") and not parsed.query
