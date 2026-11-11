@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.17.0",
+    "version": "1.18.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create schedules they own, and named operators can create schedules attributed to their own principal identity and manage schedules across owners. The legacy shared operator credential retains schedule list/get/mutate access but cannot create schedules. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
@@ -528,6 +528,27 @@
       }
     },
     "/v1/threads": {
+      "get": {
+        "operationId": "listThreads",
+        "summary": "List bounded Thread summaries",
+        "description": "Returns safe Thread summaries without task/request text, member Job IDs, submitter/owner identity, provider data, Worker identity, or progress data. Operators can inspect all retained Threads. Named submitters see only Threads attributed to their principal and receive a principal-bound opaque cursor. Pages default to 50 and accept a maximum of 100. Operator pagination is newest-first by immutable initial Job admission queue_sequence and uses before_sequence with snapshot_sequence to keep later admissions out of the traversal; lifecycle status and timestamps are current projections. Thread listing does not change append or completion ownership rules.",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator", "submitter (own Threads only)" ],
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "before_sequence", "in": "query", "required": false, "description": "Exclusive initial Job admission sequence for loading older Threads.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
+          { "name": "snapshot_sequence", "in": "query", "required": false, "description": "Admission-sequence ceiling returned by the first page; required with before_sequence.", "schema": { "type": "integer", "format": "int64", "minimum": 1 } },
+          { "name": "cursor", "in": "query", "required": false, "description": "Opaque principal-bound submitter continuation cursor; use instead of before_sequence/snapshot_sequence.", "schema": { "type": "string", "minLength": 1 } }
+        ],
+        "responses": {
+          "200": { "description": "A bounded page of redacted Thread summaries.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ThreadPage" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only GET and POST are supported.", "headers": { "Allow": { "schema": { "type": "string", "enum": [ "GET, POST" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      },
       "post": {
         "operationId": "createThread",
         "summary": "Create a Thread and its initial Job",
@@ -998,6 +1019,29 @@
           "thread": { "$ref": "#/components/schemas/Thread" },
           "job": { "$ref": "#/components/schemas/JobSnapshot" },
           "replayed": { "type": "boolean" }
+        }
+      },
+      "ThreadPage": {
+        "type": "object",
+        "required": [ "threads", "has_more" ],
+        "properties": {
+          "threads": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/ThreadSummary" } },
+          "snapshot_sequence": { "type": "integer", "format": "int64", "minimum": 0, "description": "Admission-sequence ceiling; operator pages use this with before_sequence." },
+          "next_sequence": { "type": "integer", "format": "int64", "minimum": 1, "description": "Exclusive continuation sequence when has_more is true." },
+          "has_more": { "type": "boolean" },
+          "next_cursor": { "type": "string", "description": "Opaque principal-bound continuation for submitter pages; only present when has_more is true." }
+        }
+      },
+      "ThreadSummary": {
+        "type": "object",
+        "required": [ "id", "status", "created_at", "updated_at" ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string", "enum": [ "need_attention", "in_progress", "done" ] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "updated_at": { "type": "string", "format": "date-time" },
+          "completed_at": { "type": "string", "format": "date-time" }
         }
       },
       "ThreadSnapshot": {

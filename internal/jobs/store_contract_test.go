@@ -104,6 +104,46 @@ func runStoreContract(t *testing.T, newStore func(*testing.T) Store) {
 			t.Fatalf("Thread Job admission error=%v, want ErrInvalidInput", err)
 		}
 	})
+	t.Run("Thread listing is bounded, admission-ordered, and redacted", func(t *testing.T) {
+		store := newStore(t)
+		threadStore := store.(ThreadStore)
+		first, _, err := threadStore.AdmitThreadAs("list-first", "alice", Request{Repository: "widget", Task: "private first task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := store.AdmitAs("between", "bob", Request{Repository: "widget", Task: "standalone work"}); err != nil {
+			t.Fatal(err)
+		}
+		second, _, err := threadStore.AdmitThreadAs("list-second", "bob", Request{Repository: "widget", Task: "private second task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, err := threadStore.ListThreads(context.Background(), 0, 0, 1)
+		if err != nil || len(page.Threads) != 1 || !page.HasMore || page.Threads[0].ID != second.Thread.ID || page.NextSequence == 0 || page.SnapshotSequence == 0 {
+			t.Fatalf("first Thread page=(%+v,%v), want newest admitted Thread and continuation", page, err)
+		}
+		if _, _, err := threadStore.AdmitThreadAs("list-later", "alice", Request{Repository: "widget", Task: "later task"}); err != nil {
+			t.Fatal(err)
+		}
+		older, err := threadStore.ListThreads(context.Background(), page.NextSequence, page.SnapshotSequence, 1)
+		if err != nil || len(older.Threads) != 1 || older.HasMore || older.Threads[0].ID != first.Thread.ID {
+			t.Fatalf("continuation=(%+v,%v), want stable older Thread only", older, err)
+		}
+		owned, err := threadStore.ListThreadsForPrincipal(context.Background(), "alice", 0, 0, 10)
+		if err != nil || len(owned.Threads) != 2 || owned.Threads[0].ID == second.Thread.ID || owned.Threads[1].ID == second.Thread.ID {
+			t.Fatalf("owner-filtered Thread list=(%+v,%v), want alice's Threads and no bob Thread", owned, err)
+		}
+		encoded, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, forbidden := range []string{"private", `"submitted_by"`, `"job_ids"`, `"task"`, `"provider"`, `"worker"`, `"progress"`} {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Errorf("Thread summary exposed %q: %s", forbidden, encoded)
+			}
+		}
+	})
+
 	t.Run("Thread member admission is ordered, idempotent, and owner-scoped", func(t *testing.T) {
 		store := newStore(t)
 		threadStore, ok := store.(ThreadStore)

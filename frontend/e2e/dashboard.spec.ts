@@ -44,6 +44,21 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   await expect(page.getByText('succeeded', { exact: true }).last()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('Pull request')).toHaveCount(0);
 
+  const threadTask = 'Create a browser-visible Thread for follow-up.';
+  await page.getByLabel('Repository alias').nth(1).fill('fixture');
+  await page.getByLabel('Task').nth(1).fill(threadTask);
+  await page.getByRole('button', { name: 'Create Thread' }).click();
+  const threadHeading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
+  await expect(threadHeading).toBeVisible({ timeout: 10_000 });
+  const threadID = (await threadHeading.textContent())?.replace('Thread ', '').trim();
+  expect(threadID).toBeTruthy();
+  await expect(page.getByText(threadTask)).toHaveCount(0);
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: threadID! }).click();
+  await expect(page.getByRole('heading', { name: `Thread ${threadID}` })).toBeVisible();
+  await expect(page.getByText(threadTask)).toHaveCount(0);
+
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
   const protectedResponse = await page.request.get(`${origin}/ui/api/v1/jobs?limit=100`);

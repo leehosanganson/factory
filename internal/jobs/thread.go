@@ -1,7 +1,9 @@
 package restjobs
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"time"
 )
 
@@ -33,6 +35,28 @@ type ThreadSnapshot struct {
 	Jobs   []Snapshot `json:"jobs"`
 }
 
+// ThreadSummary is the safe, compact representation returned by Thread listing.
+type ThreadSummary struct {
+	ID          string       `json:"id"`
+	Status      ThreadStatus `json:"status"`
+	CreatedAt   time.Time    `json:"created_at"`
+	UpdatedAt   time.Time    `json:"updated_at"`
+	CompletedAt *time.Time   `json:"completed_at,omitempty"`
+}
+
+// ThreadPage is a bounded page ordered by immutable initial Job admission.
+type ThreadPage struct {
+	Threads          []ThreadSummary `json:"threads"`
+	SnapshotSequence uint64          `json:"snapshot_sequence"`
+	NextSequence     uint64          `json:"next_sequence,omitempty"`
+	HasMore          bool            `json:"has_more"`
+}
+
+const (
+	DefaultThreadListLimit = 50
+	MaxThreadListLimit     = 100
+)
+
 // ThreadStore is the Store contract for ordered Thread membership and explicit
 // owner-controlled completion.
 type ThreadStore interface {
@@ -41,6 +65,8 @@ type ThreadStore interface {
 	AdmitThreadJobAs(threadID, idempotencyKey, principalID string, request Request) (ThreadSnapshot, Snapshot, bool, error)
 	GetThread(id string) (ThreadSnapshot, error)
 	GetThreadForPrincipal(id, principalID string) (ThreadSnapshot, error)
+	ListThreads(ctx context.Context, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error)
+	ListThreadsForPrincipal(ctx context.Context, principalID string, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error)
 	CompleteThreadAs(id, principalID string) (ThreadSnapshot, error)
 }
 
@@ -64,6 +90,92 @@ type threadJobIdentity struct {
 const threadRecordOverheadBytes = 128
 
 var _ ThreadStore = (*LocalManager)(nil)
+
+// ListThreads returns bounded Thread summaries newest-first by immutable initial
+// Job admission sequence. snapshotSequence fixes the upper admission boundary.
+func (m *LocalManager) ListThreads(ctx context.Context, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error) {
+	return m.listThreads(ctx, "", beforeSequence, snapshotSequence, limit)
+}
+
+// ListThreadsForPrincipal filters Threads to their submitter before paging.
+func (m *LocalManager) ListThreadsForPrincipal(ctx context.Context, principalID string, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return ThreadPage{}, err
+	}
+	return m.listThreads(ctx, principalID, beforeSequence, snapshotSequence, limit)
+}
+
+func (m *LocalManager) listThreads(ctx context.Context, principalID string, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error) {
+	if err := validateThreadPageRequest(ctx, beforeSequence, snapshotSequence, limit); err != nil {
+		return ThreadPage{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return ThreadPage{}, err
+	}
+	if snapshotSequence == 0 {
+		snapshotSequence = m.nextSequence
+	}
+	page := ThreadPage{Threads: make([]ThreadSummary, 0, limit), SnapshotSequence: snapshotSequence}
+	entries := make([]struct {
+		sequence uint64
+		thread   *threadRecord
+	}, 0, limit+1)
+	for _, thread := range m.threads {
+		if principalID != "" && thread.submitter != principalID {
+			continue
+		}
+		initial := m.jobs[thread.initialJobID]
+		if initial == nil || initial.sequence > snapshotSequence || beforeSequence != 0 && initial.sequence >= beforeSequence {
+			continue
+		}
+		entry := struct {
+			sequence uint64
+			thread   *threadRecord
+		}{initial.sequence, thread}
+		index := sort.Search(len(entries), func(i int) bool { return entries[i].sequence <= initial.sequence })
+		if index >= limit+1 {
+			continue
+		}
+		entries = append(entries, struct {
+			sequence uint64
+			thread   *threadRecord
+		}{})
+		copy(entries[index+1:], entries[index:])
+		entries[index] = entry
+		if len(entries) > limit+1 {
+			entries = entries[:limit+1]
+		}
+	}
+	page.HasMore = len(entries) > limit
+	if page.HasMore {
+		entries = entries[:limit]
+	}
+	for _, entry := range entries {
+		snapshot := m.threadSnapshotLocked(entry.thread).Thread
+		summary := ThreadSummary{ID: snapshot.ID, Status: snapshot.Status, CreatedAt: snapshot.CreatedAt, UpdatedAt: snapshot.UpdatedAt}
+		if snapshot.CompletedAt != nil {
+			completed := *snapshot.CompletedAt
+			summary.CompletedAt = &completed
+		}
+		page.Threads = append(page.Threads, summary)
+		page.NextSequence = entry.sequence
+	}
+	if !page.HasMore {
+		page.NextSequence = 0
+	}
+	return page, nil
+}
+
+func validateThreadPageRequest(ctx context.Context, beforeSequence, snapshotSequence uint64, limit int) error {
+	maxSequence := uint64(^uint64(0) >> 1)
+	if ctx == nil || limit < 1 || limit > MaxThreadListLimit || beforeSequence > maxSequence || snapshotSequence > maxSequence || (snapshotSequence == 0 && beforeSequence != 0) || (snapshotSequence != 0 && beforeSequence > snapshotSequence) {
+		return ErrInvalidInput
+	}
+	return ctx.Err()
+}
 
 // CompleteThreadAs explicitly closes an owned Thread without changing its Jobs
 // or derived aggregate status. A repeated call is an idempotent read.

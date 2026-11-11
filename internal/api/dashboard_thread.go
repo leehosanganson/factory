@@ -14,6 +14,19 @@ type dashboardThreadResponse struct {
 	Completed *time.Time            `json:"completed_at,omitempty"`
 }
 
+type dashboardThreadPage struct {
+	Threads          []dashboardThreadResponse `json:"threads"`
+	SnapshotSequence uint64                    `json:"snapshot_sequence"`
+	NextSequence     uint64                    `json:"next_sequence,omitempty"`
+	HasMore          bool                      `json:"has_more"`
+}
+
+type submitterThreadPage struct {
+	Threads    []restjobs.ThreadSummary `json:"threads"`
+	HasMore    bool                     `json:"has_more"`
+	NextCursor string                   `json:"next_cursor,omitempty"`
+}
+
 type dashboardThreadJobResponse struct {
 	ID        string          `json:"id"`
 	Status    restjobs.Status `json:"status"`
@@ -36,6 +49,14 @@ type dashboardThreadAppendResponse struct {
 	Thread   dashboardThreadResponse    `json:"thread"`
 	Job      dashboardThreadJobResponse `json:"job"`
 	Replayed bool                       `json:"replayed"`
+}
+
+func projectDashboardThreadSummaries(threads []restjobs.ThreadSummary) []dashboardThreadResponse {
+	result := make([]dashboardThreadResponse, 0, len(threads))
+	for _, thread := range threads {
+		result = append(result, dashboardThreadResponse{ID: thread.ID, Status: thread.Status, CreatedAt: thread.CreatedAt, UpdatedAt: thread.UpdatedAt, Completed: thread.CompletedAt})
+	}
+	return result
 }
 
 func projectDashboardThread(thread restjobs.Thread) dashboardThreadResponse {

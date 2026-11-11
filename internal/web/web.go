@@ -175,7 +175,7 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
-	if r.URL.EscapedPath() != r.URL.Path || !dashboardProxyAllowed(r.URL.Path, r.Method) || r.URL.RawQuery != "" && !dashboardProxyQueryAllowed(r.URL.Path, r.Method) || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" {
+	if r.URL.EscapedPath() != r.URL.Path || !dashboardProxyAllowed(r.URL.Path, r.Method) || r.URL.RawQuery != "" && !dashboardProxyQueryAllowed(r.URL.Path, r.Method) || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" || r.URL.Path == "/ui/api/v1/threads" && r.URL.RawQuery != "" && !dashboardThreadListQueryAllowed(r.URL.Query()) {
 		http.NotFound(w, r)
 		return
 	}
@@ -198,7 +198,7 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
 
 func dashboardProxyAllowed(path, method string) bool {
 	if path == "/ui/api/v1/threads" {
-		return method == http.MethodPost
+		return method == http.MethodGet || method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/ui/api/v1/threads/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/threads/"), "/")
@@ -226,7 +226,16 @@ func dashboardProxyAllowed(path, method string) bool {
 }
 
 func dashboardProxyQueryAllowed(path, method string) bool {
-	return method == http.MethodGet && (path == "/ui/api/v1/jobs" || strings.HasPrefix(path, "/ui/api/v1/schedules/") && dashboardProxyAllowed(path, method))
+	return method == http.MethodGet && (path == "/ui/api/v1/jobs" || path == "/ui/api/v1/threads" || strings.HasPrefix(path, "/ui/api/v1/schedules/") && dashboardProxyAllowed(path, method))
+}
+
+func dashboardThreadListQueryAllowed(query map[string][]string) bool {
+	for key, values := range query {
+		if (key != "limit" && key != "before_sequence" && key != "snapshot_sequence") || len(values) != 1 {
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Handler) getSession(r *http.Request) (session, bool) {

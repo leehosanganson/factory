@@ -100,8 +100,8 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.17.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.17.0", document.Info.Version)
+	if document.Info.Version != "1.18.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.18.0", document.Info.Version)
 	}
 }
 
@@ -147,14 +147,32 @@ func TestThreadOpenAPIContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.17.0" {
-		t.Fatalf("version=%q want 1.17.0", document.Info.Version)
+	if document.Info.Version != "1.18.0" {
+		t.Fatalf("version=%q want 1.18.0", document.Info.Version)
+	}
+	if document.Paths["/v1/threads"]["get"] == nil {
+		t.Error("OpenAPI missing GET /v1/threads operation")
 	}
 	for path, method := range map[string]string{"/v1/threads": "post", "/v1/threads/{id}": "get", "/v1/threads/{id}/jobs": "post", "/v1/threads/{id}/complete": "post", "/v1/notifications": "get"} {
 		var operation map[string]json.RawMessage
 		if raw, ok := document.Paths[path][method]; !ok || json.Unmarshal(raw, &operation) != nil {
 			t.Errorf("OpenAPI missing %s %s operation", method, path)
 		}
+	}
+	var threadListOperation struct {
+		Description string                       `json:"description"`
+		Security    []map[string]json.RawMessage `json:"security"`
+	}
+	if err := json.Unmarshal(document.Paths["/v1/threads"]["get"], &threadListOperation); err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{"immutable initial Job admission", "opaque cursor", "without task/request text"} {
+		if !strings.Contains(threadListOperation.Description, required) {
+			t.Errorf("Thread list OpenAPI description must include %q", required)
+		}
+	}
+	if len(threadListOperation.Security) == 0 {
+		t.Error("Thread list must require bearer authentication")
 	}
 	var inboxOperation struct {
 		Description string                       `json:"description"`
@@ -193,7 +211,7 @@ func TestThreadOpenAPIContract(t *testing.T) {
 			t.Errorf("completion OpenAPI description must include %q", required)
 		}
 	}
-	for _, schema := range []string{"CreateThreadRequest", "CreateThreadResponse", "AddThreadJobResponse", "ThreadSnapshot", "Thread", "ThreadNotification", "ThreadNotificationPage"} {
+	for _, schema := range []string{"CreateThreadRequest", "CreateThreadResponse", "AddThreadJobResponse", "ThreadPage", "ThreadSummary", "ThreadSnapshot", "Thread", "ThreadNotification", "ThreadNotificationPage"} {
 		if document.Components.Schemas[schema] == nil {
 			t.Errorf("OpenAPI missing %s schema", schema)
 		}
@@ -326,8 +344,8 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.17.0" {
-		t.Errorf("OpenAPI version = %q, want 1.17.0", document.Info.Version)
+	if document.Info.Version != "1.18.0" {
+		t.Errorf("OpenAPI version = %q, want 1.18.0", document.Info.Version)
 	}
 	for _, route := range []string{"/v1/schedules", "/v1/schedules/{id}", "/v1/schedules/{id}/history", "/v1/schedules/{id}/runs"} {
 		if _, ok := document.Paths[route]; !ok {
@@ -488,6 +506,7 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"GET /v1/jobs":                            "listJobs",
 		"POST /v1/jobs":                           "createJob",
 		"POST /v1/webhooks/github/issues":         "receiveGitHubIssueWebhook",
+		"GET /v1/threads":                         "listThreads",
 		"POST /v1/threads":                        "createThread",
 		"GET /v1/schedules":                       "listSchedules",
 		"POST /v1/schedules":                      "createSchedule",
