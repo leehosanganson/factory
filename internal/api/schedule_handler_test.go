@@ -231,12 +231,18 @@ func TestDashboardScheduleCreateUsesSQLiteAndSafeProjection(t *testing.T) {
 	if replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), `"replayed":true`) || !strings.Contains(replay.Body.String(), response.Schedule.ID) || strings.Contains(replay.Body.String(), "private dashboard schedule task") {
 		t.Fatalf("dashboard schedule replay status=%d body=%s", replay.Code, replay.Body.String())
 	}
+	get := httptest.NewRequest(http.MethodGet, "/v1/schedules/"+response.Schedule.ID, nil)
+	getResponse := httptest.NewRecorder()
+	handler.ServeAsDashboardOperator(getResponse, get)
+	if getResponse.Code != http.StatusOK || getResponse.Header().Get("ETag") != `"1"` || !strings.Contains(getResponse.Body.String(), "private dashboard schedule task") {
+		t.Fatalf("dashboard full schedule get status=%d ETag=%q body=%s", getResponse.Code, getResponse.Header().Get("ETag"), getResponse.Body.String())
+	}
 	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
 		request := httptest.NewRequest(method, "/v1/schedules/"+response.Schedule.ID, nil)
 		blocked := httptest.NewRecorder()
 		handler.ServeAsDashboardOperator(blocked, request)
-		if blocked.Code != http.StatusNotFound {
-			t.Errorf("dashboard %s schedule status=%d body=%s", method, blocked.Code, blocked.Body.String())
+		if blocked.Code != http.StatusPreconditionRequired {
+			t.Errorf("dashboard %s without If-Match status=%d body=%s", method, blocked.Code, blocked.Body.String())
 		}
 	}
 }

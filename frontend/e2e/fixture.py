@@ -42,7 +42,12 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/threads/[A-Za-z0-9_-]+", path) and not parsed.query
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/jobs/[A-Za-z0-9_-]+/(history|events)", path) and not parsed.query
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/jobs/[A-Za-z0-9_-]+", path) and not parsed.query
-            or self.command == "POST" and path in ("/ui/login", "/ui/logout", "/ui/api/v1/jobs") and not parsed.query
+            or self.command == "GET" and path == "/ui/api/v1/schedules" and not parsed.query
+            or self.command == "GET" and re.fullmatch(r"/ui/api/v1/schedules/[A-Za-z0-9_-]+", path) and not parsed.query
+            or self.command == "GET" and re.fullmatch(r"/ui/api/v1/schedules/[A-Za-z0-9_-]+/runs", path) and parsed.query == "limit=5"
+            or self.command == "POST" and path in ("/ui/login", "/ui/logout", "/ui/api/v1/jobs", "/ui/api/v1/threads") and not parsed.query
+            or self.command == "POST" and re.fullmatch(r"/ui/api/v1/schedules", path) and not parsed.query
+            or self.command in ("PATCH", "DELETE") and re.fullmatch(r"/ui/api/v1/schedules/[A-Za-z0-9_-]+", path) and not parsed.query
         )
         if not allowed:
             self.send_error(404)
@@ -77,6 +82,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 
     do_GET = forward
     do_POST = forward
+    do_PATCH = forward
+    do_DELETE = forward
 
     def log_message(self, *_args: object) -> None:
         pass
@@ -147,7 +154,7 @@ def main() -> int:
             "principals": [{"id": "e2e-operator", "role": "operator", "token_file": str(verifier), "enabled": True}],
             "verification_checks": [["test", "-f", "dashboard-e2e-result.txt"]],
             "web_ui": {"enabled": True, "operator_id": "e2e-operator"},
-            "persistence": {"backend": "memory"},
+            "persistence": {"backend": "sqlite", "path": str(root / "schedules.db")},
             "workers_enabled": True,
             "limits": {"workers": 1, "queue_capacity": 4, "max_records": 20},
         }

@@ -117,13 +117,68 @@ func TestDashboardScheduleCreateUsesSameOriginCSRFAndIdempotency(t *testing.T) {
 	if replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), created.Schedule.ID) || !strings.Contains(replay.Body.String(), `"replayed":true`) || strings.Contains(replay.Body.String(), "private scheduled task") {
 		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
 	}
-	for _, method := range []string{http.MethodPatch, http.MethodDelete} {
-		request := httptest.NewRequest(method, "/ui/api/v1/schedules/"+created.Schedule.ID, nil)
+	get := httptest.NewRequest(http.MethodGet, "/ui/api/v1/schedules/"+created.Schedule.ID, nil)
+	get.AddCookie(cookie)
+	getResponse := httptest.NewRecorder()
+	handler.ServeHTTP(getResponse, get)
+	if getResponse.Code != http.StatusOK || getResponse.Header().Get("ETag") != `"1"` || !strings.Contains(getResponse.Body.String(), "private scheduled task") {
+		t.Fatalf("explicit schedule detail status=%d ETag=%q body=%s", getResponse.Code, getResponse.Header().Get("ETag"), getResponse.Body.String())
+	}
+
+	mutate := func(method, body, etag string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, "/ui/api/v1/schedules/"+created.Schedule.ID, strings.NewReader(body))
+		request.Host = "factory.example"
+		request.Header.Set("Origin", "https://factory.example")
+		request.Header.Set("X-CSRF-Token", sessionData.CSRF)
+		request.Header.Set("If-Match", etag)
+		if body != "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
 		request.AddCookie(cookie)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
-		if response.Code != http.StatusNotFound {
-			t.Errorf("%s schedule status=%d body=%s", method, response.Code, response.Body.String())
+		return response
+	}
+	if missingCSRF := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPatch, "/ui/api/v1/schedules/"+created.Schedule.ID, strings.NewReader(`{"action":"pause"}`))
+		request.Host = "factory.example"
+		request.Header.Set("Origin", "https://factory.example")
+		request.Header.Set("If-Match", `"1"`)
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(cookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}(); missingCSRF.Code != http.StatusForbidden {
+		t.Fatalf("schedule mutation without CSRF status=%d body=%s", missingCSRF.Code, missingCSRF.Body.String())
+	}
+	edited := mutate(http.MethodPatch, `{"action":"edit","cron":"0 9 * * 1-5","repository":"widget","task":"updated private task"}`, `"1"`)
+	if edited.Code != http.StatusOK || edited.Header().Get("ETag") != `"2"` {
+		t.Fatalf("edit status=%d ETag=%q body=%s", edited.Code, edited.Header().Get("ETag"), edited.Body.String())
+	}
+	stale := mutate(http.MethodPatch, `{"action":"pause"}`, `"1"`)
+	if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), "revision_conflict") {
+		t.Fatalf("stale mutation status=%d body=%s", stale.Code, stale.Body.String())
+	}
+	paused := mutate(http.MethodPatch, `{"action":"pause"}`, `"2"`)
+	if paused.Code != http.StatusOK || !strings.Contains(paused.Body.String(), `"status":"paused"`) || paused.Header().Get("ETag") != `"3"` {
+		t.Fatalf("pause status=%d ETag=%q body=%s", paused.Code, paused.Header().Get("ETag"), paused.Body.String())
+	}
+	resumed := mutate(http.MethodPatch, `{"action":"resume"}`, `"3"`)
+	if resumed.Code != http.StatusOK || !strings.Contains(resumed.Body.String(), `"status":"active"`) || resumed.Header().Get("ETag") != `"4"` {
+		t.Fatalf("resume status=%d ETag=%q body=%s", resumed.Code, resumed.Header().Get("ETag"), resumed.Body.String())
+	}
+	removed := mutate(http.MethodDelete, "", `"4"`)
+	if removed.Code != http.StatusOK || !strings.Contains(removed.Body.String(), `"status":"removed"`) || removed.Header().Get("ETag") != `"5"` {
+		t.Fatalf("remove status=%d ETag=%q body=%s", removed.Code, removed.Header().Get("ETag"), removed.Body.String())
+	}
+	list := httptest.NewRequest(http.MethodGet, "/ui/api/v1/schedules", nil)
+	list.AddCookie(cookie)
+	listResponse := httptest.NewRecorder()
+	handler.ServeHTTP(listResponse, list)
+	for _, secret := range []string{"updated private task", `"repository"`, `"owner"`} {
+		if strings.Contains(listResponse.Body.String(), secret) {
+			t.Errorf("redacted schedule list contains %q: %s", secret, listResponse.Body.String())
 		}
 	}
 }
@@ -342,7 +397,7 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 		method string
 		path   string
 		want   int
-	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50", http.StatusOK}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?limit=50", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads?cursor=secret", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
+	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodDelete, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50", http.StatusOK}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?limit=50", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads?cursor=secret", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
 		proxyRequest := httptest.NewRequest(tc.method, tc.path, nil)
 		proxyRequest.Host = "factory.example"
 		proxyRequest.Header.Set("Origin", "https://factory.example")
@@ -398,7 +453,7 @@ func TestDashboardRequiresConfiguredNamedOperatorAndScopesProxy(t *testing.T) {
 		method string
 		path   string
 		query  string
-	}{{http.MethodPatch, "/ui/api/v1/schedules/one", ""}, {http.MethodDelete, "/ui/api/v1/schedules/one", ""}, {http.MethodGet, "/ui/api/v1/schedules/one/runs", "before_sequence=2"}} {
+	}{{http.MethodPatch, "/ui/api/v1/schedules/one", ""}, {http.MethodDelete, "/ui/api/v1/schedules/one", ""}, {http.MethodGet, "/ui/api/v1/schedules/one/history", ""}, {http.MethodGet, "/ui/api/v1/schedules/one/runs", "before_sequence=2"}} {
 		path := tc.path
 		if tc.query != "" {
 			path += "?" + tc.query

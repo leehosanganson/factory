@@ -8,6 +8,52 @@ async function runtime(): Promise<Runtime> {
   return JSON.parse(await readFile(runtimeFile, 'utf8')) as Runtime;
 }
 
+test('operator can manage schedules without exposing definitions in summaries', async ({ page }) => {
+  const fixture = await runtime();
+  const marker = 'schedule task stays inside edit form';
+  const requests: { method: string; path: string; ifMatch?: string }[] = [];
+  page.on('request', (request) => {
+    if (request.url().includes('/ui/api/v1/schedules/')) requests.push({ method: request.method(), path: new URL(request.url()).pathname, ifMatch: request.headers()['if-match'] });
+  });
+  await page.goto(fixture.url);
+  await page.getByLabel('Operator token').fill(fixture.token);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('heading', { name: 'Schedules' })).toBeVisible();
+
+  await page.getByLabel('Cron (UTC)').fill('0 9 * * 1-5');
+  await page.getByLabel('Repository alias').last().fill('fixture');
+  await page.locator('#schedule-task').fill(marker);
+  await page.getByRole('button', { name: 'Create schedule' }).click();
+  const createdRow = page.locator('.schedule-row').filter({ hasText: 'UTC · 0 9 * * 1-5' });
+  await expect(createdRow).toBeVisible();
+  const scheduleID = (await createdRow.locator('h3').textContent())?.trim();
+  expect(scheduleID).toBeTruthy();
+  const row = page.locator('.schedule-row').filter({ has: page.locator('h3', { hasText: scheduleID! }) });
+  await expect(row.getByText(marker)).toHaveCount(0);
+  expect(requests.some((request) => request.path.endsWith(`/${scheduleID}`))).toBe(false);
+
+  await row.getByRole('button', { name: 'Edit' }).click();
+  const editForm = row.getByRole('form', { name: `Edit schedule ${scheduleID}` });
+  await expect(editForm.getByLabel('Task')).toHaveValue(marker);
+  await expect.poll(() => requests.filter((request) => request.method === 'GET' && request.path === `/ui/api/v1/schedules/${scheduleID}`).length).toBe(1);
+  await editForm.getByLabel('Cron (UTC)').fill('30 10 * * 1-5');
+  await editForm.getByLabel('Task').fill('updated schedule task');
+  await editForm.getByRole('button', { name: 'Save schedule' }).click();
+  await expect(row).toContainText('UTC · 30 10 * * 1-5');
+  await expect(row.getByText('updated schedule task')).toHaveCount(0);
+
+  await row.getByRole('button', { name: 'Pause' }).click();
+  await expect(row.locator('.status')).toHaveText('paused');
+  await row.getByRole('button', { name: 'Resume' }).click();
+  await expect(row.locator('.status')).toHaveText('active');
+  page.once('dialog', (dialog) => dialog.accept());
+  await row.getByRole('button', { name: 'Remove' }).click();
+  await expect(row.locator('.status')).toHaveText('removed');
+  await expect(page.getByRole('status').filter({ hasText: 'Schedule removed.' })).toBeVisible();
+  expect(requests.filter((request) => request.method === 'GET' && request.path === `/ui/api/v1/schedules/${scheduleID}`).length).toBe(1);
+  expect(requests.filter((request) => ['PATCH', 'DELETE'].includes(request.method)).map((request) => request.ifMatch)).toEqual(['"1"', '"2"', '"3"', '"4"']);
+});
+
 test('operator can sign in, admit and inspect a job, and sign out', async ({ page, context }) => {
   const fixture = await runtime();
   const origin = new URL(fixture.url).origin;

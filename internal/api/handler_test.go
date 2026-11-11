@@ -589,7 +589,7 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		t.Fatalf("trusted principal admission status=%d body=%s", response.Code, response.Body.String())
 	}
 
-	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
+	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeAsDashboardOperator(response, request)
