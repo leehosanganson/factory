@@ -626,6 +626,20 @@ func TestWorkerCapabilityUsesLiveMappingBeforeBearerAuthentication(t *testing.T)
 	if response.Code != http.StatusOK {
 		t.Fatalf("current mapping status=%d, want 200", response.Code)
 	}
+	assertRetirementDenied := func(method, path, body string, wantStatus int, scenario string) {
+		t.Helper()
+		retireRequest := httptest.NewRequest(method, path, strings.NewReader(body))
+		retireRequest.TLS = request.TLS
+		retireRequest.Header.Set("Authorization", "Bearer "+session.Capability)
+		retireResponse := httptest.NewRecorder()
+		handler.ServeHTTP(retireResponse, retireRequest)
+		if retireResponse.Code != wantStatus {
+			t.Errorf("retirement after %s status=%d body=%s, want %d", scenario, retireResponse.Code, retireResponse.Body.String(), wantStatus)
+		}
+		if _, err := store.AuthenticateWorkerCapability(context.Background(), "worker-before", session.Capability); err != nil {
+			t.Errorf("retirement after %s changed active session: %v", scenario, err)
+		}
+	}
 	if _, err := store.ReconcileWorkerMappings(context.Background(), map[string]string{key: "worker-after"}); err != nil {
 		t.Fatal(err)
 	}
@@ -634,6 +648,8 @@ func TestWorkerCapabilityUsesLiveMappingBeforeBearerAuthentication(t *testing.T)
 	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"code":"unauthenticated"`) {
 		t.Fatalf("remapped certificate response=%d %s, want generic unauthenticated", response.Code, response.Body.String())
 	}
+	assertRetirementDenied(http.MethodDelete, "/v1/worker/session/"+session.ID, `{"boot_id":"boot-live"}`, http.StatusNotFound, "remapping through ID route")
+	assertRetirementDenied(http.MethodDelete, "/v1/worker/session", "", http.StatusUnauthorized, "remapping through capability route")
 	if _, err := store.ReconcileWorkerMappings(context.Background(), map[string]string{}); err != nil {
 		t.Fatal(err)
 	}
@@ -642,6 +658,8 @@ func TestWorkerCapabilityUsesLiveMappingBeforeBearerAuthentication(t *testing.T)
 	if response.Code != http.StatusUnauthorized || !strings.Contains(response.Body.String(), `"code":"unauthenticated"`) {
 		t.Fatalf("removed certificate response=%d %s, want generic unauthenticated", response.Code, response.Body.String())
 	}
+	assertRetirementDenied(http.MethodDelete, "/v1/worker/session/"+session.ID, `{"boot_id":"boot-live"}`, http.StatusUnauthorized, "revocation through ID route")
+	assertRetirementDenied(http.MethodDelete, "/v1/worker/session", "", http.StatusUnauthorized, "revocation through capability route")
 }
 
 func TestWorkerMappingLookupFailureFailsClosedWithSanitized503(t *testing.T) {
