@@ -78,12 +78,14 @@ type Handler struct {
 
 type submitterCursorKey struct {
 	principalID string
+	kind        string
 	after       uint64
 	snapshot    uint64
 }
 
 type submitterCursor struct {
 	principalID string
+	kind        string
 	after       uint64
 	snapshot    uint64
 	expiresAt   time.Time
@@ -142,7 +144,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ServeAsDashboardOperator serves the allowlisted embedded dashboard routes.
 func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Request) {
-	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || isThreadsPath(r.URL.Path) && r.URL.RawQuery != "" || !dashboardRoute(r.URL.Path, r.Method) {
+	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || isThreadsPath(r.URL.Path) && r.URL.RawQuery != "" && r.URL.Path != "/v1/threads" || !dashboardRoute(r.URL.Path, r.Method) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -169,7 +171,7 @@ func dashboardRoute(path, method string) bool {
 		return method == http.MethodGet || method == http.MethodPost
 	}
 	if path == "/v1/threads" {
-		return method == http.MethodPost
+		return method == http.MethodGet || method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/v1/threads/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/v1/threads/"), "/")
@@ -261,8 +263,16 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		}
 		h.getOperations(w, r)
 	case path == "/v1/threads":
+		if r.Method == http.MethodGet {
+			if caller.Role == "submitter" {
+				h.listThreadsForPrincipal(w, r, caller.ID)
+			} else {
+				h.listThreads(w, r)
+			}
+			return
+		}
 		if r.Method != http.MethodPost {
-			methodNotAllowed(w, http.MethodPost)
+			methodNotAllowed(w, http.MethodGet+", "+http.MethodPost)
 			return
 		}
 		h.createThread(w, r, caller)
@@ -451,7 +461,7 @@ func submitterRoute(path, method string) bool {
 		return method == http.MethodGet
 	}
 	if path == "/v1/threads" {
-		return method == http.MethodPost
+		return method == http.MethodGet || method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/v1/threads/") {
 		tail := strings.TrimPrefix(path, "/v1/threads/")
@@ -497,7 +507,7 @@ func (h *Handler) listJobsForPrincipal(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	for key, entries := range values {
-		if (key != "limit" && key != "cursor") || len(entries) != 1 {
+		if (key != "limit" && key != "cursor") || len(entries) != 1 || entries[0] == "" {
 			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 			return
 		}
@@ -540,25 +550,33 @@ func (h *Handler) listJobsForPrincipal(w http.ResponseWriter, r *http.Request, p
 }
 
 func (h *Handler) lookupSubmitterCursor(cursor, principalID string) (submitterCursor, bool) {
+	return h.lookupSubmitterCursorKind(cursor, principalID, "job")
+}
+
+func (h *Handler) lookupSubmitterCursorKind(cursor, principalID, kind string) (submitterCursor, bool) {
 	now := h.now()
 	h.cursorMu.Lock()
 	defer h.cursorMu.Unlock()
 	h.purgeSubmitterCursorsLocked(now)
 	state, ok := h.cursors[cursor]
-	if !ok || state.principalID != principalID {
+	if !ok || state.principalID != principalID || state.kind != kind {
 		return submitterCursor{}, false
 	}
 	return state, true
 }
 
 func (h *Handler) storeSubmitterCursor(principalID string, after, snapshot uint64) (string, bool) {
+	return h.storeSubmitterCursorKind(principalID, "job", after, snapshot)
+}
+
+func (h *Handler) storeSubmitterCursorKind(principalID, kind string, after, snapshot uint64) (string, bool) {
 	now := h.now()
 	h.cursorMu.Lock()
 	defer h.cursorMu.Unlock()
 	h.purgeSubmitterCursorsLocked(now)
-	key := submitterCursorKey{principalID: principalID, after: after, snapshot: snapshot}
+	key := submitterCursorKey{principalID: principalID, kind: kind, after: after, snapshot: snapshot}
 	if cursor, exists := h.cursorKeys[key]; exists {
-		if state, ok := h.cursors[cursor]; ok && state.principalID == principalID && state.after == after && state.snapshot == snapshot {
+		if state, ok := h.cursors[cursor]; ok && state.principalID == principalID && state.kind == kind && state.after == after && state.snapshot == snapshot {
 			return cursor, true
 		}
 		delete(h.cursorKeys, key)
@@ -575,7 +593,7 @@ func (h *Handler) storeSubmitterCursor(principalID string, after, snapshot uint6
 		if _, exists := h.cursors[cursor]; exists {
 			continue
 		}
-		h.cursors[cursor] = submitterCursor{principalID: principalID, after: after, snapshot: snapshot, expiresAt: now.Add(submitterCursorTTL)}
+		h.cursors[cursor] = submitterCursor{principalID: principalID, kind: kind, after: after, snapshot: snapshot, expiresAt: now.Add(submitterCursorTTL)}
 		h.cursorKeys[key] = cursor
 		return cursor, true
 	}
@@ -586,7 +604,7 @@ func (h *Handler) purgeSubmitterCursorsLocked(now time.Time) {
 	for cursor, state := range h.cursors {
 		if !now.Before(state.expiresAt) {
 			delete(h.cursors, cursor)
-			key := submitterCursorKey{principalID: state.principalID, after: state.after, snapshot: state.snapshot}
+			key := submitterCursorKey{principalID: state.principalID, kind: state.kind, after: state.after, snapshot: state.snapshot}
 			if h.cursorKeys[key] == cursor {
 				delete(h.cursorKeys, key)
 			}

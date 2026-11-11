@@ -8,6 +8,97 @@ import (
 	"time"
 )
 
+func (s *SQLiteStore) ListThreads(ctx context.Context, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error) {
+	return s.listThreads(ctx, "", beforeSequence, snapshotSequence, limit)
+}
+
+func (s *SQLiteStore) ListThreadsForPrincipal(ctx context.Context, principalID string, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error) {
+	principalID, err := normalizePrincipalID(principalID)
+	if err != nil {
+		return ThreadPage{}, err
+	}
+	return s.listThreads(ctx, principalID, beforeSequence, snapshotSequence, limit)
+}
+
+func (s *SQLiteStore) listThreads(ctx context.Context, principalID string, beforeSequence, snapshotSequence uint64, limit int) (ThreadPage, error) {
+	if err := validateThreadPageRequest(ctx, beforeSequence, snapshotSequence, limit); err != nil {
+		return ThreadPage{}, err
+	}
+	if err := s.checkOpen(); err != nil {
+		return ThreadPage{}, err
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return ThreadPage{}, errors.New("begin SQLite Thread listing")
+	}
+	defer tx.Rollback()
+	if snapshotSequence == 0 {
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(queue_sequence),0) FROM factory_jobs`).Scan(&snapshotSequence); err != nil {
+			return ThreadPage{}, errors.New("read SQLite Thread listing snapshot")
+		}
+	}
+	query := `SELECT t.id,j.queue_sequence FROM factory_threads t JOIN factory_jobs j ON j.id=t.initial_job_id WHERE j.queue_sequence<=?`
+	args := []any{snapshotSequence}
+	if beforeSequence != 0 {
+		query += ` AND j.queue_sequence<?`
+		args = append(args, beforeSequence)
+	}
+	if principalID != "" {
+		query += ` AND t.submitter=?`
+		args = append(args, principalID)
+	}
+	query += ` ORDER BY j.queue_sequence DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return ThreadPage{}, errors.New("read SQLite Thread listing")
+	}
+	type item struct {
+		id       string
+		sequence uint64
+	}
+	items := make([]item, 0, limit+1)
+	for rows.Next() {
+		var value item
+		if err := rows.Scan(&value.id, &value.sequence); err != nil {
+			rows.Close()
+			return ThreadPage{}, errors.New("decode SQLite Thread listing")
+		}
+		items = append(items, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return ThreadPage{}, errors.New("read SQLite Thread listing")
+	}
+	if err := rows.Close(); err != nil {
+		return ThreadPage{}, errors.New("close SQLite Thread listing")
+	}
+	page := ThreadPage{Threads: make([]ThreadSummary, 0, limit), SnapshotSequence: snapshotSequence, HasMore: len(items) > limit}
+	if page.HasMore {
+		items = items[:limit]
+	}
+	for _, item := range items {
+		snapshot, err := s.threadSnapshotTx(ctx, tx, item.id, "")
+		if err != nil {
+			return ThreadPage{}, err
+		}
+		summary := ThreadSummary{ID: snapshot.Thread.ID, Status: snapshot.Thread.Status, CreatedAt: snapshot.Thread.CreatedAt, UpdatedAt: snapshot.Thread.UpdatedAt}
+		if snapshot.Thread.CompletedAt != nil {
+			completed := *snapshot.Thread.CompletedAt
+			summary.CompletedAt = &completed
+		}
+		page.Threads = append(page.Threads, summary)
+		page.NextSequence = item.sequence
+	}
+	if !page.HasMore {
+		page.NextSequence = 0
+	}
+	if err := tx.Commit(); err != nil {
+		return ThreadPage{}, errors.New("finish SQLite Thread listing")
+	}
+	return page, nil
+}
+
 func (s *SQLiteStore) AdmitThreadJobAs(threadID, key, principalID string, request Request) (ThreadSnapshot, Snapshot, bool, error) {
 	if err := s.checkAccepting(); err != nil {
 		return ThreadSnapshot{}, Snapshot{}, false, err

@@ -2,13 +2,16 @@ package restapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/leehosanganson/factory/internal/jobs"
@@ -52,6 +55,133 @@ func (h *Handler) listNotifications(w http.ResponseWriter, r *http.Request, prin
 		return
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+func (h *Handler) listThreads(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Has("cursor") {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	query, err := parseThreadListQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	threadStore, ok := h.manager.(restjobs.ThreadStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "thread_unavailable", "Thread operations are unavailable.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	page, err := threadStore.ListThreads(ctx, query.before, query.snapshot, query.limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	if isDashboardOperator(r) {
+		writeJSON(w, http.StatusOK, dashboardThreadPage{Threads: projectDashboardThreadSummaries(page.Threads), SnapshotSequence: page.SnapshotSequence, NextSequence: page.NextSequence, HasMore: page.HasMore})
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (h *Handler) listThreadsForPrincipal(w http.ResponseWriter, r *http.Request, principalID string) {
+	if _, hasBefore := r.URL.Query()["before_sequence"]; hasBefore {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	if _, hasSnapshot := r.URL.Query()["snapshot_sequence"]; hasSnapshot {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	for key := range r.URL.Query() {
+		if key != "limit" && key != "cursor" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+	}
+	query, err := parseThreadListQuery(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	if raw, exists := r.URL.Query()["cursor"]; exists {
+		state, ok := h.lookupSubmitterCursorKind(raw[0], principalID, "thread")
+		if !ok {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+		query.before, query.snapshot = state.after, state.snapshot
+	}
+	threadStore, ok := h.manager.(restjobs.ThreadStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "thread_unavailable", "Thread operations are unavailable.")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	page, err := threadStore.ListThreadsForPrincipal(ctx, principalID, query.before, query.snapshot, query.limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	cursor := ""
+	if page.HasMore {
+		cursor, ok = h.storeSubmitterCursorKind(principalID, "thread", page.NextSequence, page.SnapshotSequence)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "cursor_capacity", "Pagination capacity is full.")
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, submitterThreadPage{Threads: page.Threads, HasMore: page.HasMore, NextCursor: cursor})
+}
+
+type threadListQuery struct {
+	before   uint64
+	snapshot uint64
+	limit    int
+}
+
+func parseThreadListQuery(r *http.Request) (threadListQuery, error) {
+	query := threadListQuery{limit: restjobs.DefaultThreadListLimit}
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return threadListQuery{}, restjobs.ErrInvalidInput
+	}
+	for key, entries := range values {
+		if (key != "limit" && key != "before_sequence" && key != "snapshot_sequence" && key != "cursor") || len(entries) != 1 || entries[0] == "" {
+			return threadListQuery{}, restjobs.ErrInvalidInput
+		}
+	}
+	if value, exists := values["limit"]; exists {
+		parsed, err := strconv.Atoi(value[0])
+		if err != nil || parsed < 1 || parsed > restjobs.MaxThreadListLimit {
+			return threadListQuery{}, restjobs.ErrInvalidInput
+		}
+		query.limit = parsed
+	}
+	if value, exists := values["cursor"]; exists {
+		// Cursor resolution is handled by the caller because it is principal-bound.
+		if value[0] == "" {
+			return threadListQuery{}, restjobs.ErrInvalidInput
+		}
+	}
+	for key, target := range map[string]*uint64{"before_sequence": &query.before, "snapshot_sequence": &query.snapshot} {
+		if value, exists := values[key]; exists {
+			parsed, err := strconv.ParseUint(value[0], 10, 64)
+			if err != nil || parsed == 0 {
+				return threadListQuery{}, restjobs.ErrInvalidInput
+			}
+			*target = parsed
+		}
+	}
+	_, hasBefore := values["before_sequence"]
+	_, hasSnapshot := values["snapshot_sequence"]
+	if hasBefore != hasSnapshot || hasBefore && query.before > query.snapshot || values.Has("cursor") && hasBefore {
+		return threadListQuery{}, restjobs.ErrInvalidInput
+	}
+	return query, nil
 }
 
 func (h *Handler) completeThread(w http.ResponseWriter, r *http.Request, threadID string, caller restserver.Principal) {

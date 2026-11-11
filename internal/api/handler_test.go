@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -142,6 +144,77 @@ func request(handler http.Handler, method, path, body string, authenticated bool
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, r)
 	return recorder
+}
+
+func TestThreadListPaginationAuthOwnershipAndRedaction(t *testing.T) {
+	manager := newTestManager(t, managerConfig(16, 32, 8))
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+	)
+	first, _, err := manager.AdmitThreadAs("list-alice-first", "alice", restjobs.Request{Repository: "widget", Task: "private sentinel task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.AdmitAs("between", "bob", restjobs.Request{Repository: "widget", Task: "standalone"}); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := manager.AdmitThreadAs("list-bob", "bob", restjobs.Request{Repository: "widget", Task: "private bob task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	operator := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1", "", namedPrincipalToken("admin"))
+	var opPage restjobs.ThreadPage
+	if operator.Code != http.StatusOK || json.Unmarshal(operator.Body.Bytes(), &opPage) != nil || len(opPage.Threads) != 1 || opPage.Threads[0].ID != second.Thread.ID || !opPage.HasMore {
+		t.Fatalf("operator page status=%d body=%s", operator.Code, operator.Body.String())
+	}
+	if _, _, err := manager.AdmitThreadAs("list-later", "alice", restjobs.Request{Repository: "widget", Task: "later"}); err != nil {
+		t.Fatal(err)
+	}
+	older := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1&before_sequence="+strconv.FormatUint(opPage.NextSequence, 10)+"&snapshot_sequence="+strconv.FormatUint(opPage.SnapshotSequence, 10), "", namedPrincipalToken("admin"))
+	var olderPage restjobs.ThreadPage
+	if older.Code != http.StatusOK || json.Unmarshal(older.Body.Bytes(), &olderPage) != nil || len(olderPage.Threads) != 1 || olderPage.Threads[0].ID != first.Thread.ID || olderPage.HasMore {
+		t.Fatalf("operator continuation status=%d body=%s", older.Code, older.Body.String())
+	}
+	owned := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1", "", namedPrincipalToken("alice"))
+	var ownedPage struct {
+		Threads    []restjobs.ThreadSummary `json:"threads"`
+		HasMore    bool                     `json:"has_more"`
+		NextCursor string                   `json:"next_cursor"`
+	}
+	if owned.Code != http.StatusOK || json.Unmarshal(owned.Body.Bytes(), &ownedPage) != nil || len(ownedPage.Threads) != 1 || ownedPage.Threads[0].ID == second.Thread.ID || !ownedPage.HasMore || ownedPage.NextCursor == "" {
+		t.Fatalf("submitter page status=%d body=%s", owned.Code, owned.Body.String())
+	}
+	foreignCursor := principalRequest(handler, http.MethodGet, "/v1/threads?cursor="+url.QueryEscape(ownedPage.NextCursor), "", namedPrincipalToken("bob"))
+	if foreignCursor.Code != http.StatusBadRequest {
+		t.Errorf("foreign submitter cursor status=%d body=%s", foreignCursor.Code, foreignCursor.Body.String())
+	}
+	continued := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1&cursor="+url.QueryEscape(ownedPage.NextCursor), "", namedPrincipalToken("alice"))
+	var continuedPage struct {
+		Threads []restjobs.ThreadSummary `json:"threads"`
+		HasMore bool                     `json:"has_more"`
+	}
+	if continued.Code != http.StatusOK || json.Unmarshal(continued.Body.Bytes(), &continuedPage) != nil || len(continuedPage.Threads) != 1 || continuedPage.Threads[0].ID == second.Thread.ID || continuedPage.HasMore {
+		t.Fatalf("submitter continuation status=%d body=%s", continued.Code, continued.Body.String())
+	}
+	invalidCursor := principalRequest(handler, http.MethodGet, "/v1/threads?cursor=invalid", "", namedPrincipalToken("alice"))
+	if invalidCursor.Code != http.StatusBadRequest {
+		t.Errorf("invalid submitter cursor status=%d", invalidCursor.Code)
+	}
+	if unauth := request(handler, http.MethodGet, "/v1/threads", "", false); unauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated list status=%d", unauth.Code)
+	}
+	for _, bad := range []string{"limit=101", "limit=1&limit=2", "before_sequence=2", "unknown=x"} {
+		if response := principalRequest(handler, http.MethodGet, "/v1/threads?"+bad, "", namedPrincipalToken("admin")); response.Code != http.StatusBadRequest {
+			t.Errorf("invalid query %q status=%d", bad, response.Code)
+		}
+	}
+	for _, forbidden := range []string{"private sentinel task", "private bob task", `"submitted_by"`, `"job_ids"`, `"task"`, `"provider"`, `"worker"`, `"progress"`} {
+		if strings.Contains(operator.Body.String(), forbidden) {
+			t.Errorf("operator summary exposed %q: %s", forbidden, operator.Body.String())
+		}
+	}
 }
 
 func TestCreateAndInspectThreadEnforcesAuthOwnershipAndIdempotency(t *testing.T) {
@@ -494,7 +567,7 @@ func TestThreadRouteValidationAndUnsupportedStore(t *testing.T) {
 		method string
 		path   string
 		want   int
-	}{{http.MethodGet, "/v1/threads", http.StatusMethodNotAllowed}, {http.MethodPost, "/v1/threads/id", http.StatusMethodNotAllowed}, {http.MethodGet, "/v1/threads/id/nested", http.StatusNotFound}} {
+	}{{http.MethodPut, "/v1/threads", http.StatusMethodNotAllowed}, {http.MethodPost, "/v1/threads/id", http.StatusMethodNotAllowed}, {http.MethodGet, "/v1/threads/id/nested", http.StatusNotFound}} {
 		response := request(handler, tc.method, tc.path, "", true)
 		if response.Code != tc.want {
 			t.Errorf("%s %s status=%d body=%s, want %d", tc.method, tc.path, response.Code, response.Body.String(), tc.want)
@@ -516,7 +589,7 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		t.Fatalf("trusted principal admission status=%d body=%s", response.Code, response.Body.String())
 	}
 
-	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
+	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeAsDashboardOperator(response, request)
