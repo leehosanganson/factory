@@ -368,7 +368,7 @@
           "409": {
             "description": "Stale revision or invalid lifecycle transition."
           },
-          "412": {
+          "428": {
             "description": "If-Match is required."
           },
           "503": {
@@ -433,7 +433,7 @@
           "409": {
             "description": "Stale revision or invalid lifecycle transition."
           },
-          "412": {
+          "428": {
             "description": "If-Match is required."
           },
           "503": {

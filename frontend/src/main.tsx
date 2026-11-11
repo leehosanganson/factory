@@ -7,14 +7,16 @@ import './style.css';
 type Session = { authenticated: boolean; csrf?: string };
 type Job = { id: string; status: string; created_at: string; updated_at: string; submitted_by?: string; worker?: { worker_id: string; boot_id: string }; progress?: { stage: string; state: string }; provider?: { repository: string; number: number; url?: string }; verification?: { checks?: { name: string; outcome: string }[]; limitations?: string[] } };
 type History = { events?: { at: string; type: string; stage?: string; state?: string }[] };
-type Schedule = { id: string; status: string; cron: string; pending_occurrence_at?: string; skipped_occurrences?: { count: number; first_at: string; last_at: string } };
+type Schedule = { id: string; status: string; cron: string; revision: number; pending_occurrence_at?: string; skipped_occurrences?: { count: number; first_at: string; last_at: string } };
+type ScheduleDefinition = { id: string; status: string; cron: string; repository: string; task: string };
 type Thread = { id: string; status: string; created_at: string; updated_at: string; completed_at?: string };
 type ThreadPage = { threads?: Thread[]; has_more?: boolean; next_sequence?: number; snapshot_sequence?: number };
 type ApiError = Error & { code?: string };
-const api = async <T,>(path: string, options: RequestInit = {}, csrf = ''): Promise<T> => {
+const api = async <T,>(path: string, options: RequestInit = {}, csrf = '', onResponse?: (response: Response) => void): Promise<T> => {
   const headers = new Headers(options.headers || {});
   if (options.method && options.method !== 'GET') headers.set('X-CSRF-Token', csrf);
   const response = await fetch(`/ui/api${path}`, { ...options, headers, credentials: 'same-origin', cache: 'no-store' });
+  onResponse?.(response);
   if (!response.ok) {
     let message = `Request failed (${response.status}).`;
     let code = '';
@@ -105,17 +107,19 @@ function App() {
     } catch (error) { if (current() && mounted.current) { setThreadLoading(''); setNotice((error as Error).message); } }
   }, [session.csrf]);
 
-  const refreshSchedules = useCallback(async () => {
+  const refreshSchedules = useCallback(async (): Promise<Schedule[]> => {
     const generation = ++scheduleRefreshGeneration.current;
     const current = () => generation === scheduleRefreshGeneration.current;
     setScheduleLoading('Refreshing…');
     try {
       const page = await api<{ schedules?: Schedule[] }>('/v1/schedules', {}, session.csrf);
-      if (!current() || !mounted.current) return;
-      setSchedules(page.schedules || []);
+      if (!current() || !mounted.current) return [];
+      const rows = page.schedules || [];
+      setSchedules(rows);
       setScheduleRevision(generation);
       if (current()) setScheduleLoading('');
-    } catch (error) { if (current() && mounted.current) { setScheduleLoading(''); setNotice((error as Error).message); } }
+      return rows;
+    } catch (error) { if (current() && mounted.current) { setScheduleLoading(''); setNotice((error as Error).message); } return []; }
   }, [session.csrf]);
 
   async function inspect(id: string, scroll = true) {
@@ -260,15 +264,59 @@ function App() {
       <div className="thread-result" aria-live="polite">{thread && <><h3>Thread {thread.id}</h3><span className={`status ${thread.status}`}>{thread.status}</span>{thread.completed_at && <p className="job-meta">Completed {date(thread.completed_at)}</p>}{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span></article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Append Job</button></form><button className="danger" type="button" disabled={threadPending} onClick={() => void completeThread()}>Complete Thread</button></section>}</section>
     <section className="panel schedules-panel" aria-labelledby="schedules-title"><div className="section-heading"><h2 id="schedules-title">Schedules</h2><span className="muted" role="status">{scheduleLoading}</span></div><p className="muted">Schedule tasks run on their cron times. Cron uses UTC and supports one-minute minimum recurrence.</p><form className="schedule-form" onSubmit={createSchedule}><label htmlFor="schedule-cron">Cron (UTC)</label><input id="schedule-cron" name="cron" maxLength={128} required autoComplete="off" placeholder="0 9 * * 1-5"/><span className="muted">Five fields; UTC; one-minute minimum recurrence.</span><label htmlFor="schedule-repository">Repository alias</label><input id="schedule-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="schedule-task">Task</label><textarea id="schedule-task" name="task" rows={4} maxLength={262144} required/><button id="schedule-submit" type="submit" disabled={schedulePending}>Create schedule</button></form>
-      <div className="schedule-list" aria-live="polite">{schedules.length ? schedules.map((schedule) => <ScheduleCard key={schedule.id} schedule={schedule} revision={scheduleRevision} csrf={session.csrf || ''} onInspect={(id) => void inspect(id)} onError={setNotice}/> ) : <p className="empty">No schedules are configured.</p>}</div></section>
+      <div className="schedule-list" aria-live="polite">{schedules.length ? schedules.map((schedule) => <ScheduleCard key={schedule.id} schedule={schedule} revision={scheduleRevision} csrf={session.csrf || ''} onInspect={(id) => void inspect(id)} onRefresh={refreshSchedules} onError={setNotice}/> ) : <p className="empty">No schedules are configured.</p>}</div></section>
     {detail && <JobDetail key={detail.job.id} job={detail.job} history={detail.history} csrf={session.csrf || ''} onRefresh={() => { void refreshJobs(); }} onError={setNotice} />}
   </main></>;
 }
 
-function ScheduleCard({ schedule, revision, csrf, onInspect, onError }: { schedule: Schedule; revision: number; csrf: string; onInspect: (id: string) => void; onError: (message: string) => void }) {
+function ScheduleCard({ schedule, revision, csrf, onInspect, onRefresh, onError }: { schedule: Schedule; revision: number; csrf: string; onInspect: (id: string) => void; onRefresh: () => Promise<Schedule[]>; onError: (message: string) => void }) {
   const [runs, setRuns] = useState<{ occurrence_at: string; status: string; job_id: string }[]>([]);
+  const [edit, setEdit] = useState<ScheduleDefinition | null>(null);
+  const [editETag, setEditETag] = useState('');
+  const [busy, setBusy] = useState(false);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { let active = true; void api<{ runs?: typeof runs }>(`/v1/schedules/${encodeURIComponent(schedule.id)}/runs?limit=5`, {}, csrf).then((page) => { if (active) setRuns(page.runs || []); }).catch((error) => { if (active) onError((error as Error).message); }); return () => { active = false; }; }, [schedule.id, revision, csrf, onError]);
-  return <article className="schedule-row"><div className="schedule-heading"><h3>{schedule.id}</h3><span className={`status ${schedule.status}`}>{schedule.status}</span></div><p className="schedule-meta"><span className="schedule-cron">UTC · {schedule.cron}</span></p>{schedule.pending_occurrence_at && <p className="schedule-summary">Pending occurrence: {new Date(schedule.pending_occurrence_at).toISOString()}</p>}{schedule.skipped_occurrences && <p className="schedule-summary">Skipped {schedule.skipped_occurrences.count} occurrence{schedule.skipped_occurrences.count === 1 ? '' : 's'} · {new Date(schedule.skipped_occurrences.first_at).toISOString()} to {new Date(schedule.skipped_occurrences.last_at).toISOString()}</p>}<h4 className="schedule-runs-title">Recent runs</h4>{runs.length === 0 ? <p className="muted">No retained runs.</p> : <ul className="schedule-runs">{runs.map((run) => <li key={run.job_id}><span className="schedule-run-time">{new Date(run.occurrence_at).toISOString()}</span><span className={`status ${run.status}`}>{run.status}</span><a className="schedule-run-link" href={`#job-${encodeURIComponent(run.job_id)}`} onClick={(e) => { e.preventDefault(); onInspect(run.job_id); }}>Job {run.job_id}</a></li>)}</ul>}</article>;
+  async function openEdit() {
+    setBusy(true);
+    try {
+      let etag = '';
+      const definition = await api<ScheduleDefinition>(`/v1/schedules/${encodeURIComponent(schedule.id)}`, {}, csrf, (response) => { etag = response.headers.get('ETag') || ''; });
+      if (!etag) throw new Error('The schedule response did not include a revision ETag. Refresh and try again.');
+      if (mounted.current) { setEdit(definition); setEditETag(etag); }
+    } catch (error) { if (mounted.current) onError((error as Error).message); }
+    finally { if (mounted.current) setBusy(false); }
+  }
+  async function mutate(action: 'edit' | 'pause' | 'resume' | 'remove', form?: HTMLFormElement) {
+    if (busy) return;
+    setBusy(true);
+    try {
+      let etag = editETag;
+      if (action !== 'edit') {
+        const latest = await onRefresh();
+        const current = latest.find((item) => item.id === schedule.id);
+        if (!current) throw new Error('Schedule is no longer available. The list has been refreshed.');
+        etag = `"${current.revision}"`;
+      }
+      let body: string | undefined;
+      if (action === 'edit' && form) {
+        const values = new FormData(form);
+        body = JSON.stringify({ action, cron: String(values.get('cron') || '').trim(), repository: String(values.get('repository') || '').trim(), task: String(values.get('task') || '') });
+      } else if (action !== 'remove') body = JSON.stringify({ action });
+      await api(`/v1/schedules/${encodeURIComponent(schedule.id)}`, { method: action === 'remove' ? 'DELETE' : 'PATCH', headers: { ...(body ? { 'Content-Type': 'application/json' } : {}), 'If-Match': etag }, ...(body ? { body } : {}) }, csrf);
+      if (!mounted.current) return;
+      setEdit(null); setEditETag(''); onError(`Schedule ${action === 'remove' ? 'removed' : action === 'pause' ? 'paused' : action === 'resume' ? 'resumed' : 'updated'}.`); await onRefresh();
+    } catch (error) {
+      if (!mounted.current) return;
+      const failure = error as ApiError;
+      if (failure.code === 'revision_conflict' || failure.code === 'precondition_required') {
+        setEdit(null); setEditETag('');
+        await onRefresh();
+        onError(failure.code === 'revision_conflict' ? 'Schedule changed since this view was loaded. The list is refreshed; review it and open edit again before trying again.' : 'The server requires a current revision. The list is refreshed; review it and try the action again.');
+      } else onError(failure.message);
+    } finally { if (mounted.current) setBusy(false); }
+  }
+  return <article className="schedule-row"><div className="schedule-heading"><h3>{schedule.id}</h3><span className={`status ${schedule.status}`}>{schedule.status}</span></div><p className="schedule-meta"><span className="schedule-cron">UTC · {schedule.cron}</span></p>{schedule.pending_occurrence_at && <p className="schedule-summary">Pending occurrence: {new Date(schedule.pending_occurrence_at).toISOString()}</p>}{schedule.skipped_occurrences && <p className="schedule-summary">Skipped {schedule.skipped_occurrences.count} occurrence{schedule.skipped_occurrences.count === 1 ? '' : 's'} · {new Date(schedule.skipped_occurrences.first_at).toISOString()} to {new Date(schedule.skipped_occurrences.last_at).toISOString()}</p>}<div className="actions" aria-label={`Schedule ${schedule.id} controls`}><button className="secondary" type="button" disabled={busy || schedule.status === 'removed'} onClick={() => void openEdit()}>Edit</button>{schedule.status !== 'removed' && <button className="secondary" type="button" disabled={busy} onClick={() => void mutate(schedule.status === 'paused' ? 'resume' : 'pause')}>{schedule.status === 'paused' ? 'Resume' : 'Pause'}</button>}{schedule.status !== 'removed' && <button className="danger" type="button" disabled={busy} onClick={() => { if (window.confirm('Remove this schedule? Existing Jobs are not changed.')) void mutate('remove'); }}>Remove</button>}</div>{edit && <form className="schedule-form schedule-edit" aria-label={`Edit schedule ${schedule.id}`} onSubmit={(event) => { event.preventDefault(); void mutate('edit', event.currentTarget); }}><h4>Edit schedule</h4><label htmlFor={`edit-cron-${schedule.id}`}>Cron (UTC)</label><input id={`edit-cron-${schedule.id}`} name="cron" maxLength={128} required autoComplete="off" value={edit.cron} onChange={(event) => setEdit({ ...edit, cron: event.target.value })}/><label htmlFor={`edit-repository-${schedule.id}`}>Repository alias</label><input id={`edit-repository-${schedule.id}`} name="repository" maxLength={64} required autoComplete="off" value={edit.repository} onChange={(event) => setEdit({ ...edit, repository: event.target.value })}/><label htmlFor={`edit-task-${schedule.id}`}>Task</label><textarea id={`edit-task-${schedule.id}`} name="task" rows={4} maxLength={262144} required value={edit.task} onChange={(event) => setEdit({ ...edit, task: event.target.value })}/><div className="actions"><button type="submit" disabled={busy}>Save schedule</button><button className="secondary" type="button" disabled={busy} onClick={() => { setEdit(null); setEditETag(''); }}>Cancel</button></div></form>}<h4 className="schedule-runs-title">Recent runs</h4>{runs.length === 0 ? <p className="muted">No retained runs.</p> : <ul className="schedule-runs">{runs.map((run) => <li key={run.job_id}><span className="schedule-run-time">{new Date(run.occurrence_at).toISOString()}</span><span className={`status ${run.status}`}>{run.status}</span><a className="schedule-run-link" href={`#job-${encodeURIComponent(run.job_id)}`} onClick={(e) => { e.preventDefault(); onInspect(run.job_id); }}>Job {run.job_id}</a></li>)}</ul>}</article>;
 }
 function JobDetail({ job, history, csrf, onRefresh, onError }: { job: Job; history: History; csrf: string; onRefresh: () => void; onError: (message: string) => void }) {
   const [busy, setBusy] = useState(false);

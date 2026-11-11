@@ -165,6 +165,9 @@ func dashboardRoute(path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/v1/schedules/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/v1/schedules/"), "/")
+		if len(parts) == 1 && parts[0] != "" {
+			return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+		}
 		return len(parts) == 2 && parts[0] != "" && parts[1] == "runs" && method == http.MethodGet
 	}
 	if path == "/v1/jobs" {
@@ -313,11 +316,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	case strings.HasPrefix(path, "/v1/schedules/"):
 		tail := strings.TrimPrefix(path, "/v1/schedules/")
 		parts := strings.Split(tail, "/")
-		if isDashboardOperator(r) {
-			if len(parts) != 2 || parts[0] == "" || parts[1] != "runs" {
-				writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
-				return
-			}
+		if isDashboardOperator(r) && len(parts) == 2 && parts[1] == "runs" {
 			h.handleDashboardScheduleRuns(w, r, parts[0])
 			return
 		}

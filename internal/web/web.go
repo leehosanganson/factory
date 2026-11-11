@@ -220,13 +220,26 @@ func dashboardProxyAllowed(path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/ui/api/v1/schedules/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")
+		if len(parts) == 1 && parts[0] != "" {
+			return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+		}
 		return len(parts) == 2 && parts[0] != "" && parts[1] == "runs" && method == http.MethodGet
 	}
 	return false
 }
 
 func dashboardProxyQueryAllowed(path, method string) bool {
-	return method == http.MethodGet && (path == "/ui/api/v1/jobs" || path == "/ui/api/v1/threads" || strings.HasPrefix(path, "/ui/api/v1/schedules/") && dashboardProxyAllowed(path, method))
+	if method != http.MethodGet {
+		return false
+	}
+	if path == "/ui/api/v1/jobs" || path == "/ui/api/v1/threads" {
+		return true
+	}
+	if strings.HasPrefix(path, "/ui/api/v1/schedules/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")
+		return len(parts) == 2 && parts[0] != "" && parts[1] == "runs"
+	}
+	return false
 }
 
 func dashboardThreadListQueryAllowed(query map[string][]string) bool {
