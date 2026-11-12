@@ -235,6 +235,10 @@ func (s *workerSessionStoreSpy) AuthenticateWorkerCapability(context.Context, st
 	return restjobs.WorkerSession{}, restjobs.ErrNotFound
 }
 
+func (s *workerSessionStoreSpy) HeartbeatWorkerSession(context.Context, string, string) (time.Time, error) {
+	return time.Time{}, restjobs.ErrNotFound
+}
+
 func (s *workerSessionStoreSpy) RetireWorkerCapability(context.Context, string, string) (restjobs.WorkerSession, error) {
 	s.capabilityRetirementCalls++
 	return restjobs.WorkerSession{}, restjobs.ErrNotFound
@@ -710,6 +714,109 @@ func TestWorkerListenerInlineCertificateMappingRemainsProcessConfigured(t *testi
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"principal_id":"worker-inline"`) {
 		t.Fatalf("inline certificate mapping registration=%d %s, want configured principal", response.Code, response.Body.String())
+	}
+}
+
+func TestWorkerHeartbeatRequiresCapabilityAndStrictEmptyRequest(t *testing.T) {
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(privateSQLiteTestDir(t), "worker-heartbeat-route.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	clientCert := workerTestCertificate(t, "heartbeat-client", true)
+	fingerprint := sha256.Sum256(clientCert.Certificate[0])
+	handler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(fingerprint[:]), PrincipalID: "worker-heartbeat-route", Enabled: true}}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, _, err := store.RegisterWorkerSession(context.Background(), "worker-heartbeat-route", "boot-heartbeat-route")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := func(cert tls.Certificate, capability, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		r := httptest.NewRequest(http.MethodPost, "/v1/worker/session/heartbeat", strings.NewReader(body))
+		r.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, cert.Certificate[0])}}
+		if capability != "" {
+			r.Header.Set("Authorization", "Bearer "+capability)
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, r)
+		return response
+	}
+	if response := request(clientCert, "", `{}`); response.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated heartbeat status=%d body=%s, want 401", response.Code, response.Body.String())
+	}
+	for _, body := range []string{`{"unexpected":true}`, `{`, `[]`, `null`, `{} {}`} {
+		if response := request(clientCert, session.Capability, body); response.Code != http.StatusBadRequest {
+			t.Errorf("invalid heartbeat body %q status=%d body=%s, want 400", body, response.Code, response.Body.String())
+		}
+	}
+	queryRequest := httptest.NewRequest(http.MethodPost, "/v1/worker/session/heartbeat?debug=true", strings.NewReader(`{}`))
+	queryRequest.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, clientCert.Certificate[0])}}
+	queryRequest.Header.Set("Authorization", "Bearer "+session.Capability)
+	queryResponse := httptest.NewRecorder()
+	handler.ServeHTTP(queryResponse, queryRequest)
+	if queryResponse.Code != http.StatusBadRequest {
+		t.Fatalf("heartbeat query status=%d body=%s, want 400", queryResponse.Code, queryResponse.Body.String())
+	}
+	job, _, err := store.Admit("heartbeat-no-lifecycle-change", restjobs.Request{Repository: "widget", Task: "queued remains queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHistory, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(clientCert, session.Capability, `{}`)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"heartbeat_at"`) {
+		t.Fatalf("authenticated heartbeat status=%d body=%s, want persisted timestamp", response.Code, response.Body.String())
+	}
+	after, err := store.Get(job.ID)
+	afterHistory, historyErr := store.History(job.ID)
+	if err != nil || historyErr != nil || after.Status != before.Status || len(afterHistory.Events) != len(beforeHistory.Events) {
+		t.Fatalf("heartbeat changed job lifecycle: before=%+v after=%+v histories=%+v/%+v errs=%v/%v", before, after, beforeHistory, afterHistory, err, historyErr)
+	}
+	rotated, replay, err := store.RegisterWorkerSession(context.Background(), session.PrincipalID, session.BootID)
+	if err != nil || !replay {
+		t.Fatalf("rotate capability=(%+v,%v,%v)", rotated, replay, err)
+	}
+	if response := request(clientCert, session.Capability, `{}`); response.Code != http.StatusUnauthorized {
+		t.Fatalf("rotated capability heartbeat status=%d body=%s, want 401", response.Code, response.Body.String())
+	}
+	if response := request(clientCert, rotated.Capability, `{}`); response.Code != http.StatusOK {
+		t.Fatalf("rotated active capability heartbeat status=%d body=%s, want 200", response.Code, response.Body.String())
+	}
+	otherCert := workerTestCertificate(t, "heartbeat-other-principal", true)
+	otherFingerprint := sha256.Sum256(otherCert.Certificate[0])
+	otherHandler, err := NewWorkerListenerHandler(WorkerListenerConfig{MaxClientCertLifetime: "72h", Certificates: []WorkerCertificatePrincipal{{SHA256: hex.EncodeToString(otherFingerprint[:]), PrincipalID: "worker-heartbeat-other", Enabled: true}}}, store, func() bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherRequest := httptest.NewRequest(http.MethodPost, "/v1/worker/session/heartbeat", strings.NewReader(`{}`))
+	otherRequest.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{workerTestParsedCertificate(t, otherCert.Certificate[0])}}
+	otherRequest.Header.Set("Authorization", "Bearer "+rotated.Capability)
+	otherResponse := httptest.NewRecorder()
+	otherHandler.ServeHTTP(otherResponse, otherRequest)
+	if otherResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("mismatched principal heartbeat status=%d body=%s, want 401", otherResponse.Code, otherResponse.Body.String())
+	}
+	retired, err := store.RetireWorkerCapability(context.Background(), session.PrincipalID, rotated.Capability)
+	if err != nil || retired.Status != "retired" {
+		t.Fatalf("retire session with rotated capability=(%+v,%v)", retired, err)
+	}
+	if response := request(clientCert, rotated.Capability, `{}`); response.Code != http.StatusUnauthorized {
+		t.Fatalf("retired capability heartbeat status=%d body=%s, want 401", response.Code, response.Body.String())
+	}
+	if _, err := store.RetireWorkerSession(context.Background(), session.PrincipalID, session.BootID, session.ID); !errors.Is(err, restjobs.ErrNotFound) {
+		t.Fatal(err)
+	}
+	if response := request(clientCert, session.Capability, `{}`); response.Code != http.StatusUnauthorized {
+		t.Fatalf("retired capability heartbeat status=%d body=%s, want 401", response.Code, response.Body.String())
 	}
 }
 

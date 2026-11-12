@@ -70,6 +70,7 @@ type Config struct {
 	Provider           ProviderConfig          `json:"provider"`
 	WebUI              WebUIConfig             `json:"web_ui,omitempty"`
 	WorkerListener     *WorkerListenerConfig   `json:"worker_listener,omitempty"`
+	WorkerController   *WorkerControllerConfig `json:"worker_controller,omitempty"`
 	GitHubWebhook      GitHubWebhookConfig     `json:"github_webhook,omitempty"`
 	WorkersEnabled     *bool                   `json:"workers_enabled,omitempty"`
 	WorkerID           string                  `json:"worker_id,omitempty"`
@@ -152,6 +153,14 @@ type WorkerListenerConfig struct {
 	Certificates          []WorkerCertificatePrincipal `json:"certificates,omitempty"`
 }
 
+// WorkerControllerConfig connects a worker process to its authenticated session controller.
+type WorkerControllerConfig struct {
+	BaseURL        string `json:"base_url"`
+	ClientCertFile string `json:"client_cert_file"`
+	ClientKeyFile  string `json:"client_key_file"`
+	ServerCAFile   string `json:"server_ca_file"`
+}
+
 // WorkerCertificatePrincipal maps an exact client certificate DER fingerprint to an identity.
 type WorkerCertificatePrincipal struct {
 	SHA256      string `json:"sha256"`
@@ -216,6 +225,9 @@ func LoadWorkerConfig(path string) (Config, error) {
 	if config.Persistence.Backend != PersistenceBackendPostgres {
 		return Config{}, errors.New("worker mode requires PostgreSQL persistence")
 	}
+	if config.WorkerController == nil {
+		return Config{}, errors.New("worker mode requires worker_controller configuration")
+	}
 	return config, nil
 }
 
@@ -257,6 +269,9 @@ func loadConfig(path string, requireAuth bool) (Config, error) {
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
 		return Config{}, errors.New("parse REST server config: expected one JSON value")
+	}
+	if requireAuth && config.WorkerController != nil {
+		return Config{}, errors.New("worker_controller is only valid in worker mode")
 	}
 	if !requireAuth {
 		config.APIKeyFile = ""
@@ -324,6 +339,18 @@ func (c Config) Validate() error {
 		return errors.New("Kubernetes execution is not implemented")
 	default:
 		return errors.New("execution.mode must be local or kubernetes")
+	}
+	if c.WorkerController != nil {
+		controller := c.WorkerController
+		parsed, err := url.Parse(controller.BaseURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || (parsed.Path != "" && parsed.Path != "/") || strings.ContainsRune(controller.BaseURL, 0) {
+			return errors.New("worker_controller.base_url must be an HTTPS origin URL")
+		}
+		for _, path := range []struct{ name, value string }{{"client_cert_file", controller.ClientCertFile}, {"client_key_file", controller.ClientKeyFile}, {"server_ca_file", controller.ServerCAFile}} {
+			if !filepath.IsAbs(path.value) || strings.TrimSpace(path.value) == "" || strings.ContainsRune(path.value, 0) {
+				return fmt.Errorf("worker_controller.%s must be an absolute path", path.name)
+			}
+		}
 	}
 	if c.Provider.Backend != "" && c.Provider.Backend != "github" {
 		return errors.New("provider.backend must be github when configured")
@@ -708,7 +735,7 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "worker_listener": {}, "github_webhook": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "worker_listener": {}, "worker_controller": {}, "github_webhook": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
 	case "execution":
 		fields = map[string]struct{}{"mode": {}}
 	case "harness":
@@ -723,6 +750,8 @@ func configFieldAllowed(parent, key string) bool {
 		fields = map[string]struct{}{"enabled": {}, "operator_id": {}}
 	case "worker_listener":
 		fields = map[string]struct{}{"listen_address": {}, "max_client_cert_lifetime": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "mapping_file": {}, "certificates": {}}
+	case "worker_controller":
+		fields = map[string]struct{}{"base_url": {}, "client_cert_file": {}, "client_key_file": {}, "server_ca_file": {}}
 	case "github_webhook":
 		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}, "owner_generations": {}}
 	case "github_webhook_sources", "github_webhook_owners", "github_webhook_owner_generations":
@@ -823,6 +852,17 @@ func validateRequiredConfigFields(data []byte) error {
 			}
 		}
 	}
+	if raw, exists := fields["worker_controller"]; exists {
+		var controller map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &controller); err != nil {
+			return errors.New("worker_controller must be an object")
+		}
+		for _, field := range []string{"base_url", "client_cert_file", "client_key_file", "server_ca_file"} {
+			if _, ok := controller[field]; !ok {
+				return fmt.Errorf("required worker_controller field %q is missing", field)
+			}
+		}
+	}
 	if raw, exists := fields["worker_listener"]; exists {
 		var listener map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &listener); err != nil {
@@ -857,7 +897,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "worker_listener", "github_webhook", "certificates", "repositories", "verification_checks", "execution":
+	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "worker_listener", "worker_controller", "github_webhook", "certificates", "repositories", "verification_checks", "execution":
 		return key
 	case "sources":
 		return "github_webhook_sources"

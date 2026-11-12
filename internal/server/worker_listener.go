@@ -61,6 +61,10 @@ func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		writeWorkerJSON(w, http.StatusNotFound, map[string]string{"code": "not_found"})
 		return
 	}
+	if r.URL.Path == "/v1/worker/session/heartbeat" && r.Method == http.MethodPost {
+		h.heartbeat(w, r)
+		return
+	}
 	if r.URL.Path == "/v1/worker/session" && (r.Method == http.MethodGet || r.Method == http.MethodDelete) {
 		if r.URL.RawQuery != "" {
 			writeWorkerJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request"})
@@ -129,6 +133,42 @@ func (h *WorkerListenerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeWorkerJSON(w, http.StatusNotFound, map[string]string{"code": "not_found"})
+}
+
+func (h *WorkerListenerHandler) heartbeat(w http.ResponseWriter, r *http.Request) {
+	session, ok := h.requireCapability(w, r)
+	if !ok {
+		return
+	}
+	if !h.ready() {
+		writeWorkerJSON(w, http.StatusServiceUnavailable, map[string]string{"code": "not_ready"})
+		return
+	}
+	if r.URL.RawQuery != "" {
+		writeWorkerJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request"})
+		return
+	}
+	if !decodeWorkerHeartbeat(w, r) {
+		return
+	}
+	heartbeatAt, err := h.store.HeartbeatWorkerSession(r.Context(), session.PrincipalID, bearerCapability(r))
+	if err != nil {
+		writeWorkerCapabilityError(w, err)
+		return
+	}
+	writeWorkerJSON(w, http.StatusOK, map[string]time.Time{"heartbeat_at": heartbeatAt})
+}
+
+func decodeWorkerHeartbeat(w http.ResponseWriter, r *http.Request) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxWorkerSessionRequestBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var request map[string]json.RawMessage
+	if decoder.Decode(&request) != nil || request == nil || len(request) != 0 || decoder.Decode(new(any)) != io.EOF {
+		writeWorkerJSON(w, http.StatusBadRequest, map[string]string{"code": "invalid_request"})
+		return false
+	}
+	return true
 }
 
 func (h *WorkerListenerHandler) register(w http.ResponseWriter, r *http.Request, principal string) {

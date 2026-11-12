@@ -1093,6 +1093,15 @@ func TestWorkerCommandRejectsInvalidWorkerConfigBeforeRuntime(t *testing.T) {
 	if err := run([]string{"worker", "--config", path}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "worker mode requires PostgreSQL persistence") {
 		t.Fatalf("worker with SQLite config error=%v, want PostgreSQL-only validation before runtime", err)
 	}
+
+	path = filepath.Join(t.TempDir(), "missing-controller.json")
+	config = `{"mode":"local_process","repositories":{"trusted":"/srv/trusted"},"harness":{"executable":"pi","args":["{task}","{system_prompt}"]},"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}}`
+	if err := os.WriteFile(path, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"worker", "--config", path}, strings.NewReader(""), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "worker mode requires worker_controller configuration") {
+		t.Fatalf("worker without controller config error=%v", err)
+	}
 }
 
 func TestServerCommandRequiresExactAbsoluteConfigSyntax(t *testing.T) {

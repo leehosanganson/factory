@@ -79,6 +79,9 @@ func Run(ctx context.Context, config restserver.Config) error {
 }
 
 func run(ctx context.Context, config restserver.Config, options runtimeOptions) error {
+	if config.WorkerController != nil {
+		return errors.New("worker_controller is only valid in worker mode")
+	}
 	if ctx == nil {
 		return errors.New("server context must not be nil")
 	}
