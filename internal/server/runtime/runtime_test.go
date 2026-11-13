@@ -1598,6 +1598,19 @@ func TestKubernetesExecutionGateRejectsBeforeRuntimeResources(t *testing.T) {
 	}
 }
 
+func TestWorkerControllerSettingsAreRejectedByServerRuntime(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	config.WorkerController = &restserver.WorkerControllerConfig{BaseURL: "https://controller.example", ClientCertFile: "/run/client.crt", ClientKeyFile: "/run/client.key", ServerCAFile: "/run/ca.crt"}
+	opened := false
+	err := run(context.Background(), config, runtimeOptions{OpenStore: func(restserver.Config) (restjobs.Store, error) {
+		opened = true
+		return nil, errors.New("store must not open")
+	}})
+	if err == nil || !strings.Contains(err.Error(), "worker_controller is only valid in worker mode") || opened {
+		t.Fatalf("server runtime error=%v opened store=%v", err, opened)
+	}
+}
+
 func TestRunConfiguredPostgresStartupFailureDoesNotOpenListenerOrLeakDSN(t *testing.T) {
 	config, _ := runtimeFixture(t)
 	config.Persistence = restserver.PersistenceConfig{

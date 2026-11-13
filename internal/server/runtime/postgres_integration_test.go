@@ -4,8 +4,11 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -966,6 +969,30 @@ func reconcileRuntimeIntegrationJob(t *testing.T, baseURL, key, id string) (int,
 	return response.StatusCode, result.Error.Code, result.Error.Message
 }
 
+func writeRuntimeTLSFiles(t *testing.T, certPath, keyPath, caPath string, certificate tls.Certificate, caPEM []byte) {
+	t.Helper()
+	var certPEM []byte
+	for _, der := range certificate.Certificate {
+		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []struct {
+		path string
+		data []byte
+	}{
+		{certPath, certPEM},
+		{keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})},
+		{caPath, caPEM},
+	} {
+		if err := os.WriteFile(file.path, file.data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func findModuleRoot(t *testing.T) string {
 	t.Helper()
 
@@ -1045,6 +1072,28 @@ func TestPostgresControlPlaneAndSeparateWorkerProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.Persistence = restserver.PersistenceConfig{Backend: "postgres", DSN: scopedDSN}
+	controllerServerCert, serverCA := runtimeTestCertificate(t, "controller", false)
+	workerClientCert, clientCA := runtimeTestCertificate(t, "worker", true)
+	serverCertPath := filepath.Join(root, "controller.crt")
+	serverKeyPath := filepath.Join(root, "controller.key")
+	serverCAPath := filepath.Join(root, "controller-ca.crt")
+	clientCertPath := filepath.Join(root, "worker.crt")
+	clientKeyPath := filepath.Join(root, "worker.key")
+	clientCAPath := filepath.Join(root, "worker-ca.crt")
+	writeRuntimeTLSFiles(t, serverCertPath, serverKeyPath, serverCAPath, controllerServerCert, serverCA)
+	writeRuntimeTLSFiles(t, clientCertPath, clientKeyPath, clientCAPath, workerClientCert, clientCA)
+	workerListenerProbe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerListenerAddress := workerListenerProbe.Addr().String()
+	_ = workerListenerProbe.Close()
+	clientFingerprint := sha256.Sum256(workerClientCert.Certificate[0])
+	config.WorkerListener = &restserver.WorkerListenerConfig{
+		ListenAddress: workerListenerAddress, MaxClientCertLifetime: "2h",
+		ServerCertFile: serverCertPath, ServerKeyFile: serverKeyPath, ClientCAFile: clientCAPath,
+		Certificates: []restserver.WorkerCertificatePrincipal{{SHA256: fmt.Sprintf("%x", clientFingerprint), PrincipalID: "process-worker-principal", Enabled: true}},
+	}
 	disabled := false
 	config.WorkersEnabled = &disabled
 	config.WorkerID = "control-plane"
@@ -1064,6 +1113,10 @@ func TestPostgresControlPlaneAndSeparateWorkerProcess(t *testing.T) {
 	workerConfig.APIKeyFile = filepath.Join(root, "must-not-load-api-key")
 	workerConfig.Principals[0].TokenFile = filepath.Join(root, "must-not-load-principal-verifier")
 	workerConfig.WorkerID = "process-worker"
+	workerConfig.WorkerController = &restserver.WorkerControllerConfig{
+		BaseURL: "https://" + workerListenerAddress, ClientCertFile: clientCertPath,
+		ClientKeyFile: clientKeyPath, ServerCAFile: serverCAPath,
+	}
 	workerBytes, _ := json.Marshal(workerConfig)
 	if err := os.WriteFile(workerPath, workerBytes, 0o600); err != nil {
 		t.Fatal(err)

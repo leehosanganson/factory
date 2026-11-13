@@ -335,6 +335,43 @@ func TestManagerConcurrencyLimitConstrainsCoordinator(t *testing.T) {
 	}
 }
 
+func TestStopClaimsLetsRunningExecutionFinishAndDoesNotClaimQueuedJobs(t *testing.T) {
+	manager := newTestManager(t, 3, 1)
+	first := admit(t, manager, "claim-stop-running")
+	second := admit(t, manager, "claim-stop-queued")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	coordinator, err := New(manager, executorFunc(func(ctx context.Context, job restjobs.Snapshot) error {
+		if job.ID == first.ID {
+			close(started)
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		t.Errorf("executor started queued job %s after claim stop", job.ID)
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	coordinator.StopClaims()
+	close(release)
+	waitForStatus(t, manager, first.ID, restjobs.StatusSucceeded)
+	secondStatus, err := manager.Get(second.ID)
+	if err != nil || secondStatus.Status != restjobs.StatusQueued {
+		t.Fatalf("queued job after StopClaims=(%+v,%v), want queued", secondStatus, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSingleWorkerExecutesFIFO(t *testing.T) {
 	manager := newTestManager(t, 3, 1)
 	var jobs []restjobs.Snapshot

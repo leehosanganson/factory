@@ -57,14 +57,17 @@ type workerLifecycleStore interface {
 
 // Coordinator dispatches attempt-fenced job claims to a fixed set of workers.
 type Coordinator struct {
-	store    workerLifecycleStore
-	executor Executor
-	ctx      context.Context
-	cancel   context.CancelFunc
-	done     chan struct{}
+	store        workerLifecycleStore
+	executor     Executor
+	ctx          context.Context
+	cancel       context.CancelFunc
+	claimCtx     context.Context
+	cancelClaims context.CancelFunc
+	done         chan struct{}
 
 	mu            sync.Mutex
 	stopped       bool
+	claimsStopped bool
 	starting      int
 	startsDone    chan struct{}
 	startsDoneSet bool
@@ -97,6 +100,7 @@ func New(store workerLifecycleStore, executor Executor, config CoordinatorConfig
 		return nil, fmt.Errorf("%w: store, executor, and positive worker count are required", ErrInvalidConfig)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	claimCtx, cancelClaims := context.WithCancel(ctx)
 	workerID, bootID := config.WorkerID, config.BootID
 	if workerID == "" {
 		workerID = "worker-local"
@@ -106,6 +110,7 @@ func New(store workerLifecycleStore, executor Executor, config CoordinatorConfig
 	}
 	coordinator := &Coordinator{
 		store: store, executor: executor, ctx: ctx, cancel: cancel,
+		claimCtx: claimCtx, cancelClaims: cancelClaims,
 		done: make(chan struct{}), startsDone: make(chan struct{}), jobs: make(map[string]context.CancelFunc), workerID: workerID, bootID: bootID,
 		beforeStart: config.beforeStart,
 	}
@@ -137,6 +142,9 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 	})
 	select {
 	case <-c.startsDone:
+		c.mu.Lock()
+		c.claimsStopped = true
+		c.mu.Unlock()
 	case <-ctx.Done():
 		c.cancel()
 		return ctx.Err()
@@ -148,6 +156,19 @@ func (c *Coordinator) Shutdown(ctx context.Context) error {
 		c.cancel()
 		return ctx.Err()
 	}
+}
+
+// StopClaims prevents this coordinator from claiming more work without closing
+// the shared store or canceling executions that already started.
+func (c *Coordinator) StopClaims() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.claimsStopped {
+		return
+	}
+	c.claimsStopped = true
+	c.cancelClaims()
+	c.closeStartsDoneIfReady()
 }
 
 func (c *Coordinator) RequestCancel(id string) (restjobs.Snapshot, error) {
@@ -169,12 +190,12 @@ func (c *Coordinator) worker() {
 	defer c.wg.Done()
 	for {
 		c.mu.Lock()
-		stopped := c.stopped
+		stopped := c.claimsStopped
 		c.mu.Unlock()
 		if stopped {
 			return
 		}
-		claim, err := c.store.WaitClaimAttempt(c.ctx)
+		claim, err := c.store.WaitClaimAttempt(c.claimCtx)
 		if err != nil {
 			if errors.Is(err, restjobs.ErrManagerClosed) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -209,7 +230,7 @@ func (c *Coordinator) worker() {
 func (c *Coordinator) claimExecutionStart() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.stopped {
+	if c.stopped || c.claimsStopped {
 		return false
 	}
 	c.starting++

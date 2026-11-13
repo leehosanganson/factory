@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/leehosanganson/factory/internal/jobs"
@@ -23,11 +24,17 @@ func RunWorker(ctx context.Context, config restserver.Config) error {
 	if ctx == nil {
 		return errors.New("worker context must not be nil")
 	}
-	if err := config.Validate(); err != nil {
+	if err := config.Validate(); err != nil && !(config.Execution != nil && config.Execution.Mode == "kubernetes" && strings.Contains(err.Error(), "Kubernetes execution is not implemented")) {
 		return fmt.Errorf("invalid REST worker config: %w", err)
+	}
+	if config.Execution != nil && config.Execution.Mode == "kubernetes" {
+		return errors.New("Kubernetes execution is not implemented")
 	}
 	if config.Persistence.Backend != restserver.PersistenceBackendPostgres {
 		return errors.New("factory worker requires PostgreSQL persistence")
+	}
+	if config.WorkerController == nil {
+		return errors.New("factory worker requires worker_controller configuration")
 	}
 	if err := config.ValidateRepositoryRoots(); err != nil {
 		return err
@@ -37,6 +44,11 @@ func RunWorker(ctx context.Context, config restserver.Config) error {
 		workerID = fmt.Sprintf("factory-%d", os.Getpid())
 	}
 	bootID := processBootID()
+	controller, err := newWorkerSessionClient(*config.WorkerController)
+	if err != nil {
+		return err
+	}
+	defer controller.close()
 	limits := restjobs.Config{QueueCapacity: config.Limits.QueueCapacity, MaxConcurrentJobs: config.Limits.Workers, MaxRecords: config.Limits.MaxRecords, MaxEventsPerJob: config.Limits.MaxEventsPerJob, MaxTaskBytes: config.Limits.TaskBytes, RegistryBytes: config.Limits.RegistryBytes}
 	store, err := restjobs.OpenPostgresWorkerStore(config.Persistence.DSN, limits, workerID, bootID)
 	if err != nil {
@@ -93,16 +105,46 @@ func RunWorker(ctx context.Context, config restserver.Config) error {
 	if err != nil {
 		return fmt.Errorf("initialize REST workflow executor: %w", err)
 	}
+	registrationCtx, cancelRegistration := context.WithTimeout(ctx, workerSessionRequestTimeout)
+	err = controller.register(registrationCtx, bootID)
+	cancelRegistration()
+	if err != nil {
+		return err
+	}
 	coordinator, err := restworker.New(store, executor, restworker.CoordinatorConfig{Workers: config.Limits.Workers, WorkerID: workerID, BootID: bootID})
 	if err != nil {
 		return err
 	}
-	<-ctx.Done()
-	shutdownCtx, cancel := newShutdownContext(0)
+	heartbeatCtx, stopHeartbeats := context.WithCancel(ctx)
+	heartbeatFailure := make(chan struct{}, 1)
+	heartbeatDone := controller.workerSessionHeartbeat(heartbeatCtx, func() {
+		coordinator.StopClaims()
+		heartbeatFailure <- struct{}{}
+	})
+	failed := false
+	select {
+	case <-ctx.Done():
+	case <-heartbeatFailure:
+		failed = true
+	}
+	stopHeartbeats()
+	<-heartbeatDone
+	coordinator.StopClaims()
+	shutdownCtx, cancel := newWorkerShutdownContext(failed, 0)
 	defer cancel()
 	shutdownErr := coordinator.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
 		return fmt.Errorf("shut down REST worker: %w", shutdownErr)
 	}
+	if failed {
+		return errors.New("worker controller heartbeat failed; claims stopped")
+	}
 	return nil
+}
+
+func newWorkerShutdownContext(heartbeatFailed bool, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if heartbeatFailed {
+		return context.WithCancel(context.Background())
+	}
+	return newShutdownContext(timeout)
 }

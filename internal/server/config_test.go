@@ -186,8 +186,36 @@ func TestLoadControlPlaneConfigRequiresPostgresAndExplicitlyDisabledWorkers(t *t
 	}
 }
 
+func TestWorkerControllerConfigIsWorkerOnlyAndRequiresHTTPSAndAbsoluteTLSPaths(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}`
+	validController := `"worker_controller":{"base_url":"https://controller.example:8443","client_cert_file":"/run/worker.crt","client_key_file":"/run/worker.key","server_ca_file":"/run/controller-ca.crt"}`
+	config, err := LoadWorkerConfig(writeConfig(t, `{`+base+`,`+validController+`}`))
+	if err != nil || config.WorkerController == nil || config.WorkerController.BaseURL != "https://controller.example:8443" {
+		t.Fatalf("LoadWorkerConfig()=(%+v,%v), want configured worker controller", config.WorkerController, err)
+	}
+	for _, controller := range []string{
+		`{"base_url":"http://controller.example","client_cert_file":"/run/cert","client_key_file":"/run/key","server_ca_file":"/run/ca"}`,
+		`{"base_url":"https://user:password@controller.example","client_cert_file":"/run/cert","client_key_file":"/run/key","server_ca_file":"/run/ca"}`,
+		`{"base_url":"https://controller.example/path?token=x","client_cert_file":"/run/cert","client_key_file":"/run/key","server_ca_file":"/run/ca"}`,
+		`{"base_url":"https://controller.example","client_cert_file":"relative","client_key_file":"/run/key","server_ca_file":"/run/ca"}`,
+		`{"base_url":"https://controller.example","client_cert_file":"/run/cert","client_key_file":"/run/key"}`,
+		`{"base_url":"https://controller.example","client_cert_file":"/run/cert","client_key_file":"/run/key","server_ca_file":"/run/ca","heartbeat_interval":"1s"}`,
+	} {
+		if _, err := LoadWorkerConfig(writeConfig(t, `{`+base+`,"worker_controller":`+controller+`}`)); err == nil {
+			t.Errorf("LoadWorkerConfig() accepted worker_controller %s", controller)
+		}
+	}
+	if _, err := LoadWorkerConfig(writeConfig(t, `{`+base+`}`)); err == nil {
+		t.Fatal("worker config without worker_controller was accepted")
+	}
+	serverConfig := strings.Replace(base, `,"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}`, `,"api_key_file":"/run/key","principals":[{"id":"admin","role":"operator","token_file":"/run/admin.json","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}`, 1)
+	if _, err := LoadConfig(writeConfig(t, `{`+serverConfig+`,`+validController+`}`)); err == nil {
+		t.Fatal("factory server config accepted client-only worker_controller settings")
+	}
+}
+
 func TestLoadWorkerConfigDoesNotRequireCallerCredentialsButKeepsStrictConfig(t *testing.T) {
-	config, err := LoadWorkerConfig(writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/secret/api-key","principals":[{"id":"unused","role":"operator","token_file":"/secret/verifier","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"}}`))
+	config, err := LoadWorkerConfig(writeConfig(t, `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/secret/api-key","principals":[{"id":"unused","role":"operator","token_file":"/secret/verifier","enabled":true}],"persistence":{"backend":"postgres","dsn":"postgres://worker:secret@localhost/factory"},"worker_controller":{"base_url":"https://controller.example","client_cert_file":"/secret/worker.crt","client_key_file":"/secret/worker.key","server_ca_file":"/secret/controller-ca.crt"}}`))
 	if err != nil || config.APIKeyFile != "" || len(config.Principals) != 0 {
 		t.Fatalf("worker-only config=(%+v,%v)", config, err)
 	}

@@ -15,6 +15,368 @@ import (
 	"time"
 )
 
+func TestSQLiteWorkerSessionHeartbeatRequiresActiveCapabilityAndAdvancesMonotonically(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "session-heartbeat.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session, _, err := store.RegisterWorkerSession(ctx, "worker-heartbeat", "boot-heartbeat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nearExpiry := time.Now().UTC().Add(5 * time.Minute)
+	if _, err := store.db.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_expires_at=? WHERE id=?`, nearExpiry.Format(time.RFC3339Nano), session.ID); err != nil {
+		t.Fatal(err)
+	}
+	session.CapabilityExpiresAt = &nearExpiry
+	first, err := store.HeartbeatWorkerSession(ctx, "worker-heartbeat", session.Capability)
+	if err != nil || first.IsZero() {
+		t.Fatalf("first heartbeat=(%v,%v), want persisted timestamp", first, err)
+	}
+	var renewedExpiry string
+	if err := store.db.QueryRowContext(ctx, `SELECT capability_expires_at FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&renewedExpiry); err != nil {
+		t.Fatal(err)
+	}
+	parsedRenewedExpiry, err := time.Parse(time.RFC3339Nano, renewedExpiry)
+	if err != nil || session.CapabilityExpiresAt == nil || !parsedRenewedExpiry.After(*session.CapabilityExpiresAt) {
+		t.Fatalf("heartbeat expiry=%q (%v), want extension beyond initial expiry %v", renewedExpiry, err, session.CapabilityExpiresAt)
+	}
+	var renewalAudits int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM factory_worker_session_audit WHERE session_id=? AND event='capability_renewed' AND capability_hash IS NOT NULL AND capability_expires_at IS NOT NULL`, session.ID).Scan(&renewalAudits); err != nil || renewalAudits != 1 {
+		t.Fatalf("heartbeat renewal audit count=%d err=%v, want one digest/expiry audit", renewalAudits, err)
+	}
+	second, err := store.HeartbeatWorkerSession(ctx, "worker-heartbeat", session.Capability)
+	if err != nil || second.Before(first) {
+		t.Fatalf("second heartbeat=(%v,%v), must not move backwards from %v", second, err, first)
+	}
+	if _, err := store.HeartbeatWorkerSession(ctx, "other-worker", session.Capability); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-principal heartbeat error=%v, want not found", err)
+	}
+	if _, err := store.RetireWorkerCapability(ctx, "worker-heartbeat", session.Capability); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.HeartbeatWorkerSession(ctx, "worker-heartbeat", session.Capability); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("retired-session heartbeat error=%v, want not found", err)
+	}
+	expired, _, err := store.RegisterWorkerSession(ctx, "worker-heartbeat-expired", "boot-heartbeat-expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_expires_at=? WHERE id=?`, time.Now().UTC().Add(-time.Second).Format("2006-01-02T15:04:05.000000000Z07:00"), expired.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.HeartbeatWorkerSession(ctx, expired.PrincipalID, expired.Capability); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired-session heartbeat error=%v, want not found", err)
+	}
+	var stored string
+	if err := store.db.QueryRowContext(ctx, `SELECT heartbeat_at FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := time.Parse(time.RFC3339Nano, stored)
+	if err != nil || persisted.Before(second) {
+		t.Fatalf("persisted heartbeat=%q (%v), want at least %v", stored, err, second)
+	}
+}
+
+func TestSQLiteWorkerSessionHeartbeatExpiryExtensionIsRetrySafe(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "session-heartbeat-expiry.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session, _, err := store.RegisterWorkerSession(ctx, "worker-heartbeat-expiry", "boot-heartbeat-expiry")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialExpiry := *session.CapabilityExpiresAt
+	now := initialExpiry.Add(-time.Minute)
+	first, err := heartbeatWorkerSessionAt(ctx, store.db, session.PrincipalID, session.Capability, "?", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var expiryAfterFirst string
+	if err := store.db.QueryRowContext(ctx, `SELECT capability_expires_at FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&expiryAfterFirst); err != nil {
+		t.Fatal(err)
+	}
+	renewedExpiry, err := time.Parse(time.RFC3339Nano, expiryAfterFirst)
+	if err != nil || !renewedExpiry.After(initialExpiry) {
+		t.Fatalf("expiry after renewal=%q (%v), want after initial %v", expiryAfterFirst, err, initialExpiry)
+	}
+	auditCount := func() int {
+		t.Helper()
+		var count int
+		if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM factory_worker_session_audit WHERE session_id=? AND event='capability_renewed'`, session.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	if got := auditCount(); got != 1 {
+		t.Fatalf("renewal audit count=%d, want one", got)
+	}
+	// The same request time models an exact retry after a lost response. It
+	// must neither shorten expiry nor add duplicate audit records.
+	retry, err := heartbeatWorkerSessionAt(ctx, store.db, session.PrincipalID, session.Capability, "?", now)
+	if err != nil || retry.Before(first) {
+		t.Fatalf("retry heartbeat=(%v,%v), want at least prior timestamp %v", retry, err, first)
+	}
+	var expiryAfterRetry string
+	if err := store.db.QueryRowContext(ctx, `SELECT capability_expires_at FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&expiryAfterRetry); err != nil {
+		t.Fatal(err)
+	}
+	if expiryAfterRetry != expiryAfterFirst || auditCount() != 1 {
+		t.Fatalf("idempotent retry changed expiry/audit: expiry %q -> %q, audit count %d", expiryAfterFirst, expiryAfterRetry, auditCount())
+	}
+}
+
+func TestSQLiteWorkerSessionHeartbeatTimestampComparesDifferentFractionalPrecisionByTime(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "session-heartbeat-precision.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session, _, err := store.RegisterWorkerSession(ctx, "worker-heartbeat-precision", "boot-heartbeat-precision")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previous := time.Date(2025, time.January, 2, 3, 4, 5, 200_000_000, time.UTC)
+	next := previous.Add(time.Nanosecond)
+	if _, err := store.db.ExecContext(ctx, `UPDATE factory_worker_sessions SET heartbeat_at=? WHERE id=?`, previous.Format("2006-01-02T15:04:05.0Z"), session.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := heartbeatWorkerSessionAt(ctx, store.db, session.PrincipalID, session.Capability, "?", next)
+	if err != nil || got.Before(next) {
+		t.Fatalf("heartbeat=(%v,%v), want at least %v despite different fractional precision", got, err, next)
+	}
+	var stored string
+	if err := store.db.QueryRowContext(ctx, `SELECT heartbeat_at FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := time.Parse(time.RFC3339Nano, stored)
+	if err != nil || persisted.Before(next) {
+		t.Fatalf("persisted heartbeat=%q (%v), want at least %v", stored, err, next)
+	}
+}
+
+func TestSQLiteWorkerCapabilityExpiryComparesDifferentFractionalPrecisionByTime(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "session-expiry-precision.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	comparisonTime := time.Date(2025, time.January, 2, 3, 4, 5, 110_000_000, time.UTC)
+	expiredAt := comparisonTime.Add(-10 * time.Millisecond)
+	validAt := comparisonTime.Add(10 * time.Millisecond)
+	setExpiry := func(session WorkerSession, expiry time.Time) {
+		t.Helper()
+		if _, err := store.db.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_expires_at=? WHERE id=?`, expiry.Format(time.RFC3339Nano), session.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	register := func(principal string) WorkerSession {
+		t.Helper()
+		session, _, err := store.RegisterWorkerSession(ctx, principal, "boot-expiry-precision")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return session
+	}
+
+	expiredHeartbeat := register("worker-expired-heartbeat-precision")
+	setExpiry(expiredHeartbeat, expiredAt) // Stored as ...05.1Z; comparison is ...05.11Z.
+	if _, err := heartbeatWorkerSessionAt(ctx, store.db, expiredHeartbeat.PrincipalID, expiredHeartbeat.Capability, "?", comparisonTime); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expired capability heartbeat error=%v, want not found", err)
+	}
+
+	expiredAuth := register("worker-expired-auth-precision")
+	setExpiry(expiredAuth, expiredAt)
+	if _, err := authenticateWorkerCapabilityAt(ctx, store.db, expiredAuth.PrincipalID, expiredAuth.Capability, "?", comparisonTime); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expired capability authentication error=%v, want not found", err)
+	}
+
+	expiredRetirement := register("worker-expired-retirement-precision")
+	setExpiry(expiredRetirement, expiredAt)
+	if _, err := retireSQLiteWorkerCapabilityAt(ctx, store.db, expiredRetirement.PrincipalID, expiredRetirement.Capability, comparisonTime); !errors.Is(err, ErrNotFound) {
+		t.Errorf("expired capability retirement error=%v, want not found", err)
+	}
+	var status string
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM factory_worker_sessions WHERE id=?`, expiredRetirement.ID).Scan(&status); err != nil || status != "active" {
+		t.Errorf("expired capability retirement status=%q err=%v, want active", status, err)
+	}
+
+	validHeartbeat := register("worker-valid-heartbeat-precision")
+	setExpiry(validHeartbeat, validAt)
+	if _, err := heartbeatWorkerSessionAt(ctx, store.db, validHeartbeat.PrincipalID, validHeartbeat.Capability, "?", comparisonTime); err != nil {
+		t.Errorf("valid capability heartbeat error=%v, want success", err)
+	}
+	validAuth := register("worker-valid-auth-precision")
+	setExpiry(validAuth, validAt)
+	if _, err := authenticateWorkerCapabilityAt(ctx, store.db, validAuth.PrincipalID, validAuth.Capability, "?", comparisonTime); err != nil {
+		t.Errorf("valid capability authentication error=%v, want success", err)
+	}
+	validRetirement := register("worker-valid-retirement-precision")
+	setExpiry(validRetirement, validAt)
+	if _, err := retireSQLiteWorkerCapabilityAt(ctx, store.db, validRetirement.PrincipalID, validRetirement.Capability, comparisonTime); err != nil {
+		t.Errorf("valid capability retirement error=%v, want success", err)
+	}
+}
+
+func TestSQLiteWorkerCapabilityExpiryIsCheckedAfterWaitingForWriteLock(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "session-expiry-lock.db")
+	firstStore, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		call func(WorkerSession) error
+	}{
+		{
+			name: "heartbeat",
+			call: func(session WorkerSession) error {
+				_, err := secondStore.HeartbeatWorkerSession(ctx, session.PrincipalID, session.Capability)
+				return err
+			},
+		},
+		{
+			name: "retirement",
+			call: func(session WorkerSession) error {
+				_, err := secondStore.RetireWorkerCapability(ctx, session.PrincipalID, session.Capability)
+				return err
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session, _, err := firstStore.RegisterWorkerSession(ctx, "worker-expiry-lock-"+tc.name, "boot-expiry-lock")
+			if err != nil {
+				t.Fatal(err)
+			}
+			expiresAt := time.Now().UTC().Add(100 * time.Millisecond)
+			if _, err := firstStore.db.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_expires_at=? WHERE id=?`, expiresAt.Format(time.RFC3339Nano), session.ID); err != nil {
+				t.Fatal(err)
+			}
+			lock, err := firstStore.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := lock.ExecContext(ctx, `UPDATE factory_worker_sessions SET heartbeat_at=heartbeat_at WHERE id=?`, session.ID); err != nil {
+				_ = lock.Rollback()
+				t.Fatal(err)
+			}
+
+			result := make(chan error, 1)
+			started := make(chan struct{})
+			go func() {
+				close(started)
+				result <- tc.call(session)
+			}()
+			<-started
+			deadline := time.Now().Add(time.Until(expiresAt) / 2)
+			for secondStore.db.Stats().InUse == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if secondStore.db.Stats().InUse == 0 {
+				t.Fatal("capability operation did not acquire a database connection before expiry")
+			}
+			select {
+			case err := <-result:
+				t.Fatalf("capability operation completed before lock release: %v", err)
+			case <-time.After(time.Until(expiresAt) + 50*time.Millisecond):
+			}
+			if err := lock.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-result:
+				if !errors.Is(err, ErrNotFound) {
+					t.Fatalf("expired capability operation error=%v, want not found", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("capability operation did not complete after lock release")
+			}
+		})
+	}
+}
+
+func TestSQLiteWorkerSessionConcurrentHeartbeatsNeverMoveBackwards(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "session-heartbeat-race.db")
+	firstStore, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	session, _, err := firstStore.RegisterWorkerSession(context.Background(), "worker-heartbeat-race", "boot-heartbeat-race")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores := []*SQLiteStore{firstStore, secondStore}
+	const contenders = 12
+	var wg sync.WaitGroup
+	errCh := make(chan error, contenders)
+	times := make(chan time.Time, contenders)
+	for i := range contenders {
+		wg.Add(1)
+		go func(store *SQLiteStore) {
+			defer wg.Done()
+			heartbeatAt, err := store.HeartbeatWorkerSession(context.Background(), session.PrincipalID, session.Capability)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			times <- heartbeatAt
+		}(stores[i%len(stores)])
+	}
+	wg.Wait()
+	close(errCh)
+	close(times)
+	for err := range errCh {
+		t.Errorf("concurrent heartbeat: %v", err)
+	}
+	var latestReturned time.Time
+	for heartbeatAt := range times {
+		if heartbeatAt.After(latestReturned) {
+			latestReturned = heartbeatAt
+		}
+	}
+	var stored sql.NullString
+	if err := firstStore.db.QueryRow(`SELECT heartbeat_at FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&stored); err != nil || !stored.Valid {
+		t.Fatalf("concurrent heartbeat timestamp=%v err=%v, want persisted timestamp", stored, err)
+	}
+	persisted, err := time.Parse(time.RFC3339Nano, stored.String)
+	if err != nil {
+		t.Fatalf("parse concurrent heartbeat timestamp %q: %v", stored.String, err)
+	}
+	if persisted.Before(latestReturned) {
+		t.Fatalf("persisted heartbeat %v is earlier than a concurrent response %v", persisted, latestReturned)
+	}
+	for i := range contenders {
+		got, err := stores[i%len(stores)].HeartbeatWorkerSession(context.Background(), session.PrincipalID, session.Capability)
+		if err != nil || got.Before(persisted) {
+			t.Fatalf("post-concurrency heartbeat %d=(%v,%v), before persisted %v", i, got, err, persisted)
+		}
+		persisted = got
+	}
+}
+
 func TestSQLiteWorkerSessionRegistrationRotatesShortLivedCapability(t *testing.T) {
 	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "session-capability.db"), testConfig())
 	if err != nil {
@@ -481,8 +843,8 @@ func TestSQLiteWorkerSessionAndWebhookMigrationsUpgradeFromV14(t *testing.T) {
 	}
 	defer store.CloseStore()
 	var version int
-	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 23 {
-		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 23", version, err)
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM factory_schema_migrations`).Scan(&version); err != nil || version != 25 {
+		t.Fatalf("upgraded SQLite schema version=%d err=%v; want 25", version, err)
 	}
 	var retainedAudit int
 	if err := store.db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
@@ -635,8 +997,8 @@ func TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.CloseStore() })
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 20 {
-		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 20", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 22 {
+		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 22", version, err)
 	}
 	var retainedAudit int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
@@ -684,6 +1046,108 @@ func assertUpgradedLegacyRecords(t *testing.T, store interface {
 	}
 	if thread.Jobs[0].Request.Task != "preserve before migration" || thread.Jobs[1].Request.Task != "preserve thread member" {
 		t.Fatalf("pre-upgrade Thread member content after migration = %+v; member Jobs must remain unchanged", thread.Jobs)
+	}
+}
+
+func TestPostgresWorkerSessionHeartbeatIsDurableAndFenced(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL worker heartbeat integration")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	id, err := newJobID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := "heartbeat-worker-" + id
+	session, _, err := store.RegisterWorkerSession(ctx, principal, "boot-heartbeat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nearExpiry := time.Now().UTC().Add(2 * time.Minute).Truncate(time.Microsecond)
+	if _, err := db.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_expires_at=$1 WHERE id=$2`, nearExpiry, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	session.CapabilityExpiresAt = &nearExpiry
+	first, err := store.HeartbeatWorkerSession(ctx, principal, session.Capability)
+	if err != nil || first.IsZero() {
+		t.Fatalf("first PostgreSQL heartbeat=(%v,%v)", first, err)
+	}
+	var renewedExpiry time.Time
+	if err := db.QueryRowContext(ctx, `SELECT capability_expires_at FROM factory_worker_sessions WHERE id=$1`, session.ID).Scan(&renewedExpiry); err != nil || session.CapabilityExpiresAt == nil || !renewedExpiry.After(*session.CapabilityExpiresAt) {
+		t.Fatalf("PostgreSQL heartbeat expiry=%v err=%v, want extension beyond %v", renewedExpiry, err, session.CapabilityExpiresAt)
+	}
+	var renewalAudits int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM factory_worker_session_audit WHERE session_id=$1 AND event='capability_renewed' AND capability_hash IS NOT NULL AND capability_expires_at IS NOT NULL`, session.ID).Scan(&renewalAudits); err != nil || renewalAudits != 1 {
+		t.Fatalf("PostgreSQL renewal audit count=%d err=%v, want one", renewalAudits, err)
+	}
+	if _, err := store.HeartbeatWorkerSession(ctx, principal, session.Capability); err != nil {
+		t.Fatal(err)
+	}
+	var renewalAuditsAfterRetry int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM factory_worker_session_audit WHERE session_id=$1 AND event='capability_renewed'`, session.ID).Scan(&renewalAuditsAfterRetry); err != nil || renewalAuditsAfterRetry != renewalAudits {
+		t.Fatalf("same-capability retry added renewal audit: before=%d after=%d err=%v", renewalAudits, renewalAuditsAfterRetry, err)
+	}
+	second, err := store.HeartbeatWorkerSession(ctx, principal, session.Capability)
+	if err != nil || second.Before(first) {
+		t.Fatalf("second PostgreSQL heartbeat=(%v,%v), after %v", second, err, first)
+	}
+	const contenders = 12
+	var wg sync.WaitGroup
+	errCh := make(chan error, contenders)
+	times := make(chan time.Time, contenders)
+	for range contenders {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			heartbeatAt, err := store.HeartbeatWorkerSession(ctx, principal, session.Capability)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			times <- heartbeatAt
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	close(times)
+	for err := range errCh {
+		t.Errorf("concurrent PostgreSQL heartbeat: %v", err)
+	}
+	latestReturned := second
+	for heartbeatAt := range times {
+		if heartbeatAt.After(latestReturned) {
+			latestReturned = heartbeatAt
+		}
+	}
+	if _, err := store.HeartbeatWorkerSession(ctx, principal+"-wrong", session.Capability); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("cross-principal PostgreSQL heartbeat error=%v, want not found", err)
+	}
+	var persisted time.Time
+	if err := db.QueryRowContext(ctx, `SELECT heartbeat_at FROM factory_worker_sessions WHERE id=$1`, session.ID).Scan(&persisted); err != nil || persisted.Before(latestReturned.Truncate(time.Microsecond)) {
+		t.Fatalf("durable PostgreSQL heartbeat=%v err=%v, want at least %v", persisted, err, latestReturned)
+	}
+	if _, err := store.RetireWorkerCapability(ctx, principal, session.Capability); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.HeartbeatWorkerSession(ctx, principal, session.Capability); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("retired PostgreSQL heartbeat error=%v, want not found", err)
+	}
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
 	}
 }
 

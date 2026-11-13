@@ -18,6 +18,7 @@ var ErrWorkerSessionConflict = errors.New("worker session conflicts with an acti
 var ErrWorkerSessionBusy = errors.New("worker session registration is busy")
 
 const WorkerSessionCapabilityTTL = 15 * time.Minute
+const workerSessionCapabilityRenewalWindow = WorkerSessionCapabilityTTL / 2
 const workerSessionCapabilityBytes = 32
 
 type WorkerSession struct {
@@ -34,6 +35,7 @@ type WorkerSession struct {
 type WorkerSessionStore interface {
 	RegisterWorkerSession(context.Context, string, string) (WorkerSession, bool, error)
 	AuthenticateWorkerCapability(context.Context, string, string) (WorkerSession, error)
+	HeartbeatWorkerSession(context.Context, string, string) (time.Time, error)
 	RetireWorkerCapability(context.Context, string, string) (WorkerSession, error)
 	RetireWorkerSession(context.Context, string, string, string) (WorkerSession, error)
 }
@@ -117,6 +119,10 @@ func registerSQLiteWorkerSession(ctx context.Context, db *sql.DB, principalID, b
 }
 
 func retireSQLiteWorkerCapability(ctx context.Context, db *sql.DB, principalID, capability string) (WorkerSession, error) {
+	return retireSQLiteWorkerCapabilityAt(ctx, db, principalID, capability, time.Time{})
+}
+
+func retireSQLiteWorkerCapabilityAt(ctx context.Context, db *sql.DB, principalID, capability string, now time.Time) (WorkerSession, error) {
 	if ctx == nil || !validPostgresOwnerID(principalID) || !validWorkerSessionCapability(capability) {
 		return WorkerSession{}, ErrNotFound
 	}
@@ -126,9 +132,15 @@ func retireSQLiteWorkerCapability(ctx context.Context, db *sql.DB, principalID, 
 		return WorkerSession{}, errors.New("begin SQLite worker session retirement")
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_hash=capability_hash WHERE principal_id=? AND capability_hash=? AND status='active'`, principalID, hex.EncodeToString(hash[:])); err != nil {
+		return WorkerSession{}, errors.New("lock SQLite worker session for capability retirement")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	var session WorkerSession
-	var created string
-	if err := tx.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active' AND capability_expires_at>?`, principalID, hex.EncodeToString(hash[:]), expiryComparisonValue("?")).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &created); errors.Is(err, sql.ErrNoRows) {
+	var created, expiresAtRaw string
+	if err := tx.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active'`, principalID, hex.EncodeToString(hash[:])).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &created, &expiresAtRaw); errors.Is(err, sql.ErrNoRows) {
 		return WorkerSession{}, ErrNotFound
 	} else if err != nil {
 		return WorkerSession{}, errors.New("read SQLite worker session for capability retirement")
@@ -137,7 +149,14 @@ func retireSQLiteWorkerCapability(ctx context.Context, db *sql.DB, principalID, 
 	if err != nil {
 		return WorkerSession{}, errors.New("decode SQLite worker session timestamp")
 	}
-	now, err := retireWorkerSessionTx(ctx, tx, "?", session, hash, true)
+	expiresAt, err := time.Parse(time.RFC3339Nano, expiresAtRaw)
+	if err != nil {
+		return WorkerSession{}, errors.New("decode SQLite worker session capability expiry")
+	}
+	if !expiresAt.After(now) {
+		return WorkerSession{}, ErrNotFound
+	}
+	now, err = retireWorkerSessionTx(ctx, tx, "?", session, hash, true, expiresAtRaw)
 	if err != nil {
 		return WorkerSession{}, err
 	}
@@ -169,7 +188,7 @@ func retireSQLiteWorkerSession(ctx context.Context, db *sql.DB, principalID, boo
 		return WorkerSession{}, errors.New("decode SQLite worker session timestamp")
 	}
 	now := time.Now().UTC()
-	if _, err := retireWorkerSessionTx(ctx, tx, "?", session, [32]byte{}, false); err != nil {
+	if _, err := retireWorkerSessionTx(ctx, tx, "?", session, [32]byte{}, false, ""); err != nil {
 		return WorkerSession{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -195,7 +214,7 @@ func retirePostgresWorkerCapability(ctx context.Context, db *sql.DB, principalID
 	} else if err != nil {
 		return WorkerSession{}, errors.New("read PostgreSQL worker session for capability retirement")
 	}
-	now, err := retireWorkerSessionTx(ctx, tx, "$", session, hash, true)
+	now, err := retireWorkerSessionTx(ctx, tx, "$", session, hash, true, "")
 	if err != nil {
 		return WorkerSession{}, err
 	}
@@ -206,13 +225,13 @@ func retirePostgresWorkerCapability(ctx context.Context, db *sql.DB, principalID
 	return session, nil
 }
 
-func retireWorkerSessionTx(ctx context.Context, tx workerSessionCapabilityTx, placeholder string, session WorkerSession, capabilityHash [32]byte, requireCapability bool) (time.Time, error) {
+func retireWorkerSessionTx(ctx context.Context, tx workerSessionCapabilityTx, placeholder string, session WorkerSession, capabilityHash [32]byte, requireCapability bool, expectedCapabilityExpiry string) (time.Time, error) {
 	now := time.Now().UTC()
 	query := `UPDATE factory_worker_sessions SET status='retired',retired_at=?,capability_hash=NULL,capability_expires_at=NULL WHERE id=? AND status='active'`
 	args := []any{now.Format(time.RFC3339Nano), session.ID}
 	if requireCapability {
-		query += ` AND capability_hash=?`
-		args = append(args, hex.EncodeToString(capabilityHash[:]))
+		query += ` AND capability_hash=? AND capability_expires_at=?`
+		args = append(args, hex.EncodeToString(capabilityHash[:]), expectedCapabilityExpiry)
 	}
 	if placeholder != "?" {
 		query = `UPDATE factory_worker_sessions SET status='retired',retired_at=$1,capability_hash=NULL,capability_expires_at=NULL WHERE id=$2 AND status='active'`
@@ -388,18 +407,24 @@ func authenticatePostgresWorkerCapability(ctx context.Context, db *sql.DB, princ
 }
 
 func authenticateWorkerCapability(ctx context.Context, db *sql.DB, principalID, capability, placeholder string) (WorkerSession, error) {
+	return authenticateWorkerCapabilityAt(ctx, db, principalID, capability, placeholder, time.Time{})
+}
+
+func authenticateWorkerCapabilityAt(ctx context.Context, db *sql.DB, principalID, capability, placeholder string, now time.Time) (WorkerSession, error) {
 	if ctx == nil || !validPostgresOwnerID(principalID) || !validWorkerSessionCapability(capability) {
 		return WorkerSession{}, ErrNotFound
 	}
 	hash := sha256.Sum256([]byte(capability))
-	query := `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active' AND capability_expires_at > ?`
-	if placeholder != "?" {
-		query = `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=$1 AND capability_hash=$2 AND status='active' AND capability_expires_at > $3`
-	}
 	var session WorkerSession
 	var createdAtRaw any
 	var expiresAtRaw any
-	if err := db.QueryRowContext(ctx, query, principalID, hex.EncodeToString(hash[:]), expiryComparisonValue(placeholder)).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &createdAtRaw, &expiresAtRaw); errors.Is(err, sql.ErrNoRows) {
+	var err error
+	if placeholder == "?" {
+		err = db.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active'`, principalID, hex.EncodeToString(hash[:])).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &createdAtRaw, &expiresAtRaw)
+	} else {
+		err = db.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=$1 AND capability_hash=$2 AND status='active' AND capability_expires_at>$3`, principalID, hex.EncodeToString(hash[:]), expiryComparisonValue(placeholder)).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &createdAtRaw, &expiresAtRaw)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerSession{}, ErrNotFound
 	} else if err != nil {
 		return WorkerSession{}, fmt.Errorf("authenticate worker session capability: %w", err)
@@ -444,16 +469,123 @@ func authenticateWorkerCapability(ctx context.Context, db *sql.DB, principalID, 
 			return WorkerSession{}, errors.New("decode PostgreSQL worker session capability expiry")
 		}
 	}
+	if placeholder == "?" {
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+		if !expiresAt.After(now) {
+			return WorkerSession{}, ErrNotFound
+		}
+	}
 	session.CapabilityExpiresAt = &expiresAt
 	return session, nil
 }
 
-func validWorkerSessionCapability(capability string) bool {
-	if len(capability) != base64.RawURLEncoding.EncodedLen(workerSessionCapabilityBytes) {
-		return false
+func heartbeatWorkerSession(ctx context.Context, db *sql.DB, principalID, capability, placeholder string) (time.Time, error) {
+	return heartbeatWorkerSessionAt(ctx, db, principalID, capability, placeholder, time.Time{})
+}
+
+func heartbeatWorkerSessionAt(ctx context.Context, db *sql.DB, principalID, capability, placeholder string, now time.Time) (time.Time, error) {
+	if ctx == nil || !validPostgresOwnerID(principalID) || !validWorkerSessionCapability(capability) {
+		return time.Time{}, ErrNotFound
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(capability)
-	return err == nil && len(decoded) == workerSessionCapabilityBytes
+	hash := sha256.Sum256([]byte(capability))
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return time.Time{}, errors.New("begin worker session heartbeat")
+	}
+	defer tx.Rollback()
+	if placeholder == "?" {
+		if _, err := tx.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_hash=capability_hash WHERE principal_id=? AND capability_hash=? AND status='active'`, principalID, hex.EncodeToString(hash[:])); err != nil {
+			return time.Time{}, errors.New("lock SQLite worker session heartbeat")
+		}
+		if now.IsZero() {
+			now = time.Now().UTC()
+		}
+	}
+	var heartbeat time.Time
+	var expiresAt time.Time
+	var expiryFence string
+	if placeholder == "?" {
+		var heartbeatRaw, expiryRaw sql.NullString
+		err = tx.QueryRowContext(ctx, `SELECT heartbeat_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active'`, principalID, hex.EncodeToString(hash[:])).Scan(&heartbeatRaw, &expiryRaw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, ErrNotFound
+		}
+		if err != nil {
+			return time.Time{}, errors.New("read SQLite worker session heartbeat")
+		}
+		if heartbeatRaw.Valid {
+			heartbeat, err = time.Parse(time.RFC3339Nano, heartbeatRaw.String)
+			if err != nil {
+				return time.Time{}, errors.New("decode SQLite worker session heartbeat timestamp")
+			}
+		}
+		expiresAt, err = time.Parse(time.RFC3339Nano, expiryRaw.String)
+		if err != nil {
+			return time.Time{}, errors.New("decode SQLite worker session capability expiry")
+		}
+		if !expiresAt.After(now) {
+			return time.Time{}, ErrNotFound
+		}
+		expiryFence = expiryRaw.String
+	} else {
+		var heartbeatRaw sql.NullTime
+		var databaseNow time.Time
+		err = tx.QueryRowContext(ctx, `SELECT heartbeat_at,capability_expires_at,clock_timestamp() FROM factory_worker_sessions WHERE principal_id=$1 AND capability_hash=$2 AND status='active' AND capability_expires_at>clock_timestamp() FOR UPDATE`, principalID, hex.EncodeToString(hash[:])).Scan(&heartbeatRaw, &expiresAt, &databaseNow)
+		if errors.Is(err, sql.ErrNoRows) {
+			return time.Time{}, ErrNotFound
+		}
+		if err != nil {
+			return time.Time{}, errors.New("read PostgreSQL worker session heartbeat")
+		}
+		if heartbeatRaw.Valid {
+			heartbeat = heartbeatRaw.Time
+		}
+		now = databaseNow
+	}
+	if now.After(heartbeat) {
+		heartbeat = now.UTC()
+	}
+	renewed := !expiresAt.After(now.Add(workerSessionCapabilityRenewalWindow))
+	if renewed {
+		expiresAt = now.UTC().Add(WorkerSessionCapabilityTTL)
+	}
+	var update string
+	var heartbeatValue, expiryValue any = heartbeat, expiresAt
+	if placeholder == "?" {
+		update = `UPDATE factory_worker_sessions SET heartbeat_at=?,capability_expires_at=? WHERE principal_id=? AND capability_hash=? AND status='active' AND capability_expires_at=?`
+		heartbeatValue = heartbeat.Format("2006-01-02T15:04:05.000000000Z07:00")
+		expiryValue = expiresAt.Format("2006-01-02T15:04:05.000000000Z07:00")
+	} else {
+		update = `UPDATE factory_worker_sessions SET heartbeat_at=$1,capability_expires_at=$2 WHERE principal_id=$3 AND capability_hash=$4 AND status='active' AND capability_expires_at>clock_timestamp()`
+	}
+	var result sql.Result
+	if placeholder == "?" {
+		result, err = tx.ExecContext(ctx, update, heartbeatValue, expiryValue, principalID, hex.EncodeToString(hash[:]), expiryFence)
+	} else {
+		result, err = tx.ExecContext(ctx, update, heartbeatValue, expiryValue, principalID, hex.EncodeToString(hash[:]))
+	}
+	if err != nil {
+		return time.Time{}, errors.New("persist worker session heartbeat")
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return time.Time{}, ErrNotFound
+	}
+	if renewed {
+		if placeholder == "?" {
+			_, err = tx.ExecContext(ctx, `INSERT INTO factory_worker_session_audit(session_id,principal_id,boot_id,event,capability_hash,capability_expires_at,created_at) SELECT id,principal_id,boot_id,'capability_renewed',capability_hash,capability_expires_at,? FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active'`, now.UTC().Format(time.RFC3339Nano), principalID, hex.EncodeToString(hash[:]))
+		} else {
+			_, err = tx.ExecContext(ctx, `INSERT INTO factory_worker_session_audit(session_id,principal_id,boot_id,event,capability_hash,capability_expires_at) SELECT id,principal_id,boot_id,'capability_renewed',capability_hash,capability_expires_at FROM factory_worker_sessions WHERE principal_id=$1 AND capability_hash=$2 AND status='active'`, principalID, hex.EncodeToString(hash[:]))
+		}
+		if err != nil {
+			return time.Time{}, errors.New("audit worker session heartbeat")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, errors.New("commit worker session heartbeat")
+	}
+	return heartbeat.UTC(), nil
 }
 
 func expiryComparisonValue(placeholder string) any {
@@ -462,6 +594,14 @@ func expiryComparisonValue(placeholder string) any {
 		return now.Format("2006-01-02T15:04:05.000000000Z07:00")
 	}
 	return now
+}
+
+func validWorkerSessionCapability(capability string) bool {
+	if len(capability) != base64.RawURLEncoding.EncodedLen(workerSessionCapabilityBytes) {
+		return false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(capability)
+	return err == nil && len(decoded) == workerSessionCapabilityBytes
 }
 
 func newWorkerSession(principalID, bootID string) (WorkerSession, error) {
@@ -478,6 +618,9 @@ func (s *SQLiteStore) RegisterWorkerSession(ctx context.Context, principalID, bo
 func (s *SQLiteStore) AuthenticateWorkerCapability(ctx context.Context, principalID, capability string) (WorkerSession, error) {
 	return authenticateSQLiteWorkerCapability(ctx, s.db, principalID, capability)
 }
+func (s *SQLiteStore) HeartbeatWorkerSession(ctx context.Context, principalID, capability string) (time.Time, error) {
+	return heartbeatWorkerSession(ctx, s.db, principalID, capability, "?")
+}
 func (s *SQLiteStore) RetireWorkerCapability(ctx context.Context, principalID, capability string) (WorkerSession, error) {
 	return retireSQLiteWorkerCapability(ctx, s.db, principalID, capability)
 }
@@ -489,6 +632,9 @@ func (s *PostgresStore) RegisterWorkerSession(ctx context.Context, principalID, 
 }
 func (s *PostgresStore) AuthenticateWorkerCapability(ctx context.Context, principalID, capability string) (WorkerSession, error) {
 	return authenticatePostgresWorkerCapability(ctx, s.db, principalID, capability)
+}
+func (s *PostgresStore) HeartbeatWorkerSession(ctx context.Context, principalID, capability string) (time.Time, error) {
+	return heartbeatWorkerSession(ctx, s.db, principalID, capability, "$1")
 }
 func (s *PostgresStore) RetireWorkerCapability(ctx context.Context, principalID, capability string) (WorkerSession, error) {
 	return retirePostgresWorkerCapability(ctx, s.db, principalID, capability)
