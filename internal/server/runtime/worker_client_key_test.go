@@ -162,7 +162,10 @@ func TestNewWorkerSessionClientSanitizesPrivateKeyStartupErrors(t *testing.T) {
 
 func writeWorkerClientCredentials(t *testing.T, certificate tls.Certificate) (string, string) {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	certPath, keyPath := filepath.Join(dir, "worker.crt"), filepath.Join(dir, "worker.key")
 	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate.Certificate[0]})
 	keyBytes, err := x509.MarshalPKCS8PrivateKey(certificate.PrivateKey)

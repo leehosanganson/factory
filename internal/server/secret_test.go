@@ -405,7 +405,11 @@ func principalDigest(token string) string {
 
 func writeSecret(t *testing.T, content string, mode os.FileMode) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "api-key")
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "api-key")
 	if err := os.WriteFile(path, []byte(content), mode); err != nil {
 		t.Fatal(err)
 	}
