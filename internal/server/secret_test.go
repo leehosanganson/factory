@@ -240,6 +240,81 @@ func TestLoadAPIKeyRejectsInvalidTokenBytesWithoutEchoing(t *testing.T) {
 	}
 }
 
+func TestLoadWorkerClientPrivateKeyRejectsUnsafeFiles(t *testing.T) {
+	validPath := writeSecret(t, "not parsed by the bounded file reader", 0o600)
+	if data, err := readWorkerClientPrivateKey(validPath); err != nil || string(data) != "not parsed by the bounded file reader" {
+		t.Fatalf("readWorkerClientPrivateKey()=(%q,%v), want bounded contents", data, err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		path func(*testing.T) string
+	}{
+		{"empty path", func(*testing.T) string { return "" }},
+		{"missing file", func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") }},
+		{"symlink", func(t *testing.T) string {
+			target := writeSecret(t, "private", 0o600)
+			link := filepath.Join(t.TempDir(), "key")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatal(err)
+			}
+			return link
+		}},
+		{"symlink parent", func(t *testing.T) string {
+			target := writeSecret(t, "private", 0o600)
+			parent := filepath.Join(t.TempDir(), "linked-dir")
+			if err := os.Symlink(filepath.Dir(target), parent); err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(parent, filepath.Base(target))
+		}},
+		{"directory", func(t *testing.T) string { return t.TempDir() }},
+		{"FIFO", func(t *testing.T) string {
+			path := filepath.Join(t.TempDir(), "key.fifo")
+			if err := syscall.Mkfifo(path, 0o600); err != nil {
+				t.Skipf("cannot create FIFO: %v", err)
+			}
+			return path
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := readWorkerClientPrivateKey(tc.path(t)); err == nil {
+				t.Fatal("unsafe private-key file was accepted")
+			}
+		})
+	}
+
+	for _, mode := range []os.FileMode{0o640, 0o604, 0o200, 0o700} {
+		t.Run(fmt.Sprintf("unsafe mode %o", mode), func(t *testing.T) {
+			path := writeSecret(t, "private", mode)
+			if _, err := readWorkerClientPrivateKey(path); err == nil {
+				t.Fatalf("unsafe mode %o was accepted", mode)
+			}
+		})
+	}
+
+	t.Run("wrong owner", func(t *testing.T) {
+		path := writeSecret(t, "private", 0o600)
+		wrongUID := 1
+		if os.Geteuid() == wrongUID {
+			wrongUID = 2
+		}
+		if err := os.Chown(path, wrongUID, -1); err != nil {
+			t.Skipf("cannot set key file to another UID: %v", err)
+		}
+		if _, err := readWorkerClientPrivateKey(path); err == nil {
+			t.Fatal("private key owned by another user was accepted")
+		}
+	})
+
+	t.Run("oversized", func(t *testing.T) {
+		path := writeSecret(t, strings.Repeat("x", workerClientKeyFileLimit+1), 0o600)
+		if _, err := readWorkerClientPrivateKey(path); err == nil {
+			t.Fatal("oversized private key was accepted")
+		}
+	})
+}
+
 func TestLoadAPIKeyRejectsUnsafeFiles(t *testing.T) {
 	t.Run("empty path", func(t *testing.T) {
 		if _, err := LoadAPIKey(""); err == nil {
