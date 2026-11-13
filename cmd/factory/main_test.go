@@ -2065,6 +2065,204 @@ func runTestGit(t *testing.T, args ...string) string {
 	return string(output)
 }
 
+func TestDetachedImplementCLINoOpCompletionRetainsInspectableRecoveryState(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	configHome := filepath.Join(root, "config")
+	configDir := filepath.Join(configHome, "factory")
+	for _, dir := range []string{state, configDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agent := filepath.Join(root, "fake-pi")
+	agentScript := "#!/bin/sh\ncase \"$*\" in *'Propose a concise slug'*) printf 'noop-cli-test\\n'; exit 0 ;; esac\nprintf 'PASS\\n'\n"
+	if err := os.WriteFile(agent, []byte(agentScript), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "config.json"), []byte(fmt.Sprintf(`{"command":%q,"args":["{system_prompt}","{task}"],"state_dir":%q,"agent_timeout":"30s","auto_publish":true}`, agent, state)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	target := filepath.Join(root, "target")
+	if err := os.MkdirAll(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"init", "-q", "-b", "main", target}, {"-C", target, "config", "user.name", "Factory Test"}, {"-C", target, "config", "user.email", "factory-test@example.invalid"}} {
+		if output, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "tracked.txt"), []byte("baseline\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command("git", "-C", target, "add", "tracked.txt").CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "commit", "-qm", "baseline").CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v\n%s", err, output)
+	}
+	remote := filepath.Join(root, "origin.git")
+	if output, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+		t.Fatalf("init local bare origin: %v\n%s", err, output)
+	}
+	if output, err := exec.Command("git", "-C", target, "remote", "add", "origin", remote).CombinedOutput(); err != nil {
+		t.Fatalf("add local origin: %v\n%s", err, output)
+	}
+	target, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialHead := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD"))
+	initialStatus := runTestGit(t, "-C", target, "status", "--porcelain")
+
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gitCalls := filepath.Join(state, "git-calls")
+	ghCalls := filepath.Join(state, "gh-calls")
+	fakeBin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(fakeBin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitWrapper := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$*\" >> %q\nexec %q \"$@\"\n", gitCalls, gitPath)
+	if err := os.WriteFile(filepath.Join(fakeBin, "git"), []byte(gitWrapper), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ghTripwire := "#!/bin/sh\nprintf 'invoked\\n' >> \"$FACTORY_TEST_GH_CALLS\"\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(fakeBin, "gh"), []byte(ghTripwire), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	binary := filepath.Join(root, "factory")
+	projectRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	build := exec.Command("go", "build", "-o", binary, "./cmd/factory")
+	build.Dir = projectRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build factory: %v\n%s", err, output)
+	}
+	env := append(os.Environ(), "XDG_CONFIG_HOME="+configHome, "XDG_STATE_HOME="+state, "FACTORY_TEST_GH_CALLS="+ghCalls, "PATH="+fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	command := exec.Command(binary, "implement", "--detach", "verify no-op completion")
+	command.Dir, command.Env = target, env
+	output, err := command.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "Started implementation job") {
+		t.Fatalf("start detached no-op implementation: %v\n%s", err, output)
+	}
+
+	storeRoot, err := factory.JobStateRoot(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := factory.NewJobStore(storeRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var job factory.JobRecord
+	workerGone := false
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err := store.ListJobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, candidate := range jobs {
+			if candidate.TaskDescription == "verify no-op completion" {
+				job = candidate
+			}
+		}
+		if job.ID != "" && job.Status == "complete" {
+			if _, err := store.ReadWorker(job.ID); errors.Is(err, os.ErrNotExist) {
+				workerGone = true
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if job.ID == "" || job.Status != "complete" || !workerGone {
+		t.Fatalf("no-op detached workflow did not complete and stop: %+v (worker gone: %t)", job, workerGone)
+	}
+	job, err = store.GetJob(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.PublicationStatus != "no-op" || !strings.Contains(job.PublicationSummary, "no commit or PR") {
+		t.Fatalf("completed workflow publication outcome = status %q summary %q", job.PublicationStatus, job.PublicationSummary)
+	}
+	session, err := store.GetSession(job.ID, "workflow")
+	if err != nil || session.Status != "complete" {
+		t.Fatalf("workflow session status = %q, err=%v; want complete", session.Status, err)
+	}
+	if info, err := os.Stat(job.Worktree); err != nil || !info.IsDir() {
+		t.Fatalf("no-op recovery worktree was not retained at %q: %v", job.Worktree, err)
+	}
+	if head := strings.TrimSpace(runTestGit(t, "-C", job.Worktree, "rev-parse", "HEAD")); head != initialHead {
+		t.Errorf("no-op worktree HEAD changed: got %s want baseline %s", head, initialHead)
+	}
+	if got := runTestGit(t, "-C", job.Worktree, "status", "--porcelain"); got != "" {
+		t.Errorf("fake no-op agent left worktree changes: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(job.Worktree, "generated.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("no-op workflow unexpectedly created an artifact: stat error=%v", err)
+	}
+	workflowLog, err := store.SessionLogPath(job.ID, "workflow")
+	if err != nil {
+		t.Fatalf("locate retained workflow log: %v", err)
+	}
+	if info, err := os.Stat(workflowLog); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		t.Fatalf("no-op workflow log was not retained at %q: %v", workflowLog, err)
+	}
+
+	inspect := exec.Command(binary, "job", "get", job.ID, "--details")
+	inspect.Dir, inspect.Env = target, env
+	details, err := inspect.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-process no-op job details: %v\n%s", err, details)
+	}
+	for _, want := range []string{"Status: complete", "Publication: no-op", "Worktree: " + job.Worktree, "Work branch: " + job.WorkBranch} {
+		if !strings.Contains(string(details), want) {
+			t.Errorf("fresh-process job details omitted %q: %s", want, details)
+		}
+	}
+	logs := exec.Command(binary, "job", "logs", job.ID, "--session", "workflow")
+	logs.Dir, logs.Env = target, env
+	logOutput, err := logs.CombinedOutput()
+	if err != nil {
+		t.Fatalf("fresh-process workflow logs: %v\n%s", err, logOutput)
+	}
+	for _, stage := range []string{"requirements", "implement", "review", "document"} {
+		if !strings.Contains(string(logOutput), "stage.completed stage="+stage) {
+			t.Errorf("fresh-process workflow logs omitted completed %s stage: %s", stage, logOutput)
+		}
+	}
+	if _, err := os.Stat(ghCalls); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("no-op publication invoked fake gh: stat error=%v", err)
+	}
+	gitCallData, err := os.ReadFile(gitCalls)
+	if err != nil {
+		t.Fatalf("read git invocation log: %v", err)
+	}
+	for _, invocation := range strings.Split(strings.TrimSpace(string(gitCallData)), "\n") {
+		for _, argument := range strings.Fields(invocation) {
+			if argument == "commit" || argument == "push" {
+				t.Errorf("no-op publication unexpectedly ran git %s: %s", argument, invocation)
+			}
+		}
+	}
+	if refs := strings.TrimSpace(runTestGit(t, "--git-dir", remote, "for-each-ref", "--format=%(refname:short)")); refs != "" {
+		t.Errorf("no-op publication pushed remote refs: %s", refs)
+	}
+	if head := strings.TrimSpace(runTestGit(t, "-C", target, "rev-parse", "HEAD")); head != initialHead {
+		t.Errorf("no-op changed invoking checkout HEAD: got %s want %s", head, initialHead)
+	}
+	if got := runTestGit(t, "-C", target, "status", "--porcelain"); got != initialStatus {
+		t.Errorf("no-op changed invoking checkout status: got %q want %q", got, initialStatus)
+	}
+}
+
 func TestDetachedImplementCLIPublishedPRPersistsAcrossProcesses(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
