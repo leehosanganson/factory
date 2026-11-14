@@ -40,7 +40,7 @@ type workerSessionClient struct {
 }
 
 func newWorkerSessionClient(config restserver.WorkerControllerConfig) (*workerSessionClient, error) {
-	certificate, err := tls.LoadX509KeyPair(config.ClientCertFile, config.ClientKeyFile)
+	certificate, err := restserver.LoadWorkerClientCertificate(config.ClientCertFile, config.ClientKeyFile)
 	if err != nil {
 		return nil, errors.New("load worker controller client certificate")
 	}
