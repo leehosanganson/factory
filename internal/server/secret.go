@@ -4,20 +4,26 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/sys/unix"
 )
 
 const apiKeyFileLimit = 4096
 const principalTokenFileLimit = 4096
+const workerClientKeyFileLimit = 1 << 20
 
 // APIKey is an immutable in-memory shared API key. Its value is never
 // included in formatting or JSON output. Load a new value to apply rotation.
@@ -179,6 +185,66 @@ func LoadWebhookSecret(path string) (WebhookSecret, error) {
 func (secret WebhookSecret) Value() []byte { return bytes.Clone(secret.value) }
 func (WebhookSecret) String() string       { return "[REDACTED]" }
 func (WebhookSecret) GoString() string     { return "[REDACTED]" }
+
+// LoadWorkerClientCertificate loads the public client certificate and its
+// protected private key for the worker's controller connection.
+func LoadWorkerClientCertificate(certificatePath, keyPath string) (tls.Certificate, error) {
+	certificatePEM, err := os.ReadFile(certificatePath)
+	if err != nil {
+		return tls.Certificate{}, errors.New("load worker client certificate")
+	}
+	keyPEM, err := readWorkerClientPrivateKey(keyPath)
+	if err != nil {
+		return tls.Certificate{}, errors.New("load worker client certificate")
+	}
+	certificate, err := tls.X509KeyPair(certificatePEM, keyPEM)
+	if err != nil {
+		return tls.Certificate{}, errors.New("load worker client certificate")
+	}
+	return certificate, nil
+}
+
+func readWorkerClientPrivateKey(path string) ([]byte, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == string(filepath.Separator) {
+		return nil, errors.New("invalid worker client key file")
+	}
+	parts := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	directoryFD, err := unix.Open(string(filepath.Separator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, errors.New("worker client key file unavailable")
+	}
+	defer func() { _ = unix.Close(directoryFD) }()
+	for _, part := range parts[:len(parts)-1] {
+		nextFD, openErr := unix.Openat(directoryFD, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if openErr != nil {
+			return nil, errors.New("worker client key file unavailable")
+		}
+		if err := unix.Close(directoryFD); err != nil {
+			_ = unix.Close(nextFD)
+			return nil, errors.New("worker client key file unavailable")
+		}
+		directoryFD = nextFD
+	}
+	fd, err := unix.Openat(directoryFD, parts[len(parts)-1], unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, errors.New("worker client key file unavailable")
+	}
+	file := os.NewFile(uintptr(fd), "worker client key")
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, errors.New("worker client key file unavailable")
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&^0o600 != 0 || info.Mode().Perm()&0o400 == 0 || stat.Uid != uint32(os.Geteuid()) || info.Size() > workerClientKeyFileLimit {
+		return nil, errors.New("worker client key file is not private, regular, owned, and bounded")
+	}
+	key, err := io.ReadAll(io.LimitReader(file, workerClientKeyFileLimit+1))
+	if err != nil || len(key) == 0 || len(key) > workerClientKeyFileLimit {
+		return nil, errors.New("worker client key file is unavailable or too large")
+	}
+	return key, nil
+}
 
 func (token ProviderToken) Authenticate(value string) bool {
 	if token.value == "" || value == "" {
