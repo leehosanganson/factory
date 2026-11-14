@@ -11,6 +11,8 @@ type Schedule = { id: string; status: string; cron: string; revision: number; pe
 type ScheduleDefinition = { id: string; status: string; cron: string; repository: string; task: string };
 type Thread = { id: string; status: string; created_at: string; updated_at: string; completed_at?: string };
 type ThreadPage = { threads?: Thread[]; has_more?: boolean; next_sequence?: number; snapshot_sequence?: number };
+type WorkerSession = { id: string; principal_id: string; status: string; created_at: string; retired_at: string | null; heartbeat_at: string | null };
+type WorkerSessionPage = { sessions?: WorkerSession[]; has_more?: boolean; next_created_at?: string; next_id?: string };
 type ApiError = Error & { code?: string };
 const api = async <T,>(path: string, options: RequestInit = {}, csrf = '', onResponse?: (response: Response) => void): Promise<T> => {
   const headers = new Headers(options.headers || {});
@@ -263,10 +265,60 @@ function App() {
     <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Threads</h2><span className="muted" role="status">{threadLoading}</span></div><p className="muted">Browse recent Threads and select one to reopen its safe job summary.</p><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => { activeThreadID.current = item.id; threadMutationGeneration.current++; appendAttempt.current = null; void inspectThread(item.id); }}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)} · Updated {date(item.updated_at)}{item.completed_at ? ` · Completed ${date(item.completed_at)}` : ''}</span></article>) : <p className="empty">No retained Threads yet.</p>}</div>{threadPage.has_more && <button className="secondary" type="button" onClick={() => void refreshThreads(true)}>Load older Threads</button>}<h3>Start a Thread</h3><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread</button></form>
       <div className="thread-result" aria-live="polite">{thread && <><h3>Thread {thread.id}</h3><span className={`status ${thread.status}`}>{thread.status}</span>{thread.completed_at && <p className="job-meta">Completed {date(thread.completed_at)}</p>}{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span></article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Append Job</button></form><button className="danger" type="button" disabled={threadPending} onClick={() => void completeThread()}>Complete Thread</button></section>}</section>
+    <WorkerSessions csrf={session.csrf || ''} />
     <section className="panel schedules-panel" aria-labelledby="schedules-title"><div className="section-heading"><h2 id="schedules-title">Schedules</h2><span className="muted" role="status">{scheduleLoading}</span></div><p className="muted">Schedule tasks run on their cron times. Cron uses UTC and supports one-minute minimum recurrence.</p><form className="schedule-form" onSubmit={createSchedule}><label htmlFor="schedule-cron">Cron (UTC)</label><input id="schedule-cron" name="cron" maxLength={128} required autoComplete="off" placeholder="0 9 * * 1-5"/><span className="muted">Five fields; UTC; one-minute minimum recurrence.</span><label htmlFor="schedule-repository">Repository alias</label><input id="schedule-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="schedule-task">Task</label><textarea id="schedule-task" name="task" rows={4} maxLength={262144} required/><button id="schedule-submit" type="submit" disabled={schedulePending}>Create schedule</button></form>
       <div className="schedule-list" aria-live="polite">{schedules.length ? schedules.map((schedule) => <ScheduleCard key={schedule.id} schedule={schedule} revision={scheduleRevision} csrf={session.csrf || ''} onInspect={(id) => void inspect(id)} onRefresh={refreshSchedules} onError={setNotice}/> ) : <p className="empty">No schedules are configured.</p>}</div></section>
     {detail && <JobDetail key={detail.job.id} job={detail.job} history={detail.history} csrf={session.csrf || ''} onRefresh={() => { void refreshJobs(); }} onError={setNotice} />}
   </main></>;
+}
+
+function WorkerSessions({ csrf }: { csrf: string }) {
+  const [sessions, setSessions] = useState<WorkerSession[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [loaded, setLoaded] = useState(false);
+  const loadInProgress = useRef(false);
+  const pageCursor = useRef<{ createdAt: string; id: string } | null>(null);
+  const moreAvailable = useRef(false);
+
+  const load = useCallback(async (older = false) => {
+    if (loadInProgress.current || older && (!moreAvailable.current || !pageCursor.current)) return;
+    loadInProgress.current = true;
+    setLoading(true);
+    setError('');
+    try {
+      const query = new URLSearchParams({ limit: '50' });
+      if (older && pageCursor.current) {
+        query.set('before_created_at', pageCursor.current.createdAt);
+        query.set('before_id', pageCursor.current.id);
+      }
+      const page = await api<WorkerSessionPage>(`/v1/worker-sessions?${query.toString()}`, {}, csrf);
+      const rows = page.sessions || [];
+      setSessions((current) => older ? current.concat(rows) : rows);
+      const nextCursor = page.has_more && page.next_created_at && page.next_id ? { createdAt: page.next_created_at, id: page.next_id } : null;
+      pageCursor.current = nextCursor;
+      moreAvailable.current = Boolean(page.has_more && nextCursor);
+      setHasMore(Boolean(page.has_more && nextCursor));
+      setLoaded(true);
+    } catch (failure) {
+      setError((failure as Error).message);
+    } finally {
+      loadInProgress.current = false;
+      setLoading(false);
+    }
+  }, [csrf]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  return <section className="panel worker-sessions-panel" aria-labelledby="worker-sessions-title">
+    <div className="section-heading"><h2 id="worker-sessions-title">Worker sessions</h2><span className="muted" role="status">{loading ? 'Loading…' : ''}</span></div>
+    <p className="muted">Read-only registration records. Heartbeat timestamps are advisory; they do not show whether a Worker is online or available.</p>
+    {error && <p className="error" role="alert">Could not load Worker sessions: {error} <button className="secondary" type="button" disabled={loading} onClick={() => void load()}>Retry</button></p>}
+    {loaded && sessions.length === 0 && !error && <p className="empty">No Worker sessions have been registered.</p>}
+    {sessions.length > 0 && <div className="worker-session-table-wrap"><table className="worker-session-table"><thead><tr><th scope="col">Principal</th><th scope="col">Session ID</th><th scope="col">Stored status</th><th scope="col">Created at</th><th scope="col">Retired at</th><th scope="col">Heartbeat at (advisory)</th></tr></thead><tbody>{sessions.map((session) => <tr key={session.id}><td>{session.principal_id}</td><td>{session.id}</td><td>{session.status}</td><td><time dateTime={session.created_at}>{session.created_at}</time></td><td>{session.retired_at ? <time dateTime={session.retired_at}>{session.retired_at}</time> : '—'}</td><td>{session.heartbeat_at ? <time dateTime={session.heartbeat_at}>{session.heartbeat_at}</time> : '—'}</td></tr>)}</tbody></table></div>}
+    {hasMore && <button className="secondary" type="button" disabled={loading} onClick={() => void load(true)}>Load older sessions</button>}
+  </section>;
 }
 
 function ScheduleCard({ schedule, revision, csrf, onInspect, onRefresh, onError }: { schedule: Schedule; revision: number; csrf: string; onInspect: (id: string) => void; onRefresh: () => Promise<Schedule[]>; onError: (message: string) => void }) {

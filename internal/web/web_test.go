@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/leehosanganson/factory/internal/api"
 	"github.com/leehosanganson/factory/internal/jobs"
@@ -180,6 +181,75 @@ func TestDashboardScheduleCreateUsesSameOriginCSRFAndIdempotency(t *testing.T) {
 		if strings.Contains(listResponse.Body.String(), secret) {
 			t.Errorf("redacted schedule list contains %q: %s", secret, listResponse.Body.String())
 		}
+	}
+}
+
+func TestDashboardWorkerSessionListingUsesPairedCursorAndIsReadOnly(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "worker-sessions.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 4, MaxEventsPerJob: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	first, _, err := store.RegisterWorkerSession(t.Context(), "dashboard-worker-first", "hidden-boot-one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := store.RegisterWorkerSession(t.Context(), "dashboard-worker-second", "hidden-boot-two")
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := testWebHandlerWithManager(t, store)
+	login := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader(url.Values{"token": {"web-test-token"}}.Encode()))
+	login.Host = "factory.example"
+	login.Header.Set("Origin", "https://factory.example")
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, login)
+	if loginResponse.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", loginResponse.Code, loginResponse.Body.String())
+	}
+	cookie := loginResponse.Result().Cookies()[0]
+	list := httptest.NewRequest(http.MethodGet, "/ui/api/v1/worker-sessions?limit=1", nil)
+	list.AddCookie(cookie)
+	pageResponse := httptest.NewRecorder()
+	handler.ServeHTTP(pageResponse, list)
+	if pageResponse.Code != http.StatusOK || strings.Contains(pageResponse.Body.String(), "hidden-boot") || strings.Contains(pageResponse.Body.String(), "capability") {
+		t.Fatalf("worker session list status=%d body=%s", pageResponse.Code, pageResponse.Body.String())
+	}
+	var page struct {
+		Sessions      []restjobs.WorkerSessionSummary `json:"sessions"`
+		HasMore       bool                            `json:"has_more"`
+		NextCreatedAt *time.Time                      `json:"next_created_at"`
+		NextID        string                          `json:"next_id"`
+	}
+	if err := json.Unmarshal(pageResponse.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Sessions) != 1 || page.Sessions[0].ID != second.ID || !page.HasMore || page.NextCreatedAt == nil || page.NextID != second.ID {
+		t.Fatalf("first session page=%+v", page)
+	}
+	cursor := url.Values{"limit": {"1"}, "before_created_at": {page.NextCreatedAt.Format(time.RFC3339Nano)}, "before_id": {page.NextID}}
+	older := httptest.NewRequest(http.MethodGet, "/ui/api/v1/worker-sessions?"+cursor.Encode(), nil)
+	older.AddCookie(cookie)
+	olderResponse := httptest.NewRecorder()
+	handler.ServeHTTP(olderResponse, older)
+	if olderResponse.Code != http.StatusOK || !strings.Contains(olderResponse.Body.String(), first.ID) || strings.Contains(olderResponse.Body.String(), "hidden-boot") {
+		t.Fatalf("cursor page status=%d body=%s", olderResponse.Code, olderResponse.Body.String())
+	}
+	post := httptest.NewRequest(http.MethodPost, "/ui/api/v1/worker-sessions", nil)
+	post.AddCookie(cookie)
+	postResponse := httptest.NewRecorder()
+	handler.ServeHTTP(postResponse, post)
+	if postResponse.Code != http.StatusNotFound {
+		t.Fatalf("worker session mutation route status=%d body=%s", postResponse.Code, postResponse.Body.String())
+	}
+	all, err := store.ListWorkerSessions(t.Context(), nil, "", 10)
+	if err != nil || len(all.Sessions) != 2 {
+		t.Fatalf("read-only dashboard request changed session rows=%d err=%v", len(all.Sessions), err)
 	}
 }
 
@@ -397,7 +467,7 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 		method string
 		path   string
 		want   int
-	}{{http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodDelete, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50", http.StatusOK}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?limit=50", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads?cursor=secret", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
+	}{{http.MethodGet, "/ui/api/v1/worker-sessions", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/worker-sessions", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?before_id=partial", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&before_id=id", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&before_created_at=2026-01-01T00%3A00%3A00Z", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&limit=1", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodDelete, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50", http.StatusOK}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?limit=50", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads?cursor=secret", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
 		proxyRequest := httptest.NewRequest(tc.method, tc.path, nil)
 		proxyRequest.Host = "factory.example"
 		proxyRequest.Header.Set("Origin", "https://factory.example")

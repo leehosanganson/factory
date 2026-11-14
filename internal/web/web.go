@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -175,7 +176,15 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
-	if r.URL.EscapedPath() != r.URL.Path || !dashboardProxyAllowed(r.URL.Path, r.Method) || r.URL.RawQuery != "" && !dashboardProxyQueryAllowed(r.URL.Path, r.Method) || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" || r.URL.Path == "/ui/api/v1/threads" && r.URL.RawQuery != "" && !dashboardThreadListQueryAllowed(r.URL.Query()) {
+	query, queryErr := url.ParseQuery(r.URL.RawQuery)
+	queryAllowed := r.URL.RawQuery == "" || dashboardProxyQueryAllowed(r.URL.Path, r.Method)
+	if r.URL.Path == "/ui/api/v1/threads" && r.URL.RawQuery != "" {
+		queryAllowed = dashboardThreadListQueryAllowed(query)
+	}
+	if r.URL.Path == "/ui/api/v1/worker-sessions" && r.URL.RawQuery != "" {
+		queryAllowed = dashboardWorkerSessionListQueryAllowed(query)
+	}
+	if r.URL.EscapedPath() != r.URL.Path || queryErr != nil || !dashboardProxyAllowed(r.URL.Path, r.Method) || !queryAllowed || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -208,6 +217,9 @@ func dashboardProxyAllowed(path, method string) bool {
 	if path == "/ui/api/v1/jobs" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
+	if path == "/ui/api/v1/worker-sessions" {
+		return method == http.MethodGet
+	}
 	if strings.HasPrefix(path, "/ui/api/v1/jobs/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/jobs/"), "/")
 		if len(parts) == 1 && parts[0] != "" {
@@ -235,11 +247,25 @@ func dashboardProxyQueryAllowed(path, method string) bool {
 	if path == "/ui/api/v1/jobs" || path == "/ui/api/v1/threads" {
 		return true
 	}
+	if path == "/ui/api/v1/worker-sessions" {
+		return true
+	}
 	if strings.HasPrefix(path, "/ui/api/v1/schedules/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/schedules/"), "/")
 		return len(parts) == 2 && parts[0] != "" && parts[1] == "runs"
 	}
 	return false
+}
+
+func dashboardWorkerSessionListQueryAllowed(query map[string][]string) bool {
+	for key, values := range query {
+		if (key != "limit" && key != "before_created_at" && key != "before_id") || len(values) != 1 || values[0] == "" {
+			return false
+		}
+	}
+	_, hasCreatedAt := query["before_created_at"]
+	_, hasID := query["before_id"]
+	return hasCreatedAt == hasID
 }
 
 func dashboardThreadListQueryAllowed(query map[string][]string) bool {
