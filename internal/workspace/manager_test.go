@@ -104,6 +104,41 @@ func TestCreateRevisionMaterializesCapturedTreeInPrivateRepository(t *testing.T)
 	}
 }
 
+func TestCreateRevisionPreservesTrackedSymlinkWithoutFollowingTarget(t *testing.T) {
+	now := time.Now().UTC()
+	manager, repo, _ := testManager(t, &now, nil)
+	linkPath := filepath.Join(repo, "tracked-link")
+	const target = "missing-target"
+	if err := os.Symlink(target, linkPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	gitTest(t, repo, "add", "tracked-link")
+	gitTest(t, repo, "commit", "-qm", "add tracked symlink")
+
+	revision, err := manager.CaptureContext(context.Background())
+	if err != nil {
+		t.Fatalf("CaptureContext() rejected tracked symlink: %v", err)
+	}
+	mode := gitText(t, repo, "ls-tree", revision.Commit, "--", "tracked-link")
+	if !strings.HasPrefix(mode, "120000 blob ") {
+		t.Fatalf("captured Git entry = %q; want tracked symlink mode 120000", mode)
+	}
+
+	workspace, err := manager.CreateRevisionContext(context.Background(), testJobID, revision)
+	if err != nil {
+		t.Fatalf("CreateRevisionContext() rejected tracked symlink: %v", err)
+	}
+	materializedLink := filepath.Join(workspace.WorktreePath, "tracked-link")
+	info, err := os.Lstat(materializedLink)
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("materialized entry = %v, %v; want symlink without following target", info, err)
+	}
+	gotTarget, err := os.Readlink(materializedLink)
+	if err != nil || gotTarget != target {
+		t.Fatalf("materialized symlink target = %q, %v; want %q", gotTarget, err, target)
+	}
+}
+
 func TestAttemptWorkspacesAreGenerationPrivateAndExclusive(t *testing.T) {
 	now := time.Now().UTC()
 	manager, _, _ := testManager(t, &now, nil)
