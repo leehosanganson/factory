@@ -1049,6 +1049,47 @@ func assertUpgradedLegacyRecords(t *testing.T, store interface {
 	}
 }
 
+func TestPostgresWorkerCapabilityAuthenticationUsesDatabaseClock(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL worker capability authentication integration")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.CloseStore() })
+
+	ctx := context.Background()
+	id, err := newJobID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := "auth-clock-worker-" + id
+	session, _, err := store.RegisterWorkerSession(ctx, principal, "boot-auth-clock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.AuthenticateWorkerCapability(ctx, principal, session.Capability); err != nil || got.ID != session.ID {
+		t.Fatalf("valid PostgreSQL worker capability=(%+v,%v), want session %s", got, err, session.ID)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE factory_worker_sessions SET capability_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, session.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.AuthenticateWorkerCapability(ctx, principal, session.Capability); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expired PostgreSQL worker capability=(%+v,%v), want not found", got, err)
+	}
+}
+
 func TestPostgresWorkerSessionHeartbeatIsDurableAndFenced(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {
