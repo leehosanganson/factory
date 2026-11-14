@@ -422,7 +422,7 @@ func authenticateWorkerCapabilityAt(ctx context.Context, db *sql.DB, principalID
 	if placeholder == "?" {
 		err = db.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=? AND capability_hash=? AND status='active'`, principalID, hex.EncodeToString(hash[:])).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &createdAtRaw, &expiresAtRaw)
 	} else {
-		err = db.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=$1 AND capability_hash=$2 AND status='active' AND capability_expires_at>$3`, principalID, hex.EncodeToString(hash[:]), expiryComparisonValue(placeholder)).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &createdAtRaw, &expiresAtRaw)
+		err = db.QueryRowContext(ctx, `SELECT id,principal_id,boot_id,status,created_at,capability_expires_at FROM factory_worker_sessions WHERE principal_id=$1 AND capability_hash=$2 AND status='active' AND capability_expires_at>clock_timestamp()`, principalID, hex.EncodeToString(hash[:])).Scan(&session.ID, &session.PrincipalID, &session.BootID, &session.Status, &createdAtRaw, &expiresAtRaw)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerSession{}, ErrNotFound
@@ -586,14 +586,6 @@ func heartbeatWorkerSessionAt(ctx context.Context, db *sql.DB, principalID, capa
 		return time.Time{}, errors.New("commit worker session heartbeat")
 	}
 	return heartbeat.UTC(), nil
-}
-
-func expiryComparisonValue(placeholder string) any {
-	now := time.Now().UTC()
-	if placeholder == "?" {
-		return now.Format("2006-01-02T15:04:05.000000000Z07:00")
-	}
-	return now
 }
 
 func validWorkerSessionCapability(capability string) bool {
