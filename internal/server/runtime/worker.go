@@ -124,22 +124,31 @@ func runWorker(ctx context.Context, config restserver.Config, bootIDReader io.Re
 	if err != nil {
 		return err
 	}
-	heartbeatCtx, stopHeartbeats := context.WithCancel(ctx)
+	return runWorkerCoordinator(ctx, coordinator, controller.workerSessionHeartbeat, 0)
+}
+
+// runWorkerCoordinator keeps advisory controller presence alive for the full
+// coordinator shutdown call. Heartbeat loss still stops claims without canceling
+// active work; neither heartbeat renewal nor expiry provides process-stop proof.
+func runWorkerCoordinator(ctx context.Context, coordinator *restworker.Coordinator, startHeartbeats func(context.Context, func()) <-chan struct{}, shutdownTimeout time.Duration) error {
+	heartbeatCtx, stopHeartbeats := context.WithCancel(context.Background())
 	heartbeatFailure := make(chan struct{}, 1)
-	heartbeatDone := controller.workerSessionHeartbeat(heartbeatCtx, func() {
+	heartbeatDone := startHeartbeats(heartbeatCtx, func() {
 		coordinator.StopClaims()
 		heartbeatFailure <- struct{}{}
 	})
+	defer func() {
+		stopHeartbeats()
+		<-heartbeatDone
+	}()
 	failed := false
 	select {
 	case <-ctx.Done():
 	case <-heartbeatFailure:
 		failed = true
 	}
-	stopHeartbeats()
-	<-heartbeatDone
 	coordinator.StopClaims()
-	shutdownCtx, cancel := newWorkerShutdownContext(failed, 0)
+	shutdownCtx, cancel := newWorkerShutdownContext(failed, shutdownTimeout)
 	defer cancel()
 	shutdownErr := coordinator.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
