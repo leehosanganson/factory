@@ -147,6 +147,58 @@ func TestSQLiteScheduleOccurrenceAdmissionRetainsPendingAndSkipsLaterOccurrences
 	}
 }
 
+func TestSQLiteScheduleAllowsOverlappingQueuedOccurrences(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "schedule-overlap.db"), Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	schedule, _, err := store.CreateSchedule("alice", "overlap", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "overlapping scheduled work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := schedule.NextOccurrence()
+	if err := store.DispatchScheduleOccurrences(context.Background(), first, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), first.Add(time.Minute), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	page, err := store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Runs) != 2 {
+		t.Fatalf("schedule runs=%+v, want two admitted occurrences", page.Runs)
+	}
+	jobIDs := map[string]struct{}{}
+	occurrences := map[time.Time]struct{}{}
+	for _, run := range page.Runs {
+		if _, duplicate := occurrences[run.OccurrenceAt]; duplicate {
+			t.Fatalf("multiple Jobs map to occurrence %s", run.OccurrenceAt)
+		}
+		occurrences[run.OccurrenceAt] = struct{}{}
+		if _, duplicate := jobIDs[run.JobID]; duplicate {
+			t.Fatalf("multiple occurrences map to Job %s", run.JobID)
+		}
+		jobIDs[run.JobID] = struct{}{}
+		job, err := store.Get(run.JobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if job.Request.Task != "overlapping scheduled work" || job.Submitter != schedule.Owner || job.Status != StatusQueued {
+			t.Fatalf("scheduled Job=%+v, want distinct canonical queued Job from schedule owner", job)
+		}
+	}
+	if len(jobIDs) != 2 || len(occurrences) != 2 {
+		t.Fatalf("distinct scheduled Jobs=%d occurrences=%d, want two of each", len(jobIDs), len(occurrences))
+	}
+	// The test drives only the dispatcher and never starts a worker, so both
+	// canonical Jobs remain queued for the overlap assertion above.
+}
+
 func TestSQLiteScheduleRunsIgnorePublicKeysInReservedNamespace(t *testing.T) {
 	store, err := OpenSQLiteServerStore(filepath.Join(privateSQLiteDir(t), "schedule-runs-reserved-key.db"), testConfig())
 	if err != nil {
