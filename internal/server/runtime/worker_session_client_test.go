@@ -311,7 +311,10 @@ func TestWorkerSessionClientUsesBoundedTimeoutAndSanitizedErrors(t *testing.T) {
 
 func workerSessionTestClient(t *testing.T, baseURL string, clientCert tls.Certificate, serverCA []byte) *workerSessionClient {
 	t.Helper()
-	state := t.TempDir()
+	state, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	certPath, keyPath, caPath := filepath.Join(state, "client.crt"), filepath.Join(state, "client.key"), filepath.Join(state, "server-ca.crt")
 	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientCert.Certificate[0]}), 0o600); err != nil {
 		t.Fatal(err)
