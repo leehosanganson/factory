@@ -54,6 +54,41 @@ test('operator can manage schedules without exposing definitions in summaries', 
   expect(requests.filter((request) => ['PATCH', 'DELETE'].includes(request.method)).map((request) => request.ifMatch)).toEqual(['"1"', '"2"', '"3"', '"4"']);
 });
 
+test('operator can inspect worker session summaries through the read-only dashboard', async ({ page }) => {
+  const fixture = await runtime();
+  const requests: { method: string; url: string }[] = [];
+  page.on('request', (request) => {
+    if (request.url().includes('/ui/api/v1/worker-sessions')) requests.push({ method: request.method(), url: request.url() });
+  });
+  await page.goto(fixture.url);
+  await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
+  const denied = await page.request.get(`${fixture.url}/ui/api/v1/worker-sessions?limit=50`);
+  expect(denied.status()).toBe(401);
+  await page.getByLabel('Operator token').fill(fixture.token);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+
+  const panel = page.getByRole('region', { name: 'Worker sessions' });
+  await expect(panel.getByRole('row')).toHaveCount(51);
+  await expect(panel.getByText('worker-zeta')).toBeVisible();
+  await expect(panel.getByText('session-latest')).toBeVisible();
+  await expect(panel.getByRole('cell', { name: 'active' }).first()).toBeVisible();
+  await expect(panel.getByRole('cell', { name: '—' }).first()).toBeVisible();
+  await expect(panel.getByText('hidden-boot-id')).toHaveCount(0);
+  const rendered = await panel.innerText();
+  for (const forbidden of ['boot_id', 'capability', 'offline', 'assignment', 'progress']) expect(rendered).not.toContain(forbidden);
+  expect(requests.some((request) => request.method !== 'GET')).toBe(false);
+  expect(requests.some((request) => new URL(request.url).searchParams.has('before_id') !== new URL(request.url).searchParams.has('before_created_at'))).toBe(false);
+  await panel.getByRole('button', { name: 'Load older sessions' }).click();
+  await expect(panel.getByText('session-first')).toBeVisible();
+  await expect(panel.getByText('session-oldest')).toBeVisible();
+  const olderRequest = requests.find((request) => new URL(request.url).searchParams.has('before_id'));
+  expect(olderRequest).toBeDefined();
+  const cursor = new URL(olderRequest!.url).searchParams;
+  expect(cursor.get('before_id')).toBe('session-48');
+  expect(cursor.get('before_created_at')).toBe('2025-01-02T23:11:00Z');
+  expect(requests.every((request) => request.method === 'GET')).toBe(true);
+});
+
 test('operator can sign in, admit and inspect a job, and sign out', async ({ page, context }) => {
   const fixture = await runtime();
   const origin = new URL(fixture.url).origin;

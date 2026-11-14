@@ -14,6 +14,7 @@ import re
 import secrets
 import signal
 import socket
+import sqlite3
 import ssl
 import subprocess
 import tempfile
@@ -37,6 +38,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         allowed = (
             self.command == "GET" and path in ("/", "/ui", "/ui/", "/ui/session", "/ui/assets/dashboard.css", "/ui/assets/dashboard.js") and not parsed.query
             or self.command == "GET" and path == "/ui/api/v1/jobs" and parsed.query == "limit=100"
+            or self.command == "GET" and path == "/ui/api/v1/worker-sessions" and parsed.query in ("limit=50", "limit=50&before_created_at=2025-01-02T23%3A11%3A00Z&before_id=session-48")
             or self.command == "POST" and path == "/ui/api/v1/threads" and not parsed.query
             or self.command == "GET" and path == "/ui/api/v1/threads" and parsed.query == "limit=50"
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/threads/[A-Za-z0-9_-]+", path) and not parsed.query
@@ -209,6 +211,22 @@ def main() -> int:
             else:
                 raise RuntimeError("Factory test server did not become ready")
 
+            with sqlite3.connect(root / "schedules.db") as database:
+                database.execute("DROP INDEX IF EXISTS factory_worker_sessions_one_active_principal")
+                database.execute("DROP INDEX IF EXISTS factory_worker_sessions_principal_boot")
+                sessions = [("session-latest", "worker-zeta", "hidden-boot-id", "active", "2025-01-03T00:00:00Z", None, None)]
+                sessions.extend(
+                    (f"session-{index}", f"worker-{index}", "hidden-boot-id", "active", f"2025-01-02T{23 - (index // 60):02d}:{59 - (index % 60):02d}:00Z", None, None)
+                    for index in range(49)
+                )
+                sessions.extend([
+                    ("session-first", "worker-alpha", "hidden-boot-id", "retired", "2025-01-02T00:00:00Z", "2025-01-02T00:01:00Z", "2025-01-02T00:00:30Z"),
+                    ("session-oldest", "worker-beta", "hidden-boot-id", "active", "2025-01-01T00:00:00Z", None, "2025-01-01T00:00:30Z"),
+                ])
+                database.executemany(
+                    "INSERT INTO factory_worker_sessions (id,principal_id,boot_id,status,created_at,retired_at,heartbeat_at) VALUES (?,?,?,?,?,?,?)",
+                    sessions,
+                )
             Proxy.upstream_port = server_port
             proxy = ProxyServer(("127.0.0.1", args.port), Proxy)
             proxy.daemon_threads = True

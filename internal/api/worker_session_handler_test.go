@@ -79,8 +79,8 @@ func TestWorkerSessionListIsOperatorOnlyBoundedAndRedacted(t *testing.T) {
 	handler.config.DashboardOperatorID = "worker-operator"
 	dashboardResponse := httptest.NewRecorder()
 	handler.ServeAsDashboardOperator(dashboardResponse, httptest.NewRequest(http.MethodGet, "/v1/worker-sessions", nil))
-	if dashboardResponse.Code != http.StatusNotFound {
-		t.Fatalf("dashboard exposed worker sessions: status=%d body=%s", dashboardResponse.Code, dashboardResponse.Body.String())
+	if dashboardResponse.Code != http.StatusOK || !strings.Contains(dashboardResponse.Body.String(), `"principal_id":"api-worker-retired"`) || strings.Contains(dashboardResponse.Body.String(), "retired-boot-label") {
+		t.Fatalf("dashboard worker session listing status=%d body=%s", dashboardResponse.Code, dashboardResponse.Body.String())
 	}
 }
 

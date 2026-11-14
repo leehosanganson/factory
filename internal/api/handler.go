@@ -167,6 +167,9 @@ func isDashboardOperator(r *http.Request) bool {
 }
 
 func dashboardRoute(path, method string) bool {
+	if path == "/v1/worker-sessions" {
+		return method == http.MethodGet
+	}
 	if path == "/v1/schedules" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
