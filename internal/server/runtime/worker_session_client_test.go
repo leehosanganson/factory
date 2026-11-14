@@ -115,13 +115,37 @@ func TestWorkerSessionClientRejectsRedirectAndStopsAfterHeartbeatError(t *testin
 }
 
 type shutdownSignalingManager struct {
-	*restjobs.Manager
-	closed chan struct{}
+	manager *restjobs.LocalManager
+	closed  chan struct{}
 }
 
 func (m *shutdownSignalingManager) Close() {
 	close(m.closed)
-	m.Manager.Close()
+	m.manager.Close()
+}
+
+func (m *shutdownSignalingManager) WaitClaimAttempt(ctx context.Context) (restjobs.AttemptClaim, error) {
+	return m.manager.WaitClaimAttempt(ctx)
+}
+
+func (m *shutdownSignalingManager) HeartbeatAttempt(attempt restjobs.AttemptHandle) error {
+	return m.manager.HeartbeatAttempt(attempt)
+}
+
+func (m *shutdownSignalingManager) Get(id string) (restjobs.Snapshot, error) {
+	return m.manager.Get(id)
+}
+
+func (m *shutdownSignalingManager) RecordProviderOutcomeForAttempt(attempt restjobs.AttemptHandle, outcome restjobs.ProviderOutcome) error {
+	return m.manager.RecordProviderOutcomeForAttempt(attempt, outcome)
+}
+
+func (m *shutdownSignalingManager) FinishAttempt(attempt restjobs.AttemptHandle, status restjobs.Status) error {
+	return m.manager.FinishAttempt(attempt, status)
+}
+
+func (m *shutdownSignalingManager) Cancel(id string) (restjobs.Snapshot, error) {
+	return m.manager.Cancel(id)
 }
 
 func TestWorkerSessionHeartbeatContinuesDuringGracefulDrain(t *testing.T) {
@@ -141,7 +165,7 @@ func TestWorkerSessionHeartbeatContinuesDuringGracefulDrain(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	storeClosed := make(chan struct{})
-	coordinator, err := restworker.New(&shutdownSignalingManager{Manager: manager, closed: storeClosed}, runtimeExecutor(func(ctx context.Context, job restjobs.Snapshot) error {
+	coordinator, err := restworker.New(&shutdownSignalingManager{manager: manager, closed: storeClosed}, runtimeExecutor(func(ctx context.Context, job restjobs.Snapshot) error {
 		if job.ID != active.ID {
 			t.Errorf("executor claimed job %s after graceful drain began", job.ID)
 			return nil
