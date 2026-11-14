@@ -133,6 +133,105 @@ func TestScheduleDispatcherPollRetriesAndStopsOnShutdown(t *testing.T) {
 	}
 }
 
+func TestProcessBootIDRequiresCryptographicEntropy(t *testing.T) {
+	if _, err := processBootIDWithReader(errorReader{}); err == nil || err.Error() != "generate worker boot ID: secure random source unavailable" {
+		t.Fatalf("processBootIDWithReader() error = %v, want sanitized entropy error", err)
+	}
+
+	reader := bytes.NewReader(append(bytes.Repeat([]byte{0x01}, 16), bytes.Repeat([]byte{0x02}, 16)...))
+	first, err := processBootIDWithReader(reader)
+	if err != nil {
+		t.Fatalf("first processBootIDWithReader(): %v", err)
+	}
+	second, err := processBootIDWithReader(reader)
+	if err != nil {
+		t.Fatalf("second processBootIDWithReader(): %v", err)
+	}
+	if len(first) != 32 || len(second) != 32 || first == second {
+		t.Fatalf("boot IDs = %q, %q; want distinct 32-character IDs", first, second)
+	}
+	if _, err := hex.DecodeString(first); err != nil {
+		t.Fatalf("first boot ID is not hex: %q", first)
+	}
+}
+
+func TestRunBootIDEntropyFailureStopsBeforeStoreOrListener(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	storeOpened, listenerOpened := false, false
+	err := run(context.Background(), config, runtimeOptions{
+		BootIDReader: errorReader{},
+		OpenStore: func(restserver.Config) (restjobs.Store, error) {
+			storeOpened = true
+			return nil, errors.New("store must not open")
+		},
+		Listen: func(string, string) (net.Listener, error) {
+			listenerOpened = true
+			return nil, errors.New("listener must not open")
+		},
+	})
+	if err == nil || err.Error() != "generate worker boot ID: secure random source unavailable" || storeOpened || listenerOpened {
+		t.Fatalf("run() error=%v store opened=%v listener opened=%v; want fail-closed before runtime resources", err, storeOpened, listenerOpened)
+	}
+}
+
+func TestRunWorkersDisabledDoesNotRequireBootIDEntropy(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	disabled := false
+	config.WorkersEnabled = &disabled
+	store, err := restworker.NewLocalServerJobManager(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deferredClose := &closeTrackingStore{Store: store}
+	ctx, cancel := context.WithCancel(context.Background())
+	listenerOpened := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config, runtimeOptions{
+			BootIDReader: errorReader{},
+			OpenStore:    func(restserver.Config) (restjobs.Store, error) { return deferredClose, nil },
+			Listen: func(string, string) (net.Listener, error) {
+				listener, listenErr := net.Listen("tcp", "127.0.0.1:0")
+				if listenErr == nil {
+					close(listenerOpened)
+				}
+				return listener, listenErr
+			},
+		})
+	}()
+	select {
+	case <-listenerOpened:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("workers-disabled control plane failed before opening listener")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("workers-disabled runtime shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("workers-disabled runtime did not stop")
+	}
+	if !deferredClose.closed {
+		t.Fatal("workers-disabled runtime did not close store")
+	}
+}
+
+func TestRunWorkerBootIDEntropyFailureStopsBeforeControllerOrStore(t *testing.T) {
+	config, _ := runtimeFixture(t)
+	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendPostgres, DSN: "postgres://worker:secret@localhost/factory"}
+	config.WorkerController = &restserver.WorkerControllerConfig{BaseURL: "https://controller.example", ClientCertFile: "/missing/client.crt", ClientKeyFile: "/missing/client.key", ServerCAFile: "/missing/controller-ca.crt"}
+	if err := runWorker(context.Background(), config, errorReader{}); err == nil || err.Error() != "generate worker boot ID: secure random source unavailable" {
+		t.Fatalf("runWorker() error = %v, want sanitized entropy failure before controller setup", err)
+	}
+}
+
+type errorReader struct{}
+
+func (errorReader) Read([]byte) (int, error) { return 0, errors.New("private entropy failure detail") }
+
 func TestRunWorkersDisabledListenerFailureClosesStoreAndSanitizesError(t *testing.T) {
 	for _, backend := range []string{restserver.PersistenceBackendSQLite, restserver.PersistenceBackendPostgres} {
 		t.Run(backend, func(t *testing.T) {
@@ -165,8 +264,9 @@ func TestRunWorkersDisabledListenerFailureClosesStoreAndSanitizesError(t *testin
 			store := &closeTrackingStore{Store: underlying}
 			const privateListenError = "bind 127.0.0.1:8080: private-listener-detail"
 			gotErr := run(context.Background(), config, runtimeOptions{
-				OpenStore: func(restserver.Config) (restjobs.Store, error) { return store, nil },
-				Listen:    func(string, string) (net.Listener, error) { return nil, errors.New(privateListenError) },
+				BootIDReader: errorReader{},
+				OpenStore:    func(restserver.Config) (restjobs.Store, error) { return store, nil },
+				Listen:       func(string, string) (net.Listener, error) { return nil, errors.New(privateListenError) },
 			})
 			if gotErr == nil || gotErr.Error() != "listen for REST server" {
 				t.Fatalf("listener failure = %v, want generic sanitized listen error", gotErr)

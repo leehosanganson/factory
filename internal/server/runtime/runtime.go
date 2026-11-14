@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -50,6 +51,7 @@ type runtimeOptions struct {
 	WorkspaceNow    func() time.Time
 	SweepInterval   time.Duration
 	SchedulePoll    time.Duration
+	BootIDReader    io.Reader
 }
 
 type providerReconciliationStore interface {
@@ -96,6 +98,18 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 		return err
 	}
 	key := principals.APIKey()
+	workersEnabled := config.WorkersEnabledValue()
+	var bootID string
+	if workersEnabled {
+		reader := options.BootIDReader
+		if reader == nil {
+			reader = rand.Reader
+		}
+		bootID, err = processBootIDWithReader(reader)
+		if err != nil {
+			return err
+		}
+	}
 	openStore := options.OpenStore
 	if openStore == nil {
 		openStore = restworker.NewLocalServerJobManager
@@ -104,12 +118,10 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if err != nil {
 		return err
 	}
-	workersEnabled := config.WorkersEnabledValue()
 	workerID := config.WorkerID
 	if workerID == "" {
 		workerID = fmt.Sprintf("factory-%d", os.Getpid())
 	}
-	bootID := processBootID()
 	if workersEnabled {
 		if identityStore, ok := store.(interface{ SetWorkerIdentity(string, string) error }); ok {
 			if err := identityStore.SetWorkerIdentity(workerID, bootID); err != nil {
@@ -611,12 +623,12 @@ func cloneStringMap(values map[string]string) map[string]string {
 	return cloned
 }
 
-func processBootID() string {
+func processBootIDWithReader(reader io.Reader) (string, error) {
 	var value [16]byte
-	if _, err := rand.Read(value[:]); err != nil {
-		return fmt.Sprintf("boot-%d", time.Now().UnixNano())
+	if _, err := io.ReadFull(reader, value[:]); err != nil {
+		return "", errors.New("generate worker boot ID: secure random source unavailable")
 	}
-	return hex.EncodeToString(value[:])
+	return hex.EncodeToString(value[:]), nil
 }
 
 func principalsConfigured(config restserver.Config) bool {
