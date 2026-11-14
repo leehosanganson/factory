@@ -2,24 +2,36 @@
 
 Keep changes focused so they are easy to understand and review. Branches and pull requests should each cover a coherent, reviewable scope.
 
-## Branch names
+## Branch names and freshness
 
 Use `type/short-kebab-case-summary`, with a concise type and a brief description of the work. For example:
 
 - `feature/add-export`
 - `docs/add-contributing-guide`
 
+Before opening a pull request, update your branch from its target branch (usually `main`) so it is as current as practical. Fetch the latest target branch, integrate it using the repository's normal merge or rebase workflow, and check for merge conflicts. Resolve any conflicts and rerun relevant checks before requesting review. Repeat this if the target branch advances substantially while the pull request is open.
+
+## Tests and documentation
+
+Include relevant tests for changes in behavior. When a change affects behavior, update the documentation for the affected feature slice as part of the same pull request. Keep documentation partitioned by feature: add or update the focused page under [`docs/features/`](docs/features/) and update its [index](docs/features/README.md) when adding a page. Keep current behavior distinct from roadmap or other planned behavior.
+
 ## Pull requests
 
-Use a Conventional Commit-style title in the form `type: concise imperative summary`. For example: `docs: add contribution guide`.
+Use this title format:
 
-Structure the PR description with these sections:
+`type(slice): description #PRNUM`
 
-- **Summary** — what changed.
-- **Rationale/context** — why the change is useful or needed, including relevant context.
-- **Verification** — checks run and their results. If you did not run checks, say so and briefly explain why when useful.
+For example: `feat(rest-client): support job cancellation #123`. Use a Conventional Commit type (such as `feat`, `fix`, `docs`, or `test`), name the affected feature slice in parentheses, write a concise description, and include the relevant pull request number in the `#PRNUM` position when available.
 
-Keep each PR scoped and reviewable; split unrelated work into separate PRs where practical.
+Describe the pull request with these sections:
+
+- **What changed** — summarize the implementation or documentation changes.
+- **Why** — explain the problem or need and the intended outcome.
+- **GitHub Issue** — link the issue this work addresses. If there is no issue, say why or state that it is not applicable.
+- **How to verify** — list the commands or steps a reviewer can use to verify the change, with results where available.
+- **End-to-end test evidence** — record relevant end-to-end tests performed and their results. If none apply or could be run, say so and explain briefly; do not claim tests that were not run.
+
+Keep each pull request scoped and reviewable; split unrelated work into separate pull requests where practical.
 
 ## Commit attribution
 
