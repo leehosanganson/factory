@@ -1,6 +1,8 @@
 # Local Compose API control plane
 
-The root `docker-compose.yml` provides a local PostgreSQL-backed API control plane using the static `factory-controller:local` image (also tagged `factory-web:local` for compatibility with this Compose setup). By default it has **no worker service**: jobs can be admitted and stored, but remain queued and are not executed. An opt-in `worker` Compose profile adds a separately configured `factory-worker:local` service for local execution exercises. This arrangement is for local API development, not a security sandbox, production deployment, or a Factory-unit runtime.
+This is the **current development sample**, not the target Factory Worker MVP. The root `docker-compose.yml` starts PostgreSQL and a Controller using the static `factory-controller:local` image (also tagged `factory-web:local` for compatibility). By default it has **no Worker service**, so jobs can be admitted but remain queued. An opt-in `worker` profile adds a separately configured `factory-worker:local` process for local execution exercises.
+
+The target requires Compose to run the Controller, PostgreSQL, and separate Worker clients as one user-facing product. Current Workers instead share PostgreSQL directly; see [Factory Worker MVP architecture](../roadmap/factory-unit-mvp.md) for the target boundary. This sample is for local development, not production or a security sandbox.
 
 ## Prerequisites and setup
 
