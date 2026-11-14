@@ -2,8 +2,10 @@ package runtime
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,6 +23,10 @@ import (
 // RunWorker starts a worker-only process. It never loads API principals or
 // binds an HTTP listener; PostgreSQL is required to share claims with a server.
 func RunWorker(ctx context.Context, config restserver.Config) error {
+	return runWorker(ctx, config, rand.Reader)
+}
+
+func runWorker(ctx context.Context, config restserver.Config, bootIDReader io.Reader) error {
 	if ctx == nil {
 		return errors.New("worker context must not be nil")
 	}
@@ -43,7 +49,10 @@ func RunWorker(ctx context.Context, config restserver.Config) error {
 	if workerID == "" {
 		workerID = fmt.Sprintf("factory-%d", os.Getpid())
 	}
-	bootID := processBootID()
+	bootID, err := processBootIDWithReader(bootIDReader)
+	if err != nil {
+		return err
+	}
 	controller, err := newWorkerSessionClient(*config.WorkerController)
 	if err != nil {
 		return err
