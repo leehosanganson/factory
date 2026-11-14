@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -110,6 +111,126 @@ func TestWorkerSessionClientRejectsRedirectAndStopsAfterHeartbeatError(t *testin
 	}
 	if failures.Load() != 1 {
 		t.Fatalf("failure callbacks=%d, want one", failures.Load())
+	}
+}
+
+type shutdownSignalingManager struct {
+	*restjobs.Manager
+	closed chan struct{}
+}
+
+func (m *shutdownSignalingManager) Close() {
+	close(m.closed)
+	m.Manager.Close()
+}
+
+func TestWorkerSessionHeartbeatContinuesDuringGracefulDrain(t *testing.T) {
+	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _, err := manager.Admit("drain-active", restjobs.Request{Repository: "trusted", Task: "active"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := manager.Admit("drain-queued", restjobs.Request{Repository: "trusted", Task: "queued"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	storeClosed := make(chan struct{})
+	coordinator, err := restworker.New(&shutdownSignalingManager{Manager: manager, closed: storeClosed}, runtimeExecutor(func(ctx context.Context, job restjobs.Snapshot) error {
+		if job.ID != active.ID {
+			t.Errorf("executor claimed job %s after graceful drain began", job.ID)
+			return nil
+		}
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}), restworker.CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(shutdownCtx); err != nil {
+			t.Errorf("coordinator cleanup shutdown: %v", err)
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active job did not start")
+	}
+
+	var requests atomic.Int32
+	heartbeatSeen := make(chan struct{}, 1)
+	client := &workerSessionClient{baseURL: "https://controller.invalid", token: "test-capability", client: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/v1/worker/session/heartbeat" || request.Method != http.MethodPost {
+			t.Errorf("unexpected controller request: %s %s", request.Method, request.URL.Path)
+		}
+		requests.Add(1)
+		select {
+		case heartbeatSeen <- struct{}{}:
+		default:
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"heartbeat_at":"2026-01-01T00:00:00Z"}`)), Header: make(http.Header), Request: request}, nil
+	})}}
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdownDone := make(chan error, 1)
+	go func() {
+		shutdownDone <- runWorkerCoordinator(ctx, coordinator, func(heartbeatCtx context.Context, failed func()) <-chan struct{} {
+			return client.runHeartbeats(heartbeatCtx, 5*time.Millisecond, failed)
+		}, time.Second)
+	}()
+	cancel()
+	select {
+	case <-storeClosed:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator shutdown did not close the store")
+	}
+	select {
+	case <-heartbeatSeen:
+	case <-time.After(time.Second):
+		t.Fatal("controller heartbeat did not run while graceful shutdown waited for the active execution")
+	}
+	if got, err := manager.Get(queued.ID); err != nil || got.Status != restjobs.StatusCanceled {
+		t.Fatalf("queued job during graceful drain=(%+v, %v), want canceled without execution", got, err)
+	}
+	select {
+	case err := <-shutdownDone:
+		t.Fatalf("worker shutdown returned before the active execution was released: %v", err)
+	default:
+	}
+
+	close(release)
+	select {
+	case err := <-shutdownDone:
+		if err != nil {
+			t.Fatalf("worker shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker shutdown did not finish after the active execution was released")
+	}
+	stoppedAt := requests.Load()
+	time.Sleep(20 * time.Millisecond)
+	if got := requests.Load(); got != stoppedAt {
+		t.Fatalf("controller heartbeat continued after coordinator shutdown returned: before=%d after=%d", stoppedAt, got)
+	}
+	if got, err := manager.Get(queued.ID); err != nil || got.Status != restjobs.StatusCanceled {
+		t.Fatalf("queued job after graceful drain=(%+v, %v), want canceled without execution", got, err)
 	}
 }
 
