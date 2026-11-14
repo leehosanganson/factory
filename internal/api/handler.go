@@ -97,6 +97,13 @@ type submitterJobPage struct {
 	NextCursor string                `json:"next_cursor"`
 }
 
+type workerSessionPageResponse struct {
+	Sessions      []restjobs.WorkerSessionSummary `json:"sessions"`
+	HasMore       bool                            `json:"has_more"`
+	NextCreatedAt *time.Time                      `json:"next_created_at,omitempty"`
+	NextID        string                          `json:"next_id,omitempty"`
+}
+
 var _ http.Handler = (*Handler)(nil)
 
 // New validates the injectable handler configuration and constructs a handler.
@@ -227,7 +234,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 		h.receiveGitHubIssueWebhook(w, r)
 		return
 	}
-	if !isJobsPath(r.URL.Path) && !isThreadsPath(r.URL.Path) && !isSchedulesPath(r.URL.Path) && r.URL.Path != "/v1/operations" && r.URL.Path != "/v1/notifications" {
+	if !isJobsPath(r.URL.Path) && !isThreadsPath(r.URL.Path) && !isSchedulesPath(r.URL.Path) && r.URL.Path != "/v1/operations" && r.URL.Path != "/v1/notifications" && r.URL.Path != "/v1/worker-sessions" {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
@@ -248,11 +255,17 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 	}
 
 	path := r.URL.Path
-	if caller.Role == "submitter" && !submitterRoute(path, r.Method) || caller.Role == "operator" && strings.HasPrefix(path, "/v1/schedules") && !operatorScheduleRoute(path) {
+	if caller.Role == "submitter" && (!submitterRoute(path, r.Method) || path == "/v1/worker-sessions") || caller.Role == "operator" && strings.HasPrefix(path, "/v1/schedules") && !operatorScheduleRoute(path) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
 	}
 	switch {
+	case path == "/v1/worker-sessions":
+		if r.Method != http.MethodGet {
+			methodNotAllowed(w, http.MethodGet)
+			return
+		}
+		h.listWorkerSessions(w, r)
 	case path == "/v1/notifications":
 		if r.Method != http.MethodGet {
 			methodNotAllowed(w, http.MethodGet)
@@ -475,6 +488,62 @@ func submitterRoute(path, method string) bool {
 	}
 	parts := strings.Split(strings.TrimPrefix(path, "/v1/jobs/"), "/")
 	return len(parts) == 1 && parts[0] != "" || len(parts) == 2 && parts[0] != "" && (parts[1] == "history" || parts[1] == "events" || parts[1] == "issue-provenance")
+}
+
+func (h *Handler) listWorkerSessions(w http.ResponseWriter, r *http.Request) {
+	store, ok := h.manager.(restjobs.WorkerSessionListingStore)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "worker_sessions_unavailable", "Worker session listing is unavailable.")
+		return
+	}
+	values, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	for key, entries := range values {
+		if (key != "limit" && key != "before_created_at" && key != "before_id") || len(entries) != 1 || entries[0] == "" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+	}
+	limit := restjobs.DefaultWorkerSessionListLimit
+	if raw, exists := values["limit"]; exists {
+		parsed, parseErr := strconv.Atoi(raw[0])
+		if parseErr != nil || parsed < 1 || parsed > restjobs.MaxWorkerSessionListLimit {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+		limit = parsed
+	}
+	var before *time.Time
+	var beforeID string
+	createdAtValue, hasCreatedAt := values["before_created_at"]
+	idValue, hasID := values["before_id"]
+	if hasCreatedAt != hasID {
+		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+		return
+	}
+	if hasCreatedAt {
+		createdAt, parseErr := time.Parse(time.RFC3339Nano, createdAtValue[0])
+		if parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
+			return
+		}
+		before, beforeID = &createdAt, idValue[0]
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	page, err := store.ListWorkerSessions(ctx, before, beforeID, limit)
+	if err != nil {
+		h.writeManagerError(w, err)
+		return
+	}
+	response := workerSessionPageResponse{Sessions: page.Sessions, HasMore: page.HasMore}
+	if page.HasMore {
+		response.NextCreatedAt, response.NextID = page.NextCreatedAt, page.NextID
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {

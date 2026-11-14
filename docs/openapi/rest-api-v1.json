@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.18.0",
+    "version": "1.19.0",
     "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create schedules they own, and named operators can create schedules attributed to their own principal identity and manage schedules across owners. The legacy shared operator credential retains schedule list/get/mutate access but cannot create schedules. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
@@ -573,6 +573,29 @@
         }
       }
     },
+    "/v1/worker-sessions": {
+      "get": {
+        "operationId": "listWorkerSessions",
+        "summary": "List worker sessions",
+        "x-allowed-roles": [ "legacy-shared operator", "named operator" ],
+        "description": "Read-only authenticated operator projection of active and retired SQL-persisted Worker sessions. Submitters receive a non-disclosing 404. Each item contains only server-generated session ID, configured principal ID, stored session status, creation time, nullable retirement time, and nullable raw heartbeat time; worker-supplied boot ID and all capability material are omitted. Heartbeat is advisory timestamp data, not liveness or evidence that a Worker stopped. No age, online/offline, availability, ownership, execution, reassignment, replay, or recovery conclusions are derived. Pages default to 50 and are capped at 100, newest first by created_at then server session ID descending. Continue with both before_created_at and before_id copied from the final returned item; the exclusive composite key remains stable when later sessions are registered.",
+        "security": [ { "bearerAuth": [] } ],
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "before_created_at", "in": "query", "required": false, "description": "Creation timestamp from the final item of the prior page; must be supplied together with before_id.", "schema": { "type": "string", "format": "date-time" } },
+          { "name": "before_id", "in": "query", "required": false, "description": "Server-generated session ID from the final item of the prior page; must be supplied together with before_created_at.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Bounded page of safe Worker session summaries.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WorkerSessionPage" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "404": { "description": "The authenticated principal is a submitter; Worker sessions are operator-only.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only GET is supported.", "headers": { "Allow": { "schema": { "type": "string", "enum": [ "GET" ] } } }, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } }
+        }
+      }
+    },
     "/v1/notifications": {
       "get": {
         "operationId": "listNotifications",
@@ -1070,6 +1093,26 @@
           "thread_id": { "type": "string" },
           "status": { "type": "string", "enum": [ "done" ] },
           "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "WorkerSessionPage": {
+        "type": "object", "required": [ "sessions", "has_more" ], "additionalProperties": false,
+        "properties": {
+          "sessions": { "type": "array", "maxItems": 100, "items": { "$ref": "#/components/schemas/WorkerSessionSummary" } },
+          "has_more": { "type": "boolean" },
+          "next_created_at": { "type": "string", "format": "date-time", "description": "When has_more is true, creation timestamp for the exclusive composite cursor." },
+          "next_id": { "type": "string", "description": "When has_more is true, server-generated session ID for the exclusive composite cursor." }
+        }
+      },
+      "WorkerSessionSummary": {
+        "type": "object", "required": [ "id", "principal_id", "status", "created_at", "retired_at", "heartbeat_at" ], "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "Server-generated session ID." },
+          "principal_id": { "type": "string", "description": "Configured principal identity." },
+          "status": { "type": "string", "enum": [ "active", "retired" ], "description": "Stored session status; not a derived availability state." },
+          "created_at": { "type": "string", "format": "date-time" },
+          "retired_at": { "type": "string", "format": "date-time", "nullable": true },
+          "heartbeat_at": { "type": "string", "format": "date-time", "nullable": true, "description": "Raw heartbeat timestamp only; advisory and not proof of liveness or process stop." }
         }
       },
       "Thread": {
