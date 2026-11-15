@@ -997,8 +997,8 @@ func TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = store.CloseStore() })
 	var version int
-	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 23 {
-		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 23", version, err)
+	if err := db.QueryRow(`SELECT MAX(version) FROM factory_rest_schema_migrations`).Scan(&version); err != nil || version != 25 {
+		t.Fatalf("upgraded PostgreSQL schema version=%d err=%v; want 25", version, err)
 	}
 	var retainedAudit int
 	if err := db.QueryRow(`SELECT count(*) FROM factory_worker_session_audit WHERE event IN ('registered', 'retired')`).Scan(&retainedAudit); err != nil || retainedAudit != 0 {
