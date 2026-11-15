@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -100,8 +101,65 @@ func TestOpenAPIVersionMatchesCurrentCompatibleContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatalf("decode OpenAPI spec: %v", err)
 	}
-	if document.Info.Version != "1.19.0" {
-		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.19.0", document.Info.Version)
+	if document.Info.Version != "1.20.0" {
+		t.Fatalf("OpenAPI info.version = %q, want compatible minor version 1.20.0", document.Info.Version)
+	}
+}
+
+func TestRemoteWorkerOpenAPIContract(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "docs", "openapi", "rest-api-v1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Paths      map[string]map[string]json.RawMessage `json:"paths"`
+		Components struct {
+			SecuritySchemes map[string]json.RawMessage `json:"securitySchemes"`
+			Schemas         map[string]json.RawMessage `json:"schemas"`
+		} `json:"components"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	for route, wantID := range map[string]string{
+		"/v1/worker/claims":                  "claimWorkerJob",
+		"/v1/worker/attempts/{id}/heartbeat": "heartbeatWorkerAttempt",
+		"/v1/worker/attempts/{id}/finish":    "finishWorkerAttempt",
+	} {
+		var operation struct {
+			OperationID string                `json:"operationId"`
+			Security    []map[string][]string `json:"security"`
+		}
+		raw, ok := document.Paths[route]["post"]
+		if !ok || json.Unmarshal(raw, &operation) != nil || operation.OperationID != wantID {
+			t.Errorf("OpenAPI POST %s operation=%s, want operationId %q", route, raw, wantID)
+			continue
+		}
+		if len(operation.Security) != 1 {
+			t.Errorf("OpenAPI POST %s security=%v, want remote Worker bearer auth only", route, operation.Security)
+			continue
+		}
+		if _, ok := operation.Security[0]["remoteWorkerBearer"]; !ok {
+			t.Errorf("OpenAPI POST %s does not use remoteWorkerBearer: %v", route, operation.Security)
+		}
+	}
+	if _, ok := document.Components.SecuritySchemes["remoteWorkerBearer"]; !ok {
+		t.Error("OpenAPI missing remoteWorkerBearer security scheme")
+	}
+	for _, name := range []string{"RemoteWorkerClaimRequest", "RemoteWorkerClaimResponse", "RemoteWorkerAttempt", "RemoteWorkerAttemptRequest", "RemoteWorkerFinishRequest", "RemoteWorkerEvidence"} {
+		if _, ok := document.Components.Schemas[name]; !ok {
+			t.Errorf("OpenAPI missing %s schema", name)
+		}
+	}
+	for _, name := range []string{"JobSnapshot", "JobSummary", "JobRequest", "CreateJobResponse", "CreateThreadResponse"} {
+		schema, ok := document.Components.Schemas[name]
+		if !ok {
+			t.Errorf("OpenAPI missing public %s schema", name)
+			continue
+		}
+		if bytes.Contains(schema, []byte("owner_token")) {
+			t.Errorf("public %s schema exposes remote Worker owner_token", name)
+		}
 	}
 }
 
@@ -147,8 +205,8 @@ func TestThreadOpenAPIContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.19.0" {
-		t.Fatalf("version=%q want 1.19.0", document.Info.Version)
+	if document.Info.Version != "1.20.0" {
+		t.Fatalf("version=%q want 1.20.0", document.Info.Version)
 	}
 	if document.Paths["/v1/threads"]["get"] == nil {
 		t.Error("OpenAPI missing GET /v1/threads operation")
@@ -345,8 +403,8 @@ func TestOpenAPIRoleDependentListingContract(t *testing.T) {
 	if err := json.Unmarshal(data, &document); err != nil {
 		t.Fatal(err)
 	}
-	if document.Info.Version != "1.19.0" {
-		t.Errorf("OpenAPI version = %q, want 1.19.0", document.Info.Version)
+	if document.Info.Version != "1.20.0" {
+		t.Errorf("OpenAPI version = %q, want 1.20.0", document.Info.Version)
 	}
 	workerSessions := document.Paths["/v1/worker-sessions"].Get
 	if !strings.Contains(workerSessions.Description, "Heartbeat is advisory") || !strings.Contains(workerSessions.Description, "boot ID") || !strings.Contains(workerSessions.Description, "active and retired") {
@@ -525,6 +583,9 @@ func TestOpenAPIRouteInventory(t *testing.T) {
 		"POST /v1/webhooks/github/issues":         "receiveGitHubIssueWebhook",
 		"GET /v1/threads":                         "listThreads",
 		"GET /v1/worker-sessions":                 "listWorkerSessions",
+		"POST /v1/worker/claims":                  "claimWorkerJob",
+		"POST /v1/worker/attempts/{id}/heartbeat": "heartbeatWorkerAttempt",
+		"POST /v1/worker/attempts/{id}/finish":    "finishWorkerAttempt",
 		"POST /v1/threads":                        "createThread",
 		"GET /v1/schedules":                       "listSchedules",
 		"POST /v1/schedules":                      "createSchedule",

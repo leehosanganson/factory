@@ -54,6 +54,31 @@ func TestNewManagerRejectsInvalidBounds(t *testing.T) {
 	}
 }
 
+func TestWorkerClaimBindsIdentityAndRejectsMismatchedAttempt(t *testing.T) {
+	manager := testManager(t, testConfig())
+	job, _, err := manager.Admit("remote-worker-claim", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claim, err := manager.ClaimNextAttemptForWorker("worker-a", "boot-a")
+	if err != nil {
+		t.Fatalf("ClaimNextAttemptForWorker() error = %v", err)
+	}
+	if claim.Job.ID != job.ID || claim.Attempt.WorkerID != "worker-a" || claim.Attempt.BootID != "boot-a" || claim.Job.Worker == nil || *claim.Job.Worker != (WorkerSummary{WorkerID: "worker-a", BootID: "boot-a"}) {
+		t.Fatalf("worker claim = %+v, want identity bound to claimed job", claim)
+	}
+
+	wrongIdentity := claim.Attempt
+	wrongIdentity.WorkerID = "worker-b"
+	if err := manager.HeartbeatAttempt(wrongIdentity); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("HeartbeatAttempt() with mismatched worker = %v, want ErrStaleAttempt", err)
+	}
+	if err := manager.HeartbeatAttempt(claim.Attempt); err != nil {
+		t.Fatalf("HeartbeatAttempt() with claimed identity = %v", err)
+	}
+}
+
 func TestTaskByteLimitIsConfigurableAndDefaultsToMaximum(t *testing.T) {
 	config := Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 2, MaxTaskBytes: 12, RegistryBytes: defaultRegistryBytes}
 	manager := testManager(t, config)

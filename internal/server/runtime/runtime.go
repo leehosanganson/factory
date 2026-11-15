@@ -385,12 +385,27 @@ func run(ctx context.Context, config restserver.Config, options runtimeOptions) 
 	if workerMappings != nil {
 		mappingStatus = workerMappings.Status
 	}
+	var remoteWorkerAPI *restapi.RemoteWorkerAPIConfig
+	if config.RemoteWorkerAPI != nil && config.RemoteWorkerAPI.Enabled {
+		remoteStore, supported := store.(restapi.RemoteWorkerStore)
+		if !supported {
+			closeStore()
+			return errors.New("configured PostgreSQL store does not support remote Worker attempts")
+		}
+		secret, secretErr := restserver.LoadRemoteWorkerSecret(config.RemoteWorkerAPI.SecretFile)
+		if secretErr != nil {
+			closeStore()
+			return errors.New("configured remote Worker API secret is unavailable")
+		}
+		remoteWorkerAPI = &restapi.RemoteWorkerAPIConfig{Authenticate: secret.Authenticate, Store: remoteStore}
+	}
 	apiHandler, err := restapi.New(manager, key, restapi.Config{
 		MaxRequestBodyBytes: config.Limits.RequestBodyBytes,
 		MaxTaskBytes:        config.Limits.TaskBytes,
 		RepositoryAliases:   repositoryAliases(config.Repositories),
 		DashboardOperatorID: dashboardOperatorID,
 		GitHubWebhook:       webhook,
+		RemoteWorkerAPI:     remoteWorkerAPI,
 		CancelJob: func(requestCtx context.Context, id string) (restjobs.Snapshot, error) {
 			if err := requestCtx.Err(); err != nil {
 				return restjobs.Snapshot{}, restjobs.ErrInvalidTransition

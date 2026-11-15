@@ -4,7 +4,7 @@
 
 ## Current execution topology
 
-The all-in-one server starts local workers by default. With PostgreSQL, operators may instead disable server workers and run separate `factory worker` processes against the same Store. Those workers currently connect directly to PostgreSQL to claim jobs and write lifecycle state; Factory does not yet provide target Controller-mediated assignment or a fleet coordinator. The current Worker config selects one harness. See [REST worker process](rest-worker.md) and the [target Factory Worker MVP](../roadmap/factory-unit-mvp.md).
+The all-in-one server starts local workers by default. Factory also supports two standalone modes: `factory worker --config <absolute-path>` connects directly to PostgreSQL, while `factory worker remote --config <absolute-path>` uses the separately enabled shared-secret HTTP Worker API and has no database connection. The remote HTTP API is a shipped Worker pull protocol, not a fleet coordinator or a claim that every part of the target Controller/Worker product is complete. The legacy direct-PostgreSQL mode remains supported. See [REST worker process](rest-worker.md), [server configuration](rest-server-config.md), and the [target Factory Worker MVP](../roadmap/factory-unit-mvp.md).
 
 The [local Compose sample](compose-local-control-plane.md) starts PostgreSQL and the API by default, with no Worker unless its optional profile is selected. It is a development setup, not the target user-facing product deployment.
 
@@ -22,4 +22,4 @@ The server executes configured harnesses and repository content with the service
 
 ## Source and API reference
 
-The current API is specified in [OpenAPI](../openapi/rest-api-v1.json). For source navigation and process-level behavior, see the [operations guide](rest-server-operations.md). Current implementation must not be confused with the target architecture in the [roadmap](../roadmap/roadmap.md).
+The current API is specified in the [OpenAPI specification](../openapi/rest-api-v1.json). Compatible API changes update the spec and info.version; incompatible API changes publish a new versioned document. For source navigation and process-level behavior, see the [operations guide](rest-server-operations.md). Current implementation must not be confused with the target architecture in the [roadmap](../roadmap/roadmap.md).

@@ -139,6 +139,20 @@ func TestWebhookSecretRequiresPrivateBoundedFileAndIsRedacted(t *testing.T) {
 	}
 }
 
+func TestRemoteWorkerSecretUsesPrivateFileAndRedactedFormatting(t *testing.T) {
+	secretValue := strings.Repeat("w", 32)
+	secret, err := LoadRemoteWorkerSecret(writeSecret(t, secretValue, 0o600))
+	if err != nil || string(secret.Value()) != secretValue {
+		t.Fatalf("remote Worker secret=(%q,%v)", secret.Value(), err)
+	}
+	if fmt.Sprint(secret) != "[REDACTED]" || strings.Contains(fmt.Sprintf("%#v", secret), secretValue) {
+		t.Fatal("remote Worker secret formatting disclosed value")
+	}
+	if _, err := LoadRemoteWorkerSecret(writeSecret(t, secretValue, 0o640)); err == nil {
+		t.Fatal("group-readable remote Worker secret accepted")
+	}
+}
+
 func TestLoadProviderTokenRejectsOversizePrivateFile(t *testing.T) {
 	path := writeSecret(t, strings.Repeat("a", apiKeyFileLimit+1), 0o600)
 	if _, err := LoadProviderToken(path); err == nil {

@@ -32,6 +32,11 @@ func CheckLocalPrerequisites(config Config) []string {
 			issues = append(issues, "github_webhook.secret_file: unavailable or invalid")
 		}
 	}
+	if config.RemoteWorkerAPI != nil && config.RemoteWorkerAPI.Enabled {
+		if _, err := LoadRemoteWorkerSecret(config.RemoteWorkerAPI.SecretFile); err != nil {
+			issues = append(issues, "remote_worker_api.secret_file: unavailable or invalid")
+		}
+	}
 	if config.Persistence.Backend == PersistenceBackendSQLite {
 		if err := checkSQLitePathMetadata(config.Persistence.Path); err != nil {
 			issues = append(issues, "persistence.path: unavailable or unsafe")

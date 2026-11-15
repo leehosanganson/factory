@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,337 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 )
+
+func TestPostgresRemoteClaimBindsWorkerIdentityAtomically(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL worker claim coverage")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	db := scopedPostgresDB(t, admin, dsn)
+	// Use the default store constructor, which has no configured worker identity;
+	// the remote claim identity must still be returned on the attempt handle.
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("remote-identity-claim", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claim, err := store.ClaimNextAttemptForWorker("worker-remote", "boot-remote")
+	if err != nil {
+		t.Fatalf("ClaimNextAttemptForWorker() error = %v", err)
+	}
+	if claim.Job.ID != job.ID || claim.Job.Status != StatusRunning || claim.Job.Worker == nil || *claim.Job.Worker != (WorkerSummary{WorkerID: "worker-remote", BootID: "boot-remote"}) || claim.Attempt.WorkerID != "worker-remote" || claim.Attempt.BootID != "boot-remote" {
+		t.Fatalf("durable claim = %+v, want job and attempt bound to remote identity", claim)
+	}
+	if err := store.HeartbeatAttempt(claim.Attempt); err != nil {
+		t.Fatalf("HeartbeatAttempt() with claimed identity = %v", err)
+	}
+	wrongIdentity := claim.Attempt
+	wrongIdentity.BootID = "other-boot"
+	if err := store.HeartbeatAttempt(wrongIdentity); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("HeartbeatAttempt() with mismatched boot ID = %v, want ErrStaleAttempt", err)
+	}
+}
+
+func TestPostgresRemoteClaimFiltersRepositoryCapabilities(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL repository capability claim coverage")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close()
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	incompatible, _, err := store.Admit("remote-capability-incompatible", Request{Repository: "third", Task: "third work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatible, _, err := store.Admit("remote-capability-compatible", Request{Repository: "other", Task: "other work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	claim, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"widget", "other"})
+	if err != nil || claim.Job.ID != compatible.ID {
+		t.Fatalf("claim with other-only capability=(%+v,%v), want matching job %s", claim, err, compatible.ID)
+	}
+	stillQueued, err := store.Get(incompatible.ID)
+	if err != nil || stillQueued.Status != StatusQueued {
+		t.Fatalf("incompatible job=(%+v,%v), want queued", stillQueued, err)
+	}
+	if _, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"other", "third", "widget"}); !errors.Is(err, ErrRemoteClaimConflict) {
+		t.Fatalf("claim retry with changed capability set=%v, want conflict", err)
+	}
+	retry, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"other", "widget"})
+	if err != nil || retry.Job.ID != compatible.ID || retry.Attempt != claim.Attempt {
+		t.Fatalf("same-capability claim retry=(%+v,%v), want original claim", retry, err)
+	}
+}
+
+func TestPostgresRemoteAttemptProtocol(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL remote attempt protocol coverage")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("remote-protocol", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	claim, err := store.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+	if err != nil {
+		t.Fatalf("initial remote claim: %v", err)
+	}
+	if claim.Job.ID != job.ID {
+		t.Fatalf("claimed Job=%s, want %s", claim.Job.ID, job.ID)
+	}
+
+	// A second store represents a Controller restart. The claim ID must recover
+	// the same active attempt and bearer token, not consume another Job.
+	restarted, err := NewPostgresStore(postgresDBForSchema(t, dsn, currentTestSchema(t, db)), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.CloseStore()
+	retried, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+	if err != nil || retried.Attempt != claim.Attempt || retried.Job.ID != claim.Job.ID {
+		t.Fatalf("retry after restart=(%+v,%v), want original claim", retried, err)
+	}
+	type claimResult struct {
+		claim AttemptClaim
+		err   error
+	}
+	concurrent := make(chan claimResult, 2)
+	go func() {
+		result, err := store.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+		concurrent <- claimResult{claim: result, err: err}
+	}()
+	go func() {
+		result, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+		concurrent <- claimResult{claim: result, err: err}
+	}()
+	for range 2 {
+		result := <-concurrent
+		if result.err != nil || result.claim.Attempt != claim.Attempt || result.claim.Job.ID != claim.Job.ID {
+			t.Fatalf("concurrent claim retry=(%+v,%v), want same original attempt", result.claim, result.err)
+		}
+	}
+	if _, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "other-worker", "boot-remote", []string{"widget"}); !errors.Is(err, ErrRemoteClaimConflict) {
+		t.Fatalf("claim ID reused by another worker = %v, want conflict", err)
+	}
+	if _, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"different"}); !errors.Is(err, ErrRemoteClaimConflict) {
+		t.Fatalf("claim retry with changed repository capabilities = %v, want conflict", err)
+	}
+	publicJSON, err := json.Marshal(retried.Job)
+	if err != nil || strings.Contains(string(publicJSON), claim.Attempt.OwnerToken) {
+		t.Fatalf("public Job JSON leaks owner token: json=%s err=%v", publicJSON, err)
+	}
+
+	canceled, err := restarted.Cancel(job.ID)
+	if err != nil || !canceled.CancellationRequested {
+		t.Fatalf("request cancellation=(%+v,%v), want cancellation requested", canceled, err)
+	}
+	requested, err := restarted.HeartbeatRemoteAttempt(claim.Attempt)
+	if err != nil || !requested {
+		t.Fatalf("remote heartbeat=(%t,%v), want successful cancellation indication", requested, err)
+	}
+	if err := restarted.HeartbeatAttempt(claim.Attempt); err != nil {
+		t.Fatalf("legacy error-only heartbeat changed behavior: %v", err)
+	}
+
+	evidence := VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}
+	for _, outcome := range []Status{StatusSucceeded, StatusFailed} {
+		if err := restarted.FinishRemoteAttempt(claim.Attempt, outcome, evidence); !errors.Is(err, ErrCancellationPending) {
+			t.Fatalf("%s after committed cancellation request = %v, want ErrCancellationPending", outcome, err)
+		}
+	}
+	stillRunning, err := restarted.Get(job.ID)
+	if err != nil || stillRunning.Status != StatusRunning || !stillRunning.CancellationRequested {
+		t.Fatalf("job after rejected success=(%+v,%v), want running with cancellation request retained", stillRunning, err)
+	}
+	if err := restarted.FinishRemoteAttempt(claim.Attempt, StatusCanceled, evidence); err != nil {
+		t.Fatalf("finish remote attempt: %v", err)
+	}
+	// Terminal retries are checked from durable result evidence, even after
+	// another store has reopened the schema.
+	resultStore, err := NewPostgresStore(postgresDBForSchema(t, dsn, currentTestSchema(t, db)), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resultStore.CloseStore()
+	if err := resultStore.FinishRemoteAttempt(claim.Attempt, StatusCanceled, evidence); err != nil {
+		t.Fatalf("exact result retry after restart: %v", err)
+	}
+	if err := resultStore.FinishRemoteAttempt(claim.Attempt, StatusCanceled, VerificationEvidence{}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("conflicting evidence retry = %v, want ErrInvalidTransition", err)
+	}
+	if err := resultStore.FinishRemoteAttempt(claim.Attempt, StatusFailed, evidence); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("conflicting outcome retry = %v, want ErrInvalidTransition", err)
+	}
+	wrongIdentity := claim.Attempt
+	wrongIdentity.WorkerID = "other-worker"
+	if err := resultStore.FinishRemoteAttempt(wrongIdentity, StatusCanceled, evidence); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("mismatched worker result = %v, want ErrStaleAttempt", err)
+	}
+	wrongIdentity = claim.Attempt
+	wrongIdentity.BootID = "other-boot"
+	if err := resultStore.FinishRemoteAttempt(wrongIdentity, StatusCanceled, evidence); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("mismatched boot result = %v, want ErrStaleAttempt", err)
+	}
+	if _, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("terminal claim retry = %v, want ErrStaleAttempt", err)
+	}
+	finished, err := resultStore.Get(job.ID)
+	if err != nil || finished.Status != StatusCanceled || finished.Verification == nil || len(finished.Verification.Checks) != len(evidence.Checks) || len(finished.Verification.Limitations) != len(evidence.Limitations) || finished.Verification.Limitations[0] != evidence.Limitations[0] {
+		t.Fatalf("persisted terminal result=(%+v,%v), want canceled with evidence", finished, err)
+	}
+
+	// Concurrent exact retries must both observe the committed result, including
+	// when one request waits for the other to finish its transaction.
+	exactJob, _, err := resultStore.Admit("remote-concurrent-exact", Request{Repository: "widget", Task: "concurrent exact retries"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exactClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-concurrent-exact", "worker-remote", "boot-remote", []string{"widget"})
+	if err != nil || exactClaim.Job.ID != exactJob.ID {
+		t.Fatalf("concurrent exact claim=(%+v,%v), want exact Job", exactClaim, err)
+	}
+	start := make(chan struct{})
+	exactResults := make(chan error, 2)
+	for _, target := range []*PostgresStore{resultStore, restarted} {
+		go func(target *PostgresStore) {
+			<-start
+			exactResults <- target.FinishRemoteAttempt(exactClaim.Attempt, StatusSucceeded, evidence)
+		}(target)
+	}
+	close(start)
+	for range 2 {
+		if err := <-exactResults; err != nil {
+			t.Fatalf("concurrent exact result retry: %v", err)
+		}
+	}
+	if got, err := resultStore.Get(exactJob.ID); err != nil || got.Status != StatusSucceeded {
+		t.Fatalf("concurrent exact result=(%+v,%v), want succeeded", got, err)
+	}
+	if _, err := resultStore.Cancel(exactJob.ID); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("cancellation after committed remote success = %v, want ErrInvalidTransition", err)
+	}
+
+	uncanceledJob, _, err := resultStore.Admit("remote-cancel-without-request", Request{Repository: "widget", Task: "cancellation must be observed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	uncanceledClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-cancel-without-request", "worker-remote", "boot-remote", []string{"widget"})
+	if err != nil || uncanceledClaim.Job.ID != uncanceledJob.ID {
+		t.Fatalf("claim without cancellation=(%+v,%v), want expected job", uncanceledClaim, err)
+	}
+	if err := resultStore.FinishRemoteAttempt(uncanceledClaim.Attempt, StatusCanceled, evidence); !errors.Is(err, ErrCancellationNotRequested) {
+		t.Fatalf("canceled result without committed request = %v, want ErrCancellationNotRequested", err)
+	}
+
+	// Conflicting concurrent outcomes must have one durable winner; the other
+	// request must reject its different result instead of replacing it.
+	conflictJob, _, err := resultStore.Admit("remote-concurrent-conflict", Request{Repository: "widget", Task: "concurrent conflicting retries"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflictClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-concurrent-conflict", "worker-remote", "boot-remote", []string{"widget"})
+	if err != nil || conflictClaim.Job.ID != conflictJob.ID {
+		t.Fatalf("concurrent conflicting claim=(%+v,%v), want conflict Job", conflictClaim, err)
+	}
+	type remoteFinishResult struct {
+		status Status
+		err    error
+	}
+	conflictStart := make(chan struct{})
+	conflictResults := make(chan remoteFinishResult, 2)
+	for _, result := range []struct {
+		target *PostgresStore
+		status Status
+	}{{resultStore, StatusSucceeded}, {restarted, StatusFailed}} {
+		go func(target *PostgresStore, status Status) {
+			<-conflictStart
+			conflictResults <- remoteFinishResult{status: status, err: target.FinishRemoteAttempt(conflictClaim.Attempt, status, evidence)}
+		}(result.target, result.status)
+	}
+	close(conflictStart)
+	var winningStatus Status
+	for range 2 {
+		result := <-conflictResults
+		if result.err == nil {
+			if winningStatus != "" {
+				t.Fatalf("both conflicting outcomes succeeded; second was %s", result.status)
+			}
+			winningStatus = result.status
+		} else if !errors.Is(result.err, ErrInvalidTransition) {
+			t.Fatalf("conflicting %s result retry = %v, want ErrInvalidTransition", result.status, result.err)
+		}
+	}
+	if winningStatus == "" {
+		t.Fatal("both conflicting outcomes were rejected; want one persisted winner")
+	}
+	if got, err := resultStore.Get(conflictJob.ID); err != nil || got.Status != winningStatus {
+		t.Fatalf("persisted conflicting result=(%+v,%v), want winner %s", got, err, winningStatus)
+	}
+
+	expiredJob, _, err := resultStore.Admit("remote-expired-claim", Request{Repository: "widget", Task: "second task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiredClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-expired", "worker-remote", "boot-remote", []string{"widget"})
+	if err != nil || expiredClaim.Job.ID != expiredJob.ID {
+		t.Fatalf("second remote claim=(%+v,%v), want second Job", expiredClaim, err)
+	}
+	if _, err := db.Exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1`, expiredJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-expired", "worker-remote", "boot-remote", []string{"widget"}); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("expired claim retry=%v, want stale without a new attempt", err)
+	}
+	if err := resultStore.FinishRemoteAttempt(expiredClaim.Attempt, StatusFailed, VerificationEvidence{}); !errors.Is(err, ErrStaleAttempt) {
+		t.Fatalf("expired attempt result=%v, want ErrStaleAttempt", err)
+	}
+	var generation int64
+	if err := db.QueryRow(`SELECT generation FROM factory_rest_worker_ownership WHERE job_id=$1`, expiredJob.ID).Scan(&generation); err != nil || generation != expiredClaim.Attempt.Generation {
+		t.Fatalf("generation after expired claim retry=%d err=%v; want unchanged generation %d", generation, err, expiredClaim.Attempt.Generation)
+	}
+}
 
 func TestPostgresProviderRecoveryReadUsesOneConsistentSnapshot(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")

@@ -2,6 +2,7 @@ package restjobs
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -446,10 +447,10 @@ func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID 
 func (s *PostgresStore) claimNext(attemptAware bool) (AttemptClaim, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return s.claimNextContext(ctx, attemptAware)
+	return s.claimNextContext(ctx, attemptAware, "", "", "", nil)
 }
 
-func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool) (AttemptClaim, error) {
+func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool, workerID, bootID, claimID string, repositories []string) (AttemptClaim, error) {
 	if ctx == nil {
 		return AttemptClaim{}, ErrInvalidInput
 	}
@@ -458,6 +459,15 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool)
 	}
 	if err := s.checkAccepting(); err != nil {
 		return AttemptClaim{}, err
+	}
+	var repositoryCapabilityHash string
+	if claimID != "" {
+		if !validPostgresOwnerID(claimID) || !validPostgresOwnerID(workerID) || !validPostgresOwnerID(bootID) || !validRemoteRepositoryAliases(repositories) {
+			return AttemptClaim{}, ErrInvalidInput
+		}
+		repositories = append([]string(nil), repositories...)
+		sort.Strings(repositories)
+		repositoryCapabilityHash = fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(repositories, "\x00"))))
 	}
 	var token string
 	var err error
@@ -472,6 +482,39 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool)
 		return AttemptClaim{}, postgresClaimContextError(ctx, "PostgreSQL job store unavailable")
 	}
 	defer tx.Rollback()
+	if claimID != "" {
+		if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, claimID); err != nil {
+			return AttemptClaim{}, postgresClaimContextError(ctx, "lock PostgreSQL remote claim")
+		}
+		var existingJob, existingWorker, existingBoot, existingToken, existingCapabilityHash string
+		var existingGeneration int64
+		lookupErr := tx.QueryRowContext(ctx, `SELECT job_id,worker_id,boot_id,generation,owner_token,repository_capability_hash FROM factory_rest_remote_claims WHERE claim_id=$1 FOR UPDATE`, claimID).Scan(&existingJob, &existingWorker, &existingBoot, &existingGeneration, &existingToken, &existingCapabilityHash)
+		if lookupErr == nil {
+			if existingWorker != workerID || existingBoot != bootID || existingCapabilityHash != repositoryCapabilityHash {
+				return AttemptClaim{}, ErrRemoteClaimConflict
+			}
+			var running, active bool
+			if err = tx.QueryRowContext(ctx, `SELECT j.status='running',o.lease_until>clock_timestamp() AND o.generation=$2 AND o.owner_token=$3 AND o.worker_id=$4 AND o.boot_id=$5 FROM factory_jobs j JOIN factory_rest_worker_ownership o ON o.job_id=j.id WHERE j.id=$1 FOR UPDATE OF j,o`, existingJob, existingGeneration, existingToken, workerID, bootID).Scan(&running, &active); errors.Is(err, sql.ErrNoRows) {
+				return AttemptClaim{}, ErrStaleAttempt
+			} else if err != nil {
+				return AttemptClaim{}, postgresClaimContextError(ctx, "read PostgreSQL remote claim")
+			}
+			if !running || !active {
+				return AttemptClaim{}, ErrStaleAttempt
+			}
+			snap, scanErr := scanPostgresSnapshot(tx.QueryRowContext(ctx, pgSnapshotQuery()+`WHERE j.id=$1`, existingJob))
+			if scanErr != nil {
+				return AttemptClaim{}, postgresClaimContextError(ctx, "read retried PostgreSQL remote claim")
+			}
+			if err = tx.Commit(); err != nil {
+				return AttemptClaim{}, postgresClaimContextError(ctx, "commit PostgreSQL remote claim retry")
+			}
+			return AttemptClaim{Job: snap, Attempt: AttemptHandle{JobID: existingJob, Generation: existingGeneration, OwnerToken: existingToken, WorkerID: workerID, BootID: bootID}}, nil
+		}
+		if !errors.Is(lookupErr, sql.ErrNoRows) {
+			return AttemptClaim{}, postgresClaimContextError(ctx, "read PostgreSQL remote claim")
+		}
+	}
 	if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, postgresStoreMigrationLock+2); err != nil {
 		return AttemptClaim{}, postgresClaimContextError(ctx, "lock PostgreSQL worker capacity")
 	}
@@ -502,7 +545,11 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool)
 		return AttemptClaim{}, ErrNoWorkerSlots
 	}
 	var id string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM factory_jobs WHERE status='queued' ORDER BY queue_sequence LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&id)
+	if claimID == "" {
+		err = tx.QueryRowContext(ctx, `SELECT id FROM factory_jobs WHERE status='queued' ORDER BY queue_sequence LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&id)
+	} else {
+		err = tx.QueryRowContext(ctx, `SELECT id FROM factory_jobs WHERE status='queued' AND request_json::jsonb->>'repository'=ANY($1::text[]) ORDER BY queue_sequence LIMIT 1 FOR UPDATE SKIP LOCKED`, postgresTextArray(repositories)).Scan(&id)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return AttemptClaim{}, ErrNoQueuedJobs
 	}
@@ -517,12 +564,18 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool)
 		if generation <= 0 {
 			return AttemptClaim{}, ErrInvalidTransition
 		}
-		workerID, bootID := pgIdentityOrDefault(s.workerID, "worker-local"), pgIdentityOrDefault(s.bootID, "boot-local")
+		workerID = pgIdentityOrDefault(workerID, pgIdentityOrDefault(s.workerID, "worker-local"))
+		bootID = pgIdentityOrDefault(bootID, pgIdentityOrDefault(s.bootID, "boot-local"))
 		if _, err = tx.ExecContext(ctx, `INSERT INTO factory_rest_worker_ownership(job_id,generation,owner_token,worker_id,boot_id,lease_until) VALUES($1,$2,$3,$4,$5,clock_timestamp()+interval '1 minute') ON CONFLICT(job_id) DO UPDATE SET generation=EXCLUDED.generation,owner_token=EXCLUDED.owner_token,worker_id=EXCLUDED.worker_id,boot_id=EXCLUDED.boot_id,lease_until=EXCLUDED.lease_until`, id, generation, token, workerID, bootID); err != nil {
 			return AttemptClaim{}, postgresClaimContextError(ctx, "record PostgreSQL worker ownership")
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO factory_rest_attempt_history(job_id,generation,worker_id,boot_id) VALUES($1,$2,$3,$4)`, id, generation, workerID, bootID); err != nil {
 			return AttemptClaim{}, postgresClaimContextError(ctx, "record PostgreSQL attempt history")
+		}
+		if claimID != "" {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO factory_rest_remote_claims(claim_id,job_id,generation,worker_id,boot_id,owner_token,repository_capability_hash) VALUES($1,$2,$3,$4,$5,$6,$7)`, claimID, id, generation, workerID, bootID, token, repositoryCapabilityHash); err != nil {
+				return AttemptClaim{}, postgresClaimContextError(ctx, "record PostgreSQL remote claim")
+			}
 		}
 	}
 	res, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status='running',updated_at=clock_timestamp() WHERE id=$1 AND status='queued'`, id)
@@ -547,9 +600,17 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool)
 	}
 	claim := AttemptClaim{Job: snap}
 	if attemptAware {
-		claim.Attempt = AttemptHandle{JobID: id, Generation: generation, OwnerToken: token, WorkerID: pgIdentityOrDefault(s.workerID, "worker-local"), BootID: pgIdentityOrDefault(s.bootID, "boot-local")}
+		claim.Attempt = AttemptHandle{JobID: id, Generation: generation, OwnerToken: token, WorkerID: workerID, BootID: bootID}
 	}
 	return claim, nil
+}
+
+func postgresTextArray(values []string) string {
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = `"` + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`) + `"`
+	}
+	return "{" + strings.Join(quoted, ",") + "}"
 }
 
 func pgIdentityOrDefault(value, fallback string) string {
@@ -571,6 +632,27 @@ func (s *PostgresStore) ClaimNext() (Snapshot, error) {
 	return claim.Job, err
 }
 func (s *PostgresStore) ClaimNextAttempt() (AttemptClaim, error) { return s.claimNext(true) }
+
+// ClaimNextAttemptForWorker atomically records the authenticated remote
+// Worker's attribution as part of the durable claim transaction.
+func (s *PostgresStore) ClaimNextAttemptForWorker(workerID, bootID string) (AttemptClaim, error) {
+	if !validPostgresOwnerID(workerID) || !validPostgresOwnerID(bootID) {
+		return AttemptClaim{}, ErrInvalidInput
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return s.claimNextContext(ctx, true, workerID, bootID, "", nil)
+}
+
+// ClaimRemoteAttempt returns the same attempt when claimID is retried while its
+// exact lease is still active. A completed or expired claim is stale, never a
+// new claim. Claim IDs are globally unique across workers and boots.
+func (s *PostgresStore) ClaimRemoteAttempt(ctx context.Context, claimID, workerID, bootID string, repositories []string) (AttemptClaim, error) {
+	if ctx == nil || !validPostgresOwnerID(claimID) || !validPostgresOwnerID(workerID) || !validPostgresOwnerID(bootID) {
+		return AttemptClaim{}, ErrInvalidInput
+	}
+	return s.claimNextContext(ctx, true, workerID, bootID, claimID, repositories)
+}
 func (s *PostgresStore) WaitClaim(ctx context.Context) (Snapshot, error) {
 	c, e := s.waitClaim(ctx, false)
 	return c.Job, e
@@ -588,7 +670,7 @@ func (s *PostgresStore) waitClaim(ctx context.Context, attempt bool) (AttemptCla
 		if err := ctx.Err(); err != nil {
 			return AttemptClaim{}, err
 		}
-		c, err := s.claimNextContext(ctx, attempt)
+		c, err := s.claimNextContext(ctx, attempt, "", "", "", nil)
 		if err == nil {
 			return c, nil
 		}
@@ -935,6 +1017,37 @@ func (s *PostgresStore) HeartbeatAttempt(a AttemptHandle) error {
 	}
 	return tx.Commit()
 }
+
+// HeartbeatRemoteAttempt renews a live attempt and reports cancellation as
+// successful state, separate from transport or database errors.
+func (s *PostgresStore) HeartbeatRemoteAttempt(a AttemptHandle) (bool, error) {
+	if !validAttemptHandle(a) {
+		return false, ErrInvalidInput
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tx, err := s.beginAttempt(ctx, a)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE factory_rest_worker_ownership o SET lease_until=clock_timestamp()+interval '1 minute' WHERE o.job_id=$1 AND o.generation=$2 AND o.owner_token=$3 AND o.worker_id=$4 AND o.boot_id=$5 AND o.lease_until>clock_timestamp() AND EXISTS (SELECT 1 FROM factory_rest_remote_claims c WHERE c.job_id=o.job_id AND c.generation=o.generation AND c.worker_id=o.worker_id AND c.boot_id=o.boot_id AND c.owner_token=o.owner_token)`, a.JobID, a.Generation, a.OwnerToken, a.WorkerID, a.BootID)
+	if err != nil {
+		return false, errors.New("renew PostgreSQL worker lease")
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, ErrStaleAttempt
+	}
+	var cancellationRequested bool
+	if err := tx.QueryRowContext(ctx, `SELECT cancellation_requested FROM factory_jobs WHERE id=$1`, a.JobID).Scan(&cancellationRequested); err != nil {
+		return false, errors.New("read PostgreSQL cancellation request")
+	}
+	if err := tx.Commit(); err != nil {
+		return false, errors.New("commit PostgreSQL worker heartbeat")
+	}
+	return cancellationRequested, nil
+}
+
 func (s *PostgresStore) beginAttempt(ctx context.Context, a AttemptHandle) (*sql.Tx, error) {
 	if !validAttemptHandle(a) {
 		return nil, ErrInvalidInput
@@ -1220,6 +1333,109 @@ func (s *PostgresStore) recordEvidence(id string, a *AttemptHandle, e Verificati
 		return errors.New("update PostgreSQL job timestamp")
 	}
 	return tx.Commit()
+}
+
+// FinishRemoteAttempt atomically persists a bounded worker outcome and its
+// evidence with the terminal job and attempt-history transition. Exact retries
+// succeed after commit; conflicting or stale retries are rejected.
+func (s *PostgresStore) FinishRemoteAttempt(a AttemptHandle, status Status, evidence VerificationEvidence) error {
+	if !validAttemptHandle(a) || !status.Terminal() || validateVerificationEvidence(evidence) != nil {
+		return ErrInvalidInput
+	}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return ErrInvalidInput
+	}
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.New("PostgreSQL job store unavailable")
+	}
+	defer tx.Rollback()
+	// Match beginAttempt's job-then-ownership lock order, but do not require a
+	// live lease yet: an exact retry arrives after the first result releases it.
+	var lockedID string
+	err = tx.QueryRowContext(ctx, `SELECT j.id FROM factory_jobs j JOIN factory_rest_worker_ownership o ON o.job_id=j.id WHERE j.id=$1 AND o.generation=$2 AND o.owner_token=$3 AND o.worker_id=$4 AND o.boot_id=$5 FOR UPDATE OF j,o`, a.JobID, a.Generation, a.OwnerToken, pgIdentityOrDefault(a.WorkerID, "worker-local"), pgIdentityOrDefault(a.BootID, "boot-local")).Scan(&lockedID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrStaleAttempt
+	}
+	if err != nil {
+		return errors.New("lock PostgreSQL remote result ownership")
+	}
+	if err := s.checkRemoteResultTx(ctx, tx, a, status, string(encoded)); err == nil {
+		return tx.Commit()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	var active, cancellationRequested bool
+	if err = tx.QueryRowContext(ctx, `SELECT j.status='running' AND o.lease_until>clock_timestamp(),j.cancellation_requested FROM factory_jobs j JOIN factory_rest_worker_ownership o ON o.job_id=j.id WHERE j.id=$1 AND o.generation=$2 AND o.owner_token=$3 AND o.worker_id=$4 AND o.boot_id=$5`, a.JobID, a.Generation, a.OwnerToken, pgIdentityOrDefault(a.WorkerID, "worker-local"), pgIdentityOrDefault(a.BootID, "boot-local")).Scan(&active, &cancellationRequested); err != nil {
+		return errors.New("validate PostgreSQL remote result ownership")
+	}
+	if !active {
+		return ErrStaleAttempt
+	}
+	if cancellationRequested && status != StatusCanceled {
+		return ErrCancellationPending
+	}
+	if status == StatusCanceled && !cancellationRequested {
+		return ErrCancellationNotRequested
+	}
+	var claimed bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM factory_rest_remote_claims WHERE job_id=$1 AND generation=$2 AND worker_id=$3 AND boot_id=$4 AND owner_token=$5)`, a.JobID, a.Generation, a.WorkerID, a.BootID, a.OwnerToken).Scan(&claimed); err != nil {
+		return errors.New("validate PostgreSQL remote claim")
+	}
+	if !claimed {
+		return ErrStaleAttempt
+	}
+	threadID, wasDone, err := postgresThreadDoneTransition(ctx, tx, a.JobID)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO factory_rest_remote_results(job_id,generation,worker_id,boot_id,owner_token,status,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7)`, a.JobID, a.Generation, a.WorkerID, a.BootID, a.OwnerToken, status, string(encoded)); err != nil {
+		return errors.New("record PostgreSQL remote result")
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO factory_job_verification_evidence(job_id,evidence_json,updated_at) VALUES($1,$2,clock_timestamp()) ON CONFLICT(job_id) DO UPDATE SET evidence_json=EXCLUDED.evidence_json,updated_at=EXCLUDED.updated_at`, a.JobID, string(encoded)); err != nil {
+		return errors.New("record PostgreSQL remote result evidence")
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE factory_jobs SET status=$2,cancellation_requested=false,updated_at=clock_timestamp() WHERE id=$1 AND status='running'`, a.JobID, status)
+	if err != nil {
+		return errors.New("finish PostgreSQL remote job")
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrStaleAttempt
+	}
+	if err = insertPostgresEvent(ctx, tx, a.JobID, string(status), "Job finished", s.config.MaxEventsPerJob); err != nil {
+		return errors.New("record PostgreSQL remote job completion")
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE factory_rest_attempt_history SET finished_at=clock_timestamp(),status=$3 WHERE job_id=$1 AND generation=$2 AND finished_at IS NULL`, a.JobID, a.Generation, status); err != nil {
+		return errors.New("finish PostgreSQL remote attempt history")
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp() WHERE job_id=$1 AND generation=$2 AND owner_token=$3`, a.JobID, a.Generation, a.OwnerToken); err != nil {
+		return errors.New("release PostgreSQL remote worker ownership")
+	}
+	if err := recordPostgresDoneTransition(ctx, tx, threadID, wasDone); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *PostgresStore) checkRemoteResultTx(ctx context.Context, tx *sql.Tx, a AttemptHandle, status Status, evidenceJSON string) error {
+	var workerID, bootID, ownerToken, storedStatus, storedEvidence string
+	err := tx.QueryRowContext(ctx, `SELECT worker_id,boot_id,owner_token,status,evidence_json FROM factory_rest_remote_results WHERE job_id=$1 AND generation=$2`, a.JobID, a.Generation).Scan(&workerID, &bootID, &ownerToken, &storedStatus, &storedEvidence)
+	if err != nil {
+		return err
+	}
+	if workerID != a.WorkerID || bootID != a.BootID || ownerToken != a.OwnerToken {
+		return ErrStaleAttempt
+	}
+	if storedStatus != string(status) || storedEvidence != evidenceJSON {
+		return ErrInvalidTransition
+	}
+	return nil
 }
 
 func (s *PostgresStore) FinishAttempt(a AttemptHandle, status Status) error {

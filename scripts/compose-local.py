@@ -62,6 +62,28 @@ def worker_config(server):
     }
 
 
+def remote_worker_config(server):
+    return {
+        "controller_base_url": "http://api:8080",
+        "allow_insecure_http": True,
+        "shared_secret_file": "/run/factory-secrets/remote-worker-secret",
+        "worker_id": "compose-remote-worker",
+        "repositories": server["repositories"],
+        "harness_profiles": {
+            "compose": {
+                "executable": "/opt/factory/harness",
+                "args": ["-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"],
+                "repositories": sorted(server["repositories"]),
+            },
+        },
+        "verification_checks": [["test", "-f", "compose-worker-result.txt"]],
+        "limits": {
+            "job_timeout": server.get("limits", limits())["job_timeout"],
+            "harness_output_bytes": server.get("limits", limits())["harness_output_bytes"],
+        },
+    }
+
+
 def add_worker_config(directory: Path) -> None:
     info = directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
@@ -72,6 +94,26 @@ def add_worker_config(directory: Path) -> None:
         raise PermissionError("server configuration must be a private regular file")
     server = json.loads(server_path.read_text())
     write_private(directory / "worker.json", (json.dumps(worker_config(server), indent=2) + "\n").encode())
+
+
+def add_remote_worker_config(directory: Path) -> None:
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise PermissionError("generated credential directory must be owned and private")
+    server_path = directory / "server.json"
+    server_info = server_path.lstat()
+    if not stat.S_ISREG(server_info.st_mode) or stat.S_ISLNK(server_info.st_mode) or stat.S_IMODE(server_info.st_mode) != 0o600:
+        raise PermissionError("server configuration must be a private regular file")
+    server = json.loads(server_path.read_text())
+    api = server.get("remote_worker_api")
+    if not isinstance(api, dict) or api.get("enabled") is not True or api.get("secret_file") != "/run/factory-secrets/remote-worker-secret":
+        raise ValueError("server configuration must enable the Compose remote Worker API")
+    write_private(directory / "remote-worker-secret", secrets.token_bytes(32))
+    try:
+        write_private(directory / "remote-worker.json", (json.dumps(remote_worker_config(server), indent=2) + "\n").encode())
+    except BaseException:
+        (directory / "remote-worker-secret").unlink()
+        raise
 
 
 def create(directory: Path) -> None:
@@ -88,6 +130,7 @@ def create(directory: Path) -> None:
     api_key = secrets.token_hex(32)
     operator_token = secrets.token_hex(32)
     postgres_password = secrets.token_hex(32)
+    remote_worker_secret = secrets.token_bytes(32)
     config = {
         "mode": "local_process",
         "execution": {"mode": "local"},
@@ -111,12 +154,15 @@ def create(directory: Path) -> None:
             "dsn": f"postgres://factory:{postgres_password}@postgres:5432/factory?sslmode=disable",
         },
         "workers_enabled": False,
+        "remote_worker_api": {"enabled": True, "secret_file": "/run/factory-secrets/remote-worker-secret"},
         "web_ui": {"enabled": True, "operator_id": "local-operator"},
         "limits": limits(),
     }
     try:
         write_private(directory / "server.json", (json.dumps(config, indent=2) + "\n").encode())
         write_private(directory / "worker.json", (json.dumps(worker_config(config), indent=2) + "\n").encode())
+        write_private(directory / "remote-worker.json", (json.dumps(remote_worker_config(config), indent=2) + "\n").encode())
+        write_private(directory / "remote-worker-secret", remote_worker_secret)
         write_private(directory / "api-key", (api_key + "\n").encode())
         verifier = {
             "version": 1,
@@ -129,7 +175,7 @@ def create(directory: Path) -> None:
         write_private(directory / "postgres-password", (postgres_password + "\n").encode())
     except BaseException:
         # Remove only regular generated files; never follow or remove unexpected entries.
-        for name in ("server.json", "worker.json", "api-key", "operator-verifier.json", "operator-token", "postgres-password"):
+        for name in ("server.json", "worker.json", "remote-worker.json", "remote-worker-secret", "api-key", "operator-verifier.json", "operator-token", "postgres-password"):
             try:
                 (directory / name).unlink()
             except FileNotFoundError:
@@ -146,8 +192,12 @@ def main() -> int:
             add_worker_config(target)
             print("Generated private Compose worker configuration under .local/factory-compose.")
             return 0
+        if sys.argv[1:] == ["--remote-worker-config-only"]:
+            add_remote_worker_config(target)
+            print("Generated private Compose remote Worker configuration and secret under .local/factory-compose.")
+            return 0
         if sys.argv[1:]:
-            raise ValueError("usage: compose-local.py [--worker-config-only]")
+            raise ValueError("usage: compose-local.py [--worker-config-only|--remote-worker-config-only]")
         target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         parent_info = target.parent.lstat()
         if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode) or parent_info.st_uid != os.geteuid() or parent_info.st_mode & 0o077:

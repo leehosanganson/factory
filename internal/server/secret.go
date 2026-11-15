@@ -186,6 +186,29 @@ func (secret WebhookSecret) Value() []byte { return bytes.Clone(secret.value) }
 func (WebhookSecret) String() string       { return "[REDACTED]" }
 func (WebhookSecret) GoString() string     { return "[REDACTED]" }
 
+// RemoteWorkerSecret stores a remote Worker API shared secret without exposing it through formatting.
+type RemoteWorkerSecret struct{ value []byte }
+
+func LoadRemoteWorkerSecret(path string) (RemoteWorkerSecret, error) {
+	secret, err := LoadWebhookSecret(path)
+	if err != nil {
+		return RemoteWorkerSecret{}, errors.New("remote Worker API secret is unavailable")
+	}
+	return RemoteWorkerSecret{value: secret.Value()}, nil
+}
+
+func (secret RemoteWorkerSecret) Value() []byte { return bytes.Clone(secret.value) }
+func (secret RemoteWorkerSecret) Authenticate(candidate string) bool {
+	if len(secret.value) == 0 || len(candidate) > apiKeyFileLimit {
+		return false
+	}
+	provided := sha256.Sum256([]byte(candidate))
+	configured := sha256.Sum256(secret.value)
+	return subtle.ConstantTimeCompare(provided[:], configured[:]) == 1
+}
+func (RemoteWorkerSecret) String() string   { return "[REDACTED]" }
+func (RemoteWorkerSecret) GoString() string { return "[REDACTED]" }
+
 // LoadWorkerClientCertificate loads the public client certificate and its
 // protected private key for the worker's controller connection.
 func LoadWorkerClientCertificate(certificatePath, keyPath string) (tls.Certificate, error) {
