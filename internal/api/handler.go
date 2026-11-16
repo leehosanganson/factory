@@ -174,6 +174,42 @@ func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Reques
 	h.serveHTTP(w, r, &restserver.Principal{ID: h.config.DashboardOperatorID, Role: "operator"})
 }
 
+// ServeAsDashboardSubmitter dispatches the browser's user-work allowlist as a
+// trusted named submitter. The caller must resolve identity before invoking it.
+func (h *Handler) ServeAsDashboardSubmitter(w http.ResponseWriter, r *http.Request, principal restserver.Principal) {
+	if principal.ID == "" || principal.Role != "submitter" || r.URL.EscapedPath() != r.URL.Path || !dashboardSubmitterRoute(r.URL.Path, r.Method) {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
+	r = r.WithContext(context.WithValue(r.Context(), dashboardSubmitterContextKey{}, true))
+	h.serveHTTP(w, r, &principal)
+}
+
+type dashboardSubmitterContextKey struct{}
+
+func isDashboardSubmitter(r *http.Request) bool {
+	value, _ := r.Context().Value(dashboardSubmitterContextKey{}).(bool)
+	return value
+}
+
+func dashboardSubmitterRoute(path, method string) bool {
+	if path == "/v1/threads" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	if path == "/v1/notifications" {
+		return method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/v1/threads/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/v1/threads/"), "/")
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/v1/jobs/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/v1/jobs/"), "/")
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+	}
+	return false
+}
+
 type dashboardOperatorContextKey struct{}
 
 func isDashboardOperator(r *http.Request) bool {
@@ -383,7 +419,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 				return
 			}
 			if caller.Role == "submitter" {
-				h.getJobForPrincipal(w, parts[0], caller.ID)
+				h.getJobForPrincipal(w, r, parts[0], caller.ID)
 			} else {
 				h.getJob(w, parts[0])
 			}
@@ -770,6 +806,13 @@ func (h *Handler) AuthenticateDashboardOperator(token string) bool {
 	return h.config.DashboardOperatorID != "" && ok && principal.ID == h.config.DashboardOperatorID && principal.Role == "operator"
 }
 
+// ResolveDashboardSubmitter resolves a configured enabled submitter token to
+// an identity. It does not retain or return the token.
+func (h *Handler) ResolveDashboardSubmitter(token string) (restserver.Principal, bool) {
+	principal, ok := h.key.Resolve(token)
+	return principal, ok && principal.ID != "" && principal.Role == "submitter"
+}
+
 func (h *Handler) authenticate(r *http.Request) (restserver.Principal, bool) {
 	values := r.Header.Values("Authorization")
 	if len(values) != 1 {
@@ -857,7 +900,7 @@ func (h *Handler) createThread(w http.ResponseWriter, r *http.Request, caller re
 		return
 	}
 	id := snapshot.Thread.ID
-	if isDashboardOperator(r) {
+	if isDashboardOperator(r) || isDashboardSubmitter(r) {
 		writeJSON(w, http.StatusAccepted, dashboardThreadCreateResponse{
 			Thread: projectDashboardThread(snapshot.Thread), Job: projectDashboardThreadJob(snapshot.Jobs[0]), Replayed: replayed,
 		})
@@ -897,6 +940,14 @@ func (h *Handler) getThread(w http.ResponseWriter, r *http.Request, id string, c
 		writeJSON(w, http.StatusOK, dashboardThreadDetailResponse{
 			Thread: projectDashboardThread(snapshot.Thread), Jobs: projectDashboardThreadJobs(snapshot.Jobs),
 		})
+		return
+	}
+	if isDashboardSubmitter(r) {
+		jobs := make([]submitterDashboardJobResponse, 0, len(snapshot.Jobs))
+		for _, job := range snapshot.Jobs {
+			jobs = append(jobs, projectSubmitterDashboardJob(job))
+		}
+		writeJSON(w, http.StatusOK, submitterDashboardJobPageResponse{Thread: projectDashboardThread(snapshot.Thread), Jobs: jobs})
 		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
@@ -1094,7 +1145,7 @@ func bodyless(r *http.Request) bool {
 	return err == nil && len(body) == 0
 }
 
-func (h *Handler) getJobForPrincipal(w http.ResponseWriter, id, principalID string) {
+func (h *Handler) getJobForPrincipal(w http.ResponseWriter, r *http.Request, id, principalID string) {
 	snapshot, err := h.manager.GetForPrincipal(id, principalID)
 	if err != nil {
 		h.writeManagerError(w, err)
@@ -1107,6 +1158,10 @@ func (h *Handler) getJobForPrincipal(w http.ResponseWriter, id, principalID stri
 		if snapshot.Progress == nil {
 			snapshot.Progress = history.Progress
 		}
+	}
+	if isDashboardSubmitter(r) {
+		writeJSON(w, http.StatusOK, projectSubmitterDashboardJob(snapshot))
+		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
 }

@@ -4,13 +4,14 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 
-type Session = { authenticated: boolean; csrf?: string };
+type Session = { authenticated: boolean; csrf?: string; role?: 'operator' | 'submitter' };
 type Job = { id: string; status: string; created_at: string; updated_at: string; submitted_by?: string; worker?: { worker_id: string; boot_id: string }; progress?: { stage: string; state: string }; provider?: { repository: string; number: number; url?: string }; verification?: { checks?: { name: string; outcome: string }[]; limitations?: string[] } };
 type History = { events?: { at: string; type: string; stage?: string; state?: string }[] };
 type Schedule = { id: string; status: string; cron: string; revision: number; pending_occurrence_at?: string; skipped_occurrences?: { count: number; first_at: string; last_at: string } };
 type ScheduleDefinition = { id: string; status: string; cron: string; repository: string; task: string };
 type Thread = { id: string; status: string; created_at: string; updated_at: string; completed_at?: string };
 type ThreadPage = { threads?: Thread[]; has_more?: boolean; next_sequence?: number; snapshot_sequence?: number };
+type Notification = { id: number; thread_id: string; status: string; created_at: string };
 type WorkerSession = { id: string; principal_id: string; status: string; created_at: string; retired_at: string | null; heartbeat_at: string | null };
 type WorkerSessionPage = { sessions?: WorkerSession[]; has_more?: boolean; next_created_at?: string; next_id?: string };
 type ApiError = Error & { code?: string };
@@ -58,6 +59,7 @@ function App() {
   const threadPageRef = useRef<ThreadPage>({});
   const [threadLoading, setThreadLoading] = useState('');
   const [threadJobs, setThreadJobs] = useState<Job[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([]);
   const [threadPending, setThreadPending] = useState(false);
   const threadMutationGeneration = useRef(0);
   const threadCreationGeneration = useRef(0);
@@ -148,10 +150,17 @@ function App() {
   }, []);
   useEffect(() => {
     if (!session.authenticated) return;
-    void refreshJobs(); void refreshSchedules(); void refreshThreads();
-    const timer = window.setInterval(() => { void refreshJobs(); void refreshSchedules(); }, 10000);
+    if (session.role === 'operator') { void refreshJobs(); void refreshSchedules(); }
+    void refreshThreads();
+    const refreshInbox = async () => {
+      if (session.role !== 'submitter') return;
+      try { const page = await api<{ notifications?: Notification[] }>('/v1/notifications?limit=50', {}, session.csrf); if (mounted.current) setNotifications(page.notifications || []); }
+      catch (error) { if (mounted.current) setNotice((error as Error).message); }
+    };
+    void refreshInbox();
+    const timer = window.setInterval(() => { if (session.role === 'operator') { void refreshJobs(); void refreshSchedules(); } void refreshInbox(); if (activeThreadID.current) void inspectThread(activeThreadID.current); }, 5000);
     return () => window.clearInterval(timer);
-  }, [session.authenticated, refreshJobs, refreshSchedules, refreshThreads]);
+  }, [session.authenticated, session.role, session.csrf, refreshJobs, refreshSchedules, refreshThreads]);
   useEffect(() => {
     mounted.current = true;
     return () => {
@@ -165,7 +174,7 @@ function App() {
     event.preventDefault(); if (loginPending) return; const generation = ++loginGeneration.current; mounted.current = true; setLoginPending(true); setLoginError(''); const value = token; setToken('');
     try {
       const response = await fetch('/ui/login', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ token: value }), cache: 'no-store' });
-      if (!response.ok) throw new Error('The configured named operator token was not accepted.');
+      if (!response.ok) throw new Error('This enabled account token was not accepted.');
       const newSession = await response.json();
       if (mounted.current && loginGeneration.current === generation) setSession(newSession);
     } catch (error) { if (mounted.current && loginGeneration.current === generation) setLoginError((error as Error).message); }
@@ -176,7 +185,7 @@ function App() {
     try { await fetch('/ui/logout', { method: 'POST', credentials: 'same-origin', headers: { 'X-CSRF-Token': session.csrf || '' }, cache: 'no-store' }); }
     finally {
       stream.current?.close(); stream.current = null; activeSelection.current = ''; selectionGeneration.current++; activeThreadID.current = ''; threadMutationGeneration.current++; threadCreationGeneration.current++; loginGeneration.current++; jobRefreshGeneration.current++; scheduleRefreshGeneration.current++; threadRefreshGeneration.current++; scheduleGeneration.current++;
-      setThreadPending(false); setSession({ authenticated: false }); setDetail(null); setThread(null); setThreads([]); threadPageRef.current = {}; setThreadPage({}); setThreadJobs([]); setSchedules([]); setNotice('');
+      setThreadPending(false); setSession({ authenticated: false }); setDetail(null); setNotifications([]); setThread(null); setThreads([]); threadPageRef.current = {}; setThreadPage({}); setThreadJobs([]); setSchedules([]); setNotice('');
       threadAttempt.current = null; appendAttempt.current = null; scheduleAttempt.current = null; scheduleKey.current = ''; admissionAttempt.current = null; setAdmissionPending(false);
     }
   }
@@ -255,7 +264,16 @@ function App() {
     finally { if (mounted.current && scheduleKey.current === key) setSchedulePending(false); }
   }
 
-  if (!session.authenticated) return <><header className="topbar"><a className="brand" href="/ui">Factory <span>Control Plane</span></a></header><main><section className="panel narrow" aria-labelledby="login-title"><p className="eyebrow">OPERATOR ACCESS</p><h1 id="login-title">Sign in</h1><p className="muted">Use the configured named operator token. It is held only in this form and is not saved.</p><form onSubmit={login}><label htmlFor="token">Operator token</label><input id="token" name="token" type="password" autoComplete="current-password" required value={token} onChange={(e) => setToken(e.target.value)} /><button type="submit" disabled={loginPending}>Sign in</button></form><p className="error" role="alert">{loginError}</p></section></main></>;
+  if (!session.authenticated) return <><header className="topbar"><a className="brand" href="/ui">Factory <span>Control Plane</span></a></header><main><section className="panel narrow" aria-labelledby="login-title"><p className="eyebrow">FACTORY ACCESS</p><h1 id="login-title">Sign in</h1><p className="muted">Use your enabled account token. It is held only in this form and is not saved.</p><form onSubmit={login}><label htmlFor="token">Access token</label><input id="token" name="token" type="password" autoComplete="current-password" required value={token} onChange={(e) => setToken(e.target.value)} /><button type="submit" disabled={loginPending}>Sign in</button></form><p className="error" role="alert">{loginError}</p></section></main></>;
+
+  if (session.role === 'submitter') return <><header className="topbar"><a className="brand" href="/ui">Factory <span>Workbench</span></a><button className="quiet" type="button" onClick={() => void logout()}>Sign out</button></header><main>
+    <div className="welcome"><div><p className="eyebrow">YOUR WORK</p><h1>Threads</h1><p className="muted">Submit work, follow safe job outcomes, and review completion notices.</p></div><button className="secondary" type="button" onClick={() => { void refreshThreads(); if (thread) void inspectThread(thread.id); }}>Refresh</button></div>
+    <div className="notice" role="status" aria-live="polite">{notice}</div>
+    <section className="panel" aria-labelledby="inbox-title"><div className="section-heading"><h2 id="inbox-title">Inbox</h2></div><div className="notification-list" aria-live="polite">{notifications.length ? notifications.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => { activeThreadID.current = item.thread_id; void inspectThread(item.thread_id); }}>Thread {item.thread_id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">Completed {date(item.created_at)}</span></article>) : <p className="empty">No completed Threads yet. A notice appears here when all Jobs in a Thread reach a terminal outcome.</p>}</div></section>
+    <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Your Threads</h2><span className="muted" role="status">{threadLoading}</span></div><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => { activeThreadID.current = item.id; void inspectThread(item.id); }}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)}</span></article>) : <p className="empty">No Threads yet. Create one to submit your first Job.</p>}</div><h2>Start a Thread</h2><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread with Job</button></form>
+      <div className="thread-result" aria-live="polite">{thread && <><h2>Thread {thread.id}</h2><p className="status">Thread status: {thread.status}</p>{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span>{job.verification && <div className="safe-outcome"><h3>Safe outcome</h3><p>Factory recorded the Job as {job.status}.</p>{job.verification.checks?.map((check) => <p key={check.name}>{check.name}: {check.outcome}</p>)}{job.verification.limitations?.map((limitation) => <p className="muted" key={limitation}>{limitation}</p>)}</div>}</article>)}</>}</div>
+    </section>
+  </main></>;
 
   return <><header className="topbar"><a className="brand" href="/ui">Factory <span>Control Plane</span></a><button className="quiet" type="button" onClick={() => void logout()}>Sign out</button></header><main>
     <div className="welcome"><div><p className="eyebrow">LOCAL JOB SERVICE</p><h1>Jobs</h1><p className="muted">Admit work, monitor safe lifecycle progress, and inspect outcomes.</p></div><button className="secondary" type="button" onClick={() => { void refreshJobs(); void refreshSchedules(); void refreshThreads(); if (thread) void inspectThread(thread.id); }}>Refresh</button></div>

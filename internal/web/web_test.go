@@ -34,12 +34,16 @@ func testWebHandlerWithManager(t *testing.T, manager restjobs.Manager) http.Hand
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256([]byte("web-test-token"))
-	verifierPath := t.TempDir() + "/operator.json"
-	verifier, _ := json.Marshal(map[string]any{"version": 1, "principals": []any{map[string]string{"id": "admin", "token_sha256": hex.EncodeToString(digest[:])}}})
+	submitterDigest := sha256.Sum256([]byte("submitter-test-token"))
+	verifierPath := t.TempDir() + "/principals.json"
+	verifier, _ := json.Marshal(map[string]any{"version": 1, "principals": []any{
+		map[string]string{"id": "admin", "token_sha256": hex.EncodeToString(digest[:])},
+		map[string]string{"id": "alice", "token_sha256": hex.EncodeToString(submitterDigest[:])},
+	}})
 	if err := os.WriteFile(verifierPath, verifier, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	resolver, err := restserver.LoadPrincipalResolver(restserver.Config{APIKeyFile: keyPath, Principals: []restserver.PrincipalConfig{{ID: "admin", Role: "operator", TokenFile: verifierPath, Enabled: true}}})
+	resolver, err := restserver.LoadPrincipalResolver(restserver.Config{APIKeyFile: keyPath, Principals: []restserver.PrincipalConfig{{ID: "admin", Role: "operator", TokenFile: verifierPath, Enabled: true}, {ID: "alice", Role: "submitter", TokenFile: verifierPath, Enabled: true}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +53,90 @@ func testWebHandlerWithManager(t *testing.T, manager restjobs.Manager) http.Hand
 		t.Fatal(err)
 	}
 	return New(api, "admin")
+}
+
+func TestSubmitterLoginUsesNamedTokenButNotLegacyKey(t *testing.T) {
+	handler := testWebHandler(t)
+	for _, tc := range []struct {
+		token  string
+		status int
+		role   string
+	}{
+		{"submitter-test-token", http.StatusOK, `"role":"submitter"`},
+		{"legacy-web-test-token", http.StatusUnauthorized, ""},
+	} {
+		request := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader(url.Values{"token": {tc.token}}.Encode()))
+		request.Host = "factory.example"
+		request.Header.Set("Origin", "https://factory.example")
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != tc.status || tc.role != "" && !strings.Contains(response.Body.String(), tc.role) {
+			t.Errorf("login token %q status=%d body=%s", tc.token, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestSubmitterProxyAllowsOnlyUserWorkAndChecksCSRFAndOrigin(t *testing.T) {
+	handler := testWebHandler(t)
+	login := httptest.NewRequest(http.MethodPost, "/ui/login", strings.NewReader("token=submitter-test-token"))
+	login.Host = "factory.example"
+	login.Header.Set("Origin", "https://factory.example")
+	login.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	loggedIn := httptest.NewRecorder()
+	handler.ServeHTTP(loggedIn, login)
+	if loggedIn.Code != http.StatusOK {
+		t.Fatalf("login status=%d body=%s", loggedIn.Code, loggedIn.Body.String())
+	}
+	cookie := loggedIn.Result().Cookies()[0]
+	var sessionData struct {
+		CSRF string `json:"csrf"`
+	}
+	if err := json.Unmarshal(loggedIn.Body.Bytes(), &sessionData); err != nil || sessionData.CSRF == "" {
+		t.Fatalf("login body=%s err=%v", loggedIn.Body.String(), err)
+	}
+
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{
+		{"/ui/api/v1/schedules", http.StatusNotFound},
+		{"/ui/api/v1/worker-sessions", http.StatusNotFound},
+		{"/ui/api/v1/jobs/job-id/history", http.StatusNotFound},
+		{"/ui/api/v1/threads", http.StatusOK},
+		{"/ui/api/v1/threads?cursor=older", http.StatusNotFound},
+		{"/ui/api/v1/threads?limit=50", http.StatusOK},
+		{"/ui/api/v1/notifications", http.StatusOK},
+	} {
+		request := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		request.AddCookie(cookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != tc.status {
+			t.Errorf("GET %s status=%d body=%s want %d", tc.path, response.Code, response.Body.String(), tc.status)
+		}
+	}
+	create := func(origin, csrf string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads", strings.NewReader(`{"repository":"widget","task":"browser task"}`))
+		request.Host = "factory.example"
+		request.Header.Set("Origin", origin)
+		request.Header.Set("X-CSRF-Token", csrf)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "submitter-thread")
+		request.AddCookie(cookie)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := create("https://factory.example", ""); response.Code != http.StatusForbidden {
+		t.Errorf("missing CSRF status=%d", response.Code)
+	}
+	if response := create("https://evil.example", sessionData.CSRF); response.Code != http.StatusForbidden {
+		t.Errorf("wrong Origin status=%d", response.Code)
+	}
+	if response := create("https://factory.example", sessionData.CSRF); response.Code != http.StatusAccepted {
+		t.Fatalf("submitter create status=%d body=%s", response.Code, response.Body.String())
+	}
 }
 
 func TestDashboardScheduleCreateUsesSameOriginCSRFAndIdempotency(t *testing.T) {
