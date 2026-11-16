@@ -13,7 +13,7 @@ This index links to documentation for behavior in the current Factory CLI and RE
 - [REST server configuration](rest-server-config.md)
 - [REST server operations](rest-server-operations.md)
 - [PostgreSQL store](postgres-store.md)
-- [REST worker process](rest-worker.md)
+- [REST worker processes](rest-worker.md) — standalone HTTP Worker API and legacy direct-PostgreSQL Worker modes.
 - [REST job client](rest-client.md)
 - [Supervised systemd deployment](rest-server-systemd.md)
 

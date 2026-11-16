@@ -71,6 +71,7 @@ type Config struct {
 	WebUI              WebUIConfig             `json:"web_ui,omitempty"`
 	WorkerListener     *WorkerListenerConfig   `json:"worker_listener,omitempty"`
 	WorkerController   *WorkerControllerConfig `json:"worker_controller,omitempty"`
+	RemoteWorkerAPI    *RemoteWorkerAPIConfig  `json:"remote_worker_api,omitempty"`
 	GitHubWebhook      GitHubWebhookConfig     `json:"github_webhook,omitempty"`
 	WorkersEnabled     *bool                   `json:"workers_enabled,omitempty"`
 	WorkerID           string                  `json:"worker_id,omitempty"`
@@ -151,6 +152,12 @@ type WorkerListenerConfig struct {
 	ClientCAFile          string                       `json:"client_ca_file"`
 	MappingFile           string                       `json:"mapping_file,omitempty"`
 	Certificates          []WorkerCertificatePrincipal `json:"certificates,omitempty"`
+}
+
+// RemoteWorkerAPIConfig enables the shared-secret-authenticated PostgreSQL pull API.
+type RemoteWorkerAPIConfig struct {
+	Enabled    bool   `json:"enabled"`
+	SecretFile string `json:"secret_file,omitempty"`
 }
 
 // WorkerControllerConfig connects a worker process to its authenticated session controller.
@@ -339,6 +346,18 @@ func (c Config) Validate() error {
 		return errors.New("Kubernetes execution is not implemented")
 	default:
 		return errors.New("execution.mode must be local or kubernetes")
+	}
+	if c.RemoteWorkerAPI != nil {
+		if c.RemoteWorkerAPI.Enabled {
+			if c.Persistence.Backend != PersistenceBackendPostgres {
+				return errors.New("remote_worker_api requires PostgreSQL persistence")
+			}
+			if !filepath.IsAbs(c.RemoteWorkerAPI.SecretFile) || strings.TrimSpace(c.RemoteWorkerAPI.SecretFile) == "" || strings.ContainsRune(c.RemoteWorkerAPI.SecretFile, 0) {
+				return errors.New("remote_worker_api.secret_file must be an absolute path")
+			}
+		} else if c.RemoteWorkerAPI.SecretFile != "" {
+			return errors.New("remote_worker_api.secret_file requires remote_worker_api.enabled")
+		}
 	}
 	if c.WorkerController != nil {
 		controller := c.WorkerController
@@ -735,7 +754,7 @@ func configFieldAllowed(parent, key string) bool {
 	var fields map[string]struct{}
 	switch parent {
 	case "":
-		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "worker_listener": {}, "worker_controller": {}, "github_webhook": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
+		fields = map[string]struct{}{"mode": {}, "execution": {}, "listen_address": {}, "repositories": {}, "harness": {}, "verification_checks": {}, "parallel_subtasks": {}, "api_key_file": {}, "principals": {}, "persistence": {}, "provider": {}, "web_ui": {}, "worker_listener": {}, "worker_controller": {}, "remote_worker_api": {}, "github_webhook": {}, "workers_enabled": {}, "worker_id": {}, "limits": {}}
 	case "execution":
 		fields = map[string]struct{}{"mode": {}}
 	case "harness":
@@ -752,6 +771,8 @@ func configFieldAllowed(parent, key string) bool {
 		fields = map[string]struct{}{"listen_address": {}, "max_client_cert_lifetime": {}, "server_cert_file": {}, "server_key_file": {}, "client_ca_file": {}, "mapping_file": {}, "certificates": {}}
 	case "worker_controller":
 		fields = map[string]struct{}{"base_url": {}, "client_cert_file": {}, "client_key_file": {}, "server_ca_file": {}}
+	case "remote_worker_api":
+		fields = map[string]struct{}{"enabled": {}, "secret_file": {}}
 	case "github_webhook":
 		fields = map[string]struct{}{"secret_file": {}, "trigger_label": {}, "sources": {}, "owners": {}, "owner_generations": {}}
 	case "github_webhook_sources", "github_webhook_owners", "github_webhook_owner_generations":
@@ -852,6 +873,24 @@ func validateRequiredConfigFields(data []byte) error {
 			}
 		}
 	}
+	if raw, exists := fields["remote_worker_api"]; exists {
+		var remoteAPI map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &remoteAPI); err != nil || remoteAPI == nil {
+			return errors.New("remote_worker_api must be an object")
+		}
+		if _, exists := remoteAPI["enabled"]; !exists {
+			return errors.New("required remote_worker_api field \"enabled\" is missing")
+		}
+		var enabled bool
+		if err := json.Unmarshal(remoteAPI["enabled"], &enabled); err != nil {
+			return errors.New("remote_worker_api.enabled must be a boolean")
+		}
+		if enabled {
+			if _, exists := remoteAPI["secret_file"]; !exists {
+				return errors.New("required remote_worker_api field \"secret_file\" is missing when enabled")
+			}
+		}
+	}
 	if raw, exists := fields["worker_controller"]; exists {
 		var controller map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &controller); err != nil {
@@ -897,7 +936,7 @@ func validateRequiredConfigFields(data []byte) error {
 
 func configChild(key string) string {
 	switch key {
-	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "worker_listener", "worker_controller", "github_webhook", "certificates", "repositories", "verification_checks", "execution":
+	case "harness", "limits", "parallel_subtasks", "principals", "persistence", "provider", "web_ui", "worker_listener", "worker_controller", "remote_worker_api", "github_webhook", "certificates", "repositories", "verification_checks", "execution":
 		return key
 	case "sources":
 		return "github_webhook_sources"

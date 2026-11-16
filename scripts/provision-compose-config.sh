@@ -4,18 +4,26 @@ umask 077
 
 config_volume=/target/factory-config
 worker_config_volume=/target/worker-config
+remote_worker_config_volume=/target/remote-worker-config
+remote_worker_secrets_volume=/target/remote-worker-secrets
 secrets_volume=/target/postgres-secrets
 config_names='server.json api-key operator-verifier.json'
 worker_config_names='worker.json'
+remote_worker_config_names='remote-worker.json'
+remote_worker_secret_names='remote-worker-secret'
 secret_names='postgres-password'
 config_stage_dir=
 worker_config_stage_dir=
+remote_worker_config_stage_dir=
+remote_worker_secrets_stage_dir=
+remote_worker_secret_present=0
 secrets_stage_dir=
 mode=${1:-default}
 
 config_source() {
   case "$1" in
-    server.json|worker.json|api-key|operator-verifier.json) printf '/source/%s' "$1" ;;
+    server.json|worker.json|remote-worker.json|api-key|operator-verifier.json) printf '/source/%s' "$1" ;;
+    remote-worker-secret) printf '/source/remote-worker-secret' ;;
     postgres-password) printf '/source/postgres-password' ;;
     *) return 1 ;;
   esac
@@ -23,6 +31,8 @@ config_source() {
 config_target() {
   case "$1" in
     worker.json) printf '%s/%s' "$worker_config_volume" "$1" ;;
+    remote-worker.json) printf '%s/%s' "$remote_worker_config_volume" "$1" ;;
+    remote-worker-secret) printf '%s/remote-worker-secret' "$remote_worker_secrets_volume" ;;
     server.json|api-key|operator-verifier.json) printf '%s/%s' "$config_volume" "$1" ;;
     postgres-password) printf '%s/postgres-password' "$secrets_volume" ;;
     *) return 1 ;;
@@ -31,6 +41,8 @@ config_target() {
 stage_dir() {
   case "$1" in
     worker.json) printf '%s' "$worker_config_stage_dir" ;;
+    remote-worker.json) printf '%s' "$remote_worker_config_stage_dir" ;;
+    remote-worker-secret) printf '%s' "$remote_worker_secrets_stage_dir" ;;
     server.json|api-key|operator-verifier.json) printf '%s' "$config_stage_dir" ;;
     postgres-password) printf '%s' "$secrets_stage_dir" ;;
     *) return 1 ;;
@@ -44,12 +56,14 @@ cleanup() {
   # These mode-0700 directories were uniquely created by this PID; never touch a final path.
   [ -z "$config_stage_dir" ] || rm -rf "$config_stage_dir"
   [ -z "$worker_config_stage_dir" ] || rm -rf "$worker_config_stage_dir"
+  [ -z "$remote_worker_config_stage_dir" ] || rm -rf "$remote_worker_config_stage_dir"
+  [ -z "$remote_worker_secrets_stage_dir" ] || rm -rf "$remote_worker_secrets_stage_dir"
   [ -z "$secrets_stage_dir" ] || rm -rf "$secrets_stage_dir"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-[ "$#" -le 1 ] && { [ "$mode" = default ] || [ "$mode" = worker ]; } || fail 'usage: provision-compose-config.sh [default|worker]'
+[ "$#" -le 1 ] && { [ "$mode" = default ] || [ "$mode" = worker ] || [ "$mode" = remote-worker ]; } || fail 'usage: provision-compose-config.sh [default|worker|remote-worker]'
 [ -d /source ] && [ ! -L /source ] && [ "$(stat -c %a /source)" = 700 ] || fail 'invalid source directory'
 if [ "$mode" = default ]; then
   for name in $config_names; do
@@ -60,10 +74,25 @@ if [ "$mode" = default ]; then
     source=$(config_source "$name")
     [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid source credentials'
   done
-else
+  if [ -e /source/remote-worker-secret ] || [ -L /source/remote-worker-secret ]; then
+    name=remote-worker-secret
+    source=$(config_source "$name")
+    [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid remote Worker source credentials'
+    remote_worker_secret_present=1
+  else
+    remote_worker_secret_present=0
+  fi
+elif [ "$mode" = worker ]; then
   name=worker.json
   source=$(config_source "$name")
   [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid worker source configuration'
+else
+  name=remote-worker.json
+  source=$(config_source "$name")
+  [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid remote Worker source configuration'
+  name=remote-worker-secret
+  source=$(config_source "$name")
+  [ -f "$source" ] && [ ! -L "$source" ] && [ "$(stat -c %h "$source")" = 1 ] && [ -s "$source" ] && [ "$(stat -c %a "$source")" = 600 ] || fail 'invalid remote Worker source credentials'
 fi
 
 validate_target() {
@@ -85,10 +114,20 @@ if [ "$mode" = default ]; then
   secrets_stage_dir=$(mktemp -d "$secrets_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private secret staging directory'
   chmod 0700 "$config_stage_dir" "$secrets_stage_dir"
   names="$config_names $secret_names"
-else
+  if [ "$remote_worker_secret_present" = 1 ]; then
+    remote_worker_secrets_stage_dir=$(mktemp -d "$remote_worker_secrets_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private remote Worker secret staging directory'
+    chmod 0700 "$remote_worker_secrets_stage_dir"
+    names="$names remote-worker-secret"
+  fi
+elif [ "$mode" = worker ]; then
   worker_config_stage_dir=$(mktemp -d "$worker_config_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private worker config staging directory'
   chmod 0700 "$worker_config_stage_dir"
   names=$worker_config_names
+else
+  remote_worker_config_stage_dir=$(mktemp -d "$remote_worker_config_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private remote Worker config staging directory'
+  remote_worker_secrets_stage_dir=$(mktemp -d "$remote_worker_secrets_volume/.factory-provision-$$.XXXXXX") || fail 'cannot create private remote Worker secret staging directory'
+  chmod 0700 "$remote_worker_config_stage_dir" "$remote_worker_secrets_stage_dir"
+  names="$remote_worker_config_names $remote_worker_secret_names"
 fi
 
 for name in $names; do

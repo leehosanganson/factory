@@ -361,6 +361,34 @@ func TestLoadConfigAcceptsGitHubProviderAndRejectsPartialProviderConfig(t *testi
 	}
 }
 
+func TestRemoteWorkerAPIRequiresExplicitPostgresSecretConfiguration(t *testing.T) {
+	base := `"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","persistence":{"backend":"postgres","dsn":"postgres://localhost/factory"}`
+	valid, err := LoadConfig(writeConfig(t, `{`+base+`,"remote_worker_api":{"enabled":true,"secret_file":"/run/secrets/worker-api"}}`))
+	if err != nil || valid.RemoteWorkerAPI == nil || !valid.RemoteWorkerAPI.Enabled || valid.RemoteWorkerAPI.SecretFile != "/run/secrets/worker-api" {
+		t.Fatalf("valid remote worker config=(%+v,%v)", valid.RemoteWorkerAPI, err)
+	}
+	for _, document := range []string{
+		`{"enabled":true}`,
+		`{"enabled":true,"secret_file":"relative"}`,
+		`{"enabled":false,"secret_file":"/run/secrets/worker-api"}`,
+		`{"enabled":true,"secret_file":"/run/secrets/worker-api","extra":true}`,
+		`{"enabled":"yes","secret_file":"/run/secrets/worker-api"}`,
+	} {
+		if _, err := LoadConfig(writeConfig(t, `{`+base+`,"remote_worker_api":`+document+`}`)); err == nil {
+			t.Errorf("LoadConfig accepted remote_worker_api %s", document)
+		}
+	}
+	if _, err := LoadConfig(writeConfig(t, `{`+base+`,"remote_worker_api":{"enabled":null}}`)); err == nil {
+		t.Error("LoadConfig accepted null remote_worker_api.enabled")
+	}
+	for _, persistence := range []string{`"backend":"memory"`, `"backend":"sqlite","path":"/var/lib/factory/jobs.db"`} {
+		config := strings.Replace(base, `"backend":"postgres","dsn":"postgres://localhost/factory"`, persistence, 1)
+		if _, err := LoadConfig(writeConfig(t, `{`+config+`,"remote_worker_api":{"enabled":true,"secret_file":"/run/secrets/worker-api"}}`)); err == nil || !strings.Contains(err.Error(), "remote_worker_api requires PostgreSQL") {
+			t.Errorf("non-PostgreSQL remote worker config error=%v", err)
+		}
+	}
+}
+
 func TestGitHubWebhookRequiresPostgresAndOwnerGenerations(t *testing.T) {
 	base := `{"mode":"local_process","repositories":{"widget":"/srv/widget"},"harness":{"executable":"pi","args":["{system_prompt}","{task}"]},"api_key_file":"/run/key","principals":[{"id":"issue-owner","role":"submitter","token_file":"/run/owner-verifier","enabled":true},{"id":"admin","role":"operator","token_file":"/run/admin-verifier","enabled":true}],"persistence":{"backend":"sqlite","path":"/var/lib/factory/jobs.db"},"github_webhook":{"secret_file":"/run/secrets/github-webhook","trigger_label":"factory:ready","sources":{"acme/issues":"widget"},"owners":{"acme/issues":"issue-owner"},"owner_generations":{"acme/issues":1}}}`
 	if _, err := LoadConfig(writeConfig(t, base)); err == nil || !strings.Contains(err.Error(), "github_webhook requires PostgreSQL persistence") {

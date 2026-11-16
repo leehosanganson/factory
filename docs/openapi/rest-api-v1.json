@@ -2,8 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Factory REST Job API",
-    "version": "1.19.0",
-    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create schedules they own, and named operators can create schedules attributed to their own principal identity and manage schedules across owners. The legacy shared operator credential retains schedule list/get/mutate access but cannot create schedules. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
+    "version": "1.20.0",
+    "description": "Authenticated API for submitting and inspecting bounded Factory jobs and direct-request Threads, with an optional shared-secret HTTP Worker pull API on PostgreSQL-backed Controllers. A successful agent process or PR publication is not an independent correctness verdict. Named submitters can create schedules they own, and named operators can create schedules attributed to their own principal identity and manage schedules across owners. The legacy shared operator credential retains schedule list/get/mutate access but cannot create schedules. A bounded server dispatcher admits due occurrences as standalone Jobs and reports pending and skipped occurrences in schedule responses."
   },
   "paths": {
     "/v1/webhooks/github/issues": {
@@ -573,6 +573,66 @@
         }
       }
     },
+    "/v1/worker/claims": {
+      "post": {
+        "operationId": "claimWorkerJob",
+        "summary": "Claim a queued job for a remote Worker",
+        "description": "Optional Worker-only endpoint, enabled by remote_worker_api on a PostgreSQL-backed Controller. It is authenticated with the separately configured shared-secret Worker bearer credential, not the human/operator API credential or worker-session credential. Claim ID retries from the same worker and boot return the same active claim and owner token only when the allowed repository set is exactly unchanged; reuse with a changed set, worker, or boot conflicts. Returns 204 when no queued job or worker capacity is available. The returned owner_token is a worker-only fencing value: it is present only in this authenticated claim response and is required for that attempt's heartbeat and finish. It is not exposed in public job snapshots. The HTTP API server does not terminate TLS; use HTTPS except for loopback-only development. Standalone Workers reject non-loopback HTTP unless the local config explicitly sets allow_insecure_http=true; redirects are not followed.",
+        "security": [ { "remoteWorkerBearer": [] } ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemoteWorkerClaimRequest" } } } },
+        "responses": {
+          "200": { "description": "A job and its fenced attempt were assigned.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemoteWorkerClaimResponse" } } } },
+          "204": { "description": "No queued job or worker capacity is available." },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "409": { "description": "The claim ID conflicts with a claim made by another worker, boot, or repository capability set.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "413": { "description": "The request exceeds the Worker API body limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only POST is supported." }
+        }
+      }
+    },
+    "/v1/worker/attempts/{id}/heartbeat": {
+      "post": {
+        "operationId": "heartbeatWorkerAttempt",
+        "summary": "Renew a remote Worker attempt and check cancellation",
+        "description": "Worker-only heartbeat for the attempt identified by the path job ID and fenced body identity. cancellation_requested is a state signal, not an error. A cancellation request does not prove that local execution stopped. Stale ownership is rejected; heartbeat loss or lease expiry does not trigger automatic replay or reassignment.",
+        "security": [ { "remoteWorkerBearer": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemoteWorkerAttemptRequest" } } } },
+        "responses": {
+          "200": { "description": "The attempt was renewed.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemoteWorkerHeartbeatResponse" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "409": { "description": "The attempt is stale or no longer owns the job.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "413": { "description": "The request exceeds the Worker API body limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only POST is supported." }
+        }
+      }
+    },
+    "/v1/worker/attempts/{id}/finish": {
+      "post": {
+        "operationId": "finishWorkerAttempt",
+        "summary": "Record a remote Worker attempt result",
+        "description": "Worker-only terminal result. The result and evidence are atomically persisted with the job outcome. An exact retry after commit succeeds; a different result or stale attempt conflicts. A canceled result requires a persisted cancellation request, while a non-canceled result is rejected while cancellation is pending. The Worker must report only confirmed cooperative cancellation; uncertainty leaves the job inspectable.",
+        "security": [ { "remoteWorkerBearer": [] } ],
+        "parameters": [ { "$ref": "#/components/parameters/JobId" } ],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemoteWorkerFinishRequest" } } } },
+        "responses": {
+          "200": { "description": "The terminal result was recorded.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RemoteWorkerFinishResponse" } } } },
+          "400": { "$ref": "#/components/responses/InvalidRequest" },
+          "401": { "$ref": "#/components/responses/Unauthenticated" },
+          "409": { "description": "The attempt is stale, the result conflicts, or the result disagrees with cancellation state.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "413": { "description": "The request exceeds the Worker API body limit.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ErrorEnvelope" } } } },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "503": { "$ref": "#/components/responses/NotReady" },
+          "405": { "description": "Only POST is supported." }
+        }
+      }
+    },
     "/v1/worker-sessions": {
       "get": {
         "operationId": "listWorkerSessions",
@@ -950,6 +1010,12 @@
         "scheme": "bearer",
         "bearerFormat": "Bearer token",
         "description": "Send the operator-provisioned shared API key or a configured named-principal bearer token as Authorization: Bearer <token>; never place credentials in a URL or job payload. The shared legacy key is operator-wide. Named submitter credentials are restricted to submission and owner-filtered inspection/listing; named operator credentials have operator-wide job and operator-action access."
+      },
+      "remoteWorkerBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "Worker shared secret",
+        "description": "Separate operator-provisioned shared secret for the optional PostgreSQL-backed remote Worker API. It is not an operator, submitter, or worker-session credential. Use only over HTTPS except for loopback or a private network explicitly opted into by the standalone Worker configuration; the API server does not terminate TLS."
       }
     },
     "parameters": {
@@ -1012,6 +1078,91 @@
       }
     },
     "schemas": {
+      "RemoteWorkerClaimRequest": {
+        "type": "object", "additionalProperties": false, "required": [ "claim_id", "worker_id", "boot_id", "repositories" ],
+        "properties": {
+          "claim_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "description": "Worker-generated idempotency identity for this claim request. Retry an ambiguous request with the same ID and exact repository alias set." },
+          "worker_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "boot_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", "description": "Fresh Worker process identity." },
+          "repositories": { "type": "array", "minItems": 1, "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" }, "description": "Allowed repository aliases this Worker can execute. This is capability metadata only; it does not select a harness profile. Retry the same claim ID with exactly the same set." }
+        }
+      },
+      "RemoteWorkerClaimResponse": {
+        "type": "object", "additionalProperties": false, "required": [ "job", "attempt" ],
+        "properties": {
+          "job": { "$ref": "#/components/schemas/RemoteWorkerJob" },
+          "attempt": { "$ref": "#/components/schemas/RemoteWorkerAttempt" }
+        }
+      },
+      "RemoteWorkerJob": {
+        "type": "object", "additionalProperties": false, "required": [ "id", "request" ],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "request": { "$ref": "#/components/schemas/RemoteWorkerJobRequest" }
+        }
+      },
+      "RemoteWorkerJobRequest": {
+        "type": "object", "additionalProperties": false, "required": [ "repository", "task" ],
+        "properties": {
+          "repository": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Configured repository alias, not a path." },
+          "task": { "type": "string", "maxLength": 262144, "x-maxBytes": 262144, "description": "UTF-8 task text bounded to 256 KiB by byte length." },
+          "issue": { "type": "integer", "minimum": 1 },
+          "issue_provenance": { "$ref": "#/components/schemas/IssueProvenance" }
+        }
+      },
+      "RemoteWorkerAttempt": {
+        "type": "object", "additionalProperties": false, "required": [ "job_id", "generation", "owner_token", "worker_id", "boot_id" ],
+        "description": "Worker-only fenced attempt. The opaque owner token appears only in the authenticated Worker claim response and is never part of public job schemas.",
+        "properties": {
+          "job_id": { "type": "string", "format": "uuid" },
+          "generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "owner_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$", "description": "Secret worker-only fencing value; send only in authenticated heartbeat and finish requests." },
+          "worker_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "boot_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" }
+        }
+      },
+      "RemoteWorkerAttemptRequest": {
+        "type": "object", "additionalProperties": false, "required": [ "generation", "owner_token", "worker_id", "boot_id" ],
+        "properties": {
+          "generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "owner_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$" },
+          "worker_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "boot_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" }
+        }
+      },
+      "RemoteWorkerHeartbeatResponse": {
+        "type": "object", "additionalProperties": false, "required": [ "cancellation_requested" ],
+        "properties": { "cancellation_requested": { "type": "boolean", "description": "A cancellation signal is not proof that Worker execution stopped." } }
+      },
+      "RemoteWorkerFinishRequest": {
+        "type": "object", "additionalProperties": false, "required": [ "generation", "owner_token", "worker_id", "boot_id", "status", "evidence" ],
+        "properties": {
+          "generation": { "type": "integer", "format": "int64", "minimum": 1 },
+          "owner_token": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$" },
+          "worker_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "boot_id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" },
+          "status": { "type": "string", "enum": [ "succeeded", "failed", "canceled" ] },
+          "evidence": { "$ref": "#/components/schemas/RemoteWorkerEvidence" }
+        }
+      },
+      "RemoteWorkerEvidence": {
+        "type": "object", "additionalProperties": false, "required": [ "checks", "limitations" ],
+        "properties": {
+          "checks": { "type": "array", "maxItems": 16, "items": { "$ref": "#/components/schemas/RemoteWorkerVerificationCheck" } },
+          "limitations": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 128, "enum": [ "No operator-configured verification checks were run.", "Agent-reported completion is not an independent correctness verdict." ] } }
+        }
+      },
+      "RemoteWorkerVerificationCheck": {
+        "type": "object", "additionalProperties": false, "required": [ "name", "outcome" ],
+        "properties": {
+          "name": { "type": "string", "pattern": "^check-(0[1-9]|1[0-6])$" },
+          "outcome": { "type": "string", "enum": [ "not_completed", "passed", "failed", "canceled" ] }
+        }
+      },
+      "RemoteWorkerFinishResponse": {
+        "type": "object", "additionalProperties": false, "required": [ "status" ],
+        "properties": { "status": { "type": "string", "enum": [ "finished" ] } }
+      },
       "CreateThreadRequest": {
         "type": "object",
         "additionalProperties": false,

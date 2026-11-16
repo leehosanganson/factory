@@ -105,6 +105,40 @@ func (*attemptAwareExecutor) Complete(context.Context, restjobs.Snapshot, restjo
 	return nil
 }
 
+type localClaimStore struct{ *lifecycleOnlyStore }
+
+func (s localClaimStore) WaitClaimAttempt(context.Context) (restjobs.AttemptClaim, error) {
+	return s.manager.ClaimNextAttempt()
+}
+func (s localClaimStore) SetAttemptIdentity(attempt restjobs.AttemptHandle) error {
+	return s.manager.SetAttemptIdentity(attempt)
+}
+
+func TestCoordinatorAppliesConfiguredIdentityToDefaultLocalClaim(t *testing.T) {
+	manager := newTestManager(t, 1, 1)
+	job := admit(t, manager, "configured-local-identity")
+	store := localClaimStore{lifecycleOnlyStore: &lifecycleOnlyStore{manager: manager}}
+	coordinator, err := New(store, attemptExecutorFunc(func(context.Context, restjobs.Snapshot, restjobs.AttemptHandle) ExecutionResult {
+		return ExecutionResult{}
+	}), CoordinatorConfig{Workers: 1, WorkerID: "worker-configured", BootID: "boot-configured"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+
+	result := waitForStatus(t, manager, job.ID, restjobs.StatusSucceeded)
+	wantWorker := &restjobs.WorkerSummary{WorkerID: "worker-configured", BootID: "boot-configured"}
+	if result.Worker == nil || *result.Worker != *wantWorker {
+		t.Fatalf("terminal job worker = %+v, want %+v", result.Worker, wantWorker)
+	}
+}
+
 func TestCoordinatorPassesClaimHandleToAttemptAwareExecutor(t *testing.T) {
 	manager := newTestManager(t, 1, 1)
 	job := admit(t, manager, "attempt-aware")

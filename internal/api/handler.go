@@ -51,6 +51,7 @@ type Config struct {
 	CancelJob           func(context.Context, string) (restjobs.Snapshot, error)
 	DashboardOperatorID string
 	GitHubWebhook       GitHubWebhookConfig
+	RemoteWorkerAPI     *RemoteWorkerAPIConfig
 	WorkerMappingStatus func() restserver.WorkerMappingStatus
 }
 
@@ -62,6 +63,13 @@ type GitHubWebhookConfig struct {
 	Sources      map[string]string
 	Owners       map[string]string
 	Generations  map[string]int64
+}
+
+// RemoteWorkerAPIConfig enables the separate shared-secret Worker pull API.
+type RemoteWorkerAPIConfig struct {
+	Secret       []byte
+	Authenticate func(string) bool
+	Store        RemoteWorkerStore
 }
 
 type Handler struct {
@@ -111,6 +119,9 @@ func New(manager restjobs.Manager, key restserver.APIKey, config Config) (*Handl
 	if manager == nil || config.MaxRequestBodyBytes < 1 || config.MaxRequestBodyBytes > maxRequestBodyBytes || config.MaxTaskBytes < 1 || config.MaxTaskBytes > maxTaskBytes || config.MaxTaskBytes > config.MaxRequestBodyBytes || len(config.RepositoryAliases) == 0 {
 		return nil, errors.New("invalid REST API handler configuration")
 	}
+	if config.RemoteWorkerAPI != nil && (config.RemoteWorkerAPI.Store == nil || config.RemoteWorkerAPI.Authenticate == nil && len(config.RemoteWorkerAPI.Secret) < 32) {
+		return nil, errors.New("invalid remote Worker API configuration")
+	}
 	aliases := make(map[string]struct{}, len(config.RepositoryAliases))
 	for alias := range config.RepositoryAliases {
 		if strings.TrimSpace(alias) != alias || alias == "" {
@@ -146,6 +157,10 @@ func (h *Handler) readinessError(ctx context.Context) error {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.config.RemoteWorkerAPI != nil && isRemoteWorkerPath(r.URL.Path) {
+		h.serveRemoteWorkerHTTP(w, r)
+		return
+	}
 	h.serveHTTP(w, r, nil)
 }
 

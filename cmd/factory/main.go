@@ -77,6 +77,19 @@ func run(args []string, in io.Reader, out, errOut io.Writer) error {
 			}
 			return runDoctor(out)
 		case "worker":
+			if len(args) > 1 && args[1] == "remote" {
+				configPath, err := parseWorkerOptions(args[2:])
+				if err != nil {
+					return err
+				}
+				config, err := restserver.LoadRemoteWorkerConfig(configPath)
+				if err != nil {
+					return err
+				}
+				ctx, stop := foregroundContext()
+				defer stop()
+				return serverruntime.RunRemoteWorker(ctx, config)
+			}
 			configPath, err := parseWorkerOptions(args[1:])
 			if err != nil {
 				return err
@@ -387,9 +400,9 @@ func printCommandHelp(out io.Writer, args []string) {
 		title = "Setup diagnostics"
 		commands = []helpCommand{{"factory doctor", "Check config and required executables without starting work."}}
 	case "worker":
-		title = "REST job worker (PostgreSQL job worker)"
-		commands = []helpCommand{{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."}}
-		paragraphs = []string{"Uses a worker-mode server JSON config for the same PostgreSQL persistence as the API. Worker configs require trusted repositories, harness settings, and matching limits.workers; caller API credentials are not required. The worker runs without opening an HTTP listener. See docs/features/rest-worker.md for operating constraints."}
+		title = "REST job worker"
+		commands = []helpCommand{{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."}, {"factory worker remote --config <absolute-path>", "Start a standalone HTTP-polling worker without PostgreSQL access."}}
+		paragraphs = []string{"The direct worker uses a worker-mode server JSON config and shared PostgreSQL persistence. Worker mode supports PostgreSQL workers; caller API credentials are not required. The remote worker uses a separate strict config with a Controller URL, shared credential file, worker identity, trusted repository roots, and local harness profiles. Remote HTTP is restricted to localhost; use HTTPS for all other Controller URLs. The direct worker requires matching limits.workers."}
 	case "implement":
 		title = "Implement workflow"
 		commands = []helpCommand{
@@ -981,6 +994,7 @@ func printRootHelpWithOptions(out io.Writer, width int, terminal, noColor bool) 
 		{"factory run <command>", "Manage gated runs."},
 		{"factory server --config <absolute-path>", "Start the REST API server."},
 		{"factory worker --config <absolute-path>", "Start a PostgreSQL-backed worker without an HTTP listener."},
+		{"factory worker remote --config <absolute-path>", "Start a standalone HTTP-polling worker without PostgreSQL access."},
 		{"factory issue-poller --config <absolute-path>", "Poll allowlisted GitHub issues and admit jobs into PostgreSQL."},
 		{"factory intake-owner register|inspect|transfer --config <absolute-path> --source <owner/repo> --label <exact-label> --kind webhook|poller [--attest <statement>]", "Register, inspect, or transfer ownership of one exact PostgreSQL issue-intake pair."},
 		{"factory issue-poller list|resolve --config <absolute-path>", "Inspect or resolve bounded issue-poller operator outcomes."},

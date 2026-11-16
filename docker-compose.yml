@@ -28,6 +28,7 @@ services:
       - ./scripts/provision-compose-config.sh:/provision/provision-compose-config.sh:ro
       - factory-config:/target/factory-config
       - postgres-secrets:/target/postgres-secrets
+      - remote-worker-secrets:/target/remote-worker-secrets
     restart: "no"
 
   provision-worker-config:
@@ -43,6 +44,22 @@ services:
       - ${FACTORY_COMPOSE_CONFIG_DIR:-./.local/factory-compose}:/source:ro
       - ./scripts/provision-compose-config.sh:/provision/provision-compose-config.sh:ro
       - factory-worker-config:/target/worker-config
+    restart: "no"
+
+  provision-remote-worker-config:
+    image: busybox:1.37
+    profiles: [remote-worker]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/provision/provision-compose-config.sh"]
+    command: ["remote-worker"]
+    depends_on:
+      provision-config:
+        condition: service_completed_successfully
+    volumes:
+      - ${FACTORY_COMPOSE_CONFIG_DIR:-./.local/factory-compose}:/source:ro
+      - ./scripts/provision-compose-config.sh:/provision/provision-compose-config.sh:ro
+      - factory-remote-worker-config:/target/remote-worker-config
+      - remote-worker-secrets:/target/remote-worker-secrets
     restart: "no"
 
   worker-init:
@@ -94,6 +111,57 @@ services:
           create_host_path: false
     restart: unless-stopped
 
+  remote-worker-init:
+    image: factory-worker:local
+    profiles: [remote-worker]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        chown 65532:65532 /checkout /state
+        git config --global --add safe.directory /checkout
+        if ! git -C /checkout rev-parse --verify HEAD >/dev/null 2>&1; then
+          git -C /checkout init -q -b main
+          git -C /checkout config user.name 'Factory Compose fixture'
+          git -C /checkout config user.email 'factory-compose@example.invalid'
+          printf '%s\n' 'Disposable local Compose worker checkout.' > /checkout/README.md
+          git -C /checkout add README.md
+          git -C /checkout commit -q -m 'Initialize local Compose worker checkout'
+        fi
+        test "$(git -C /checkout rev-parse --show-toplevel)" = /checkout
+        test -z "$(git -C /checkout status --porcelain)"
+        chown -R 65532:65532 /checkout /state
+    volumes:
+      - remote-worker-checkout:/checkout
+      - remote-worker-state:/state
+    restart: "no"
+
+  remote-worker:
+    image: factory-worker:local
+    profiles: [remote-worker]
+    entrypoint: ["/factory", "worker", "remote", "--config", "/etc/factory/remote-worker.json"]
+    depends_on:
+      api:
+        condition: service_healthy
+      provision-remote-worker-config:
+        condition: service_completed_successfully
+      remote-worker-init:
+        condition: service_completed_successfully
+    environment:
+      XDG_STATE_HOME: /var/lib/factory/state
+    volumes:
+      - factory-remote-worker-config:/etc/factory:ro
+      - remote-worker-secrets:/run/factory-secrets:ro
+      - remote-worker-checkout:/var/lib/factory/checkouts/local
+      - remote-worker-state:/var/lib/factory/state
+      - type: bind
+        source: ${FACTORY_COMPOSE_HARNESS_DIR:-./.local/factory-compose/harness}
+        target: /opt/factory
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: unless-stopped
+
   api:
     image: factory-web:local
     build:
@@ -107,6 +175,7 @@ services:
       - "127.0.0.1::8080"
     volumes:
       - factory-config:/etc/factory:ro
+      - remote-worker-secrets:/run/factory-secrets:ro
     healthcheck:
       test: ["CMD", "/factory", "probe", "--url", "http://127.0.0.1:8080/readyz"]
       interval: 5s
@@ -119,6 +188,10 @@ volumes:
   postgres-data:
   factory-config:
   factory-worker-config:
+  factory-remote-worker-config:
   postgres-secrets:
+  remote-worker-secrets:
   worker-checkout:
   worker-state:
+  remote-worker-checkout:
+  remote-worker-state:

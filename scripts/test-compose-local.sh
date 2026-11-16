@@ -25,8 +25,8 @@ import os
 import subprocess
 
 project = os.environ['COMPOSE_PROJECT_NAME']
-volumes = [f'{project}_factory-config', f'{project}_factory-worker-config', f'{project}_postgres-secrets', f'{project}_postgres-data', f'{project}_worker-checkout', f'{project}_worker-state']
-containers = [f'{project}-interrupted', f'{project}-concurrent']
+volumes = [f'{project}_factory-config', f'{project}_factory-worker-config', f'{project}_factory-remote-worker-config', f'{project}_postgres-secrets', f'{project}_remote-worker-secrets', f'{project}_postgres-data', f'{project}_worker-checkout', f'{project}_worker-state', f'{project}_remote-worker-checkout', f'{project}_remote-worker-state']
+containers = [f'{project}-interrupted', f'{project}-concurrent', f'{project}-different-0', f'{project}-different-1']
 for volume in volumes:
     result = subprocess.run(['docker', 'volume', 'inspect', volume], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     assert result.returncode != 0, f'refusing to reuse existing smoke volume {volume}'
@@ -88,7 +88,7 @@ harness_dir=$(mktemp -d "${TMPDIR:-/tmp}/factory-compose-harness-$project_suffix
 chmod 755 "$harness_dir"
 export FACTORY_COMPOSE_HARNESS_DIR="$harness_dir"
 cleanup() {
-  docker compose -f docker-compose.yml --profile worker down --volumes --remove-orphans >/dev/null 2>&1 || true
+  docker compose -f docker-compose.yml --profile worker --profile remote-worker down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf -- "$harness_dir"
 }
 trap cleanup EXIT INT TERM
@@ -104,9 +104,20 @@ config = json.loads(config_path.read_text())
 assert config['listen_address'] == '0.0.0.0:8080'
 assert 'execution' in config and config['execution']['mode'] == 'local'
 assert config['workers_enabled'] is False
+assert config['remote_worker_api'] == {'enabled': True, 'secret_file': '/run/factory-secrets/remote-worker-secret'}
 assert config['web_ui'] == {'enabled': True, 'operator_id': 'local-operator'}
 assert config['persistence']['backend'] == 'postgres'
+remote_enabled = config['remote_worker_api']['enabled']
+assert isinstance(remote_enabled, bool) and remote_enabled is True
 worker = json.loads((root / 'worker.json').read_text())
+remote_worker = json.loads((root / 'remote-worker.json').read_text())
+assert remote_worker['controller_base_url'] == 'http://api:8080'
+assert remote_worker['allow_insecure_http'] is True
+assert remote_worker['shared_secret_file'] == '/run/factory-secrets/remote-worker-secret'
+assert 'persistence' not in remote_worker and 'dsn' not in remote_worker
+assert remote_worker['repositories']['local'] == '/var/lib/factory/checkouts/local'
+assert remote_worker['harness_profiles']['compose']['executable'] == '/opt/factory/harness'
+assert remote_worker['harness_profiles']['compose']['repositories'] == ['local']
 assert worker['limits'] == config.get('limits', {
     'request_body_bytes': 524288,
     'task_bytes': 262144,
@@ -126,6 +137,7 @@ assert worker['harness']['args'] == ['-p', '--no-session', '--append-system-prom
 assert worker['verification_checks'] == [['test', '-f', 'compose-worker-result.txt']]
 assert config['api_key_file'] == '/etc/factory/api-key'
 assert Path('.local/factory-compose/postgres-password').stat().st_mode & 0o777 == 0o600
+assert Path('.local/factory-compose/remote-worker-secret').stat().st_mode & 0o777 == 0o600
 assert config['principals'][0]['token_file'] == '/etc/factory/operator-verifier.json'
 assert config['harness']['args'].count('{task}') == 1
 assert config['harness']['args'].count('{system_prompt}') == 1
@@ -246,7 +258,7 @@ def assert_complete():
 with tempfile.TemporaryDirectory(prefix='factory-compose-legacy-source-') as legacy_source:
     source = Path(legacy_source)
     os.chmod(source, 0o700)
-    for filename in source_files:
+    for filename in ('server.json', 'api-key', 'operator-verifier.json', 'postgres-password'):
         shutil.copyfile(root / filename, source / filename)
         os.chmod(source / filename, 0o600)
     legacy_config = f'{project}_legacy-factory-config'
@@ -483,6 +495,7 @@ PY
 )
 export FACTORY_COMPOSE_JOB_ID="$job_id"
 docker compose -f docker-compose.yml --profile worker config --quiet
+docker compose -f docker-compose.yml --profile remote-worker config --quiet
 python3 - <<'PY'
 import json
 import os
@@ -552,6 +565,92 @@ content = subprocess.run(
     check=True, capture_output=True, text=True,
 ).stdout
 assert content == 'compose worker fixture completed\n', f'unexpected fixture result: {content!r}'
+PY
+# Stop the legacy Worker before proving the separate HTTP Worker path.
+docker compose -f docker-compose.yml --profile worker stop worker
+remote_job_id=$(python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+base = os.environ['FACTORY_COMPOSE_API_BASE']
+token = Path('.local/factory-compose/operator-token').read_text().strip()
+request = Request(
+    f'{base}/v1/jobs',
+    data=json.dumps({'repository': 'local', 'task': 'compose fixture: create the expected worker result'}).encode(),
+    headers={'Authorization': f'Bearer {token}', 'Content-Type': 'application/json', 'Idempotency-Key': 'compose-remote-worker-smoke'},
+    method='POST',
+)
+with urlopen(request, timeout=10) as response:
+    print(json.load(response)['job']['id'])
+PY
+)
+export FACTORY_COMPOSE_REMOTE_JOB_ID="$remote_job_id"
+docker compose -f docker-compose.yml --profile remote-worker config --quiet
+python3 - <<'PY'
+import json
+import os
+import subprocess
+from pathlib import Path
+
+project = os.environ['COMPOSE_PROJECT_NAME']
+harness_dir = Path(os.environ['FACTORY_COMPOSE_HARNESS_DIR'])
+harness = Path('scripts/fixtures/compose-worker-harness.sh').resolve()
+harness_target = harness_dir / 'harness'
+if harness_target.exists() or harness_target.is_symlink():
+    raise AssertionError(f'refusing to replace existing test harness: {harness_target}')
+harness_target.write_bytes(harness.read_bytes())
+harness_target.chmod(0o755)
+subprocess.run(['docker', 'compose', '-f', 'docker-compose.yml', '--profile', 'remote-worker', 'run', '--rm', '--no-deps', 'remote-worker-init'], check=True)
+subprocess.run(['docker', 'compose', '-f', 'docker-compose.yml', '--profile', 'remote-worker', 'up', '-d', '--wait', 'remote-worker'], check=True)
+worker = subprocess.run(['docker', 'inspect', f'{project}-remote-worker-1'], check=True, capture_output=True, text=True)
+container = json.loads(worker.stdout)[0]
+assert container['Config']['User'] == '65532:65532'
+assert not any('postgres' in value.lower() for value in container['Config']['Env']), 'remote Worker received PostgreSQL configuration in its environment'
+mounts = {item['Destination']: item for item in container['Mounts']}
+assert '/var/lib/factory/checkouts/local' in mounts and '/var/lib/factory/state' in mounts
+assert '/opt/factory' in mounts and mounts['/opt/factory']['RW'] is False
+assert '/etc/factory' in mounts and mounts['/etc/factory']['RW'] is False
+assert '/run/factory-secrets' in mounts and mounts['/run/factory-secrets']['RW'] is False
+assert '/run/factory-secrets' not in mounts or 'postgres-secrets' not in mounts['/run/factory-secrets']['Name']
+assert all(item['Destination'] != '/run/factory-secrets/postgres-password' for item in container['Mounts'])
+assert not any('postgres-secrets' in item['Name'] for item in container['Mounts']), 'remote Worker mounted the PostgreSQL password volume'
+subprocess.run(['docker', 'exec', f'{project}-remote-worker-1', 'test', '-f', '/var/lib/factory/checkouts/local/.git/HEAD'], check=True)
+subprocess.run(['docker', 'exec', f'{project}-remote-worker-1', 'test', '-w', '/var/lib/factory/state'], check=True)
+subprocess.run(['docker', 'exec', f'{project}-remote-worker-1', 'test', '-x', '/opt/factory/harness'], check=True)
+PY
+FACTORY_COMPOSE_REMOTE_JOB_ID="$FACTORY_COMPOSE_REMOTE_JOB_ID" FACTORY_COMPOSE_API_BASE="$FACTORY_COMPOSE_API_BASE" python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+from urllib.request import Request, urlopen
+
+base = os.environ['FACTORY_COMPOSE_API_BASE']
+token = Path('.local/factory-compose/operator-token').read_text().strip()
+job_id = os.environ['FACTORY_COMPOSE_REMOTE_JOB_ID']
+request = Request(f'{base}/v1/jobs/{job_id}', headers={'Authorization': f'Bearer {token}'})
+deadline = time.monotonic() + 90
+while time.monotonic() < deadline:
+    with urlopen(request, timeout=10) as response:
+        job = json.load(response)
+    if job['status'] in ('succeeded', 'failed', 'canceled'):
+        break
+    time.sleep(0.25)
+assert job['status'] == 'succeeded', f'HTTP remote Worker job ended as {job["status"]}: {job}'
+assert job['request']['task'] == 'compose fixture: create the expected worker result'
+results = subprocess.run(
+    ['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-remote-worker-1', 'find', '/var/lib/factory/state', '-path', f'*/results/{job_id}/attempts/*/worktree/compose-worker-result.txt', '-type', 'f'],
+    check=True, capture_output=True, text=True,
+).stdout.splitlines()
+assert len(results) == 1, f'expected one HTTP remote Worker artifact, found {len(results)}'
+content = subprocess.run(
+    ['docker', 'exec', f'{os.environ["COMPOSE_PROJECT_NAME"]}-remote-worker-1', 'cat', results[0]],
+    check=True, capture_output=True, text=True,
+).stdout
+assert content == 'compose worker fixture completed\\n', f'unexpected HTTP remote Worker result: {content!r}'
 PY
 # Exercise the embedded dashboard through a test-only loopback HTTPS reverse proxy.
 # The proxy is not part of the Compose product stack and forwards only these test routes.

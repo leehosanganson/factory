@@ -32,6 +32,9 @@ var (
 	ErrNoWorkerSlots               = errors.New("no worker slots available")
 	ErrManagerClosed               = errors.New("job manager is closed")
 	ErrStaleAttempt                = errors.New("stale worker attempt")
+	ErrRemoteClaimConflict         = errors.New("remote claim ID conflicts with another worker, boot, or repository capability set")
+	ErrCancellationPending         = errors.New("job cancellation is pending")
+	ErrCancellationNotRequested    = errors.New("job cancellation was not requested")
 	ErrInvalidProviderRecovery     = errors.New("invalid provider recovery data")
 	ErrProviderRecoveryUnavailable = errors.New("provider recovery data is unavailable")
 )
@@ -46,6 +49,33 @@ func validateProviderOutcome(outcome ProviderOutcome) error {
 	return nil
 }
 
+func validRemoteRepositoryAliases(aliases []string) bool {
+	if len(aliases) == 0 || len(aliases) > maxRemoteWorkerRepositories {
+		return false
+	}
+	seen := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		if len(alias) == 0 || len(alias) > maxRemoteRepositoryAliasBytes || !isASCIIAlphaNumeric(alias[0]) {
+			return false
+		}
+		for i := 1; i < len(alias); i++ {
+			char := alias[i]
+			if !isASCIIAlphaNumeric(char) && char != '_' && char != '-' {
+				return false
+			}
+		}
+		if _, exists := seen[alias]; exists {
+			return false
+		}
+		seen[alias] = struct{}{}
+	}
+	return true
+}
+
+func isASCIIAlphaNumeric(char byte) bool {
+	return char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z' || char >= '0' && char <= '9'
+}
+
 func validRepositoryName(value string) bool {
 	parts := strings.Split(value, "/")
 	return len(parts) == 2 && parts[0] != "" && parts[1] != "" && !strings.Contains(value, "..")
@@ -54,18 +84,20 @@ func validRepositoryName(value string) bool {
 const attemptLeaseDuration = time.Minute
 
 const (
-	maxRecordsLimit            = 1000
-	maxConcurrentLimit         = 100_000
-	maxQueueLimit              = 100_000
-	maxEventsLimit             = 200
-	maxKeyBytes                = 256
-	maxAliasBytes              = 256
-	maxTaskBytes               = 256 << 10
-	maxIssueTitleBytes         = 4 << 10
-	maxEventBytes              = 4_096
-	maxVerificationChecks      = 16
-	maxVerificationLimitations = 4
-	maxVerificationTextBytes   = 128
+	maxRemoteWorkerRepositories   = 16
+	maxRemoteRepositoryAliasBytes = 64
+	maxRecordsLimit               = 1000
+	maxConcurrentLimit            = 100_000
+	maxQueueLimit                 = 100_000
+	maxEventsLimit                = 200
+	maxKeyBytes                   = 256
+	maxAliasBytes                 = 256
+	maxTaskBytes                  = 256 << 10
+	maxIssueTitleBytes            = 4 << 10
+	maxEventBytes                 = 4_096
+	maxVerificationChecks         = 16
+	maxVerificationLimitations    = 4
+	maxVerificationTextBytes      = 128
 
 	defaultRegistryBytes = 256 << 20
 	recordOverheadBytes  = 256
@@ -618,6 +650,32 @@ func (m *LocalManager) ClaimNextAttempt() (AttemptClaim, error) {
 	return m.claimLocked()
 }
 
+// ClaimNextAttemptForWorker atomically claims a queued Job and binds its
+// fencing identity to the authenticated remote Worker before it is returned.
+func (m *LocalManager) ClaimNextAttemptForWorker(workerID, bootID string) (AttemptClaim, error) {
+	if !WorkerIdentityValid(workerID) || !WorkerIdentityValid(bootID) {
+		return AttemptClaim{}, ErrInvalidInput
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return AttemptClaim{}, ErrManagerClosed
+	}
+	claim, err := m.claimLocked()
+	if err != nil {
+		return AttemptClaim{}, err
+	}
+	claim.Attempt.WorkerID = workerID
+	claim.Attempt.BootID = bootID
+	entry := m.jobs[claim.Attempt.JobID]
+	if entry == nil || entry.snapshot.Status != StatusRunning || entry.generation != claim.Attempt.Generation || entry.ownerToken != claim.Attempt.OwnerToken {
+		return AttemptClaim{}, ErrStaleAttempt
+	}
+	entry.snapshot.Worker = &WorkerSummary{WorkerID: workerID, BootID: bootID}
+	claim.Job = cloneSnapshot(entry.snapshot)
+	return claim, nil
+}
+
 // WaitClaim blocks without polling until a queued job and worker slot are
 // available. This is an unfenced single-process/admin compatibility API; it
 // must never be used by distributed workers. Use WaitClaimAttempt instead.
@@ -824,7 +882,7 @@ func (m *LocalManager) ownsAttemptLocked(attempt AttemptHandle) (*job, error) {
 	if entry == nil {
 		return nil, ErrNotFound
 	}
-	if entry.snapshot.Status != StatusRunning || entry.generation != attempt.Generation || entry.ownerToken != attempt.OwnerToken || !time.Now().UTC().Before(entry.leaseUntil) {
+	if entry.snapshot.Status != StatusRunning || entry.generation != attempt.Generation || entry.ownerToken != attempt.OwnerToken || (attempt.WorkerID != "" && entry.snapshot.Worker != nil && (entry.snapshot.Worker.WorkerID != attempt.WorkerID || entry.snapshot.Worker.BootID != attempt.BootID)) || !time.Now().UTC().Before(entry.leaseUntil) {
 		return nil, ErrStaleAttempt
 	}
 	return entry, nil
