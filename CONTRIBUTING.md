@@ -21,7 +21,7 @@ Use this title format:
 
 `type(slice): description #PRNUM`
 
-For example: `feat(rest-client): support job cancellation #123`. Use a Conventional Commit type (such as `feat`, `fix`, `docs`, or `test`), name the affected feature slice in parentheses, write a concise description, and include the relevant pull request number in the `#PRNUM` position when available.
+For example: `feat(rest-client): support job cancellation #123`. Use a Conventional Commit type (such as `feat`, `fix`, `docs`, but not `test` because tests should be a integral part of any PRs), name the affected feature slice in parentheses, write a concise description, and include the relevant pull request number in the `#PRNUM` position when available.
 
 Describe the pull request with these sections:
 
