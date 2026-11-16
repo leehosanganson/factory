@@ -82,7 +82,7 @@ jobs:
 
   dashboard-browser-e2e:
     name: Dashboard browser E2E
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [classify]
     if: always() && needs.classify.outputs.run_full != 'false'
     steps:
