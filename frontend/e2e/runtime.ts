@@ -1,1 +1,1 @@
-export type Runtime = { url: string; token: string };
+export type Runtime = { url: string; token: string; submitterToken: string };

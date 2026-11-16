@@ -37,7 +37,9 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         allowed = (
             self.command == "GET" and path in ("/", "/ui", "/ui/", "/ui/session", "/ui/assets/dashboard.css", "/ui/assets/dashboard.js") and not parsed.query
-            or self.command == "GET" and path == "/ui/api/v1/jobs" and parsed.query == "limit=100"
+            or self.command == "GET" and path in ("/ui/api/v1/jobs", "/ui/api/v1/threads") and parsed.query in ("limit=100", "limit=50")
+            or self.command == "GET" and path == "/ui/api/v1/notifications" and parsed.query == "limit=50"
+            or self.command == "GET" and re.fullmatch(r"/ui/api/v1/threads/[A-Za-z0-9_-]+", path) and not parsed.query
             or self.command == "GET" and path == "/ui/api/v1/worker-sessions" and parsed.query in ("limit=50", "limit=50&before_created_at=2025-01-02T23%3A11%3A00Z&before_id=session-48")
             or self.command == "POST" and path == "/ui/api/v1/threads" and not parsed.query
             or self.command == "GET" and path == "/ui/api/v1/threads" and parsed.query == "limit=50"
@@ -127,9 +129,13 @@ def main() -> int:
         root = Path(temporary)
         root.chmod(0o700)
         token = secrets.token_hex(32)
+        submitter_token = secrets.token_hex(32)
         key = secrets.token_hex(32)
-        verifier = root / "operator-verifier.json"
-        verifier.write_text(json.dumps({"version": 1, "principals": [{"id": "e2e-operator", "token_sha256": hashlib.sha256(token.encode()).hexdigest()}]}))
+        verifier = root / "principal-verifier.json"
+        verifier.write_text(json.dumps({"version": 1, "principals": [
+            {"id": "e2e-operator", "token_sha256": hashlib.sha256(token.encode()).hexdigest()},
+            {"id": "e2e-submitter", "token_sha256": hashlib.sha256(submitter_token.encode()).hexdigest()},
+        ]}))
         verifier.chmod(0o600)
         key_file = root / "api-key"
         key_file.write_text(key)
@@ -153,7 +159,10 @@ def main() -> int:
             "repositories": {"fixture": str(repository)},
             "harness": {"executable": str(harness), "args": ["{system_prompt}", "{task}"]},
             "api_key_file": str(key_file),
-            "principals": [{"id": "e2e-operator", "role": "operator", "token_file": str(verifier), "enabled": True}],
+            "principals": [
+                {"id": "e2e-operator", "role": "operator", "token_file": str(verifier), "enabled": True},
+                {"id": "e2e-submitter", "role": "submitter", "token_file": str(verifier), "enabled": True},
+            ],
             "verification_checks": [["test", "-f", "dashboard-e2e-result.txt"]],
             "web_ui": {"enabled": True, "operator_id": "e2e-operator"},
             "persistence": {"backend": "sqlite", "path": str(root / "schedules.db")},
@@ -235,7 +244,7 @@ def main() -> int:
             proxy.socket = tls.wrap_socket(proxy.socket, server_side=True)
             proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
             proxy_thread.start()
-            runtime_data = json.dumps({"url": f"https://127.0.0.1:{proxy.server_address[1]}", "token": token, "fixture_pid": os.getpid(), "server_pid": process.pid}).encode()
+            runtime_data = json.dumps({"url": f"https://127.0.0.1:{proxy.server_address[1]}", "token": token, "submitterToken": submitter_token, "fixture_pid": os.getpid(), "server_pid": process.pid}).encode()
             descriptor = os.open(args.runtime_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "wb") as runtime_output:
                 runtime_output.write(runtime_data)

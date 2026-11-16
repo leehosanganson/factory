@@ -16,7 +16,7 @@ test('operator can manage schedules without exposing definitions in summaries', 
     if (request.url().includes('/ui/api/v1/schedules/')) requests.push({ method: request.method(), path: new URL(request.url()).pathname, ifMatch: request.headers()['if-match'] });
   });
   await page.goto(fixture.url);
-  await page.getByLabel('Operator token').fill(fixture.token);
+  await page.getByLabel('Access token').fill(fixture.token);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('heading', { name: 'Schedules' })).toBeVisible();
 
@@ -64,7 +64,7 @@ test('operator can inspect worker session summaries through the read-only dashbo
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
   const denied = await page.request.get(`${fixture.url}/ui/api/v1/worker-sessions?limit=50`);
   expect(denied.status()).toBe(401);
-  await page.getByLabel('Operator token').fill(fixture.token);
+  await page.getByLabel('Access token').fill(fixture.token);
   await page.getByRole('button', { name: 'Sign in' }).click();
 
   const panel = page.getByRole('region', { name: 'Worker sessions' });
@@ -89,6 +89,44 @@ test('operator can inspect worker session summaries through the read-only dashbo
   expect(requests.every((request) => request.method === 'GET')).toBe(true);
 });
 
+test('enabled submitter follows a Thread outcome and inbox after reload without operator controls', async ({ page }) => {
+  const fixture = await runtime();
+  await page.goto(fixture.url);
+  await page.getByLabel('Access token').fill(fixture.submitterToken);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('heading', { name: 'Threads', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible();
+  const submitterCookie = (await page.context().cookies(new URL(fixture.url).origin)).find((cookie) => cookie.name === 'factory_operator_session');
+  expect(submitterCookie?.httpOnly).toBe(true);
+  expect(submitterCookie?.secure).toBe(true);
+  for (const forbidden of ['Schedules', 'Worker sessions', 'Recent jobs', 'Admit a job']) {
+    await expect(page.getByRole('heading', { name: forbidden, exact: true })).toHaveCount(0);
+  }
+
+  const task = 'Create dashboard-e2e-result.txt so Factory can verify this Thread.';
+  await page.getByLabel('Repository alias').fill('fixture');
+  await page.getByLabel('Task').fill(task);
+  await page.getByRole('button', { name: 'Create Thread with Job' }).click();
+  const threadHeading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
+  await expect(threadHeading).toBeVisible();
+  const threadID = (await threadHeading.textContent())?.replace('Thread ', '').trim();
+  expect(threadID).toBeTruthy();
+  const job = page.locator('.thread-job').first();
+  await expect(job.locator('.status')).toHaveText('succeeded', { timeout: 30_000 });
+  await expect(job.getByRole('heading', { name: 'Safe outcome' })).toBeVisible();
+  await expect(job).toContainText('check-01: passed');
+  await expect(page.locator('.notification-list').getByRole('button', { name: `Thread ${threadID}` })).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText(task)).toHaveCount(0);
+
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Threads', exact: true })).toBeVisible();
+  await page.locator('.thread-list').getByRole('button', { name: threadID! }).click();
+  await expect(page.getByRole('heading', { name: `Thread ${threadID}` })).toBeVisible();
+  await expect(page.locator('.thread-job').first().locator('.status')).toHaveText('succeeded');
+  await expect(page.locator('.notification-list').getByRole('button', { name: `Thread ${threadID}` })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Schedules' })).toHaveCount(0);
+});
+
 test('operator can sign in, admit and inspect a job, and sign out', async ({ page, context }) => {
   const fixture = await runtime();
   const origin = new URL(fixture.url).origin;
@@ -96,12 +134,12 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Queue job' })).toHaveCount(0);
 
-  await page.getByLabel('Operator token').fill('not-the-operator-token');
+  await page.getByLabel('Access token').fill('not-the-operator-token');
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('alert')).toContainText('configured named operator token was not accepted');
+  await expect(page.getByRole('alert')).toContainText('enabled account token was not accepted');
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();
 
-  await page.getByLabel('Operator token').fill(fixture.token);
+  await page.getByLabel('Access token').fill(fixture.token);
   await page.getByRole('button', { name: 'Sign in' }).click();
   await expect(page.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
   const cookies = await context.cookies(origin);
@@ -115,11 +153,12 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   await page.getByLabel('Repository alias').first().fill('fixture');
   await page.getByLabel('Task').first().fill('Write the fixture result file.');
   await page.getByRole('button', { name: 'Queue job' }).click();
-  const jobLink = page.locator('.job-link').first();
-  await expect(jobLink).toBeVisible({ timeout: 10_000 });
-  const jobID = (await jobLink.textContent())?.trim();
+  await expect(page.locator('.notice')).toContainText(' admitted.');
+  const admissionNotice = (await page.locator('.notice').textContent()) || '';
+  const jobID = admissionNotice.match(/Job ([0-9a-f-]+) admitted\./)?.[1];
   expect(jobID).toBeTruthy();
-  await expect(page.getByRole('status').filter({ hasText: `Job ${jobID} admitted.` })).toBeVisible();
+  const jobLink = page.locator('.job-link').filter({ hasText: jobID! });
+  await expect(jobLink).toBeVisible({ timeout: 10_000 });
   await jobLink.click();
   await expect(page.getByRole('heading', { name: `Job ${jobID}` })).toBeVisible();
   await expect(page.getByText('succeeded', { exact: true }).last()).toBeVisible({ timeout: 15_000 });

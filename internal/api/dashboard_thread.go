@@ -45,6 +45,19 @@ type dashboardThreadDetailResponse struct {
 	Jobs   []dashboardThreadJobResponse `json:"jobs"`
 }
 
+type submitterDashboardJobResponse struct {
+	ID           string                         `json:"id"`
+	Status       restjobs.Status                `json:"status"`
+	CreatedAt    time.Time                      `json:"created_at"`
+	UpdatedAt    time.Time                      `json:"updated_at"`
+	Verification *restjobs.VerificationEvidence `json:"verification,omitempty"`
+}
+
+type submitterDashboardJobPageResponse struct {
+	Thread dashboardThreadResponse         `json:"thread"`
+	Jobs   []submitterDashboardJobResponse `json:"jobs"`
+}
+
 type dashboardThreadAppendResponse struct {
 	Thread   dashboardThreadResponse    `json:"thread"`
 	Job      dashboardThreadJobResponse `json:"job"`
@@ -76,4 +89,15 @@ func projectDashboardThreadJobs(jobs []restjobs.Snapshot) []dashboardThreadJobRe
 		result = append(result, projectDashboardThreadJob(job))
 	}
 	return result
+}
+
+func projectSubmitterDashboardJob(job restjobs.Snapshot) submitterDashboardJobResponse {
+	return submitterDashboardJobResponse{ID: job.ID, Status: job.Status, CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt, Verification: terminalVerification(job)}
+}
+
+func terminalVerification(job restjobs.Snapshot) *restjobs.VerificationEvidence {
+	if job.Status.Terminal() {
+		return job.Verification
+	}
+	return nil
 }

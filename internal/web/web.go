@@ -89,7 +89,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if current, ok := h.getSession(r); ok {
-			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrf": current.csrf, "operator": current.principal.ID})
+			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrf": current.csrf, "role": current.principal.Role})
 		} else {
 			writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
 		}
@@ -133,9 +133,14 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
-	if !h.api.AuthenticateDashboardOperator(r.Form.Get("token")) {
-		http.Error(w, "invalid credentials", http.StatusUnauthorized)
-		return
+	principal, ok := h.api.ResolveDashboardSubmitter(r.Form.Get("token"))
+	if !ok {
+		if h.api.AuthenticateDashboardOperator(r.Form.Get("token")) && h.operatorID != "" {
+			principal = restserver.Principal{ID: h.operatorID, Role: "operator"}
+		} else {
+			http.Error(w, "invalid credentials", http.StatusUnauthorized)
+			return
+		}
 	}
 	id, err := randomValue()
 	if err != nil {
@@ -154,11 +159,10 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session capacity full", http.StatusServiceUnavailable)
 		return
 	}
-	principal := restserver.Principal{ID: h.operatorID, Role: "operator"}
 	h.sessions[id] = session{principal: principal, csrf: csrf, expires: h.now().Add(sessionTTL)}
 	h.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: id, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, Expires: h.now().Add(sessionTTL), MaxAge: int(sessionTTL.Seconds())})
-	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrf": csrf, "operator": principal.ID})
+	writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrf": csrf, "role": principal.Role})
 }
 
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
@@ -184,7 +188,10 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/ui/api/v1/worker-sessions" && r.URL.RawQuery != "" {
 		queryAllowed = dashboardWorkerSessionListQueryAllowed(query)
 	}
-	if r.URL.EscapedPath() != r.URL.Path || queryErr != nil || !dashboardProxyAllowed(r.URL.Path, r.Method) || !queryAllowed || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" {
+	if r.URL.Path == "/ui/api/v1/notifications" && r.URL.RawQuery != "" {
+		queryAllowed = notificationListQueryAllowed(query)
+	}
+	if r.URL.EscapedPath() != r.URL.Path || queryErr != nil || !queryAllowed || strings.HasPrefix(r.URL.Path, "/ui/api/v1/threads/") && r.URL.RawQuery != "" {
 		http.NotFound(w, r)
 		return
 	}
@@ -194,6 +201,28 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	path := "/" + strings.TrimPrefix(r.URL.Path, "/ui/api/")
+	if current.principal.Role == "operator" {
+		if r.URL.Path == "/ui/api/v1/threads" && r.URL.RawQuery != "" && !dashboardOperatorThreadListQueryAllowed(query) {
+			http.NotFound(w, r)
+			return
+		}
+		if !dashboardProxyAllowed(r.URL.Path, r.Method) {
+			http.NotFound(w, r)
+			return
+		}
+	} else if current.principal.Role == "submitter" {
+		if r.URL.Path == "/ui/api/v1/threads" && r.URL.RawQuery != "" && !submitterThreadListQueryAllowed(query) {
+			http.NotFound(w, r)
+			return
+		}
+		if !submitterProxyAllowed(r.URL.Path, r.Method) {
+			http.NotFound(w, r)
+			return
+		}
+	} else {
+		http.NotFound(w, r)
+		return
+	}
 	if r.Method != http.MethodGet {
 		if !validCSRF(r, current) || !sameOrigin(r) {
 			http.Error(w, "request rejected", http.StatusForbidden)
@@ -202,7 +231,11 @@ func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	r.URL.Path = path
 	r.URL.RawPath = ""
-	h.api.ServeAsDashboardOperator(w, r)
+	if current.principal.Role == "operator" {
+		h.api.ServeAsDashboardOperator(w, r)
+	} else {
+		h.api.ServeAsDashboardSubmitter(w, r, current.principal)
+	}
 }
 
 func dashboardProxyAllowed(path, method string) bool {
@@ -240,11 +273,41 @@ func dashboardProxyAllowed(path, method string) bool {
 	return false
 }
 
+func notificationListQueryAllowed(query map[string][]string) bool {
+	for key, values := range query {
+		if (key != "limit" && key != "before") || len(values) != 1 || values[0] == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func submitterProxyAllowed(path, method string) bool {
+	if path == "/ui/api/v1/threads" {
+		return method == http.MethodGet || method == http.MethodPost
+	}
+	if path == "/ui/api/v1/notifications" {
+		return method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/ui/api/v1/threads/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/threads/"), "/")
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/ui/api/v1/jobs/") {
+		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/jobs/"), "/")
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+	}
+	return false
+}
+
 func dashboardProxyQueryAllowed(path, method string) bool {
 	if method != http.MethodGet {
 		return false
 	}
 	if path == "/ui/api/v1/jobs" || path == "/ui/api/v1/threads" {
+		return true
+	}
+	if path == "/ui/api/v1/notifications" {
 		return true
 	}
 	if path == "/ui/api/v1/worker-sessions" {
@@ -269,6 +332,24 @@ func dashboardWorkerSessionListQueryAllowed(query map[string][]string) bool {
 }
 
 func dashboardThreadListQueryAllowed(query map[string][]string) bool {
+	for key, values := range query {
+		if (key != "limit" && key != "before_sequence" && key != "snapshot_sequence" && key != "cursor") || len(values) != 1 {
+			return false
+		}
+	}
+	return true
+}
+
+func submitterThreadListQueryAllowed(query map[string][]string) bool {
+	for key, values := range query {
+		if key != "limit" || len(values) != 1 || values[0] == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func dashboardOperatorThreadListQueryAllowed(query map[string][]string) bool {
 	for key, values := range query {
 		if (key != "limit" && key != "before_sequence" && key != "snapshot_sequence") || len(values) != 1 {
 			return false

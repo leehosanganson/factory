@@ -575,6 +575,91 @@ func TestThreadRouteValidationAndUnsupportedStore(t *testing.T) {
 	}
 }
 
+func TestDashboardSubmitterBridgeRequiresSubmitterAndUsesOwnerSafeRoutes(t *testing.T) {
+	manager, err := restjobs.NewManager(restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+	)
+
+	create := httptest.NewRequest(http.MethodPost, "/v1/threads", strings.NewReader(`{"repository":"widget","task":"private request that must not enter the browser summary"}`))
+	create.Header.Set("Content-Type", "application/json")
+	create.Header.Set("Idempotency-Key", "trusted-submitter-thread")
+	created := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(created, create, restserver.Principal{ID: "alice", Role: "submitter"})
+	if created.Code != http.StatusAccepted || strings.Contains(created.Body.String(), "private request") || strings.Contains(created.Body.String(), `"request"`) {
+		t.Fatalf("submitter create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var response struct {
+		Thread struct {
+			ID string `json:"id"`
+		} `json:"thread"`
+		Job struct {
+			ID     string `json:"id"`
+			Status string `json:"status"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &response); err != nil || response.Thread.ID == "" || response.Job.ID == "" || response.Job.Status != "queued" {
+		t.Fatalf("submitter create response=%s err=%v", created.Body.String(), err)
+	}
+
+	inspect := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(inspect, httptest.NewRequest(http.MethodGet, "/v1/threads/"+response.Thread.ID, nil), restserver.Principal{ID: "alice", Role: "submitter"})
+	if inspect.Code != http.StatusOK || strings.Contains(inspect.Body.String(), "private request") || strings.Contains(inspect.Body.String(), `"request"`) {
+		t.Fatalf("submitter inspect status=%d body=%s", inspect.Code, inspect.Body.String())
+	}
+	if strings.Contains(inspect.Body.String(), `"submitted_by"`) || strings.Contains(inspect.Body.String(), `"job_ids"`) {
+		t.Fatalf("submitter dashboard detail exposed ownership internals: %s", inspect.Body.String())
+	}
+	jobInspect := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(jobInspect, httptest.NewRequest(http.MethodGet, "/v1/jobs/"+response.Job.ID, nil), restserver.Principal{ID: "alice", Role: "submitter"})
+	if jobInspect.Code != http.StatusOK || strings.Contains(jobInspect.Body.String(), "private request") || !strings.Contains(jobInspect.Body.String(), `"status":"queued"`) {
+		t.Fatalf("submitter Job inspect status=%d body=%s", jobInspect.Code, jobInspect.Body.String())
+	}
+	history := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(history, httptest.NewRequest(http.MethodGet, "/v1/jobs/"+response.Job.ID+"/history", nil), restserver.Principal{ID: "alice", Role: "submitter"})
+	if history.Code != http.StatusNotFound {
+		t.Errorf("submitter bridge exposed the operator Job history route: status=%d body=%s", history.Code, history.Body.String())
+	}
+	for _, tc := range []struct{ path, method string }{
+		{"/v1/threads/" + response.Thread.ID, http.MethodGet},
+		{"/v1/schedules", http.MethodGet},
+		{"/v1/worker-sessions", http.MethodGet},
+		{"/v1/operations", http.MethodGet},
+	} {
+		blocked := httptest.NewRecorder()
+		handler.ServeAsDashboardSubmitter(blocked, httptest.NewRequest(tc.method, tc.path, nil), restserver.Principal{ID: "admin", Role: "operator"})
+		if blocked.Code != http.StatusNotFound {
+			t.Errorf("submitter bridge accepted operator/path %s status=%d", tc.path, blocked.Code)
+		}
+	}
+	for _, tc := range []struct{ path, method string }{{"/v1/jobs", http.MethodGet}, {"/v1/jobs", http.MethodPost}, {"/v1/jobs/job/history", http.MethodGet}, {"/v1/threads/id/jobs", http.MethodPost}, {"/v1/threads/id/complete", http.MethodPost}} {
+		blocked := httptest.NewRecorder()
+		handler.ServeAsDashboardSubmitter(blocked, httptest.NewRequest(tc.method, tc.path, nil), restserver.Principal{ID: "alice", Role: "submitter"})
+		if blocked.Code != http.StatusNotFound {
+			t.Errorf("submitter bridge accepted unapproved route %s %s status=%d", tc.method, tc.path, blocked.Code)
+		}
+	}
+	foreign, _, err := manager.AdmitThreadAs("foreign-submit-thread", "bob", restjobs.Request{Repository: "widget", Task: "another user's private work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignResponse := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(foreignResponse, httptest.NewRequest(http.MethodGet, "/v1/threads/"+foreign.Thread.ID, nil), restserver.Principal{ID: "alice", Role: "submitter"})
+	if foreignResponse.Code != http.StatusNotFound || strings.Contains(foreignResponse.Body.String(), "another user's private work") {
+		t.Errorf("submitter bridge exposed another owner's Thread: status=%d body=%s", foreignResponse.Code, foreignResponse.Body.String())
+	}
+	blocked := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(blocked, httptest.NewRequest(http.MethodGet, "/v1/worker-sessions", nil), restserver.Principal{ID: "alice", Role: "submitter"})
+	if blocked.Code != http.StatusNotFound {
+		t.Errorf("submitter bridge exposed operator route status=%d", blocked.Code)
+	}
+}
+
 func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T) {
 	manager := newTestManager(t, managerConfig(4, 100, 8))
 	handler := newTestHandler(t, manager, func() bool { return true })
