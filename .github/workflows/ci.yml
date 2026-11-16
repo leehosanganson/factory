@@ -74,8 +74,8 @@ jobs:
       - name: Build
         run: make build
 
-      - name: Test
-        run: make test
+      - name: Test coverage gate
+        run: make test-coverage
 
       - name: Vet
         run: make vet
