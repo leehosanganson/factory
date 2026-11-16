@@ -1658,6 +1658,78 @@ func TestPostgresThreadAdmissionAndDispatchShareCapacityGate(t *testing.T) {
 	}
 }
 
+func TestPostgresRemoteAttemptFinishingFinalThreadJobNotifiesOwnerOnce(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL 18 remote Thread notification integration test")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	store, err := NewPostgresStore(db, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.CloseStore() })
+
+	created, _, err := store.AdmitThreadAs("remote-thread-notification", "alice", Request{Repository: "widget", Task: "first Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, finalJob, _, err := store.AdmitThreadJobAs(created.Thread.ID, "remote-thread-notification-final", "alice", Request{Repository: "widget", Task: "final Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	firstClaim, err := store.ClaimRemoteAttempt(ctx, "remote-thread-notification-first", "worker", "boot", []string{"widget"})
+	if err != nil || firstClaim.Job.ID != created.Jobs[0].ID {
+		t.Fatalf("first remote claim=(%+v,%v), want first Thread Job", firstClaim, err)
+	}
+	finalClaim, err := store.ClaimRemoteAttempt(ctx, "remote-thread-notification-final", "worker", "boot", []string{"widget"})
+	if err != nil || finalClaim.Job.ID != finalJob.ID {
+		t.Fatalf("final remote claim=(%+v,%v), want final Thread Job", finalClaim, err)
+	}
+	evidence := VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}
+	if err := store.FinishRemoteAttempt(firstClaim.Attempt, StatusSucceeded, evidence); err != nil {
+		t.Fatalf("finish first remote attempt: %v", err)
+	}
+	inProgress, err := store.GetThread(created.Thread.ID)
+	if err != nil || inProgress.Thread.Status != ThreadStatusInProgress {
+		t.Fatalf("Thread after first Job=(%+v,%v), want in_progress", inProgress.Thread, err)
+	}
+	if page, err := store.ListNotificationsForPrincipal(ctx, "alice", 0, 10); err != nil || len(page.Notifications) != 0 {
+		t.Fatalf("owner inbox before final Job=(%+v,%v), want empty", page, err)
+	}
+
+	if err := store.FinishRemoteAttempt(finalClaim.Attempt, StatusSucceeded, evidence); err != nil {
+		t.Fatalf("finish final remote attempt: %v", err)
+	}
+	finished, err := store.GetThread(created.Thread.ID)
+	if err != nil || finished.Thread.Status != ThreadStatusDone {
+		t.Fatalf("Thread after final Job=(%+v,%v), want done", finished.Thread, err)
+	}
+	if err := store.FinishRemoteAttempt(finalClaim.Attempt, StatusSucceeded, evidence); err != nil {
+		t.Fatalf("exact final result retry: %v", err)
+	}
+	ownerInbox, err := store.ListNotificationsForPrincipal(ctx, "alice", 0, 10)
+	if err != nil || len(ownerInbox.Notifications) != 1 {
+		t.Fatalf("owner inbox after final result retry=(%+v,%v), want exactly one notification", ownerInbox, err)
+	}
+	notification := ownerInbox.Notifications[0]
+	if notification.ThreadID != created.Thread.ID || notification.Status != ThreadStatusDone {
+		t.Fatalf("owner notification=%+v, want Done for Thread %s", notification, created.Thread.ID)
+	}
+	if foreignInbox, err := store.ListNotificationsForPrincipal(ctx, "bob", 0, 10); err != nil || len(foreignInbox.Notifications) != 0 {
+		t.Fatalf("other principal inbox=(%+v,%v), want empty", foreignInbox, err)
+	}
+}
+
 func TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {
