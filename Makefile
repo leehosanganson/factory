@@ -1,4 +1,4 @@
-.PHONY: build frontend-build frontend-check test-dashboard-e2e container-build test test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
+.PHONY: build frontend-build frontend-check test-dashboard-e2e container-build test test-coverage test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
@@ -34,6 +34,10 @@ container-build:
 
 test:
 	go test ./...
+
+test-coverage:
+	go test ./... -coverprofile=coverage.out -count=1
+	go run ./cmd/factory-coverage-gate -root . -profile coverage.out
 
 test-compose-local:
 	./scripts/test-compose-local.sh

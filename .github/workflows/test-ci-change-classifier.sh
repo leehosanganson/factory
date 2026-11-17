@@ -232,6 +232,8 @@ for required in \
   "if: always() && needs.classify.outputs.run_full != 'false'" \
   "if: always() && needs.classify.outputs.run_macos != 'false'" \
   '  linux-build:' \
+  '      - name: Test coverage gate' \
+  '        run: make test-coverage' \
   '  dashboard-browser-e2e:' \
   'run: make test-dashboard-e2e' \
   'run: .github/workflows/test-ci-change-classifier.sh' \
