@@ -366,9 +366,16 @@ func TestRemoteWorkerHeartbeatCancellationFinishesAfterHarnessStops(t *testing.T
 		ownerToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 		workerID   = "worker-cancel-e2e"
 	)
-	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	initE2ERepository(t, root)
-	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	stateHome, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", stateHome)
 	harnessDir := t.TempDir()
 	pidPath := filepath.Join(harnessDir, "harness-pid")
 	pidTempPath := pidPath + ".tmp"
