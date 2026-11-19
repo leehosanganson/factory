@@ -370,10 +370,10 @@ func TestRemoteWorkerHeartbeatCancellationFinishesAfterHarnessStops(t *testing.T
 	initE2ERepository(t, root)
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	harnessDir := t.TempDir()
-	startedPath := filepath.Join(harnessDir, "harness-started")
 	pidPath := filepath.Join(harnessDir, "harness-pid")
+	pidTempPath := pidPath + ".tmp"
 	harness := filepath.Join(harnessDir, "blocking-harness.sh")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"" + pidPath + "\"\nprintf 'started\\n' > \"" + startedPath + "\"\nexec sleep 300\n"
+	script := "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"" + pidTempPath + "\"\nmv \"" + pidTempPath + "\" \"" + pidPath + "\"\nexec sleep 300\n"
 	if err := os.WriteFile(harness, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -408,10 +408,17 @@ func TestRemoteWorkerHeartbeatCancellationFinishesAfterHarnessStops(t *testing.T
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"job":{"id":"` + jobID + `","request":{"repository":"widget","task":"wait for cancellation"}},"attempt":{"job_id":"` + jobID + `","generation":1,"owner_token":"` + ownerToken + `","worker_id":"` + workerID + `","boot_id":"` + payload.BootID + `"}}`))
 		case strings.HasSuffix(r.URL.Path, "/heartbeat"):
-			if _, err := os.Stat(startedPath); err == nil {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{"cancellation_requested":true}`))
-				return
+			if pidData, err := os.ReadFile(pidPath); err == nil {
+				var pid int
+				if _, scanErr := fmt.Sscanf(string(pidData), "%d", &pid); scanErr != nil {
+					t.Errorf("read harness PID before requesting cancellation: %v", scanErr)
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"cancellation_requested":true}`))
+					return
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("read harness PID before requesting cancellation: %v", err)
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"cancellation_requested":false}`))
