@@ -351,6 +351,9 @@ func (e *FactoryExecutor) Execute(ctx context.Context, job restjobs.Snapshot, at
 	closeErr := outputFile.Close()
 	if runErr != nil || flushErr != nil || closeErr != nil || jobCtx.Err() != nil {
 		result.Err = errExecutionFailed
+		if errors.Is(runErr, context.Canceled) && jobCtx.Err() == context.Canceled {
+			result.Err = fmt.Errorf("%w: %w", errExecutionFailed, context.Canceled)
+		}
 		return result
 	}
 	if e.provider != nil {

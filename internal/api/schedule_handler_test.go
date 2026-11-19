@@ -751,6 +751,100 @@ func TestScheduleOperatorAuditAndOwnerHistory(t *testing.T) {
 	}
 }
 
+func TestSQLiteScheduleAPIEditRevisionConflictAndOwnership(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-edit.db"), restjobs.Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store,
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+		restserver.PrincipalConfig{ID: "bob", Role: "submitter", Enabled: true},
+	)
+
+	create := httptest.NewRequest(http.MethodPost, "/v1/schedules", strings.NewReader(`{"cron":"*/5 * * * *","repository":"widget","task":"original private task"}`))
+	create.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	create.Header.Set("Content-Type", "application/json")
+	create.Header.Set("Idempotency-Key", "schedule-edit-contract")
+	created := httptest.NewRecorder()
+	handler.ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status=%d body=%s", created.Code, created.Body.String())
+	}
+	var createBody struct {
+		Schedule struct {
+			ID string `json:"id"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal(created.Body.Bytes(), &createBody); err != nil || createBody.Schedule.ID == "" {
+		t.Fatalf("create response=%s err=%v", created.Body.String(), err)
+	}
+	id := createBody.Schedule.ID
+
+	get := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("alice"))
+	if get.Code != http.StatusOK || get.Header().Get("ETag") != `"1"` {
+		t.Fatalf("initial get status=%d ETag=%q body=%s", get.Code, get.Header().Get("ETag"), get.Body.String())
+	}
+
+	edit := httptest.NewRequest(http.MethodPatch, "/v1/schedules/"+id, strings.NewReader(`{"action":"edit","cron":"*/10 * * * *","repository":"widget","task":"updated private task"}`))
+	edit.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	edit.Header.Set("Content-Type", "application/json")
+	edit.Header.Set("If-Match", `"1"`)
+	edited := httptest.NewRecorder()
+	handler.ServeHTTP(edited, edit)
+	if edited.Code != http.StatusOK || edited.Header().Get("ETag") != `"2"` {
+		t.Fatalf("edit status=%d ETag=%q body=%s", edited.Code, edited.Header().Get("ETag"), edited.Body.String())
+	}
+	var editBody struct {
+		ID         string `json:"id"`
+		Owner      string `json:"owner"`
+		Cron       string `json:"cron"`
+		Repository string `json:"repository"`
+		Task       string `json:"task"`
+		Revision   int64  `json:"revision"`
+	}
+	if err := json.Unmarshal(edited.Body.Bytes(), &editBody); err != nil {
+		t.Fatalf("edit response=%s err=%v", edited.Body.String(), err)
+	}
+	if editBody.ID != id || editBody.Owner != "alice" || editBody.Cron != "*/10 * * * *" || editBody.Repository != "widget" || editBody.Task != "updated private task" || editBody.Revision != 2 {
+		t.Fatalf("edited schedule projection=%+v body=%s", editBody, edited.Body.String())
+	}
+
+	stale := httptest.NewRequest(http.MethodPatch, "/v1/schedules/"+id, strings.NewReader(`{"action":"edit","cron":"*/15 * * * *","repository":"widget","task":"stale private task"}`))
+	stale.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+	stale.Header.Set("Content-Type", "application/json")
+	stale.Header.Set("If-Match", `"1"`)
+	staleResponse := httptest.NewRecorder()
+	handler.ServeHTTP(staleResponse, stale)
+	assertError(t, staleResponse, http.StatusConflict, "revision_conflict")
+	for _, private := range []string{"original private task", "updated private task", "stale private task"} {
+		if strings.Contains(staleResponse.Body.String(), private) {
+			t.Errorf("stale edit response leaked %q: %s", private, staleResponse.Body.String())
+		}
+	}
+
+	unchanged := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("alice"))
+	var unchangedBody struct {
+		Cron       string `json:"cron"`
+		Repository string `json:"repository"`
+		Task       string `json:"task"`
+		Revision   int64  `json:"revision"`
+	}
+	if err := json.Unmarshal(unchanged.Body.Bytes(), &unchangedBody); err != nil || unchanged.Code != http.StatusOK || unchanged.Header().Get("ETag") != `"2"` {
+		t.Fatalf("follow-up get status=%d ETag=%q body=%s err=%v", unchanged.Code, unchanged.Header().Get("ETag"), unchanged.Body.String(), err)
+	}
+	if unchangedBody.Cron != "*/10 * * * *" || unchangedBody.Repository != "widget" || unchangedBody.Task != "updated private task" || unchangedBody.Revision != 2 {
+		t.Fatalf("stale edit changed schedule: %+v body=%s", unchangedBody, unchanged.Body.String())
+	}
+	if foreign := principalRequest(handler, http.MethodGet, "/v1/schedules/"+id, "", namedPrincipalToken("bob")); foreign.Code != http.StatusNotFound {
+		t.Fatalf("foreign get status=%d body=%s", foreign.Code, foreign.Body.String())
+	}
+}
+
 func TestSQLiteScheduleAPIOwnershipIdempotencyAndRevision(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {

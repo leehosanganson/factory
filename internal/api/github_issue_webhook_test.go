@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -141,6 +142,26 @@ func TestGitHubIssueWebhookAuthenticatesRawBytesHeadersAndBodyLimit(t *testing.T
 	}
 }
 
+func TestGitHubIssueWebhookIgnoresEventLabelMissingFromIssueLabels(t *testing.T) {
+	manager, handler := newSQLiteWebhookHandler(t, 4096, 2048)
+	defer manager.CloseStore()
+	body := `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":42,"title":"Issue","body":"body","state":"open","labels":[{"name":"other"}]},"repository":{"full_name":"acme/issues"}}`
+
+	response := githubWebhookRequest(handler, body, "event-label-not-on-issue", "issues", true)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("webhook status=%d body=%s, want %d", response.Code, response.Body.String(), http.StatusAccepted)
+	}
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatalf("decode webhook response: %v", err)
+	}
+	if result.Status != "ignored" {
+		t.Fatalf("webhook status field=%q, want ignored", result.Status)
+	}
+}
+
 func TestGitHubIssueWebhookIgnoresWrongActionLabelSourceClosedAndPullRequest(t *testing.T) {
 	manager, handler := newSQLiteWebhookHandler(t, 4096, 2048)
 	defer manager.CloseStore()
@@ -180,5 +201,31 @@ func TestGitHubIssueWebhookOnSQLiteDoesNotPersistDeliveryOrAdmitWork(t *testing.
 	jobs, err := manager.ListJobs(context.Background(), 0, 0, 20)
 	if err != nil || len(jobs.Jobs) != 0 {
 		t.Fatalf("SQLite webhook admitted jobs: %+v %v", jobs, err)
+	}
+}
+
+func TestGitHubIssueWebhookRejectsDerivedTaskOverTaskLimit(t *testing.T) {
+	manager, handler := newSQLiteWebhookHandler(t, 4096, 350)
+	defer manager.CloseStore()
+	body := `{"action":"labeled","label":{"name":"factory:ready"},"issue":{"number":42,"title":"` + strings.Repeat("x", 300) + `","state":"open","labels":[{"name":"factory:ready"}]},"repository":{"full_name":"acme/issues"}}`
+	if len(body) >= 4096 {
+		t.Fatalf("test webhook body is %d bytes, want under 4096", len(body))
+	}
+
+	response := githubWebhookRequest(handler, body, "over-task-limit", "issues", true)
+	assertError(t, response, http.StatusBadRequest, "invalid_request")
+	var envelope struct {
+		Error errorDTO `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if got, want := envelope.Error.Message, "Issue task exceeds the configured bound."; got != want {
+		t.Fatalf("error message = %q, want %q", got, want)
+	}
+
+	jobs, err := manager.ListJobs(context.Background(), 0, 0, 20)
+	if err != nil || len(jobs.Jobs) != 0 {
+		t.Fatalf("oversized derived task admitted jobs: %+v %v", jobs, err)
 	}
 }

@@ -163,6 +163,62 @@ func TestSQLiteInterruptedDispositionNotifiesOnlyFinalThreadMember(t *testing.T)
 	}
 }
 
+func TestSQLiteAttemptFinishingFinalThreadJobNotifiesOwnerOnce(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "attempt-thread-notification.db")
+	config := Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 8}
+	store, err := OpenSQLiteStore(path, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	created, _, err := store.AdmitThreadAs("attempt-thread-notification", "alice", Request{Repository: "widget", Task: "first Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, finalJob, _, err := store.AdmitThreadJobAs(created.Thread.ID, "attempt-thread-notification-final", "alice", Request{Repository: "widget", Task: "final Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstClaim, err := store.ClaimNextAttempt()
+	if err != nil || firstClaim.Job.ID != created.Jobs[0].ID {
+		t.Fatalf("first attempt claim=(%+v,%v), want first Thread Job", firstClaim, err)
+	}
+	finalClaim, err := store.ClaimNextAttempt()
+	if err != nil || finalClaim.Job.ID != finalJob.ID {
+		t.Fatalf("final attempt claim=(%+v,%v), want final Thread Job", finalClaim, err)
+	}
+	if err := store.FinishAttempt(firstClaim.Attempt, StatusSucceeded); err != nil {
+		t.Fatalf("finish first attempt: %v", err)
+	}
+	inProgress, err := store.GetThread(created.Thread.ID)
+	if err != nil || inProgress.Thread.Status != ThreadStatusInProgress {
+		t.Fatalf("Thread after first Job=(%+v,%v), want in_progress", inProgress.Thread, err)
+	}
+	if page, err := store.ListNotificationsForPrincipal(context.Background(), "alice", 0, 10); err != nil || len(page.Notifications) != 0 {
+		t.Fatalf("owner inbox before final Job=(%+v,%v), want empty", page, err)
+	}
+
+	if err := store.FinishAttempt(finalClaim.Attempt, StatusSucceeded); err != nil {
+		t.Fatalf("finish final attempt: %v", err)
+	}
+	finished, err := store.GetThread(created.Thread.ID)
+	if err != nil || finished.Thread.Status != ThreadStatusDone {
+		t.Fatalf("Thread after final Job=(%+v,%v), want done", finished.Thread, err)
+	}
+	ownerInbox, err := store.ListNotificationsForPrincipal(context.Background(), "alice", 0, 10)
+	if err != nil || len(ownerInbox.Notifications) != 1 {
+		t.Fatalf("owner inbox after final Job=(%+v,%v), want exactly one notification", ownerInbox, err)
+	}
+	if notification := ownerInbox.Notifications[0]; notification.ThreadID != created.Thread.ID || notification.Status != ThreadStatusDone {
+		t.Fatalf("owner notification=%+v, want Done for Thread %s", notification, created.Thread.ID)
+	}
+	if foreignInbox, err := store.ListNotificationsForPrincipal(context.Background(), "bob", 0, 10); err != nil || len(foreignInbox.Notifications) != 0 {
+		t.Fatalf("other principal inbox=(%+v,%v), want empty", foreignInbox, err)
+	}
+}
+
 func TestSQLiteThreadNotificationsAtomicDoneCyclesAndRestart(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "notifications.db")
 	config := Config{QueueCapacity: 8, MaxConcurrentJobs: 2, MaxRecords: 8}

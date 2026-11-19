@@ -72,6 +72,43 @@ func TestWorkerSessionClientRegistersAndHeartbeatsWithMutualTLS(t *testing.T) {
 	}
 }
 
+func TestWorkerSessionClientRejectsRegistrationForDifferentBootID(t *testing.T) {
+	client := &workerSessionClient{
+		baseURL: "https://controller.invalid",
+		client: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodPost || request.URL.Path != "/v1/worker/session" {
+				t.Errorf("registration request=%s %s, want POST /v1/worker/session", request.Method, request.URL.Path)
+			}
+			if request.Header.Get("Content-Type") != "application/json" {
+				t.Errorf("registration Content-Type=%q, want application/json", request.Header.Get("Content-Type"))
+			}
+			if request.Header.Get("Authorization") != "" {
+				t.Errorf("registration Authorization=%q, want none", request.Header.Get("Authorization"))
+			}
+			body, err := io.ReadAll(request.Body)
+			if err != nil || string(body) != `{"boot_id":"process-boot"}` {
+				t.Errorf("registration body=%q err=%v, want boot ID JSON", body, err)
+			}
+			return &http.Response{
+				StatusCode: http.StatusCreated,
+				Body:       io.NopCloser(strings.NewReader(`{"id":"session","principal_id":"worker","boot_id":"different-boot","status":"active","created_at":"2026-01-01T00:00:00Z","capability":"process-only-secret","capability_expires_at":"2099-01-01T00:00:00Z"}`)),
+				Header:     make(http.Header),
+				Request:    request,
+			}, nil
+		})},
+	}
+
+	if client.token != "" {
+		t.Fatalf("initial token=%q, want empty", client.token)
+	}
+	if err := client.register(context.Background(), "process-boot"); err == nil {
+		t.Fatal("registration with a mismatched boot ID succeeded")
+	}
+	if client.token != "" {
+		t.Fatalf("token after rejected registration=%q, want empty", client.token)
+	}
+}
+
 func TestWorkerSessionClientRejectsRedirectAndStopsAfterHeartbeatError(t *testing.T) {
 	clientCert, clientCA := runtimeTestCertificate(t, "worker-client", true)
 	serverCert, serverCA := runtimeTestCertificate(t, "controller-server", false)
@@ -393,6 +430,29 @@ func TestHeartbeatFailureStopsClaimsWithoutCancelingRunningExecution(t *testing.
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ordinary shutdown did not retain its bounded timeout")
+	}
+}
+
+func TestWorkerSessionClientCloseClearsTokenAndPreventsHeartbeat(t *testing.T) {
+	var calls atomic.Int32
+	client := &workerSessionClient{
+		baseURL: "https://controller.invalid",
+		token:   "test-capability",
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return nil, errors.New("unexpected transport call")
+		})},
+	}
+
+	client.close()
+	if client.token != "" {
+		t.Fatalf("token after close=%q, want empty", client.token)
+	}
+	if err := client.heartbeat(context.Background()); err == nil || err.Error() != "worker session is not registered" {
+		t.Fatalf("heartbeat error=%v, want unregistered session", err)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("transport calls after close=%d, want zero", got)
 	}
 }
 

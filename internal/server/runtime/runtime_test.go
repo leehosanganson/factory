@@ -219,6 +219,60 @@ func TestRunWorkersDisabledDoesNotRequireBootIDEntropy(t *testing.T) {
 	}
 }
 
+func TestRunWorkerPreflightRequirements(t *testing.T) {
+	for _, test := range []struct {
+		name             string
+		persistence      func(*testing.T) restserver.PersistenceConfig
+		workerController *restserver.WorkerControllerConfig
+		wantError        string
+	}{
+		{
+			name: "memory requires PostgreSQL",
+			persistence: func(*testing.T) restserver.PersistenceConfig {
+				return restserver.PersistenceConfig{Backend: restserver.PersistenceBackendMemory}
+			},
+			workerController: &restserver.WorkerControllerConfig{
+				BaseURL: "https://controller.example", ClientCertFile: "/worker/client.crt",
+				ClientKeyFile: "/worker/client.key", ServerCAFile: "/worker/controller-ca.crt",
+			},
+			wantError: "factory worker requires PostgreSQL persistence",
+		},
+		{
+			name: "SQLite requires PostgreSQL",
+			persistence: func(t *testing.T) restserver.PersistenceConfig {
+				return restserver.PersistenceConfig{Backend: restserver.PersistenceBackendSQLite, Path: filepath.Join(t.TempDir(), "jobs.db")}
+			},
+			workerController: &restserver.WorkerControllerConfig{
+				BaseURL: "https://controller.example", ClientCertFile: "/worker/client.crt",
+				ClientKeyFile: "/worker/client.key", ServerCAFile: "/worker/controller-ca.crt",
+			},
+			wantError: "factory worker requires PostgreSQL persistence",
+		},
+		{
+			name: "PostgreSQL requires worker controller",
+			persistence: func(*testing.T) restserver.PersistenceConfig {
+				return restserver.PersistenceConfig{
+					Backend: restserver.PersistenceBackendPostgres,
+					DSN:     "postgres://worker:secret@127.0.0.1:1/factory?sslmode=disable",
+				}
+			},
+			wantError: "factory worker requires worker_controller configuration",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config, _ := runtimeFixture(t)
+			config.Persistence = test.persistence(t)
+			config.WorkerController = test.workerController
+			if err := config.Validate(); err != nil {
+				t.Fatalf("test config is invalid: %v", err)
+			}
+			if err := runWorker(context.Background(), config, errorReader{}); err == nil || err.Error() != test.wantError {
+				t.Fatalf("runWorker() error = %v, want exactly %q", err, test.wantError)
+			}
+		})
+	}
+}
+
 func TestRunWorkerBootIDEntropyFailureStopsBeforeControllerOrStore(t *testing.T) {
 	config, _ := runtimeFixture(t)
 	config.Persistence = restserver.PersistenceConfig{Backend: restserver.PersistenceBackendPostgres, DSN: "postgres://worker:secret@localhost/factory"}
