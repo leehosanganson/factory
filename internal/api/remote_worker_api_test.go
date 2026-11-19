@@ -23,6 +23,7 @@ type remoteWorkerStoreFake struct {
 	claim                 restjobs.AttemptClaim
 	claimErr              error
 	cancellationRequested bool
+	heartbeatCalls        int
 	heartbeatErr          error
 	finishStatus          restjobs.Status
 	finishEvidence        restjobs.VerificationEvidence
@@ -43,6 +44,7 @@ func (f *remoteWorkerStoreFake) ClaimRemoteAttempt(_ context.Context, claimID, w
 }
 
 func (f *remoteWorkerStoreFake) HeartbeatRemoteAttempt(attempt restjobs.AttemptHandle) (bool, error) {
+	f.heartbeatCalls++
 	if attempt.JobID != remoteTestJobID {
 		return false, restjobs.ErrInvalidInput
 	}
@@ -69,13 +71,17 @@ func (f *remoteWorkerStoreFake) FinishRemoteAttempt(_ restjobs.AttemptHandle, st
 }
 
 func newRemoteWorkerHandler(t *testing.T, store RemoteWorkerStore) http.Handler {
+	return newRemoteWorkerHandlerWithReadiness(t, store, func() bool { return true })
+}
+
+func newRemoteWorkerHandlerWithReadiness(t *testing.T, store RemoteWorkerStore, ready func() bool) http.Handler {
 	t.Helper()
 	manager := newTestManager(t, restjobs.Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 10, MaxEventsPerJob: 10, MaxTaskBytes: 128})
 	handler, err := New(manager, testAPIKeyObject(t), Config{
 		MaxRequestBodyBytes: 2048,
 		MaxTaskBytes:        128,
 		RepositoryAliases:   map[string]struct{}{"widget": {}},
-		Ready:               func() bool { return true },
+		Ready:               ready,
 		ReadyError:          func(context.Context) error { return nil },
 		RemoteWorkerAPI:     &RemoteWorkerAPIConfig{Secret: []byte(remoteTestSecret), Store: store},
 	})
@@ -144,6 +150,128 @@ func TestRemoteWorkerAPIRequiresSeparateSecretAndReturnsClaimTokenOnlyInClaim(t 
 	}
 }
 
+func TestRemoteWorkerAPIRejectsMalformedClaimsFromStore(t *testing.T) {
+	baseClaim := restjobs.AttemptClaim{
+		Job:     restjobs.Snapshot{ID: remoteTestJobID, Request: restjobs.Request{Repository: "widget", Task: "private task text"}},
+		Attempt: restjobs.AttemptHandle{JobID: remoteTestJobID, Generation: 3, OwnerToken: remoteTestToken, WorkerID: "worker-1", BootID: "boot-1"},
+	}
+	cases := []struct {
+		name   string
+		mutate func(*restjobs.AttemptClaim)
+		leaks  []string
+	}{
+		{"invalid job ID", func(claim *restjobs.AttemptClaim) { claim.Job.ID = "private-invalid-job-id" }, []string{"private-invalid-job-id", "private task text", remoteTestToken, "private-repository"}},
+		{"unconfigured repository", func(claim *restjobs.AttemptClaim) { claim.Job.Request.Repository = "private-repository" }, []string{"private-repository", "private task text", remoteTestToken}},
+		{"oversized task", func(claim *restjobs.AttemptClaim) {
+			claim.Job.Request.Task = strings.Repeat("private oversized task ", 8)
+		}, []string{"private oversized task", "private-repository", remoteTestToken}},
+		{"mismatched attempt job ID", func(claim *restjobs.AttemptClaim) { claim.Attempt.JobID = "private-mismatched-job-id" }, []string{"private-mismatched-job-id", "private task text", remoteTestToken, "private-repository"}},
+		{"invalid generation", func(claim *restjobs.AttemptClaim) { claim.Attempt.Generation = 0 }, []string{"private task text", remoteTestToken, "private-repository"}},
+		{"invalid token", func(claim *restjobs.AttemptClaim) { claim.Attempt.OwnerToken = "private-owner-token" }, []string{"private-owner-token", "private task text", "private-repository"}},
+		{"mismatched worker ID", func(claim *restjobs.AttemptClaim) { claim.Attempt.WorkerID = "private-worker-id" }, []string{"private-worker-id", "private task text", remoteTestToken, "private-repository"}},
+		{"mismatched boot ID", func(claim *restjobs.AttemptClaim) { claim.Attempt.BootID = "private-boot-id" }, []string{"private-boot-id", "private task text", remoteTestToken, "private-repository"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			claim := baseClaim
+			tc.mutate(&claim)
+			store := &remoteWorkerStoreFake{claim: claim}
+			handler := newRemoteWorkerHandler(t, store)
+			body := `{"claim_id":"claim-1","worker_id":"worker-1","boot_id":"boot-1","repositories":["widget"]}`
+			response := remoteRequest(handler, "/v1/worker/claims", body, remoteTestSecret)
+			if response.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), http.StatusServiceUnavailable)
+			}
+			if !strings.Contains(response.Body.String(), `"code":"service_unavailable"`) || !strings.Contains(response.Body.String(), `"message":"Worker operation is unavailable."`) {
+				t.Fatalf("response=%s, want generic service_unavailable error", response.Body.String())
+			}
+			for _, leak := range tc.leaks {
+				if strings.Contains(response.Body.String(), leak) {
+					t.Errorf("response leaked %q: %s", leak, response.Body.String())
+				}
+			}
+			if store.claimCalls != 1 {
+				t.Fatalf("claim calls=%d, want 1", store.claimCalls)
+			}
+		})
+	}
+}
+
+func TestRemoteWorkerAPIRouteGatesDoNotCallStore(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		method     string
+		path       string
+		wantStatus int
+		wantAllow  string
+	}{
+		{"claim wrong method", http.MethodGet, "/v1/worker/claims", http.StatusMethodNotAllowed, http.MethodPost},
+		{"unknown attempt action", http.MethodPost, "/v1/worker/attempts/" + remoteTestJobID + "/cancel", http.StatusNotFound, ""},
+		{"malformed attempt path", http.MethodPost, "/v1/worker/attempts/" + remoteTestJobID, http.StatusNotFound, ""},
+		{"query string", http.MethodPost, "/v1/worker/claims?unexpected=1", http.StatusNotFound, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &remoteWorkerStoreFake{}
+			handler := newRemoteWorkerHandler(t, store)
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"claim_id":"claim-1","worker_id":"worker-1","boot_id":"boot-1","repositories":["widget"]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+remoteTestSecret)
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), tc.wantStatus)
+			}
+			if tc.wantAllow != "" && response.Header().Get("Allow") != tc.wantAllow {
+				t.Errorf("Allow=%q, want %q", response.Header().Get("Allow"), tc.wantAllow)
+			}
+			if store.claimCalls != 0 || store.heartbeatCalls != 0 || store.finishCalls != 0 {
+				t.Fatalf("store calls claim=%d heartbeat=%d finish=%d, want none", store.claimCalls, store.heartbeatCalls, store.finishCalls)
+			}
+		})
+	}
+}
+
+func TestRemoteWorkerAPIReadinessGateDoesNotCallStore(t *testing.T) {
+	store := &remoteWorkerStoreFake{}
+	handler := newRemoteWorkerHandlerWithReadiness(t, store, func() bool { return false })
+	body := `{"claim_id":"claim-1","worker_id":"worker-1","boot_id":"boot-1","repositories":["widget"]}`
+	response := remoteRequest(handler, "/v1/worker/claims", body, remoteTestSecret)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), `"code":"not_ready"`) {
+		t.Fatalf("response=(%d,%s), want 503 not_ready", response.Code, response.Body.String())
+	}
+	if store.claimCalls != 0 || store.heartbeatCalls != 0 || store.finishCalls != 0 {
+		t.Fatalf("store calls claim=%d heartbeat=%d finish=%d, want none", store.claimCalls, store.heartbeatCalls, store.finishCalls)
+	}
+}
+
+func TestRemoteWorkerAPIMapsClaimStoreErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		err           error
+		wantStatus    int
+		wantErrorCode string
+	}{
+		{"no queued jobs", restjobs.ErrNoQueuedJobs, http.StatusNoContent, ""},
+		{"invalid input", restjobs.ErrInvalidInput, http.StatusBadRequest, "invalid_request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &remoteWorkerStoreFake{claimErr: tc.err}
+			handler := newRemoteWorkerHandler(t, store)
+			body := `{"claim_id":"claim-1","worker_id":"worker-1","boot_id":"boot-1","repositories":["widget"]}`
+			response := remoteRequest(handler, "/v1/worker/claims", body, remoteTestSecret)
+			if response.Code != tc.wantStatus {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), tc.wantStatus)
+			}
+			if tc.wantErrorCode != "" && !strings.Contains(response.Body.String(), `"code":"`+tc.wantErrorCode+`"`) {
+				t.Fatalf("response=%s, want error code %q", response.Body.String(), tc.wantErrorCode)
+			}
+			if store.claimCalls != 1 {
+				t.Fatalf("claim calls=%d, want 1", store.claimCalls)
+			}
+		})
+	}
+}
+
 func TestRemoteWorkerAPIRejectsAliasesOutsideControllerAllowlist(t *testing.T) {
 	store := &remoteWorkerStoreFake{}
 	handler := newRemoteWorkerHandler(t, store)
@@ -208,6 +336,7 @@ func TestRemoteWorkerHeartbeatSeparatesCancellationFromErrors(t *testing.T) {
 	}{
 		{"cancel requested", true, nil, http.StatusOK, `"cancellation_requested":true`},
 		{"no cancellation", false, nil, http.StatusOK, `"cancellation_requested":false`},
+		{"stale attempt", false, restjobs.ErrStaleAttempt, http.StatusConflict, "attempt_conflict"},
 		{"database error", false, errors.New("database unavailable"), http.StatusServiceUnavailable, "service_unavailable"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -217,6 +346,46 @@ func TestRemoteWorkerHeartbeatSeparatesCancellationFromErrors(t *testing.T) {
 			response := remoteRequest(handler, "/v1/worker/attempts/"+remoteTestJobID+"/heartbeat", body, remoteTestSecret)
 			if response.Code != tc.wantStatus || !strings.Contains(response.Body.String(), tc.wantBody) {
 				t.Fatalf("response=(%d,%s), want status %d and %q", response.Code, response.Body.String(), tc.wantStatus, tc.wantBody)
+			}
+			if store.heartbeatCalls != 1 {
+				t.Fatalf("heartbeat calls=%d, want 1", store.heartbeatCalls)
+			}
+		})
+	}
+}
+
+func TestRemoteWorkerFinishRejectsInvalidPayloadBeforeStoreCall(t *testing.T) {
+	valid := `{"generation":1,"owner_token":"` + remoteTestToken + `","worker_id":"worker-1","boot_id":"boot-1","status":"succeeded","evidence":{"checks":[{"name":"check-01","outcome":"passed"}],"limitations":["` + restjobs.LimitationAgentNotVerdict + `"]}}`
+	for _, tc := range []struct {
+		name string
+		old  string
+		new  string
+	}{
+		{"invalid generation", `"generation":1`, `"generation":0`},
+		{"invalid token", `"owner_token":"` + remoteTestToken + `"`, `"owner_token":"invalid"`},
+		{"invalid worker", `"worker_id":"worker-1"`, `"worker_id":"invalid worker"`},
+		{"invalid boot", `"boot_id":"boot-1"`, `"boot_id":"invalid boot"`},
+		{"nonterminal status", `"status":"succeeded"`, `"status":"running"`},
+		{"missing evidence", `,"evidence":{"checks":[{"name":"check-01","outcome":"passed"}],"limitations":["` + restjobs.LimitationAgentNotVerdict + `"]}`, ""},
+		{"null checks", `"checks":[{"name":"check-01","outcome":"passed"}]`, `"checks":null`},
+		{"null limitations", `"limitations":["` + restjobs.LimitationAgentNotVerdict + `"]`, `"limitations":null`},
+		{"invalid check name", `"name":"check-01"`, `"name":"check-02"`},
+		{"invalid check outcome", `"outcome":"passed"`, `"outcome":"unknown"`},
+		{"invalid limitation", `"` + restjobs.LimitationAgentNotVerdict + `"`, `"not an allowed limitation"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := strings.Replace(valid, tc.old, tc.new, 1)
+			if body == valid {
+				t.Fatalf("test mutation %q did not change the valid payload", tc.name)
+			}
+			store := &remoteWorkerStoreFake{}
+			handler := newRemoteWorkerHandler(t, store)
+			response := remoteRequest(handler, "/v1/worker/attempts/"+remoteTestJobID+"/finish", body, remoteTestSecret)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d body=%s, want %d", response.Code, response.Body.String(), http.StatusBadRequest)
+			}
+			if store.finishCalls != 0 {
+				t.Fatalf("finish calls=%d, want 0 for rejected payload", store.finishCalls)
 			}
 		})
 	}
@@ -230,7 +399,7 @@ func TestRemoteWorkerFinishPassesExactTerminalEvidenceAndMapsConflicts(t *testin
 		wantErrorCode string
 	}{
 		{"accepted", nil, http.StatusOK, ""},
-		{"conflicting retry", restjobs.ErrInvalidTransition, http.StatusConflict, ""},
+		{"conflicting retry", restjobs.ErrInvalidTransition, http.StatusConflict, "attempt_conflict"},
 		{"cancellation pending", restjobs.ErrCancellationPending, http.StatusConflict, "cancellation_pending"},
 		{"cancellation not requested", restjobs.ErrCancellationNotRequested, http.StatusConflict, "cancellation_not_requested"},
 	} {

@@ -26,20 +26,28 @@ const (
 )
 
 type testWorkspaceManager struct {
-	root       string
-	workspace  restworkspace.Workspace
-	createdID  string
-	markedID   string
-	markErr    error
-	createErr  error
-	createFn   func(context.Context) (restworkspace.Workspace, error)
-	revision   restworkspace.SourceRevision
-	captureErr error
+	root         string
+	workspace    restworkspace.Workspace
+	createdID    string
+	markedID     string
+	markErr      error
+	createErr    error
+	createFn     func(context.Context) (restworkspace.Workspace, error)
+	verifyErr    error
+	verifyCalls  int
+	verifiedPath string
+	revision     restworkspace.SourceRevision
+	captureErr   error
 }
 
 func (m *testWorkspaceManager) RepositoryRoot() string { return m.root }
 
 func (m *testWorkspaceManager) VerifyResultDirectory(path string) error {
+	m.verifyCalls++
+	m.verifiedPath = path
+	if m.verifyErr != nil {
+		return m.verifyErr
+	}
 	if filepath.Clean(path) != path || (filepath.Base(path) != executorJobID && filepath.Base(filepath.Dir(filepath.Dir(path))) != executorJobID) {
 		return errors.New("invalid result directory")
 	}
@@ -194,12 +202,21 @@ func TestProviderReconciliationUsesExactGenerationAndLegacyWorkspace(t *testing.
 		}
 		return restprovider.Outcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: attempt.Branch, Commit: commit, State: "open"}, nil
 	})
-	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, attempt, reconciler); err != nil || calls != 1 {
+	ineligible := job
+	ineligible.Status = restjobs.StatusRunning
+	if outcome, err := executor.ReconcileProvider(context.Background(), ineligible, attempt, reconciler); err == nil || outcome != (restjobs.ProviderOutcome{}) || calls != 0 {
+		t.Fatalf("ineligible reconciliation = %+v, %v, calls=%d; want rejection without provider lookup", outcome, err, calls)
+	}
+	wantOutcome := restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: attempt.Branch, Commit: commit, State: "open"}
+	if outcome, err := executor.ReconcileProvider(context.Background(), job, attempt, reconciler); err != nil || outcome != wantOutcome || calls != 1 {
+		t.Fatalf("eligible reconciliation = %+v, %v, calls=%d; want %+v and one provider lookup", outcome, err, calls, wantOutcome)
+	}
+	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, attempt, reconciler); err != nil || calls != 2 {
 		t.Fatalf("generation reconciliation = %v calls=%d", err, calls)
 	}
 	missing := attempt
 	missing.Generation = 3
-	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, missing, reconciler); err == nil || calls != 1 {
+	if _, err := executor.ReconcileInterruptedProvider(context.Background(), job, missing, reconciler); err == nil || calls != 2 {
 		t.Fatalf("missing generation fell back: err=%v lookup calls=%d", err, calls)
 	}
 	legacy := attempt
@@ -311,6 +328,182 @@ func TestFactoryExecutorAndWorkerPersistUncertainProviderAttempt(t *testing.T) {
 	}
 	if len(history.Events) == 0 || history.Events[len(history.Events)-1].Type != string(restjobs.StatusFailed) {
 		t.Fatalf("uncertain job history = %+v, want terminal failed event", history.Events)
+	}
+}
+
+func TestFactoryExecutorAndWorkerPersistSuccessfulProviderOutcomeBeforeCompletion(t *testing.T) {
+	databaseDir, err := os.MkdirTemp(t.TempDir(), "sqlite-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(databaseDir, "jobs.db"), restjobs.Config{
+		QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("successful-publish", restjobs.Request{Repository: "trusted", Task: "publish verified change"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	agent := &executorTestAgent{createFileDuringStage: "implement"}
+	executor, _, repo := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+	canonicalDatabaseDir, err := filepath.EvalSymlinks(databaseDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceManager, err := restworkspace.New(restworkspace.Config{RepositoryRoot: repo, ResultsRoot: filepath.Join(canonicalDatabaseDir, "results")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor.workspaces["trusted"] = workspaceManager
+	executor.server.Provider.Repositories = map[string]string{"trusted": "acme/widget"}
+	executor.server.Provider.BaseBranch = "main"
+	executor.recordProviderAttempt = store.RecordProviderAttemptForAttempt
+	executor.recordVerificationEvidence = store.RecordVerificationEvidenceForAttempt
+	type publishObservation struct {
+		request restprovider.PublishRequest
+		attempt restjobs.ProviderAttempt
+	}
+	published := make(chan publishObservation, 1)
+	outcome := restprovider.Outcome{
+		Provider: "github", Repository: "acme/widget", Number: 7,
+		URL: "https://github.com/acme/widget/pull/7", Branch: restprovider.JobBranch(job.ID), State: "open",
+	}
+	executor.provider = testJobPublisher(func(_ context.Context, request restprovider.PublishRequest) (restprovider.Outcome, error) {
+		attempt, err := store.ProviderAttempt(request.JobID)
+		if err != nil {
+			t.Errorf("ProviderAttempt(%q) during Publish = %v", request.JobID, err)
+			return restprovider.Outcome{}, err
+		}
+		outcome.Commit = request.Commit
+		outcome.Branch = request.Branch
+		published <- publishObservation{request: request, attempt: attempt}
+		return outcome, nil
+	})
+
+	completionObserved := make(chan restjobs.Snapshot, 1)
+	observingExecutor := testCompletionObserver{
+		Executor: executor,
+		beforeComplete: func() {
+			stored, err := store.Get(job.ID)
+			if err != nil {
+				t.Errorf("Get(%q) before Complete = %v", job.ID, err)
+				return
+			}
+			completionObserved <- stored
+		},
+	}
+	coordinator, err := New(store, observingExecutor, CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown: %v", err)
+		}
+	}()
+
+	final := waitForStatus(t, store, job.ID, restjobs.StatusSucceeded)
+	var publishAttempt restjobs.ProviderAttempt
+	select {
+	case observation := <-published:
+		publishAttempt = observation.attempt
+		if observation.request.JobID != job.ID || observation.request.Repository != "acme/widget" {
+			t.Errorf("Publish request identity = %+v", observation.request)
+		}
+		if want := restprovider.JobBranch(job.ID); observation.request.Branch != want || observation.attempt.Branch != want {
+			t.Errorf("publish/persisted branches = %q/%q, want %q", observation.request.Branch, observation.attempt.Branch, want)
+		}
+		if observation.request.Commit == "" || observation.request.Commit != observation.attempt.Commit {
+			t.Errorf("publish commit = %q, persisted attempt commit = %q; want same non-empty commit", observation.request.Commit, observation.attempt.Commit)
+		}
+		if observation.attempt.Generation != 1 || observation.attempt.Provider != "github" || observation.attempt.Repository != "acme/widget" || observation.attempt.Uncertain {
+			t.Errorf("persisted attempt during Publish = %+v", observation.attempt)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Publisher.Publish was not called")
+	}
+	select {
+	case beforeComplete := <-completionObserved:
+		if beforeComplete.Status != restjobs.StatusRunning || beforeComplete.Provider == nil {
+			t.Fatalf("job before Executor.Complete = %+v; want running with provider outcome", beforeComplete)
+		}
+		want := restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: restprovider.JobBranch(job.ID), Commit: publishAttempt.Commit, State: "open"}
+		if beforeComplete.Provider.Commit == "" || beforeComplete.Provider.Commit != publishAttempt.Commit || *beforeComplete.Provider != want {
+			t.Fatalf("persisted provider outcome before Complete = %+v, want %+v", beforeComplete.Provider, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Executor.Complete did not inspect the running job with persisted provider outcome")
+	}
+	if final.Provider == nil {
+		t.Fatalf("final succeeded snapshot has no provider outcome: %+v", final)
+	}
+	wantFinal := restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: restprovider.JobBranch(job.ID), Commit: publishAttempt.Commit, State: "open"}
+	if final.Provider.Commit == "" || final.Provider.Commit != publishAttempt.Commit || *final.Provider != wantFinal {
+		t.Fatalf("final provider outcome = %+v, want %+v", final.Provider, wantFinal)
+	}
+}
+
+type testCompletionObserver struct {
+	Executor
+	beforeComplete func()
+}
+
+func (e testCompletionObserver) Complete(ctx context.Context, job restjobs.Snapshot, attempt restjobs.AttemptHandle, result ExecutionResult) error {
+	e.beforeComplete()
+	return e.Executor.Complete(ctx, job, attempt, result)
+}
+
+func TestFactoryExecutorCompleteRejectsUnpersistedProviderOutcome(t *testing.T) {
+	executor, _, _ := newExecutorFixture(t, "10s", restJobOutputLimit, &executorTestAgent{})
+	executor.provider = testJobPublisher(func(context.Context, restprovider.PublishRequest) (restprovider.Outcome, error) {
+		return restprovider.Outcome{}, nil
+	})
+	result := ExecutionResult{
+		ProviderOutcome:         &restjobs.ProviderOutcome{Provider: "github", Repository: "acme/widget", Number: 7, URL: "https://github.com/acme/widget/pull/7", Branch: restprovider.JobBranch(executorJobID), Commit: "0123456789abcdef0123456789abcdef01234567", State: "open"},
+		ProviderOutcomeRequired: true,
+	}
+
+	err := executor.Complete(context.Background(), executorJob("unpersisted provider outcome"), executorAttempt(), result)
+	if err != errExecutionFailed {
+		t.Fatalf("Complete() error = %v, want generic execution failure", err)
+	}
+}
+
+func TestFactoryExecutorCompleteLegacyAttemptRequiresWorkspaceManager(t *testing.T) {
+	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, &executorTestAgent{})
+	delete(executor.workspaces, "trusted")
+
+	err := executor.Complete(context.Background(), executorJob("legacy completion"), restjobs.AttemptHandle{}, ExecutionResult{})
+	if err != errExecutionFailed {
+		t.Fatalf("Complete() error = %v, want generic execution failure", err)
+	}
+	if manager.markedID != "" {
+		t.Fatalf("workspace marker called after manager removal: %q", manager.markedID)
+	}
+}
+
+func TestFactoryExecutorCompleteLegacyAttemptSanitizesMarkSucceededError(t *testing.T) {
+	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, &executorTestAgent{})
+	manager.markErr = errors.New("private marker filesystem detail")
+
+	err := executor.Complete(context.Background(), executorJob("legacy completion"), restjobs.AttemptHandle{}, ExecutionResult{})
+	if err != errExecutionFailed {
+		t.Fatalf("Complete() error = %v, want generic execution failure", err)
+	}
+	if strings.Contains(err.Error(), "private marker filesystem detail") {
+		t.Fatalf("Complete() leaked marker error: %v", err)
+	}
+	if manager.markedID != executorJobID {
+		t.Fatalf("MarkSucceeded() attempted for %q, want %q", manager.markedID, executorJobID)
 	}
 }
 
@@ -554,6 +747,83 @@ func TestNewLocalJobManagerUsesServerRegistryLimits(t *testing.T) {
 	}
 }
 
+func TestNewLocalServerJobManagerOwnsConfiguredSQLiteStore(t *testing.T) {
+	databaseDir, err := os.MkdirTemp(t.TempDir(), "sqlite-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := restserver.DefaultConfig()
+	config.Repositories = map[string]string{"trusted": t.TempDir()}
+	config.Harness = restserver.HarnessConfig{Executable: "agent", Args: []string{"{task}", "{system_prompt}"}}
+	config.APIKeyFile = filepath.Join(t.TempDir(), "api-key")
+	config.Persistence = restserver.PersistenceConfig{
+		Backend: restserver.PersistenceBackendSQLite,
+		Path:    filepath.Join(databaseDir, "jobs.db"),
+	}
+
+	closeStore := func(store restjobs.Store) error {
+		closer, ok := store.(interface{ CloseStore() error })
+		if !ok {
+			return errors.New("server SQLite store does not expose CloseStore")
+		}
+		return closer.CloseStore()
+	}
+	var first restjobs.Store
+	defer func() {
+		if first != nil {
+			if err := closeStore(first); err != nil {
+				t.Errorf("close first server job manager: %v", err)
+			}
+		}
+	}()
+	first, err = NewLocalServerJobManager(config)
+	if err != nil {
+		t.Fatalf("open first server job manager: %v", err)
+	}
+
+	second, err := NewLocalServerJobManager(config)
+	if err == nil {
+		if second != nil {
+			if closeErr := closeStore(second); closeErr != nil {
+				t.Errorf("close unexpectedly opened second server job manager: %v", closeErr)
+			}
+		}
+		t.Fatal("open second server job manager while first owns SQLite path; want ownership failure")
+	}
+	if !strings.Contains(err.Error(), "already owned") {
+		t.Fatalf("second server job manager error = %v, want SQLite ownership failure", err)
+	}
+
+	if err := closeStore(first); err != nil {
+		t.Fatalf("close first server job manager: %v", err)
+	}
+	first = nil
+
+	third, err := NewLocalServerJobManager(config)
+	if err != nil {
+		t.Fatalf("open third server job manager after first closes: %v", err)
+	}
+	defer func() {
+		if err := closeStore(third); err != nil {
+			t.Errorf("close third server job manager: %v", err)
+		}
+	}()
+	admitted, _, err := third.Admit("server-owned-store", restjobs.Request{Repository: "trusted", Task: "verify server ownership wiring"})
+	if err != nil {
+		t.Fatalf("admit through third server job manager: %v", err)
+	}
+	got, err := third.Get(admitted.ID)
+	if err != nil {
+		t.Fatalf("read admitted job through third server job manager: %v", err)
+	}
+	if got.ID != admitted.ID || got.Request.Task != admitted.Request.Task || got.Status != restjobs.StatusQueued {
+		t.Fatalf("read job = %+v, want admitted queued job %+v", got, admitted)
+	}
+}
+
 func TestNewLocalJobManagerReturnsConfiguredDurableStoreOpenFailures(t *testing.T) {
 	for _, persistence := range []restserver.PersistenceConfig{
 		{Backend: restserver.PersistenceBackendSQLite, Path: "relative.db"},
@@ -595,6 +865,92 @@ func TestFactoryExecutorRejectsUncapturableSourceBeforeWorkspaceOrWorkflow(t *te
 	}
 	if manager.createdID != "" || len(agent.calls) != 0 {
 		t.Fatalf("unsupported source caused side effects: workspace=%q stages=%v", manager.createdID, agent.calls)
+	}
+}
+
+func TestFactoryExecutorRejectsResultDirectoryOwnedByAnotherJob(t *testing.T) {
+	agent := &executorTestAgent{}
+	executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+	manager.verifyErr = errors.New("result directory belongs to another job")
+	manager.createFn = func(_ context.Context) (restworkspace.Workspace, error) {
+		workspace := manager.workspace
+		workspace.JobID = executorJobID
+		workspace.SourceRevision = manager.revision
+		otherJobDir := filepath.Join(filepath.Dir(manager.root), "fedcba98-7654-4321-8abc-0123456789ab")
+		workspace.WorktreePath = filepath.Join(otherJobDir, "worktree")
+		workspace.StatePath = filepath.Join(otherJobDir, "state")
+		workspace.OutputPath = filepath.Join(otherJobDir, "output")
+		if err := os.MkdirAll(workspace.OutputPath, 0o700); err != nil {
+			return restworkspace.Workspace{}, err
+		}
+		return workspace, nil
+	}
+
+	result := executor.Execute(context.Background(), executorJob("must not run"), restjobs.AttemptHandle{})
+	if result.Err != errExecutionFailed {
+		t.Fatalf("Execute() error = %v, want errExecutionFailed", result.Err)
+	}
+	if manager.verifyCalls != 1 || manager.verifiedPath != filepath.Join(filepath.Dir(manager.root), "fedcba98-7654-4321-8abc-0123456789ab") {
+		t.Fatalf("VerifyResultDirectory calls=%d path=%q, want one check of the foreign job's result directory", manager.verifyCalls, manager.verifiedPath)
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("workflow ran for an unowned result directory: stages=%v", agent.calls)
+	}
+	if manager.markedID != "" {
+		t.Fatalf("MarkSucceeded() called for rejected workspace: %q", manager.markedID)
+	}
+}
+
+func TestFactoryExecutorRejectsInvalidWorkspaceBeforeVerifyingOrRunningWorkflow(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*restworkspace.Workspace)
+	}{
+		{
+			name: "mismatched job ID",
+			change: func(workspace *restworkspace.Workspace) {
+				workspace.JobID = "fedcba98-7654-4321-8abc-0123456789ab"
+			},
+		},
+		{
+			name: "noncanonical absolute layout",
+			change: func(workspace *restworkspace.Workspace) {
+				workspace.WorktreePath = filepath.Join(filepath.Dir(workspace.WorktreePath), "unexpected-worktree")
+			},
+		},
+		{
+			name: "non-absolute paths",
+			change: func(workspace *restworkspace.Workspace) {
+				workspace.WorktreePath = filepath.Join("relative", "worktree")
+				workspace.StatePath = filepath.Join("relative", "state")
+				workspace.OutputPath = filepath.Join("relative", "output")
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agent := &executorTestAgent{}
+			executor, manager, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+			manager.createFn = func(_ context.Context) (restworkspace.Workspace, error) {
+				created := manager.workspace
+				created.SourceRevision = manager.revision
+				test.change(&created)
+				return created, nil
+			}
+
+			result := executor.Execute(context.Background(), executorJob("must not run"), restjobs.AttemptHandle{})
+			if result.Err != errExecutionFailed {
+				t.Fatalf("Execute() error = %v, want errExecutionFailed", result.Err)
+			}
+			if manager.verifyCalls != 0 || manager.verifiedPath != "" {
+				t.Fatalf("VerifyResultDirectory called before workspace rejection: calls=%d path=%q", manager.verifyCalls, manager.verifiedPath)
+			}
+			if len(agent.calls) != 0 {
+				t.Fatalf("workflow ran for invalid workspace: stages=%v", agent.calls)
+			}
+			if manager.markedID != "" {
+				t.Fatalf("MarkSucceeded() called for rejected workspace: %q", manager.markedID)
+			}
+		})
 	}
 }
 
@@ -657,6 +1013,90 @@ func TestFactoryExecutorRecordsNoConfiguredCheckLimitation(t *testing.T) {
 	if len(evidence.Checks) != 0 || len(evidence.Limitations) != 2 || evidence.Limitations[0] != restjobs.LimitationAgentNotVerdict || evidence.Limitations[1] != restjobs.LimitationNoChecksConfigured {
 		t.Fatalf("no-check verification evidence = %+v", evidence)
 	}
+}
+
+func TestFactoryExecutorRecordsStageProgressInWorkflowOrder(t *testing.T) {
+	t.Run("all stages succeed", func(t *testing.T) {
+		agent := &executorTestAgent{}
+		executor, _, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+		var progress []restjobs.ProgressSummary
+		executor.progress = func(_ restjobs.AttemptHandle, summary restjobs.ProgressSummary) error {
+			progress = append(progress, summary)
+			return nil
+		}
+
+		if err := executeFactoryForTest(executor, context.Background(), executorJob("do work"), executorAttempt()); err != nil {
+			t.Fatalf("Execute() error = %v", err)
+		}
+		want := []restjobs.ProgressSummary{
+			{Stage: "requirements", State: "started"}, {Stage: "requirements", State: "completed"},
+			{Stage: "implement", State: "started"}, {Stage: "implement", State: "completed"},
+			{Stage: "review", State: "started"}, {Stage: "review", State: "completed"},
+			{Stage: "document", State: "started"}, {Stage: "document", State: "completed"},
+		}
+		if fmt.Sprint(progress) != fmt.Sprint(want) {
+			t.Fatalf("stage progress = %+v, want %+v", progress, want)
+		}
+		if got := strings.Join(agent.calls, ","); got != "requirements,implement,review,document" {
+			t.Fatalf("executed stages = %q", got)
+		}
+	})
+
+	t.Run("agent failure ends progress at failed stage", func(t *testing.T) {
+		agent := &executorTestAgent{failAt: "review"}
+		executor, _, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+		var progress []restjobs.ProgressSummary
+		executor.progress = func(_ restjobs.AttemptHandle, summary restjobs.ProgressSummary) error {
+			progress = append(progress, summary)
+			return nil
+		}
+
+		err := executeFactoryForTest(executor, context.Background(), executorJob("do work"), executorAttempt())
+		if !errors.Is(err, errExecutionFailed) || strings.Contains(err.Error(), "private agent failure detail") {
+			t.Fatalf("Execute() error = %v, want sanitized failure", err)
+		}
+		want := []restjobs.ProgressSummary{
+			{Stage: "requirements", State: "started"}, {Stage: "requirements", State: "completed"},
+			{Stage: "implement", State: "started"}, {Stage: "implement", State: "completed"},
+			{Stage: "review", State: "started"}, {Stage: "review", State: "failed"},
+		}
+		if fmt.Sprint(progress) != fmt.Sprint(want) {
+			t.Fatalf("stage progress = %+v, want %+v", progress, want)
+		}
+		if got := strings.Join(agent.calls, ","); got != "requirements,implement,review" {
+			t.Fatalf("stages continued after failure: %q", got)
+		}
+	})
+
+	t.Run("recorder failure stops execution and stays private", func(t *testing.T) {
+		agent := &executorTestAgent{}
+		executor, _, _ := newExecutorFixture(t, "10s", restJobOutputLimit, agent)
+		const privateRecorderError = "private progress recorder failure"
+		var progress []restjobs.ProgressSummary
+		executor.progress = func(_ restjobs.AttemptHandle, summary restjobs.ProgressSummary) error {
+			progress = append(progress, summary)
+			if summary.Stage == "requirements" && summary.State == "completed" {
+				return errors.New(privateRecorderError)
+			}
+			return nil
+		}
+
+		err := executeFactoryForTest(executor, context.Background(), executorJob("do work"), executorAttempt())
+		if !errors.Is(err, errExecutionFailed) || strings.Contains(err.Error(), privateRecorderError) {
+			t.Fatalf("Execute() error = %v, want sanitized failure", err)
+		}
+		// Workflow treats an observer error on stage.completed as the stage error;
+		// it does not emit a second stage.failed event for that same stage.
+		want := []restjobs.ProgressSummary{
+			{Stage: "requirements", State: "started"}, {Stage: "requirements", State: "completed"},
+		}
+		if fmt.Sprint(progress) != fmt.Sprint(want) {
+			t.Fatalf("stage progress = %+v, want %+v", progress, want)
+		}
+		if got := strings.Join(agent.calls, ","); got != "requirements" {
+			t.Fatalf("stages continued after recorder failure: %q", got)
+		}
+	})
 }
 
 func TestFactoryExecutorRetainsWorkspaceUnmarkedOnStageOrCheckFailure(t *testing.T) {
@@ -831,6 +1271,63 @@ func TestFactoryExecutorUsesConfiguredSharedOutputLimitAndDrainsStagesAndChecks(
 	if len(capture) != configuredLimit || !strings.Contains(string(capture), "rr") || !strings.Contains(string(capture), "check-one-output") || !strings.Contains(string(capture), "output truncated") {
 		t.Fatalf("shared output length=%d content=%q, want configured cap and check output", len(capture), capture)
 	}
+}
+
+func TestFactoryExecutorPreservesOnlyConfirmedWorkflowCancellation(t *testing.T) {
+	t.Run("canceled execution preserves both sentinels", func(t *testing.T) {
+		agent := &executorTestAgent{}
+		executor, _, _ := newExecutorFixture(t, "5s", restJobOutputLimit, agent)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := make(chan struct{})
+		executor.agent = func(_ workflow.Config, _ []string, output io.Writer) workflow.Agent {
+			return &cancelingExecutorTestAgent{executorTestAgent: agent, started: started}
+		}
+		resultDone := make(chan ExecutionResult, 1)
+		go func() {
+			resultDone <- executor.Execute(ctx, executorJob("cancel blocked execution"), executorAttempt())
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("workflow did not reach blocked harness")
+		}
+		cancel()
+		var result ExecutionResult
+		select {
+		case result = <-resultDone:
+		case <-time.After(time.Second):
+			t.Fatal("canceled workflow did not stop")
+		}
+		if !errors.Is(result.Err, errExecutionFailed) || !errors.Is(result.Err, context.Canceled) {
+			t.Fatalf("canceled execution error = %v, want both sanitized failure and context cancellation", result.Err)
+		}
+	})
+
+	t.Run("unrelated execution error stays generic", func(t *testing.T) {
+		agent := &executorTestAgent{failAt: "requirements"}
+		executor, _, _ := newExecutorFixture(t, "5s", restJobOutputLimit, agent)
+		result := executor.Execute(context.Background(), executorJob("unrelated execution failure"), executorAttempt())
+		if !errors.Is(result.Err, errExecutionFailed) || errors.Is(result.Err, context.Canceled) || strings.Contains(result.Err.Error(), "private agent failure") {
+			t.Fatalf("unrelated execution error = %v, want only generic failure", result.Err)
+		}
+	})
+}
+
+type cancelingExecutorTestAgent struct {
+	*executorTestAgent
+	started chan struct{}
+}
+
+func (a *cancelingExecutorTestAgent) WithOutputWriter(io.Writer) workflow.Agent { return a }
+
+func (a *cancelingExecutorTestAgent) RunWithContext(ctx context.Context, stage, prompt, task, workdir, logPath string) error {
+	if stage == "requirements" {
+		close(a.started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return a.executorTestAgent.RunWithContext(ctx, stage, prompt, task, workdir, logPath)
 }
 
 func TestFactoryExecutorUsesOneDeadlineForWorkspaceAndAllStages(t *testing.T) {

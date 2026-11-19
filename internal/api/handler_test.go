@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,6 +110,62 @@ func principalRequest(handler http.Handler, method, path, body, token string) *h
 
 func namedPrincipalToken(id string) string { return id + "-named-token" }
 
+func TestAuthenticateDashboardOperator(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 8, 8))
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+	)
+
+	for _, tc := range []struct {
+		name               string
+		configuredOperator string
+		token              string
+		want               bool
+	}{
+		{name: "configured operator", configuredOperator: "admin", token: namedPrincipalToken("admin"), want: true},
+		{name: "wrong role", configuredOperator: "alice", token: namedPrincipalToken("alice")},
+		{name: "unknown token", configuredOperator: "admin", token: "unknown-token"},
+		{name: "empty token", configuredOperator: "admin"},
+		{name: "mismatched configured ID", configuredOperator: "other", token: namedPrincipalToken("admin")},
+		{name: "empty configured ID", token: namedPrincipalToken("admin")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			handler.config.DashboardOperatorID = tc.configuredOperator
+			if got := handler.AuthenticateDashboardOperator(tc.token); got != tc.want {
+				t.Errorf("AuthenticateDashboardOperator() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveDashboardSubmitter(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 8, 8))
+	handler := newPrincipalTestHandler(t, manager,
+		restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true},
+		restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true},
+	)
+
+	for _, tc := range []struct {
+		name  string
+		token string
+		want  restserver.Principal
+		ok    bool
+	}{
+		{name: "submitter principal", token: namedPrincipalToken("alice"), want: restserver.Principal{ID: "alice", Role: "submitter"}, ok: true},
+		{name: "operator principal", token: namedPrincipalToken("admin"), want: restserver.Principal{ID: "admin", Role: "operator"}},
+		{name: "unknown token", token: "unknown-token"},
+		{name: "empty token"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := handler.ResolveDashboardSubmitter(tc.token)
+			if got != tc.want || ok != tc.ok {
+				t.Errorf("ResolveDashboardSubmitter() = (%+v, %t), want (%+v, %t)", got, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
+
 func newTestManager(t *testing.T, config restjobs.Config) *restjobs.LocalManager {
 	t.Helper()
 	manager, err := restjobs.NewManager(config)
@@ -164,19 +222,101 @@ func TestThreadListPaginationAuthOwnershipAndRedaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	completed, err := manager.CompleteThreadAs(first.Thread.ID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
 	operator := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1", "", namedPrincipalToken("admin"))
-	var opPage restjobs.ThreadPage
+	var opPage dashboardThreadPage
 	if operator.Code != http.StatusOK || json.Unmarshal(operator.Body.Bytes(), &opPage) != nil || len(opPage.Threads) != 1 || opPage.Threads[0].ID != second.Thread.ID || !opPage.HasMore {
 		t.Fatalf("operator page status=%d body=%s", operator.Code, operator.Body.String())
+	}
+	assertJSONKeys := func(label string, data []byte, want ...string) map[string]json.RawMessage {
+		t.Helper()
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatalf("decode %s: %v", label, err)
+		}
+		if len(fields) != len(want) {
+			t.Fatalf("%s has fields %v, want exactly %v", label, fields, want)
+		}
+		for _, key := range want {
+			if _, ok := fields[key]; !ok {
+				t.Fatalf("%s missing allowed field %q: %s", label, key, data)
+			}
+		}
+		return fields
+	}
+	pageFields := assertJSONKeys("operator page", operator.Body.Bytes(), "threads", "snapshot_sequence", "next_sequence", "has_more")
+	var operatorSummaries []json.RawMessage
+	if err := json.Unmarshal(pageFields["threads"], &operatorSummaries); err != nil || len(operatorSummaries) != 1 {
+		t.Fatalf("decode operator summaries: count=%d err=%v", len(operatorSummaries), err)
+	}
+	assertJSONKeys("uncompleted operator summary", operatorSummaries[0], "id", "status", "created_at", "updated_at")
+	var snapshotSequence, nextSequence uint64
+	if err := json.Unmarshal(pageFields["snapshot_sequence"], &snapshotSequence); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(pageFields["next_sequence"], &nextSequence); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotSequence != 3 || nextSequence != 3 || !opPage.HasMore {
+		t.Fatalf("operator page metadata=(snapshot %d, next %d, has_more %t), want (3, 3, true)", snapshotSequence, nextSequence, opPage.HasMore)
+	}
+	if opPage.Threads[0].Status != restjobs.ThreadStatusInProgress || !opPage.Threads[0].CreatedAt.Equal(second.Thread.CreatedAt) || !opPage.Threads[0].UpdatedAt.Equal(second.Thread.UpdatedAt) || opPage.Threads[0].Completed != nil {
+		t.Fatalf("uncompleted operator summary=%+v, want ID %q, in_progress, original timestamps, and no completed_at", opPage.Threads[0], second.Thread.ID)
 	}
 	if _, _, err := manager.AdmitThreadAs("list-later", "alice", restjobs.Request{Repository: "widget", Task: "later"}); err != nil {
 		t.Fatal(err)
 	}
 	older := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1&before_sequence="+strconv.FormatUint(opPage.NextSequence, 10)+"&snapshot_sequence="+strconv.FormatUint(opPage.SnapshotSequence, 10), "", namedPrincipalToken("admin"))
-	var olderPage restjobs.ThreadPage
+	var olderPage dashboardThreadPage
 	if older.Code != http.StatusOK || json.Unmarshal(older.Body.Bytes(), &olderPage) != nil || len(olderPage.Threads) != 1 || olderPage.Threads[0].ID != first.Thread.ID || olderPage.HasMore {
 		t.Fatalf("operator continuation status=%d body=%s", older.Code, older.Body.String())
 	}
+	olderFields := assertJSONKeys("operator continuation page", older.Body.Bytes(), "threads", "snapshot_sequence", "has_more")
+	if err := json.Unmarshal(olderFields["snapshot_sequence"], &snapshotSequence); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotSequence != 3 || olderPage.NextSequence != 0 || olderPage.HasMore {
+		t.Fatalf("operator continuation metadata=(snapshot %d, next %d, has_more %t), want (3, omitted, false)", snapshotSequence, olderPage.NextSequence, olderPage.HasMore)
+	}
+	var olderSummaries []json.RawMessage
+	if err := json.Unmarshal(olderFields["threads"], &olderSummaries); err != nil || len(olderSummaries) != 1 {
+		t.Fatalf("decode operator continuation summaries: count=%d err=%v", len(olderSummaries), err)
+	}
+	assertJSONKeys("completed operator summary", olderSummaries[0], "id", "status", "created_at", "updated_at", "completed_at")
+	if olderPage.Threads[0].ID != completed.Thread.ID || olderPage.Threads[0].Status != restjobs.ThreadStatusInProgress || !olderPage.Threads[0].CreatedAt.Equal(completed.Thread.CreatedAt) || !olderPage.Threads[0].UpdatedAt.Equal(completed.Thread.UpdatedAt) || olderPage.Threads[0].Completed == nil || !olderPage.Threads[0].Completed.Equal(*completed.Thread.CompletedAt) {
+		t.Fatalf("completed operator summary=%+v, want ID %q, in_progress, original timestamps, and completion time %v", olderPage.Threads[0], completed.Thread.ID, completed.Thread.CompletedAt)
+	}
+	terminal, _, err := manager.AdmitThreadAs("list-terminal", "bob", restjobs.Request{Repository: "widget", Task: "terminal jobs without explicit completion"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		job, err := manager.ClaimNext()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Finish(job.ID, restjobs.StatusSucceeded); err != nil {
+			t.Fatal(err)
+		}
+		if job.ID == terminal.Jobs[0].ID {
+			break
+		}
+	}
+	terminalList := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1", "", namedPrincipalToken("admin"))
+	var terminalPage dashboardThreadPage
+	if terminalList.Code != http.StatusOK || json.Unmarshal(terminalList.Body.Bytes(), &terminalPage) != nil || len(terminalPage.Threads) != 1 || terminalPage.Threads[0].ID != terminal.Thread.ID || terminalPage.Threads[0].Status != restjobs.ThreadStatusDone || terminalPage.Threads[0].Completed != nil {
+		t.Fatalf("terminal thread summary status=%d body=%s, want latest thread done without completed_at", terminalList.Code, terminalList.Body.String())
+	}
+	var terminalSummaryFields struct {
+		Threads []json.RawMessage `json:"threads"`
+	}
+	if err := json.Unmarshal(terminalList.Body.Bytes(), &terminalSummaryFields); err != nil || len(terminalSummaryFields.Threads) != 1 {
+		t.Fatalf("decode terminal thread summaries: count=%d err=%v", len(terminalSummaryFields.Threads), err)
+	}
+	assertJSONKeys("terminal thread summary", terminalSummaryFields.Threads[0], "id", "status", "created_at", "updated_at")
 	owned := principalRequest(handler, http.MethodGet, "/v1/threads?limit=1", "", namedPrincipalToken("alice"))
 	var ownedPage struct {
 		Threads    []restjobs.ThreadSummary `json:"threads"`
@@ -527,6 +667,105 @@ func TestThreadDoneNotificationsAreOwnerFilteredAndSafe(t *testing.T) {
 	}
 }
 
+func TestAppendThreadJobRejectsInvalidTasksWithoutChangingSQLiteState(t *testing.T) {
+	databaseDir := t.TempDir()
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(databaseDir, "threads.db")
+	store, err := restjobs.OpenSQLiteStore(databasePath, managerConfig(4, 8, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true})
+	created, _, err := store.AdmitThreadAs("append-validation-seed", "alice", restjobs.Request{Repository: "widget", Task: "initial task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type persistedState struct {
+		thread   restjobs.ThreadSnapshot
+		jobs     map[string]restjobs.Snapshot
+		history  map[string]restjobs.History
+		rowCount map[string]int64
+	}
+	captureState := func() persistedState {
+		t.Helper()
+		thread, err := store.GetThread(created.Thread.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		page, err := store.ListJobs(context.Background(), 0, 0, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state := persistedState{
+			thread: thread, jobs: make(map[string]restjobs.Snapshot, len(page.Jobs)),
+			history: make(map[string]restjobs.History, len(page.Jobs)), rowCount: make(map[string]int64),
+		}
+		for _, summary := range page.Jobs {
+			job, err := store.Get(summary.ID)
+			if err != nil {
+				t.Fatalf("get Job %q: %v", summary.ID, err)
+			}
+			history, err := store.History(summary.ID)
+			if err != nil {
+				t.Fatalf("get history for Job %q: %v", summary.ID, err)
+			}
+			state.jobs[job.ID] = job
+			state.history[job.ID] = history
+		}
+		for _, table := range []string{
+			"factory_jobs", "factory_job_events", "factory_job_idempotency", "factory_threads",
+			"factory_thread_jobs", "factory_thread_idempotency", "factory_thread_job_idempotency",
+		} {
+			var count int64
+			if err := db.QueryRowContext(context.Background(), "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+				t.Fatalf("count rows in %s: %v", table, err)
+			}
+			state.rowCount[table] = count
+		}
+		return state
+	}
+	baseline := captureState()
+	if len(baseline.jobs) != 1 || len(baseline.thread.Jobs) != 1 || len(baseline.thread.Thread.JobIDs) != 1 {
+		t.Fatalf("unexpected SQLite baseline: jobs=%d thread_jobs=%d membership=%v", len(baseline.jobs), len(baseline.thread.Jobs), baseline.thread.Thread.JobIDs)
+	}
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "numeric task", body: `{"repository":"widget","task":123}`},
+		{name: "task exceeds configured limit", body: `{"repository":"widget","task":"` + strings.Repeat("x", 129) + `"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if len(tc.body) > 256 {
+				t.Fatalf("test request body has %d bytes, want no more than configured 256-byte body limit", len(tc.body))
+			}
+			before := captureState()
+			req := httptest.NewRequest(http.MethodPost, "/v1/threads/"+created.Thread.ID+"/jobs", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+namedPrincipalToken("alice"))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Idempotency-Key", "append-validation-"+strings.ReplaceAll(tc.name, " ", "-"))
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, req)
+			assertError(t, response, http.StatusBadRequest, "invalid_request")
+			after := captureState()
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("invalid append mutated SQLite state:\nbefore: %+v\nafter:  %+v", before, after)
+			}
+		})
+	}
+}
+
 func TestThreadRouteValidationAndUnsupportedStore(t *testing.T) {
 	manager := newTestManager(t, managerConfig(4, 8, 8))
 	handler := newTestHandler(t, manager, func() bool { return true })
@@ -573,6 +812,141 @@ func TestThreadRouteValidationAndUnsupportedStore(t *testing.T) {
 			t.Errorf("%s %s status=%d body=%s, want %d", tc.method, tc.path, response.Code, response.Body.String(), tc.want)
 		}
 	}
+}
+
+func TestSubmitterThreadAndJobInspectionExposeVerificationOnlyAtTerminal(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 8, 8))
+	created, _, err := manager.AdmitThreadAs("submitter-verification", "alice", restjobs.Request{
+		Repository: "widget",
+		Task:       "private request text must not be exposed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newPrincipalTestHandler(t, manager, restserver.PrincipalConfig{ID: "alice", Role: "submitter", Enabled: true})
+
+	claim, err := manager.ClaimNextAttemptForWorker("private-worker", "private-boot")
+	if err != nil || claim.Job.ID != created.Jobs[0].ID {
+		t.Fatalf("claim Job=(%+v,%v), want %q", claim.Job, err, created.Jobs[0].ID)
+	}
+	evidence := restjobs.VerificationEvidence{
+		Checks:      []restjobs.VerificationCheck{{Name: "check-01", Outcome: restjobs.VerificationPassed}},
+		Limitations: []string{restjobs.LimitationAgentNotVerdict},
+	}
+	if err := manager.RecordProgressForAttempt(claim.Attempt, restjobs.ProgressSummary{Stage: "implement", State: "started"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RecordProviderOutcomeForAttempt(claim.Attempt, restjobs.ProviderOutcome{
+		Provider: "github", Repository: "private/provider-repository", Number: 17,
+		URL: "https://github.com/private/provider-repository/pull/17", Branch: "private/provider-branch", Commit: "private-provider-commit", State: "open",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEventForAttempt(claim.Attempt, "command_output", "private raw command output"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.RecordVerificationEvidenceForAttempt(claim.Attempt, evidence); err != nil {
+		t.Fatal(err)
+	}
+
+	assertKeys := func(label string, data []byte, want ...string) map[string]json.RawMessage {
+		t.Helper()
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatalf("decode %s: %v", label, err)
+		}
+		if len(fields) != len(want) {
+			t.Fatalf("%s fields=%v, want exactly %v", label, fields, want)
+		}
+		for _, key := range want {
+			if _, ok := fields[key]; !ok {
+				t.Fatalf("%s missing allowed field %q: %s", label, key, data)
+			}
+		}
+		return fields
+	}
+	jobKeys := func(terminal bool) []string {
+		keys := []string{"id", "status", "created_at", "updated_at"}
+		if terminal {
+			keys = append(keys, "verification")
+		}
+		return keys
+	}
+	assertSafeInspection := func(label, path, status string, terminal bool) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeAsDashboardSubmitter(response, httptest.NewRequest(http.MethodGet, path, nil), restserver.Principal{ID: "alice", Role: "submitter"})
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", label, response.Code, response.Body.String())
+		}
+		for _, forbidden := range []string{
+			"private request text", "private/provider-repository", "private/provider-branch", "private-provider-commit",
+			"private-worker", "private-boot", "private raw command output", `"request"`, `"provider"`, `"worker"`, `"progress"`, `"output"`,
+		} {
+			if strings.Contains(response.Body.String(), forbidden) {
+				t.Errorf("%s exposed %q: %s", label, forbidden, response.Body.String())
+			}
+		}
+		var jobFields map[string]json.RawMessage
+		if strings.HasPrefix(path, "/v1/threads/") {
+			root := assertKeys(label+" response", response.Body.Bytes(), "thread", "jobs")
+			var thread json.RawMessage
+			if err := json.Unmarshal(root["thread"], &thread); err != nil {
+				t.Fatalf("decode %s Thread: %v", label, err)
+			}
+			threadFields := assertKeys(label+" Thread", thread, "id", "status", "created_at", "updated_at")
+			wantThreadStatus := restjobs.ThreadStatusInProgress
+			if terminal {
+				wantThreadStatus = restjobs.ThreadStatusDone
+			}
+			var gotStatus string
+			if err := json.Unmarshal(threadFields["status"], &gotStatus); err != nil || gotStatus != string(wantThreadStatus) {
+				t.Errorf("%s Thread status=%q, want %q (err=%v)", label, gotStatus, wantThreadStatus, err)
+			}
+			var jobs []json.RawMessage
+			if err := json.Unmarshal(root["jobs"], &jobs); err != nil || len(jobs) != 1 {
+				t.Fatalf("decode %s Jobs: count=%d err=%v", label, len(jobs), err)
+			}
+			jobFields = assertKeys(label+" Job", jobs[0], jobKeys(terminal)...)
+		} else {
+			jobFields = assertKeys(label+" response", response.Body.Bytes(), jobKeys(terminal)...)
+		}
+		var gotStatus string
+		if err := json.Unmarshal(jobFields["status"], &gotStatus); err != nil || gotStatus != status {
+			t.Errorf("%s Job status=%q, want %q (err=%v)", label, gotStatus, status, err)
+		}
+		verification, hasVerification := jobFields["verification"]
+		if !terminal {
+			if hasVerification {
+				t.Errorf("%s running Job exposed verification: %s", label, verification)
+			}
+			return
+		}
+		verificationFields := assertKeys(label+" verification", verification, "checks", "limitations")
+		var checks []json.RawMessage
+		if err := json.Unmarshal(verificationFields["checks"], &checks); err != nil || len(checks) != 1 {
+			t.Fatalf("decode %s verification checks: count=%d err=%v", label, len(checks), err)
+		}
+		checkFields := assertKeys(label+" verification check", checks[0], "name", "outcome")
+		var name, outcome string
+		if err := json.Unmarshal(checkFields["name"], &name); err != nil || name != "check-01" {
+			t.Errorf("%s verification check name=%q, want check-01 (err=%v)", label, name, err)
+		}
+		if err := json.Unmarshal(checkFields["outcome"], &outcome); err != nil || outcome != restjobs.VerificationPassed {
+			t.Errorf("%s verification check outcome=%q, want %q (err=%v)", label, outcome, restjobs.VerificationPassed, err)
+		}
+		var limitations []string
+		if err := json.Unmarshal(verificationFields["limitations"], &limitations); err != nil || len(limitations) != 1 || limitations[0] != restjobs.LimitationAgentNotVerdict {
+			t.Errorf("%s verification limitations=%q, want exactly [%q] (err=%v)", label, limitations, restjobs.LimitationAgentNotVerdict, err)
+		}
+	}
+	assertSafeInspection("running Thread", "/v1/threads/"+created.Thread.ID, string(restjobs.StatusRunning), false)
+	assertSafeInspection("running Job", "/v1/jobs/"+created.Jobs[0].ID, string(restjobs.StatusRunning), false)
+	if err := manager.FinishAttempt(claim.Attempt, restjobs.StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+	assertSafeInspection("terminal Thread", "/v1/threads/"+created.Thread.ID, string(restjobs.StatusSucceeded), true)
+	assertSafeInspection("terminal Job", "/v1/jobs/"+created.Jobs[0].ID, string(restjobs.StatusSucceeded), true)
 }
 
 func TestDashboardSubmitterBridgeRequiresSubmitterAndUsesOwnerSafeRoutes(t *testing.T) {
@@ -845,6 +1219,146 @@ func TestDashboardThreadCreateAndInspectUseSafeProjection(t *testing.T) {
 	}
 }
 
+func TestDashboardOperatorThreadListUsesSafeProjectionAndPagination(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 8, 8))
+	handler := newTestHandler(t, manager, func() bool { return true })
+	handler.config.DashboardOperatorID = "admin"
+
+	completed, _, err := manager.AdmitThreadAs("dashboard-list-completed", "alice", restjobs.Request{
+		Repository: "widget",
+		Task:       "private completed task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed, err = manager.CompleteThreadAs(completed.Thread.ID, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, _, err := manager.AdmitThreadAs("dashboard-list-current", "bob", restjobs.Request{
+		Repository: "widget",
+		Task:       "private current task",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertKeys := func(label string, data []byte, want ...string) map[string]json.RawMessage {
+		t.Helper()
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &fields); err != nil {
+			t.Fatalf("decode %s: %v", label, err)
+		}
+		if len(fields) != len(want) {
+			t.Fatalf("%s fields=%v, want exactly %v", label, fields, want)
+		}
+		for _, key := range want {
+			if _, ok := fields[key]; !ok {
+				t.Fatalf("%s missing field %q: %s", label, key, data)
+			}
+		}
+		return fields
+	}
+	list := func(path string) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(response, httptest.NewRequest(http.MethodGet, path, nil))
+		return response
+	}
+
+	firstPage := list("/v1/threads?limit=1")
+	if firstPage.Code != http.StatusOK {
+		t.Fatalf("dashboard Thread list status=%d body=%s", firstPage.Code, firstPage.Body.String())
+	}
+	for _, private := range []string{"private completed task", "private current task", "alice", "bob", "submitted_by", "job_ids", "provider"} {
+		if strings.Contains(firstPage.Body.String(), private) {
+			t.Errorf("dashboard Thread list exposed %q: %s", private, firstPage.Body.String())
+		}
+	}
+	pageFields := assertKeys("first page", firstPage.Body.Bytes(), "threads", "snapshot_sequence", "next_sequence", "has_more")
+	var firstSummaries []json.RawMessage
+	if err := json.Unmarshal(pageFields["threads"], &firstSummaries); err != nil || len(firstSummaries) != 1 {
+		t.Fatalf("decode first-page summaries: count=%d err=%v", len(firstSummaries), err)
+	}
+	currentFields := assertKeys("current summary", firstSummaries[0], "id", "status", "created_at", "updated_at")
+	var currentID, currentStatus string
+	var currentCreatedAt, currentUpdatedAt time.Time
+	if err := json.Unmarshal(currentFields["id"], &currentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(currentFields["status"], &currentStatus); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(currentFields["created_at"], &currentCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(currentFields["updated_at"], &currentUpdatedAt); err != nil {
+		t.Fatal(err)
+	}
+	var snapshotSequence, nextSequence uint64
+	if err := json.Unmarshal(pageFields["snapshot_sequence"], &snapshotSequence); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(pageFields["next_sequence"], &nextSequence); err != nil {
+		t.Fatal(err)
+	}
+	var hasMore bool
+	if err := json.Unmarshal(pageFields["has_more"], &hasMore); err != nil {
+		t.Fatal(err)
+	}
+	if currentID != current.Thread.ID || currentStatus != string(restjobs.ThreadStatusInProgress) ||
+		!currentCreatedAt.Equal(current.Thread.CreatedAt) || !currentUpdatedAt.Equal(current.Thread.UpdatedAt) ||
+		snapshotSequence != 2 || nextSequence != 2 || !hasMore {
+		t.Fatalf("first-page projection=(id %q, status %q, created %v, updated %v), metadata=(snapshot %d, next %d, has_more %t)",
+			currentID, currentStatus, currentCreatedAt, currentUpdatedAt, snapshotSequence, nextSequence, hasMore)
+	}
+
+	olderPage := list("/v1/threads?limit=1&before_sequence=2&snapshot_sequence=2")
+	if olderPage.Code != http.StatusOK {
+		t.Fatalf("dashboard Thread continuation status=%d body=%s", olderPage.Code, olderPage.Body.String())
+	}
+	olderFields := assertKeys("continuation page", olderPage.Body.Bytes(), "threads", "snapshot_sequence", "has_more")
+	var olderSummaries []json.RawMessage
+	if err := json.Unmarshal(olderFields["threads"], &olderSummaries); err != nil || len(olderSummaries) != 1 {
+		t.Fatalf("decode continuation summaries: count=%d err=%v", len(olderSummaries), err)
+	}
+	completedFields := assertKeys("completed summary", olderSummaries[0], "id", "status", "created_at", "updated_at", "completed_at")
+	var completedID, completedStatus string
+	var completedCreatedAt, completedUpdatedAt, completedAt time.Time
+	for key, target := range map[string]*time.Time{
+		"created_at":   &completedCreatedAt,
+		"updated_at":   &completedUpdatedAt,
+		"completed_at": &completedAt,
+	} {
+		if err := json.Unmarshal(completedFields[key], target); err != nil {
+			t.Fatalf("decode completed summary %s: %v", key, err)
+		}
+	}
+	if err := json.Unmarshal(completedFields["id"], &completedID); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(completedFields["status"], &completedStatus); err != nil {
+		t.Fatal(err)
+	}
+	var continuationSnapshot uint64
+	if err := json.Unmarshal(olderFields["snapshot_sequence"], &continuationSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	var continuationHasMore bool
+	if err := json.Unmarshal(olderFields["has_more"], &continuationHasMore); err != nil {
+		t.Fatal(err)
+	}
+	if completedID != completed.Thread.ID || completedStatus != string(restjobs.ThreadStatusInProgress) ||
+		!completedCreatedAt.Equal(completed.Thread.CreatedAt) || !completedUpdatedAt.Equal(completed.Thread.UpdatedAt) ||
+		completed.Thread.CompletedAt == nil || !completedAt.Equal(*completed.Thread.CompletedAt) || continuationSnapshot != 2 || continuationHasMore {
+		t.Fatalf("completed summary=(id %q, status %q, created %v, updated %v, completed %v), snapshot=%d; want Thread %q with completion time %v at snapshot 2",
+			completedID, completedStatus, completedCreatedAt, completedUpdatedAt, completedAt, continuationSnapshot, completed.Thread.ID, completed.Thread.CompletedAt)
+	}
+	if strings.Contains(olderPage.Body.String(), "private completed task") || strings.Contains(olderPage.Body.String(), "submitted_by") {
+		t.Errorf("completed dashboard summary exposed private Thread fields: %s", olderPage.Body.String())
+	}
+}
+
 func TestDashboardThreadProjectionDropsTaskAndProviderFields(t *testing.T) {
 	job := restjobs.Snapshot{
 		ID: "job-id", Request: restjobs.Request{Repository: "private/repository", Task: "sentinel task"},
@@ -905,6 +1419,19 @@ func TestSafeStageSummaryDoesNotExposePrivateEventMessages(t *testing.T) {
 	}
 }
 
+func TestWriteStreamHeartbeat(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	controller := http.NewResponseController(recorder)
+
+	err := writeStreamHeartbeat(recorder, controller, time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("writeStreamHeartbeat() error = %v, want nil", err)
+	}
+	if got, want := recorder.Body.String(), ": heartbeat\n\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
 func TestJobEventStreamReplaysSafeOrderedHistoryAndClosesAtTerminal(t *testing.T) {
 	manager := newTestManager(t, managerConfig(2, 2, 4))
 	job, _, err := manager.Admit("event-stream", restjobs.Request{Repository: "widget", Task: "private task payload"})
@@ -941,6 +1468,108 @@ func TestJobEventStreamReplaysSafeOrderedHistoryAndClosesAtTerminal(t *testing.T
 	}
 	if strings.Index(body, "event: queued") > strings.Index(body, "event: running") || strings.Index(body, "event: running") > strings.Index(body, "event: succeeded") {
 		t.Fatalf("event stream history is out of order: %q", body)
+	}
+}
+
+func TestJobEventStreamSerializesOnlyValidStageProgressFields(t *testing.T) {
+	manager := newTestManager(t, managerConfig(2, 2, 8))
+	job, _, err := manager.Admit("stage-progress-wire", restjobs.Request{Repository: "widget", Task: "private task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.AddEvent(job.ID, "stage_progress", "stage=implement state=started"); err != nil {
+		t.Fatalf("AddEvent(valid progress while queued): %v", err)
+	}
+	if err := manager.AddEvent(job.ID, "stage_progress", "stage=implement state=unknown private queued text"); err != nil {
+		t.Fatalf("AddEvent(malformed progress while queued): %v", err)
+	}
+
+	claim, err := manager.ClaimNextAttempt()
+	if err != nil {
+		t.Fatalf("ClaimNextAttempt(): %v", err)
+	}
+	if err := manager.AddEventForAttempt(claim.Attempt, "stage_progress", "stage=review state=completed"); err != nil {
+		t.Fatalf("AddEventForAttempt(valid progress while running): %v", err)
+	}
+	if err := manager.AddEventForAttempt(claim.Attempt, "stage_progress", "stage=review state=unknown private running text"); err != nil {
+		t.Fatalf("AddEventForAttempt(malformed progress while running): %v", err)
+	}
+	if err := manager.FinishAttempt(claim.Attempt, restjobs.StatusSucceeded); err != nil {
+		t.Fatalf("FinishAttempt(): %v", err)
+	}
+
+	handler := newTestHandler(t, manager, func() bool { return true })
+	response := request(handler, http.MethodGet, "/v1/jobs/"+job.ID+"/events", "", true)
+	if response.Code != http.StatusOK || response.Header().Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("event stream response status=%d content-type=%q body=%q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+
+	type streamEvent struct {
+		id   string
+		name string
+		data string
+	}
+	var events []streamEvent
+	for _, frame := range strings.Split(response.Body.String(), "\n\n") {
+		if !strings.Contains(frame, "id: ") {
+			continue
+		}
+		var event streamEvent
+		for _, line := range strings.Split(frame, "\n") {
+			switch {
+			case strings.HasPrefix(line, "id: "):
+				event.id = strings.TrimPrefix(line, "id: ")
+			case strings.HasPrefix(line, "event: "):
+				event.name = strings.TrimPrefix(line, "event: ")
+			case strings.HasPrefix(line, "data: "):
+				event.data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		events = append(events, event)
+	}
+	want := []streamEvent{
+		{id: "1", name: "queued"},
+		{id: "2", name: "stage_progress"},
+		{id: "4", name: "running"},
+		{id: "5", name: "stage_progress"},
+		{id: "7", name: "succeeded"},
+	}
+	gotIDsAndNames := make([]streamEvent, len(events))
+	for index, event := range events {
+		gotIDsAndNames[index] = streamEvent{id: event.id, name: event.name}
+	}
+	if !reflect.DeepEqual(gotIDsAndNames, want) {
+		t.Fatalf("stream event IDs and names = %+v, want stable IDs and no malformed progress frames: %+v; body=%q", gotIDsAndNames, want, response.Body.String())
+	}
+	for _, index := range []int{1, 3} {
+		var data map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(events[index].data), &data); err != nil {
+			t.Fatalf("decode stage_progress data %q: %v", events[index].data, err)
+		}
+		if len(data) != 4 || data["at"] == nil || data["type"] == nil || data["stage"] == nil || data["state"] == nil {
+			t.Errorf("stage_progress data keys = %v, want only at/type/stage/state", data)
+		}
+		var at, eventType, stage, state string
+		for key, target := range map[string]*string{"at": &at, "type": &eventType, "stage": &stage, "state": &state} {
+			if err := json.Unmarshal(data[key], target); err != nil {
+				t.Fatalf("decode %s: %v", key, err)
+			}
+		}
+		if _, err := time.Parse(time.RFC3339Nano, at); err != nil {
+			t.Errorf("stage_progress at = %q, want RFC3339 timestamp: %v", at, err)
+		}
+		if eventType != "stage_progress" {
+			t.Errorf("stage_progress data type = %q, want stage_progress", eventType)
+		}
+		wantProgress := []restjobs.ProgressSummary{{Stage: "implement", State: "started"}, {Stage: "review", State: "completed"}}[index/2]
+		if stage != wantProgress.Stage || state != wantProgress.State {
+			t.Errorf("stage_progress = %s/%s, want %s/%s", stage, state, wantProgress.Stage, wantProgress.State)
+		}
+	}
+	for _, private := range []string{"private task", "private queued text", "private running text", "state=unknown"} {
+		if strings.Contains(response.Body.String(), private) {
+			t.Errorf("event stream exposed private or malformed progress text %q: %s", private, response.Body.String())
+		}
 	}
 }
 
@@ -2172,6 +2801,117 @@ func TestProviderReconciliationRouteRequiresAuthenticationAndEligibility(t *test
 	if response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", `{"number":1}`, true); response.Code != http.StatusBadRequest {
 		t.Fatalf("body-bearing reconcile status=%d", response.Code)
 	}
+}
+
+func TestProviderReconciliationRouteSanitizesCallbackFailureWithoutMutation(t *testing.T) {
+	databaseDir := t.TempDir()
+	if err := os.Chmod(databaseDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(databaseDir, "jobs.db"), managerConfig(2, 2, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	job, _, err := store.Admit("reconcile-callback-error", restjobs.Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := restjobs.ProviderAttempt{
+		Generation: claim.Attempt.Generation,
+		Provider:   "github",
+		Repository: "acme/widget",
+		Branch:     "factory/job/" + job.ID,
+		Commit:     "0123456789abcdef",
+	}
+	if err := store.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishAttempt(claim.Attempt, restjobs.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	attempt.Uncertain = true
+
+	before, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Status != restjobs.StatusFailed {
+		t.Fatalf("seed job status=%q, want failed", before.Status)
+	}
+	beforeHistory, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeAttempt, err := store.ProviderAttempt(job.ID)
+	if err != nil || beforeAttempt != attempt {
+		t.Fatalf("seed provider attempt=(%+v,%v), want %+v", beforeAttempt, err, attempt)
+	}
+	if _, err := store.ProviderObservation(job.ID); !errors.Is(err, restjobs.ErrInvalidTransition) {
+		t.Fatalf("seed provider observation error=%v, want no observation", err)
+	}
+
+	const providerError = "provider token=callback-secret private API response"
+	var callbackErr error = errors.New(providerError)
+	var gotJobID string
+	var callbackHasDeadline bool
+	handler := newTestHandler(t, store, func() bool { return true })
+	handler.config.ReconcileProvider = func(ctx context.Context, jobID string) error {
+		gotJobID = jobID
+		deadline, ok := ctx.Deadline()
+		callbackHasDeadline = ok && time.Until(deadline) > 0 && time.Until(deadline) <= 20*time.Second
+		return callbackErr
+	}
+	verifyUnchanged := func(label string) {
+		t.Helper()
+		after, err := store.Get(job.ID)
+		if err != nil || !reflect.DeepEqual(after, before) {
+			t.Errorf("snapshot after %s=(%+v,%v), want unchanged %+v", label, after, err, before)
+		}
+		afterHistory, err := store.History(job.ID)
+		if err != nil || !reflect.DeepEqual(afterHistory, beforeHistory) {
+			t.Errorf("history after %s=(%+v,%v), want unchanged %+v", label, afterHistory, err, beforeHistory)
+		}
+		afterAttempt, err := store.ProviderAttempt(job.ID)
+		if err != nil || afterAttempt != beforeAttempt {
+			t.Errorf("provider attempt after %s=(%+v,%v), want unchanged %+v", label, afterAttempt, err, beforeAttempt)
+		}
+		if _, err := store.ProviderObservation(job.ID); !errors.Is(err, restjobs.ErrInvalidTransition) {
+			t.Errorf("provider observation after %s error=%v, want no observation", label, err)
+		}
+	}
+
+	response := request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", "", true)
+	assertError(t, response, http.StatusInternalServerError, "internal_error")
+	if strings.Contains(response.Body.String(), providerError) || strings.Contains(response.Body.String(), "callback-secret") || strings.Contains(response.Body.String(), "private API response") {
+		t.Fatalf("reconciliation response leaked provider error text: %s", response.Body.String())
+	}
+	if gotJobID != job.ID {
+		t.Errorf("reconciliation callback job ID=%q, want %q", gotJobID, job.ID)
+	}
+	if !callbackHasDeadline {
+		t.Error("reconciliation callback did not receive a deadline within the route's 20-second limit")
+	}
+	verifyUnchanged("generic callback failure")
+
+	callbackErr = restjobs.ErrInvalidTransition
+	response = request(handler, http.MethodPost, "/v1/jobs/"+job.ID+"/reconcile", "", true)
+	assertError(t, response, http.StatusConflict, "reconciliation_not_allowed")
+	var envelope struct {
+		Error errorDTO `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &envelope); err != nil || envelope.Error.Message != "Job is not eligible for provider reconciliation." {
+		t.Errorf("invalid-transition response message=%q, decode error=%v; want fixed safe message", envelope.Error.Message, err)
+	}
+	verifyUnchanged("invalid-transition callback failure")
 }
 
 func TestListJobsIsAuthenticatedBoundedAndReadOnly(t *testing.T) {

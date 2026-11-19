@@ -414,6 +414,65 @@ func TestRegistryBudgetRejectsWithoutStoringKeyAndAllowsRetry(t *testing.T) {
 	}
 }
 
+func TestRecordVerificationEvidenceForAttemptRejectsInvalidEvidenceWithoutMutation(t *testing.T) {
+	manager := testManager(t, testConfig())
+	job, _, err := manager.Admit("invalid-verification", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttemptForWorker("worker-a", "boot-a")
+	if err != nil {
+		t.Fatalf("ClaimNextAttemptForWorker() error = %v", err)
+	}
+
+	valid := VerificationEvidence{
+		Checks:      []VerificationCheck{{Name: "check-01", Outcome: VerificationPassed}},
+		Limitations: []string{LimitationAgentNotVerdict},
+	}
+	if err := manager.RecordVerificationEvidenceForAttempt(claim.Attempt, valid); err != nil {
+		t.Fatalf("RecordVerificationEvidenceForAttempt(valid evidence) error = %v", err)
+	}
+	before, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name     string
+		evidence VerificationEvidence
+	}{
+		{
+			name: "unsupported outcome",
+			evidence: VerificationEvidence{
+				Checks: []VerificationCheck{{Name: "check-01", Outcome: "skipped"}},
+			},
+		},
+		{
+			name: "nonsequential check name",
+			evidence: VerificationEvidence{
+				Checks: []VerificationCheck{{Name: "check-02", Outcome: VerificationPassed}},
+			},
+		},
+		{
+			name: "unapproved limitation",
+			evidence: VerificationEvidence{
+				Limitations: []string{"unapproved limitation"},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := manager.RecordVerificationEvidenceForAttempt(claim.Attempt, tc.evidence); !errors.Is(err, ErrInvalidInput) {
+				t.Fatalf("RecordVerificationEvidenceForAttempt() error = %v, want ErrInvalidInput", err)
+			}
+			after, err := manager.Get(job.ID)
+			if err != nil || !reflect.DeepEqual(after, before) {
+				t.Fatalf("rejected evidence changed the job: before=%+v after=%+v err=%v", before, after, err)
+			}
+		})
+	}
+}
+
 func TestVerificationEvidenceRejectionDoesNotEvictTerminalJobs(t *testing.T) {
 	terminalRequest := Request{Repository: "repo", Task: "terminal"}
 	targetRequest := Request{Repository: "repo", Task: "target"}
@@ -683,6 +742,72 @@ func TestHistoryAppendEvictsOlderTerminalRecordBeforeItsOwnHistory(t *testing.T)
 	}
 	if manager.registryBytes > uint64(manager.config.RegistryBytes) {
 		t.Fatalf("registry accounting exceeded budget: %d", manager.registryBytes)
+	}
+}
+
+func TestEventPressureEvictsThreadInitialJobAndReleasesIdempotency(t *testing.T) {
+	config := Config{QueueCapacity: 3, MaxConcurrentJobs: 1, MaxRecords: 3, MaxEventsPerJob: 4}
+	manager := testManager(t, config)
+	threadKey := "pressure-thread"
+	principalID := "alice"
+	request := Request{Repository: "repo", Task: "initial"}
+	created, replay, err := manager.AdmitThreadAs(threadKey, principalID, request)
+	if err != nil || replay {
+		t.Fatalf("create Thread=(%+v,%t,%v)", created, replay, err)
+	}
+	initial, err := manager.ClaimNext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Finish(initial.ID, StatusSucceeded); err != nil {
+		t.Fatal(err)
+	}
+
+	trigger, _, err := manager.Admit("pressure-trigger", Request{Repository: "repo", Task: "queued trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialEntry := manager.jobs[initial.ID]
+	if initialEntry == nil {
+		t.Fatalf("finished initial Thread Job %s is missing before pressure", initial.ID)
+	}
+	freshAdmissionCharge := recordBytes(request, threadKey, principalID) + threadRecordOverheadBytes +
+		eventBytes(Event{Type: "queued", Message: "Job admitted"})
+	pressureEvent := Event{Type: "pressure", Message: stringsOf('x', int(freshAdmissionCharge))}
+	beforeBytes := manager.registryBytes
+	incomingCharge := eventBytes(pressureEvent)
+	if freshAdmissionCharge >= initialEntry.accountedBytes {
+		t.Fatalf("test setup must require terminal eviction while leaving room for a fresh Thread: fresh admission=%d initial Job=%d", freshAdmissionCharge, initialEntry.accountedBytes)
+	}
+	// This budget makes the event fit only after the initial terminal Job is
+	// evicted, while retaining enough room to retry the original Thread request.
+	manager.config.RegistryBytes = int64(beforeBytes + incomingCharge - initialEntry.accountedBytes + freshAdmissionCharge)
+	if beforeBytes+incomingCharge <= uint64(manager.config.RegistryBytes) {
+		t.Fatalf("test setup does not require byte-pressure eviction: current=%d incoming=%d budget=%d", beforeBytes, incomingCharge, manager.config.RegistryBytes)
+	}
+
+	if err := manager.AddEvent(trigger.ID, pressureEvent.Type, pressureEvent.Message); err != nil {
+		t.Fatalf("AddEvent under byte pressure: %v", err)
+	}
+	if manager.registryBytes > uint64(manager.config.RegistryBytes) {
+		t.Fatalf("registry accounting exceeded budget after pressure event: %d > %d", manager.registryBytes, manager.config.RegistryBytes)
+	}
+	if _, err := manager.Get(initial.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("initial Thread Job survived event-pressure eviction: %v", err)
+	}
+	if _, err := manager.GetThread(created.Thread.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Thread survived event-pressure eviction of its initial Job: %v", err)
+	}
+	freshThread, replay, err := manager.AdmitThreadAs(threadKey, principalID, request)
+	if err != nil || replay || freshThread.Thread.ID == created.Thread.ID {
+		t.Fatalf("retry after event-pressure eviction=(%+v, replay %t, err %v), want a fresh Thread", freshThread, replay, err)
+	}
+	if manager.registryBytes > uint64(manager.config.RegistryBytes) {
+		t.Fatalf("registry accounting exceeded budget: %d > %d", manager.registryBytes, manager.config.RegistryBytes)
+	}
+	history, err := manager.History(trigger.ID)
+	if err != nil || len(history.Events) == 0 || history.Events[len(history.Events)-1].Type != pressureEvent.Type || history.Events[len(history.Events)-1].Message != pressureEvent.Message {
+		t.Fatalf("trigger history did not retain pressure event: (%+v, %v)", history, err)
 	}
 }
 
@@ -1000,6 +1125,44 @@ func TestWaitClaimWakesAfterAdmission(t *testing.T) {
 	}
 }
 
+func TestWaitClaimAttemptWakesAfterAdmission(t *testing.T) {
+	manager := testManager(t, testConfig())
+	result := make(chan struct {
+		claim AttemptClaim
+		err   error
+	}, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		claim, err := manager.WaitClaimAttempt(context.Background())
+		result <- struct {
+			claim AttemptClaim
+			err   error
+		}{claim, err}
+	}()
+	<-started
+	select {
+	case got := <-result:
+		t.Fatalf("WaitClaimAttempt returned before admission: (%+v, %v)", got.claim, got.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	admitted, _, err := manager.Admit("wait-attempt", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil || got.claim.Job.ID != admitted.ID || got.claim.Job.Status != StatusRunning {
+			t.Fatalf("WaitClaimAttempt() = (%+v, %v), want admitted running job", got.claim, got.err)
+		}
+		if !validAttemptHandle(got.claim.Attempt) || got.claim.Attempt.JobID != admitted.ID {
+			t.Fatalf("WaitClaimAttempt() attempt = %+v, want valid identity for assigned job %q", got.claim.Attempt, admitted.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaimAttempt did not wake after admission")
+	}
+}
+
 func TestWaitClaimWakesWhenFinishReleasesWorkerSlot(t *testing.T) {
 	manager := testManager(t, Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 2, MaxEventsPerJob: 4})
 	first, _, err := manager.Admit("first", Request{Repository: "widget", Task: "first"})
@@ -1070,6 +1233,34 @@ func TestWaitClaimReturnsOnContextCancellation(t *testing.T) {
 	}
 }
 
+func TestWaitClaimAttemptReturnsOnContextCancellation(t *testing.T) {
+	manager := testManager(t, testConfig())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err := manager.WaitClaimAttempt(ctx)
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("WaitClaimAttempt returned before cancellation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("WaitClaimAttempt() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaimAttempt did not return after context cancellation")
+	}
+}
+
 func TestWaitClaimWakesOnClose(t *testing.T) {
 	manager := testManager(t, testConfig())
 	result := make(chan error, 1)
@@ -1093,6 +1284,32 @@ func TestWaitClaimWakesOnClose(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("WaitClaim did not return after manager close")
+	}
+}
+
+func TestWaitClaimAttemptWakesOnClose(t *testing.T) {
+	manager := testManager(t, testConfig())
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		_, err := manager.WaitClaimAttempt(context.Background())
+		result <- err
+	}()
+	<-started
+	select {
+	case err := <-result:
+		t.Fatalf("WaitClaimAttempt returned before close: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	manager.Close()
+	select {
+	case err := <-result:
+		if !errors.Is(err, ErrManagerClosed) {
+			t.Fatalf("WaitClaimAttempt() error = %v, want ErrManagerClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaimAttempt did not return after manager close")
 	}
 }
 
@@ -1253,6 +1470,185 @@ func TestAdmissionAndEventInputValidation(t *testing.T) {
 	} {
 		if err := manager.AddEvent(job.ID, tc.eventType, tc.message); !errors.Is(err, ErrInvalidInput) {
 			t.Errorf("AddEvent(%q, %q) error = %v, want ErrInvalidInput", tc.eventType, tc.message, err)
+		}
+	}
+}
+
+func TestParseProgressEventAcceptsEverySupportedStageAndState(t *testing.T) {
+	stages := []string{"requirements", "implement", "review", "document"}
+	states := []string{"started", "completed", "failed"}
+	for _, stage := range stages {
+		for _, state := range states {
+			t.Run(stage+"/"+state, func(t *testing.T) {
+				got, ok := ParseProgressEvent("stage=" + stage + " state=" + state)
+				want := &ProgressSummary{Stage: stage, State: state}
+				if !ok || !reflect.DeepEqual(got, want) {
+					t.Fatalf("ParseProgressEvent() = (%+v, %t), want (%+v, true)", got, ok, want)
+				}
+			})
+		}
+	}
+}
+
+func TestParseProgressEventRejectsMalformedAndUnsupportedInput(t *testing.T) {
+	for _, message := range []string{
+		"", "stage=implement", "state=started stage=implement", "stage=implement state=started extra=value",
+		"stage=unknown state=started", "stage=implement state=unknown", "stage= state=started",
+		"stage=implement state=", "stage=implement  state=started", " stage=implement state=started",
+		"stage=implement state=started ", "stage=implementation state=started", "stage=implement state=running",
+	} {
+		t.Run(fmt.Sprintf("%q", message), func(t *testing.T) {
+			if got, ok := ParseProgressEvent(message); ok || got != nil {
+				t.Fatalf("ParseProgressEvent(%q) = (%+v, %t), want (nil, false)", message, got, ok)
+			}
+		})
+	}
+}
+
+func TestRecordProgressForAttemptUpdatesActiveJobProgress(t *testing.T) {
+	manager := testManager(t, testConfig())
+	job, _, err := manager.Admit("progress", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttemptForWorker("worker-a", "boot-a")
+	if err != nil {
+		t.Fatalf("ClaimNextAttemptForWorker() error = %v", err)
+	}
+
+	progressUpdates := []ProgressSummary{
+		{Stage: "requirements", State: "started"},
+		{Stage: "implement", State: "completed"},
+	}
+	for _, progress := range progressUpdates {
+		if err := manager.RecordProgressForAttempt(claim.Attempt, progress); err != nil {
+			t.Fatalf("RecordProgressForAttempt(%+v) error = %v", progress, err)
+		}
+		got, err := manager.Get(job.ID)
+		if err != nil || got.Progress == nil || *got.Progress != progress {
+			t.Fatalf("Get() progress = (%+v, %v), want latest update %+v", got.Progress, err, progress)
+		}
+		if got.Worker == nil || *got.Worker != (WorkerSummary{WorkerID: "worker-a", BootID: "boot-a"}) {
+			t.Fatalf("Get() worker = %+v, want active attempt identity", got.Worker)
+		}
+	}
+}
+
+func TestRecordProgressForAttemptRejectsInvalidProgressWithoutMutation(t *testing.T) {
+	manager := testManager(t, testConfig())
+	job, _, err := manager.Admit("invalid-progress", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttemptForWorker("worker-a", "boot-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialProgress := ProgressSummary{Stage: "requirements", State: "started"}
+	if err := manager.RecordProgressForAttempt(claim.Attempt, initialProgress); err != nil {
+		t.Fatal(err)
+	}
+	before, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, invalid := range []ProgressSummary{
+		{}, {Stage: "unknown", State: "started"}, {Stage: "implement", State: "running"},
+		{Stage: "", State: "completed"}, {Stage: "review", State: ""},
+	} {
+		if err := manager.RecordProgressForAttempt(claim.Attempt, invalid); !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("RecordProgressForAttempt(%+v) error = %v, want ErrInvalidInput", invalid, err)
+		}
+		after, err := manager.Get(job.ID)
+		if err != nil || !reflect.DeepEqual(after, before) {
+			t.Fatalf("rejected progress %+v changed the job: before=%+v after=%+v err=%v", invalid, before, after, err)
+		}
+	}
+}
+
+func TestRecordProgressForAttemptRejectsStaleAttemptWithoutMutation(t *testing.T) {
+	manager := testManager(t, testConfig())
+	job, _, err := manager.Admit("stale-progress", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttemptForWorker("worker-a", "boot-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	progress := ProgressSummary{Stage: "review", State: "started"}
+	if err := manager.RecordProgressForAttempt(claim.Attempt, progress); err != nil {
+		t.Fatal(err)
+	}
+	before, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	staleAttempts := []AttemptHandle{claim.Attempt, claim.Attempt}
+	staleAttempts[0].Generation++
+	staleAttempts[1].OwnerToken = strings.Repeat("0", 64)
+	for _, stale := range staleAttempts {
+		if err := manager.RecordProgressForAttempt(stale, ProgressSummary{Stage: "document", State: "completed"}); !errors.Is(err, ErrStaleAttempt) {
+			t.Errorf("RecordProgressForAttempt(stale attempt) error = %v, want ErrStaleAttempt", err)
+		}
+		after, err := manager.Get(job.ID)
+		if err != nil || !reflect.DeepEqual(after, before) {
+			t.Fatalf("stale attempt changed the job: before=%+v after=%+v err=%v", before, after, err)
+		}
+	}
+}
+
+func TestLocalManagerSetAttemptIdentity(t *testing.T) {
+	manager := testManager(t, testConfig())
+	job, _, err := manager.Admit("set-attempt-identity", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := manager.ClaimNextAttempt()
+	if err != nil {
+		t.Fatalf("ClaimNextAttempt() error = %v", err)
+	}
+	if claim.Job.ID != job.ID {
+		t.Fatalf("claimed job ID = %q, want %q", claim.Job.ID, job.ID)
+	}
+	if claim.Job.Worker != nil {
+		t.Fatalf("claimed job worker = %+v, want absent before identity is set", claim.Job.Worker)
+	}
+	before, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Worker != nil {
+		t.Fatalf("Get() worker = %+v, want absent before identity is set", before.Worker)
+	}
+
+	attempt := claim.Attempt
+	attempt.WorkerID, attempt.BootID = "worker-local-test", "boot-local-test"
+	if err := manager.SetAttemptIdentity(attempt); err != nil {
+		t.Fatalf("SetAttemptIdentity() error = %v", err)
+	}
+	got, err := manager.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantWorker := &WorkerSummary{WorkerID: attempt.WorkerID, BootID: attempt.BootID}
+	if !reflect.DeepEqual(got.Worker, wantWorker) {
+		t.Fatalf("Get() worker = %+v, want %+v", got.Worker, wantWorker)
+	}
+	before = got
+
+	staleAttempts := []AttemptHandle{attempt, attempt}
+	staleAttempts[0].Generation++
+	staleAttempts[1].WorkerID = "different-worker"
+	for _, stale := range staleAttempts {
+		if err := manager.SetAttemptIdentity(stale); !errors.Is(err, ErrStaleAttempt) {
+			t.Errorf("SetAttemptIdentity(stale attempt) error = %v, want ErrStaleAttempt", err)
+		}
+		after, err := manager.Get(job.ID)
+		if err != nil || !reflect.DeepEqual(after, before) {
+			t.Fatalf("stale attempt changed the job: before=%+v after=%+v err=%v", before, after, err)
 		}
 	}
 }

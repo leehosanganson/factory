@@ -18,6 +18,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	restjobs "github.com/leehosanganson/factory/internal/jobs"
 	restserver "github.com/leehosanganson/factory/internal/server"
@@ -400,6 +402,18 @@ func finishRemoteWorkerFailure(ctx context.Context, cancel context.CancelFunc, h
 	return nil
 }
 
+func validRemoteWorkerTask(task string) bool {
+	if strings.TrimSpace(task) == "" || len(task) > 256<<10 || !utf8.ValidString(task) {
+		return false
+	}
+	for _, r := range task {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
 func cloneRemoteEvidence(value restjobs.VerificationEvidence) restjobs.VerificationEvidence {
 	checks := make([]restjobs.VerificationCheck, len(value.Checks))
 	copy(checks, value.Checks)
@@ -487,7 +501,7 @@ func runRemoteWorkerAttempt(parent context.Context, config restserver.RemoteWork
 	if !ok {
 		return finishRemoteWorkerFailure(parent, cancel, heartbeatDone, config, client, claim)
 	}
-	if strings.TrimSpace(claim.Job.Request.Task) == "" || len(claim.Job.Request.Task) > 256<<10 {
+	if !validRemoteWorkerTask(claim.Job.Request.Task) {
 		return finishRemoteWorkerFailure(parent, cancel, heartbeatDone, config, client, claim)
 	}
 	if err := (restserver.Config{Repositories: map[string]string{claim.Job.Request.Repository: root}}).ValidateRepositoryRoots(); err != nil {
