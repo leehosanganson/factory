@@ -65,6 +65,9 @@ function App() {
   const threadCreationGeneration = useRef(0);
   const mounted = useRef(true);
   const activeThreadID = useRef('');
+  const threadHeading = useRef<HTMLHeadingElement>(null);
+  const threadSelection = useRef<{ id: string } | null>(null);
+  const [threadFocus, setThreadFocus] = useState<typeof threadSelection.current>(null);
   const [schedulePending, setSchedulePending] = useState(false);
   const scheduleKey = useRef('');
   const stream = useRef<EventSource | null>(null);
@@ -186,6 +189,7 @@ function App() {
     finally {
       stream.current?.close(); stream.current = null; activeSelection.current = ''; selectionGeneration.current++; activeThreadID.current = ''; threadMutationGeneration.current++; threadCreationGeneration.current++; loginGeneration.current++; jobRefreshGeneration.current++; scheduleRefreshGeneration.current++; threadRefreshGeneration.current++; scheduleGeneration.current++;
       setThreadPending(false); setSession({ authenticated: false }); setDetail(null); setNotifications([]); setThread(null); setThreads([]); threadPageRef.current = {}; setThreadPage({}); setThreadJobs([]); setSchedules([]); setNotice('');
+      threadSelection.current = null;
       threadAttempt.current = null; appendAttempt.current = null; scheduleAttempt.current = null; scheduleKey.current = ''; admissionAttempt.current = null; setAdmissionPending(false);
     }
   }
@@ -208,15 +212,29 @@ function App() {
       const result = await api<{ thread: Thread; job: Job }>('/v1/threads', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Idempotency-Key': threadAttempt.current.key }, body: fingerprint }, session.csrf);
       if (!mounted.current) return;
       threadCreationGeneration.current++;
+      threadSelection.current = null;
       threadMutationGeneration.current++; activeThreadID.current = result.thread.id; setThreadJobs([]); setThread(result.thread); setThreadPending(false); appendAttempt.current = null; threadAttempt.current = null; formElement.reset(); setNotice(`Thread ${result.thread.id} created with Job ${result.job.id}.`); await refreshThreads(); await inspectThread(result.thread.id);
     } catch (error) { if (mounted.current) { setNotice((error as Error).message); setThreadPending(false); } }
   }
-  async function inspectThread(id: string) {
+  async function inspectThread(id: string, selection?: { id: string }) {
     const generation = threadMutationGeneration.current;
-    try { const result = await api<{ thread: Thread; jobs?: Job[] }>(`/v1/threads/${encodeURIComponent(id)}`, {}, session.csrf); if (generation === threadMutationGeneration.current && activeThreadID.current === id && mounted.current) { setThread(result.thread); setThreadJobs(result.jobs || []); } }
-    catch (error) { if (generation === threadMutationGeneration.current && activeThreadID.current === id && mounted.current) setNotice((error as Error).message); }
+    const current = () => generation === threadMutationGeneration.current && activeThreadID.current === id && mounted.current;
+    try {
+      const result = await api<{ thread: Thread; jobs?: Job[] }>(`/v1/threads/${encodeURIComponent(id)}`, {}, session.csrf);
+      if (!current()) return;
+      if (result.thread.id !== id) throw new Error('Thread detail did not match the requested Thread.');
+      setThread(result.thread);
+      setThreadJobs(result.jobs || []);
+      const pending = threadSelection.current;
+      if (pending?.id === id) setThreadFocus(pending);
+    } catch (error) {
+      if (mounted.current && selection && threadSelection.current === selection) threadSelection.current = null;
+      if (current()) setNotice((error as Error).message);
+    }
   }
   function selectThread(id: string) {
+    const selection = { id };
+    threadSelection.current = selection;
     if (activeThreadID.current !== id) {
       activeThreadID.current = id;
       threadMutationGeneration.current++;
@@ -224,8 +242,16 @@ function App() {
       setThreadJobs([]);
       setThreadPending(false);
     }
-    void inspectThread(id);
+    void inspectThread(id, selection);
   }
+  const renderedThreadID = thread?.id;
+  useEffect(() => {
+    const heading = threadHeading.current;
+    if (!heading || !mounted.current || !threadFocus || threadFocus !== threadSelection.current || renderedThreadID !== threadFocus.id) return;
+    threadSelection.current = null;
+    heading.focus({ preventScroll: true });
+    heading.scrollIntoView({ behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+  }, [threadFocus, renderedThreadID]);
   async function appendThread(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); if (!thread || activeThreadID.current !== thread.id || thread.completed_at || threadPending) return;
     const formElement = event.currentTarget; const form = new FormData(formElement); const input = { repository: String(form.get('repository') || '').trim(), task: String(form.get('task') || '') }; const fingerprint = JSON.stringify(input);
@@ -281,7 +307,7 @@ function App() {
     <div className="notice" role="status" aria-live="polite">{notice}</div>
     <section className="panel" aria-labelledby="inbox-title"><div className="section-heading"><h2 id="inbox-title">Inbox</h2></div><div className="notification-list" aria-live="polite">{notifications.length ? notifications.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => selectThread(item.thread_id)}>Thread {item.thread_id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">Completed {date(item.created_at)}</span></article>) : <p className="empty">No completed Threads yet. A notice appears here when all Jobs in a Thread reach a terminal outcome.</p>}</div></section>
     <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Your Threads</h2><span className="muted" role="status">{threadLoading}</span></div><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => selectThread(item.id)}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)}</span></article>) : <p className="empty">No Threads yet. Create one to submit your first Job.</p>}</div><h2>Start a Thread</h2><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread with Job</button></form>
-      <div className="thread-result" aria-live="polite">{thread && <><h2>Thread {thread.id}</h2><p className="status">Thread status: {thread.status}</p>{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span>{job.reply && <div className="safe-outcome"><h3>Reply</h3><p className="task-reply">{job.reply}</p>{job.reply_truncated && <p className="muted">Reply truncated.</p>}</div>}{job.verification && <div className="safe-outcome"><h3>Safe outcome</h3><p>Factory recorded the Job as {job.status}.</p>{job.verification.checks?.map((check) => <p key={check.name}>{check.name}: {check.outcome}</p>)}{job.verification.limitations?.map((limitation) => <p className="muted" key={limitation}>{limitation}</p>)}</div>}</article>)}</>}</div>
+      <div className="thread-result" aria-live="polite">{thread && <><h2 ref={threadHeading} tabIndex={-1}>Thread {thread.id}</h2><p className="status">Thread status: {thread.status}</p>{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span>{job.reply && <div className="safe-outcome"><h3>Reply</h3><p className="task-reply">{job.reply}</p>{job.reply_truncated && <p className="muted">Reply truncated.</p>}</div>}{job.verification && <div className="safe-outcome"><h3>Safe outcome</h3><p>Factory recorded the Job as {job.status}.</p>{job.verification.checks?.map((check) => <p key={check.name}>{check.name}: {check.outcome}</p>)}{job.verification.limitations?.map((limitation) => <p className="muted" key={limitation}>{limitation}</p>)}</div>}</article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form key={thread.id} className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Follow-up repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Send follow-up</button></form></section>}
 
     </section>
@@ -293,7 +319,7 @@ function App() {
     <div className="layout"><section className="panel admission" aria-labelledby="admit-title"><h2 id="admit-title">Admit a job</h2><form onSubmit={admit}><label htmlFor="repository">Repository alias</label><input id="repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="task">Task</label><textarea id="task" name="task" rows={6} maxLength={262144} required/><button type="submit" disabled={admissionPending}>{admissionPending ? 'Queueing…' : 'Queue job'}</button></form></section>
     <section className="panel jobs-panel" aria-labelledby="jobs-title"><div className="section-heading"><h2 id="jobs-title">Recent jobs</h2><span className="muted" role="status">{loading}</span></div><div className="job-list" aria-live="polite">{jobs.length ? jobs.map((job) => <article className="job-row" key={job.id}><a className="job-link" href={`#job-${encodeURIComponent(job.id)}`} onClick={(e) => { e.preventDefault(); void inspect(job.id); }}>{job.id}</a><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">{date(job.created_at)} · Updated {date(job.updated_at)}</span></article>) : <p className="empty">No jobs yet. Submit a task to create the first job.</p>}</div></section></div>
     <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Threads</h2><span className="muted" role="status">{threadLoading}</span></div><p className="muted">Browse recent Threads and select one to reopen its safe job summary.</p><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => selectThread(item.id)}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)} · Updated {date(item.updated_at)}{item.completed_at ? ` · Completed ${date(item.completed_at)}` : ''}</span></article>) : <p className="empty">No retained Threads yet.</p>}</div>{threadPage.has_more && <button className="secondary" type="button" onClick={() => void refreshThreads(true)}>Load older Threads</button>}<h3>Start a Thread</h3><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread</button></form>
-      <div className="thread-result" aria-live="polite">{thread && <><h3>Thread {thread.id}</h3><span className={`status ${thread.status}`}>{thread.status}</span>{thread.completed_at && <p className="job-meta">Completed {date(thread.completed_at)}</p>}{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span></article>)}</>}</div>
+      <div className="thread-result" aria-live="polite">{thread && <><h3 ref={threadHeading} tabIndex={-1}>Thread {thread.id}</h3><span className={`status ${thread.status}`}>{thread.status}</span>{thread.completed_at && <p className="job-meta">Completed {date(thread.completed_at)}</p>}{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span></article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Append Job</button></form><button className="danger" type="button" disabled={threadPending} onClick={() => void completeThread()}>Complete Thread</button></section>}</section>
     <WorkerSessions csrf={session.csrf || ''} />
     <section className="panel schedules-panel" aria-labelledby="schedules-title"><div className="section-heading"><h2 id="schedules-title">Schedules</h2><span className="muted" role="status">{scheduleLoading}</span></div><p className="muted">Schedule tasks run on their cron times. Cron uses UTC and supports one-minute minimum recurrence.</p><form className="schedule-form" onSubmit={createSchedule}><label htmlFor="schedule-cron">Cron (UTC)</label><input id="schedule-cron" name="cron" maxLength={128} required autoComplete="off" placeholder="0 9 * * 1-5"/><span className="muted">Five fields; UTC; one-minute minimum recurrence.</span><label htmlFor="schedule-repository">Repository alias</label><input id="schedule-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="schedule-task">Task</label><textarea id="schedule-task" name="task" rows={4} maxLength={262144} required/><button id="schedule-submit" type="submit" disabled={schedulePending}>Create schedule</button></form>

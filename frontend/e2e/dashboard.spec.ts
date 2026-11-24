@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import type { Route } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import type { Runtime } from './runtime.js';
 
@@ -129,6 +130,146 @@ test('Thread owner sees a verified source edit and inbox notice after reload wit
   await expect(page.locator('.notification-list').getByRole('button', { name: `Thread ${threadID}` })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Schedules' })).toHaveCount(0);
 });
+
+for (const role of ['submitter', 'operator'] as const) {
+  test(`${role} Thread selection moves mobile focus and viewport, but polling does not`, async ({ page }) => {
+    const fixture = await runtime();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto(fixture.url);
+    await page.getByLabel('Access token').fill(role === 'submitter' ? fixture.submitterToken : fixture.token);
+    await page.getByRole('button', { name: 'Sign in' }).click();
+
+    const threads = page.getByRole('region', { name: role === 'submitter' ? 'Your Threads' : 'Threads', exact: true });
+    await threads.getByLabel('Repository alias').fill('fixture');
+    await threads.getByLabel('Task', { exact: true }).fill('Create a Thread to reopen on mobile.');
+    await threads.getByRole('button', { name: /Create Thread/ }).click();
+    const heading = threads.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
+    await expect(heading).toBeVisible();
+    const threadName = (await heading.innerText()).trim();
+    const threadID = threadName.slice('Thread '.length);
+    await page.reload();
+
+    const select = threads.getByRole('button', { name: threadID, exact: true });
+    const detail = threads.getByRole('heading', { name: threadName, exact: true });
+    for (let selection = 0; selection < 2; selection++) {
+      await select.evaluate((button) => button.scrollIntoView({ block: 'end' }));
+      await expect(detail).not.toBeInViewport();
+      await select.press('Enter');
+      await expect(detail).toBeVisible();
+      await expect.soft(detail).toBeFocused();
+      await expect.soft(detail).toBeInViewport({ ratio: 0.95 });
+      if (test.info().errors.length) return;
+    }
+
+    const create = threads.getByRole('button', { name: /Create Thread/ });
+    await create.evaluate((button) => {
+      button.scrollIntoView({ block: 'end' });
+      button.focus({ preventScroll: true });
+    });
+    await expect(detail).not.toBeInViewport();
+    const scrollY = await page.evaluate(() => window.scrollY);
+    await page.route(`**/ui/api/v1/threads/${threadID}`, async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.thread.status = 'need_attention';
+      await route.fulfill({ response, json: body });
+    }, { times: 1 });
+    await expect(threads.getByText(/^(Thread status: )?need_attention$/)).toBeVisible({ timeout: 10_000 });
+    await expect(create).toBeFocused();
+    expect(await page.evaluate(() => window.scrollY)).toBe(scrollY);
+  });
+}
+
+for (const failure of ['none', 'refresh', 'selection'] as const) {
+  test(`Thread reselection during completion (failure: ${failure})`, async ({ page }) => {
+    const fixture = await runtime();
+    await page.clock.install({ time: new Date('2025-01-01T00:00:00Z') });
+    await page.clock.pauseAt(new Date('2025-01-01T00:01:00Z'));
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await page.goto(fixture.url);
+    await page.getByLabel('Access token').fill(fixture.token);
+    await page.getByRole('button', { name: 'Sign in' }).click();
+
+    const threads = page.getByRole('region', { name: 'Threads', exact: true });
+    await threads.getByLabel('Repository alias').fill('fixture');
+    await threads.getByLabel('Task', { exact: true }).fill('Create a Thread for the completion race.');
+    await threads.getByRole('button', { name: 'Create Thread', exact: true }).click();
+    await expect(threads.locator('.thread-job')).toHaveCount(1);
+    const heading = threads.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
+    const id = (await heading.innerText()).trim().slice('Thread '.length);
+    const detailURL = `**/ui/api/v1/threads/${id}`;
+    const selection = threads.getByRole('button', { name: id, exact: true });
+    async function holdNextRequest(url: string) {
+      let capture!: (route: Route) => void;
+      const request = new Promise<Route>((resolve) => { capture = resolve; });
+      let held = false;
+      await page.route(url, (route) => {
+        if (held) return route.fallback();
+        held = true;
+        capture(route);
+      });
+      return { request };
+    }
+    const completionRequest = await holdNextRequest(`${detailURL}/complete`);
+    const selectionRequest = await holdNextRequest(detailURL);
+
+    const complete = threads.getByRole('button', { name: 'Complete Thread' });
+    await complete.click();
+    const completion = await completionRequest.request;
+    await selection.press('Enter');
+    const selectionRoute = await selectionRequest.request;
+    const openDetail = await selectionRoute.fetch();
+    expect(openDetail.ok()).toBe(true);
+    await expect(selection).toBeFocused();
+    const refreshRequest = await holdNextRequest(detailURL);
+    await completion.continue();
+    const refreshRoute = await refreshRequest.request;
+    const controls = threads.getByRole('region', { name: 'Current Thread actions' });
+    const selectionFinished = page.waitForEvent('requestfinished', (request) => request === selectionRoute.request());
+    if (failure === 'selection') {
+      await selectionRoute.fulfill({ status: 503, json: { message: 'Selection unavailable' } });
+      await selectionFinished;
+      await refreshRoute.continue();
+      await expect(controls).toHaveCount(0);
+      await expect(selection).toBeFocused();
+      return;
+    }
+
+    if (failure === 'refresh') {
+      await refreshRoute.fulfill({ status: 503, json: { message: 'Completion refresh unavailable' } });
+      await expect(page.getByRole('status').filter({ hasText: 'Completion refresh unavailable' })).toBeVisible();
+      await expect(selection).toBeFocused();
+    } else {
+      await refreshRoute.continue();
+      await expect(controls).toHaveCount(0);
+      await expect(heading).toBeFocused();
+    }
+    await selectionRoute.fulfill({ response: openDetail });
+    await selectionFinished;
+    await page.unrouteAll({ behavior: 'wait' });
+    if (failure === 'refresh') {
+      await page.clock.runFor(6000);
+      await expect(controls).toHaveCount(0);
+      await expect(heading).toBeFocused();
+      return;
+    }
+
+    await page.route(detailURL, (route) => route.fulfill({ status: 503, json: { message: 'Detail unavailable' } }), { times: 1 });
+    await selection.click();
+    await expect(page.getByRole('status').filter({ hasText: 'Detail unavailable' })).toBeVisible();
+    await expect(controls).toHaveCount(0);
+    await page.route(detailURL, async (route) => {
+      const response = await route.fetch();
+      const body = await response.json();
+      body.thread.status = 'need_attention';
+      await route.fulfill({ response, json: body });
+    }, { times: 1 });
+    await page.clock.runFor(6000);
+    await expect(threads.locator('.thread-result').getByText('need_attention', { exact: true })).toBeVisible();
+    await expect(selection).toBeFocused();
+  });
+}
 
 test('operator can sign in, admit and inspect a job, and sign out', async ({ page, context }) => {
   const fixture = await runtime();
