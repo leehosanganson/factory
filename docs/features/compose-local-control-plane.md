@@ -56,12 +56,27 @@ The one-off container uses the same user and Pi mount as the Worker. It does not
 
 ```sh
 docker compose up -d
+docker compose ps api remote-worker task-board
 docker compose port task-board 443
 ```
 
+Wait for `api` to show `healthy` and for `remote-worker` and `task-board` to be running. The API health check uses `/readyz` to check Controller readiness, including its PostgreSQL connection. Running containers and a passing Pi mount preflight do not prove that the Worker can claim a Job or that Pi can use the model provider.
+
 Open `https://localhost:<port>/ui` using the returned port. Caddy issues a local certificate for `localhost`; export its public CA certificate with `docker compose cp task-board:/data/caddy/pki/authorities/local/root.crt .local/factory-compose/task-board-ca.crt` and trust it with your browser or OS tooling if you trust this local stack. Do not bypass certificate checks for normal use. The HTTPS endpoint serves only the board; the separate HTTP API port from `docker compose port api 8080` is bound to loopback and is not the browser endpoint.
 
-Sign in with the token in `.local/factory-compose/owner-token`. Create two Threads using repository alias `local`. After they finish, select either Thread and send a follow-up using the same alias. The separate `operator-token` opens the operator dashboard; it does not expose private replies. Keep all tokens out of logs and shell history.
+## Verify one live Job
+
+Use the default stack without the test-only `scripts/fixtures/task-board-pi.compose.yml` overlay. `docker compose config --services` lists service names only: if it includes `pi-provider`, you are using the mock overlay. Also check privately that Pi's configured provider and model point to the external service you intend to use, not a custom mock endpoint. Pi sends the task and any context it uses to that provider. Even one read-only Job can use quota or incur charges. If you do not want a live call, use the [mock smoke test](#verify-without-provider-credentials) instead.
+
+1. Sign in to the HTTPS board with the token in `.local/factory-compose/owner-token`. Under **Start a Thread**, enter `local` as the **Repository alias** and use this **Task**:
+
+   > Read only `README.md` in the current checkout. Reply with its first line and nothing else. Do not modify files, make commits, or contact any other service.
+
+   The fresh disposable checkout is seeded by `remote-worker-init` in [`docker-compose.yml`](../../docker-compose.yml), not copied from the Factory source tree.
+2. Click **Create Thread with Job** once. In the selected Thread, confirm that the Job reaches `succeeded` and its **Reply** contains `Disposable local Compose worker checkout.` That confirms a result through the configured harness, but the board does not identify the model endpoint. To corroborate live rather than mock execution, check the provider's request or usage records for the configured account and model around the Job time, if available.
+3. If the Job stays `queued`, recheck `docker compose ps api remote-worker task-board` and verify that the HTTP Worker is configured for this Controller and the `local` alias. If it reaches `failed`, recheck the Pi mount preflight, model settings, credentials, and provider access or quota privately. Use the Job ID to inspect status and lifecycle in the operator dashboard with the separate `operator-token`; it does not show private replies. Inspect the original Job before retrying. Enter board tokens only in the HTTPS sign-in form, not in shell commands. Do not print credential files or share raw logs or Pi sessions.
+
+**Optional next step:** Create two Threads using repository alias `local`. After they finish, select either Thread and send a follow-up using the same alias. These Jobs also use the configured model provider.
 
 ## What is retained
 
