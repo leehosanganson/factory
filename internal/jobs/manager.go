@@ -215,13 +215,24 @@ const (
 	LimitationAgentNotVerdict    = "Agent-reported completion is not an independent correctness verdict."
 )
 
-// VerificationEvidence is bounded job outcome metadata safe for API exposure.
+const MaxTaskReplyBytes = 8 << 10
+
+// VerificationEvidence carries check results and an optional private task reply.
 type VerificationEvidence struct {
-	Checks      []VerificationCheck `json:"checks"`
-	Limitations []string            `json:"limitations"`
+	Checks         []VerificationCheck `json:"checks"`
+	Limitations    []string            `json:"limitations"`
+	Reply          string              `json:"reply,omitempty"`
+	ReplyTruncated bool                `json:"reply_truncated,omitempty"`
+}
+
+func ValidTaskReply(reply string, truncated bool) bool {
+	return (reply != "" || !truncated) && validText(reply, 0, MaxTaskReplyBytes, true)
 }
 
 func validateVerificationEvidence(evidence VerificationEvidence) error {
+	if !ValidTaskReply(evidence.Reply, evidence.ReplyTruncated) {
+		return ErrInvalidInput
+	}
 	if len(evidence.Checks) > maxVerificationChecks || len(evidence.Limitations) > maxVerificationLimitations {
 		return ErrInvalidInput
 	}
@@ -269,12 +280,13 @@ type ProgressSummary struct {
 
 // AttemptClaim pairs a claimed job snapshot with its fencing identity.
 type AttemptClaim struct {
-	Job     Snapshot
-	Attempt AttemptHandle
+	Job            Snapshot
+	Attempt        AttemptHandle
+	ThreadID       string
+	ThreadPosition int
 }
 
-// Snapshot is a copy of public job state. Verification contains only safe
-// check labels/outcomes and fixed limitation messages, never command output.
+// Snapshot holds job state. Its JSON form omits private task replies.
 type Snapshot struct {
 	ID                    string                `json:"id"`
 	Submitter             string                `json:"submitted_by"`
@@ -287,6 +299,16 @@ type Snapshot struct {
 	Verification          *VerificationEvidence `json:"verification,omitempty"`
 	Worker                *WorkerSummary        `json:"worker,omitempty"`
 	Progress              *ProgressSummary      `json:"progress,omitempty"`
+}
+
+func (s Snapshot) MarshalJSON() ([]byte, error) {
+	type publicSnapshot Snapshot
+	if s.Verification != nil {
+		evidence := *s.Verification
+		evidence.Reply, evidence.ReplyTruncated = "", false
+		s.Verification = &evidence
+	}
+	return json.Marshal(publicSnapshot(s))
 }
 
 // Event is one bounded history entry.

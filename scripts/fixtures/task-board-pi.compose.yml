@@ -1,0 +1,30 @@
+services:
+  remote-worker:
+    networks: !override [pi-fixture]
+    depends_on:
+      pi-provider:
+        condition: service_healthy
+    environment:
+      PI_CODING_AGENT_DIR: /var/lib/factory/state
+    volumes:
+      - ./scripts/fixtures/task-board-pi-settings.json:/var/lib/factory/state/settings.json:ro
+      - ./scripts/fixtures/task-board-pi-models.json:/var/lib/factory/state/models.json:ro
+
+  api:
+    networks: [default, pi-fixture]
+
+  pi-provider:
+    image: factory-pi-worker:local
+    entrypoint: [node, /fixture/task-board-provider.mjs]
+    volumes:
+      - ./scripts/fixtures/task-board-provider.mjs:/fixture/task-board-provider.mjs:ro
+    networks: [pi-fixture]
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:8080/health').then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 1s
+      timeout: 2s
+      retries: 20
+
+networks:
+  pi-fixture:
+    internal: true

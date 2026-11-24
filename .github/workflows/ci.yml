@@ -106,6 +106,10 @@ jobs:
           PLAYWRIGHT_INSTALL_FLAGS: --with-deps
         run: make test-dashboard-e2e
 
+      - name: Run task-board Compose smoke with Pi
+        timeout-minutes: 20
+        run: make test-task-board-compose
+
   macos-build:
     name: macOS build, test, and vet
     runs-on: macos-latest
@@ -175,8 +179,8 @@ jobs:
         with:
           go-version: '1.26.3'
 
-      - name: Run PostgreSQL ownership, Store, runtime, and issue-poller integration tests
-        run: go test ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically)$' -count=1 -v
+      - name: Run PostgreSQL API, Store, runtime, and issue-poller integration tests
+        run: go test ./internal/api ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce|TestPostgresRemoteClaimFiltersRepositoryCapabilities|TestPostgresRemoteClaimsRespectThreadOrder|TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestRunConfiguredPostgresStoreIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically)$' -count=1 -v
 
   ci-result:
     name: CI result

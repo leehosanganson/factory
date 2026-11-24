@@ -1,0 +1,14 @@
+{
+  "providers": {
+    "task-board-fixture": {
+      "baseUrl": "http://pi-provider:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "task-board-fixture-only",
+      "models": [
+        {
+          "id": "deterministic"
+        }
+      ]
+    }
+  }
+}

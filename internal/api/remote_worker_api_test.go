@@ -2,6 +2,7 @@ package restapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -34,7 +35,7 @@ type remoteWorkerStoreFake struct {
 	storedEvidence        restjobs.VerificationEvidence
 }
 
-func (f *remoteWorkerStoreFake) ClaimRemoteAttempt(_ context.Context, claimID, workerID, bootID string, repositories []string) (restjobs.AttemptClaim, error) {
+func (f *remoteWorkerStoreFake) ClaimRemoteAttempt(_ context.Context, claimID, workerID, bootID string, repositories []string, _ bool) (restjobs.AttemptClaim, error) {
 	f.claimCalls++
 	f.claimRepositories = append([]string(nil), repositories...)
 	if claimID != "claim-1" || workerID != "worker-1" || bootID != "boot-1" || len(repositories) == 0 {
@@ -447,5 +448,37 @@ func TestRemoteWorkerFinishPassesExactTerminalEvidenceAndMapsConflicts(t *testin
 				t.Fatalf("conflict stored/replaced worker outcome: stored=%t status=%q", store.storedFinish, store.finishStatus)
 			}
 		})
+	}
+}
+
+func TestRemoteWorkerFinishEscapedReplyUsesSeparateBodyLimit(t *testing.T) {
+	store := &remoteWorkerStoreFake{}
+	handler := newRemoteWorkerHandler(t, store)
+	request := remoteFinishRequest{
+		remoteAttemptRequest: remoteAttemptRequest{Generation: 1, OwnerToken: remoteTestToken, WorkerID: "worker-1", BootID: "boot-1"},
+		Status:               restjobs.StatusSucceeded,
+		Evidence:             &remoteEvidenceDTO{Reply: strings.Repeat("<", restjobs.MaxTaskReplyBytes), ReplyTruncated: true, Checks: []remoteVerificationCheckDTO{}, Limitations: []string{}},
+	}
+	post := func(want int) {
+		t.Helper()
+		body, err := json.Marshal(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := remoteRequest(handler, "/v1/worker/attempts/"+remoteTestJobID+"/finish", string(body), remoteTestSecret)
+		if response.Code != want {
+			t.Fatalf("finish status=%d, want %d", response.Code, want)
+		}
+	}
+	post(http.StatusOK)
+	if store.finishEvidence.Reply != request.Evidence.Reply || !store.finishEvidence.ReplyTruncated {
+		t.Fatal("reply not passed to store intact")
+	}
+	request.Evidence.Reply += "<"
+	post(http.StatusBadRequest)
+	request.Evidence.Reply = strings.Repeat("<", 64<<10)
+	post(http.StatusRequestEntityTooLarge)
+	if store.finishCalls != 1 {
+		t.Fatalf("finish store calls=%d, want one", store.finishCalls)
 	}
 }

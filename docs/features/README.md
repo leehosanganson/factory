@@ -5,7 +5,7 @@ This index links to documentation for behavior in the current Factory CLI and RE
 ## REST service and browser UI
 
 - [REST job server](rest-server.md)
-- [Local Compose API control plane](compose-local-control-plane.md)
+- [Local Compose task board](compose-local-control-plane.md)
 - [Embedded REST operator dashboard](rest-web-ui.md)
 
 ## Technical references

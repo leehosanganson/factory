@@ -46,11 +46,13 @@ type dashboardThreadDetailResponse struct {
 }
 
 type submitterDashboardJobResponse struct {
-	ID           string                         `json:"id"`
-	Status       restjobs.Status                `json:"status"`
-	CreatedAt    time.Time                      `json:"created_at"`
-	UpdatedAt    time.Time                      `json:"updated_at"`
-	Verification *restjobs.VerificationEvidence `json:"verification,omitempty"`
+	ID             string                         `json:"id"`
+	Status         restjobs.Status                `json:"status"`
+	CreatedAt      time.Time                      `json:"created_at"`
+	UpdatedAt      time.Time                      `json:"updated_at"`
+	Verification   *restjobs.VerificationEvidence `json:"verification,omitempty"`
+	Reply          string                         `json:"reply,omitempty"`
+	ReplyTruncated bool                           `json:"reply_truncated,omitempty"`
 }
 
 type submitterDashboardJobPageResponse struct {
@@ -92,12 +94,18 @@ func projectDashboardThreadJobs(jobs []restjobs.Snapshot) []dashboardThreadJobRe
 }
 
 func projectSubmitterDashboardJob(job restjobs.Snapshot) submitterDashboardJobResponse {
-	return submitterDashboardJobResponse{ID: job.ID, Status: job.Status, CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt, Verification: terminalVerification(job)}
+	result := submitterDashboardJobResponse{ID: job.ID, Status: job.Status, CreatedAt: job.CreatedAt, UpdatedAt: job.UpdatedAt, Verification: terminalVerification(job)}
+	if job.Status == restjobs.StatusSucceeded && job.Verification != nil {
+		result.Reply, result.ReplyTruncated = job.Verification.Reply, job.Verification.ReplyTruncated
+	}
+	return result
 }
 
 func terminalVerification(job restjobs.Snapshot) *restjobs.VerificationEvidence {
-	if job.Status.Terminal() {
-		return job.Verification
+	if job.Status.Terminal() && job.Verification != nil {
+		evidence := *job.Verification
+		evidence.Reply, evidence.ReplyTruncated = "", false
+		return &evidence
 	}
 	return nil
 }

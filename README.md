@@ -8,7 +8,7 @@ Browser → Controller ↔ PostgreSQL
                   Workers → configured harness
 ```
 
-The product direction is described in the [Factory Worker MVP](docs/roadmap/factory-unit-mvp.md). It is distinct from the current implementation: today's Compose setup is a development sample with an opt-in Worker, today's Worker connects directly to PostgreSQL, and today's browser UI is operator-focused. See [implemented features](docs/features/README.md) for shipped behavior.
+The [local Compose task board](docs/features/compose-local-control-plane.md) runs one Pi Worker and an HTTPS browser UI. See that guide for Pi credentials and setup. GitHub is not required. The [Factory Worker MVP](docs/roadmap/factory-unit-mvp.md) describes the broader product direction.
 
 ## Run Factory's local CLI
 

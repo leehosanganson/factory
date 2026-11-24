@@ -68,15 +68,15 @@ def remote_worker_config(server):
         "allow_insecure_http": True,
         "shared_secret_file": "/run/factory-secrets/remote-worker-secret",
         "worker_id": "compose-remote-worker",
+        "max_concurrent_jobs": limits()["workers"],
         "repositories": server["repositories"],
         "harness_profiles": {
             "compose": {
-                "executable": "/opt/factory/harness",
-                "args": ["-p", "--no-session", "--append-system-prompt", "{system_prompt}", "{task}"],
+                "executable": "/usr/local/bin/pi",
+                "adapter": "pi",
                 "repositories": sorted(server["repositories"]),
             },
         },
-        "verification_checks": [["test", "-f", "compose-worker-result.txt"]],
         "limits": {
             "job_timeout": server.get("limits", limits())["job_timeout"],
             "harness_output_bytes": server.get("limits", limits())["harness_output_bytes"],
@@ -108,7 +108,7 @@ def add_remote_worker_config(directory: Path) -> None:
     api = server.get("remote_worker_api")
     if not isinstance(api, dict) or api.get("enabled") is not True or api.get("secret_file") != "/run/factory-secrets/remote-worker-secret":
         raise ValueError("server configuration must enable the Compose remote Worker API")
-    write_private(directory / "remote-worker-secret", secrets.token_bytes(32))
+    write_private(directory / "remote-worker-secret", secrets.token_hex(32).encode())
     try:
         write_private(directory / "remote-worker.json", (json.dumps(remote_worker_config(server), indent=2) + "\n").encode())
     except BaseException:
@@ -129,8 +129,9 @@ def create(directory: Path) -> None:
 
     api_key = secrets.token_hex(32)
     operator_token = secrets.token_hex(32)
+    submitter_token = secrets.token_hex(32)
     postgres_password = secrets.token_hex(32)
-    remote_worker_secret = secrets.token_bytes(32)
+    remote_worker_secret = secrets.token_hex(32).encode()
     config = {
         "mode": "local_process",
         "execution": {"mode": "local"},
@@ -145,6 +146,12 @@ def create(directory: Path) -> None:
             {
                 "id": "local-operator",
                 "role": "operator",
+                "token_file": "/etc/factory/operator-verifier.json",
+                "enabled": True,
+            },
+            {
+                "id": "local-owner",
+                "role": "submitter",
                 "token_file": "/etc/factory/operator-verifier.json",
                 "enabled": True,
             }
@@ -167,15 +174,17 @@ def create(directory: Path) -> None:
         verifier = {
             "version": 1,
             "principals": [
-                {"id": "local-operator", "token_sha256": hashlib.sha256(operator_token.encode()).hexdigest()}
+                {"id": "local-operator", "token_sha256": hashlib.sha256(operator_token.encode()).hexdigest()},
+                {"id": "local-owner", "token_sha256": hashlib.sha256(submitter_token.encode()).hexdigest()}
             ],
         }
         write_private(directory / "operator-verifier.json", (json.dumps(verifier, indent=2) + "\n").encode())
+        write_private(directory / "owner-token", (submitter_token + "\n").encode())
         write_private(directory / "operator-token", (operator_token + "\n").encode())
         write_private(directory / "postgres-password", (postgres_password + "\n").encode())
     except BaseException:
         # Remove only regular generated files; never follow or remove unexpected entries.
-        for name in ("server.json", "worker.json", "remote-worker.json", "remote-worker-secret", "api-key", "operator-verifier.json", "operator-token", "postgres-password"):
+        for name in ("server.json", "worker.json", "remote-worker.json", "remote-worker-secret", "api-key", "operator-verifier.json", "owner-token", "operator-token", "postgres-password"):
             try:
                 (directory / name).unlink()
             except FileNotFoundError:
@@ -186,7 +195,7 @@ def create(directory: Path) -> None:
 
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
-    target = root / ".local" / "factory-compose"
+    target = Path(os.environ.get("FACTORY_COMPOSE_CONFIG_DIR", root / ".local" / "factory-compose"))
     try:
         if sys.argv[1:] == ["--worker-config-only"]:
             add_worker_config(target)

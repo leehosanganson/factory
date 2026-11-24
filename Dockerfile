@@ -23,4 +23,11 @@ ENV FACTORY_IMAGE_ROLE=worker
 USER 65532:65532
 ENTRYPOINT ["/factory", "worker", "--config", "/etc/factory/worker.json"]
 
+FROM node:24-alpine AS pi-worker
+RUN apk add --no-cache git && addgroup -S -g 65532 factory && adduser -S -D -H -u 65532 -G factory factory \
+    && npm install --global @earendil-works/pi-coding-agent@1.3.0
+COPY --from=build /out/factory /factory
+ENV FACTORY_IMAGE_ROLE=remote-worker
+USER 65532:65532
+
 FROM controller AS default

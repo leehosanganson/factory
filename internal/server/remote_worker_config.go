@@ -22,6 +22,7 @@ type RemoteWorkerConfig struct {
 	AllowInsecureHTTP  bool                           `json:"allow_insecure_http,omitempty"`
 	SharedSecretFile   string                         `json:"shared_secret_file"`
 	WorkerID           string                         `json:"worker_id"`
+	MaxConcurrentJobs  int                            `json:"max_concurrent_jobs,omitempty"`
 	Repositories       map[string]string              `json:"repositories"`
 	HarnessProfiles    map[string]RemoteHarnessConfig `json:"harness_profiles"`
 	VerificationChecks [][]string                     `json:"verification_checks,omitempty"`
@@ -30,6 +31,7 @@ type RemoteWorkerConfig struct {
 
 // RemoteHarnessConfig is a locally trusted harness and its repository scope.
 type RemoteHarnessConfig struct {
+	Adapter      string   `json:"adapter,omitempty"`
 	Executable   string   `json:"executable"`
 	Args         []string `json:"args"`
 	Repositories []string `json:"repositories"`
@@ -68,11 +70,14 @@ func LoadRemoteWorkerConfig(path string) (RemoteWorkerConfig, error) {
 	if raw, exists := fields["allow_insecure_http"]; exists && string(bytes.TrimSpace(raw)) != "true" && string(bytes.TrimSpace(raw)) != "false" {
 		return RemoteWorkerConfig{}, errors.New("parse remote Worker config: allow_insecure_http must be a boolean")
 	}
-	var config RemoteWorkerConfig
+	config := RemoteWorkerConfig{MaxConcurrentJobs: 1}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil || decoder.Decode(new(any)) != io.EOF {
 		return RemoteWorkerConfig{}, errors.New("parse remote Worker config: invalid schema")
+	}
+	if config.MaxConcurrentJobs == 0 {
+		return RemoteWorkerConfig{}, errors.New("invalid remote Worker config: max_concurrent_jobs must be 1 or 2")
 	}
 	if err := config.Validate(); err != nil {
 		return RemoteWorkerConfig{}, fmt.Errorf("invalid remote Worker config: %w", err)
@@ -102,6 +107,9 @@ func (c RemoteWorkerConfig) Validate() error {
 	if !postgresWorkerIDPattern.MatchString(c.WorkerID) {
 		return errors.New("worker_id is invalid")
 	}
+	if c.MaxConcurrentJobs < 0 || c.MaxConcurrentJobs > 2 {
+		return errors.New("max_concurrent_jobs must be 1 or 2")
+	}
 	if len(c.Repositories) == 0 || len(c.HarnessProfiles) == 0 {
 		return errors.New("repositories and harness_profiles must not be empty")
 	}
@@ -115,8 +123,20 @@ func (c RemoteWorkerConfig) Validate() error {
 		if !remoteWorkerProfileNamePattern.MatchString(name) || strings.TrimSpace(profile.Executable) == "" || strings.ContainsAny(profile.Executable, "{}") || strings.ContainsRune(profile.Executable, 0) {
 			return errors.New("harness profile name or executable is invalid")
 		}
-		if err := validateHarnessArgs(profile.Args); err != nil {
-			return fmt.Errorf("harness profile %q: %w", name, err)
+		switch profile.Adapter {
+		case "":
+			if c.MaxConcurrentJobs > 1 {
+				return errors.New("max_concurrent_jobs greater than 1 requires the pi adapter")
+			}
+			if err := validateHarnessArgs(profile.Args); err != nil {
+				return fmt.Errorf("harness profile %q: %w", name, err)
+			}
+		case "pi":
+			if !filepath.IsAbs(profile.Executable) || len(profile.Args) != 0 || len(c.HarnessProfiles) != 1 || len(c.VerificationChecks) != 0 {
+				return errors.New("pi requires an absolute executable, no args or verification checks, and a single harness profile")
+			}
+		default:
+			return fmt.Errorf("harness profile %q: unknown adapter", name)
 		}
 		if len(profile.Repositories) == 0 {
 			return fmt.Errorf("harness profile %q must support at least one repository", name)

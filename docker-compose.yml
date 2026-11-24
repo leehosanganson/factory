@@ -48,7 +48,6 @@ services:
 
   provision-remote-worker-config:
     image: busybox:1.37
-    profiles: [remote-worker]
     user: "0:0"
     entrypoint: ["/bin/sh", "/provision/provision-compose-config.sh"]
     command: ["remote-worker"]
@@ -112,8 +111,10 @@ services:
     restart: unless-stopped
 
   remote-worker-init:
-    image: factory-worker:local
-    profiles: [remote-worker]
+    image: factory-pi-worker:local
+    build: &pi-worker-build
+      context: .
+      target: pi-worker
     user: "0:0"
     entrypoint: ["/bin/sh", "-ec"]
     command:
@@ -137,8 +138,8 @@ services:
     restart: "no"
 
   remote-worker:
-    image: factory-worker:local
-    profiles: [remote-worker]
+    image: factory-pi-worker:local
+    build: *pi-worker-build
     entrypoint: ["/factory", "worker", "remote", "--config", "/etc/factory/remote-worker.json"]
     depends_on:
       api:
@@ -149,17 +150,36 @@ services:
         condition: service_completed_successfully
     environment:
       XDG_STATE_HOME: /var/lib/factory/state
+      HOME: /var/lib/factory/state
+      PI_CODING_AGENT_DIR: /var/lib/factory/pi
     volumes:
       - factory-remote-worker-config:/etc/factory:ro
       - remote-worker-secrets:/run/factory-secrets:ro
       - remote-worker-checkout:/var/lib/factory/checkouts/local
       - remote-worker-state:/var/lib/factory/state
       - type: bind
-        source: ${FACTORY_COMPOSE_HARNESS_DIR:-./.local/factory-compose/harness}
+        source: ${FACTORY_COMPOSE_PI_DIR:-./.local/factory-compose/pi}
+        target: /var/lib/factory/pi
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${FACTORY_COMPOSE_HARNESS_DIR:-./scripts/fixtures}
         target: /opt/factory
         read_only: true
         bind:
           create_host_path: false
+    restart: unless-stopped
+
+  task-board:
+    image: caddy:2.10-alpine
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1::443"
+    volumes:
+      - ./scripts/compose-task-board.Caddyfile:/etc/caddy/Caddyfile:ro
+      - task-board-tls:/data
     restart: unless-stopped
 
   api:
@@ -195,3 +215,4 @@ volumes:
   worker-state:
   remote-worker-checkout:
   remote-worker-state:
+  task-board-tls:

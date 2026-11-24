@@ -77,14 +77,19 @@ class ComposeConfigTests(unittest.TestCase):
                 "enabled": True,
                 "secret_file": "/run/factory-secrets/remote-worker-secret",
             })
-            self.assertGreaterEqual(len(secret), 32)
+            self.assertRegex(secret, rb"^[0-9a-f]{64}$")
+            self.assertEqual(worker["max_concurrent_jobs"], 2)
+            self.assertEqual(server["limits"]["workers"], worker["max_concurrent_jobs"])
             self.assertEqual(worker["controller_base_url"], "http://api:8080")
             self.assertIs(worker["allow_insecure_http"], True)
             self.assertEqual(worker["shared_secret_file"], "/run/factory-secrets/remote-worker-secret")
             self.assertNotIn("persistence", worker)
             self.assertNotIn("dsn", worker)
             self.assertEqual(worker["repositories"]["local"], "/var/lib/factory/checkouts/local")
-            self.assertEqual(worker["harness_profiles"]["compose"]["executable"], "/opt/factory/harness")
+            self.assertEqual(worker["harness_profiles"]["compose"]["executable"], "/usr/local/bin/pi")
+            self.assertEqual(worker["harness_profiles"]["compose"]["adapter"], "pi")
+            self.assertEqual(server["principals"][1]["role"], "submitter")
+            self.assertEqual((directory / "owner-token").stat().st_mode & 0o777, 0o600)
             self.assertEqual(worker["harness_profiles"]["compose"]["repositories"], ["local"])
             for name in ("server.json", "remote-worker.json", "remote-worker-secret"):
                 self.assertEqual((directory / name).stat().st_mode & 0o777, 0o600)

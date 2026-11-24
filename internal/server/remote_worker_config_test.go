@@ -55,6 +55,42 @@ func TestLoadRemoteWorkerConfigIsStandaloneAndStrict(t *testing.T) {
 	}
 }
 
+func TestRemoteWorkerConcurrencyConfig(t *testing.T) {
+	const config = `{"controller_base_url":"https://controller.example","shared_secret_file":"/run/worker-secret","worker_id":"worker-a","repositories":{"widget":"/srv/widget"},"harness_profiles":{"fast":{%s,"repositories":["widget"]}},"limits":{"job_timeout":"1m","harness_output_bytes":4096}%s}`
+	const pi = `"adapter":"pi","executable":"/usr/bin/pi"`
+	const legacy = `"executable":"pi","args":["{system_prompt}","{task}"]`
+	for _, test := range []struct {
+		name, profile, concurrency string
+		valid                      bool
+	}{
+		{"legacy default", legacy, "", true},
+		{"legacy explicit one", legacy, `,"max_concurrent_jobs":1`, true},
+		{"Pi default", pi, "", true},
+		{"Pi explicit two", pi, `,"max_concurrent_jobs":2`, true},
+		{"legacy cannot opt into two", legacy, `,"max_concurrent_jobs":2`, false},
+		{"zero", pi, `,"max_concurrent_jobs":0`, false},
+		{"negative", pi, `,"max_concurrent_jobs":-1`, false},
+		{"over maximum", pi, `,"max_concurrent_jobs":3`, false},
+		{"fraction", pi, `,"max_concurrent_jobs":1.5`, false},
+		{"null concurrency", pi, `,"max_concurrent_jobs":null`, false},
+		{"null adapter", `"adapter":null,` + legacy, "", false},
+		{"null Pi args", pi + `,"args":null`, "", false},
+		{"null verification checks", pi, `,"verification_checks":null`, false},
+		{"null HTTP opt-in", pi, `,"allow_insecure_http":null`, false},
+		{"duplicate", pi, `,"max_concurrent_jobs":1,"max_concurrent_jobs":2`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "worker.json")
+			if err := os.WriteFile(path, fmt.Appendf(nil, config, test.profile, test.concurrency), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadRemoteWorkerConfig(path); (err == nil) != test.valid {
+				t.Fatalf("LoadRemoteWorkerConfig() error=%v, want valid=%v", err, test.valid)
+			}
+		})
+	}
+}
+
 func TestRemoteWorkerHTTPRequiresExplicitOptInOutsideLoopback(t *testing.T) {
 	for _, test := range []struct {
 		name          string

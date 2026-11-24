@@ -284,7 +284,7 @@ func (h *Handler) addThreadJob(w http.ResponseWriter, r *http.Request, threadID 
 		h.writeManagerError(w, err)
 		return
 	}
-	if isDashboardOperator(r) {
+	if isDashboardOperator(r) || isDashboardSubmitter(r) {
 		writeJSON(w, http.StatusAccepted, dashboardThreadAppendResponse{Thread: projectDashboardThread(snapshot.Thread), Job: projectDashboardThreadJob(job), Replayed: replayed})
 		return
 	}

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -55,7 +56,7 @@ func TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce(t *tes
 	db := stdlib.OpenDB(*config)
 	db.SetMaxOpenConns(1)
 	store, err := restjobs.NewPostgresStore(db, restjobs.Config{
-		QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 16, MaxEventsPerJob: 8, MaxTaskBytes: 128,
+		QueueCapacity: 4, MaxConcurrentJobs: 2, MaxRecords: 16, MaxEventsPerJob: 8, MaxTaskBytes: 128,
 	})
 	if err != nil {
 		_ = db.Close()
@@ -125,11 +126,72 @@ func TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce(t *tes
 	for _, principal := range []string{"bob", "admin"} {
 		assertPostgresHTTPInbox(t, handler, principal, 0)
 	}
+
+	create := httptest.NewRequest(http.MethodPost, "/v1/threads", strings.NewReader(`{"repository":"widget","task":"board task"}`))
+	create.Header.Set("Content-Type", "application/json")
+	create.Header.Set("Idempotency-Key", "board-thread")
+	created := httptest.NewRecorder()
+	handler.ServeAsDashboardSubmitter(created, create, restserver.Principal{ID: "alice", Role: "submitter"})
+	var board dashboardThreadCreateResponse
+	if created.Code != http.StatusAccepted || json.Unmarshal(created.Body.Bytes(), &board) != nil || board.Job.ID == "" {
+		t.Fatalf("board Thread create: %d %s", created.Code, created.Body.String())
+	}
+	_, followUp, _, err := store.AdmitThreadJobAs(board.Thread.ID, "board-follow-up", "alice", restjobs.Request{Repository: "widget", Task: "board follow-up"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, _, err := store.AdmitThreadAs("legacy-after-board", "alice", restjobs.Request{Repository: "widget", Task: "legacy Thread job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimBoard := func(id, capability string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := fmt.Sprintf(`{"claim_id":%q,"worker_id":"http-worker","boot_id":"http-boot","repositories":["widget"]%s}`, id, capability)
+		return remoteRequest(handler, "/v1/worker/claims", body, remoteTestSecret)
+	}
+	old := claimBoard("old", "")
+	var oldClaim postgresHTTPWorkerClaim
+	if old.Code != http.StatusOK || json.Unmarshal(old.Body.Bytes(), &oldClaim) != nil || oldClaim.Job.ID != legacy.Jobs[0].ID || strings.Contains(old.Body.String(), `"thread_`) {
+		t.Fatalf("legacy HTTP claim: %d %s", old.Code, old.Body.String())
+	}
+	if response := finishPostgresHTTPWorkerJob(t, handler, oldClaim); response.Code != http.StatusOK {
+		t.Fatalf("legacy finish: %d %s", response.Code, response.Body.String())
+	}
+	if claim, err := store.ClaimNextAttempt(); !errors.Is(err, restjobs.ErrNoQueuedJobs) {
+		t.Fatalf("direct claim picked %q, err=%v; want no Jobs", claim.Job.ID, err)
+	}
+	const pi = `,"thread_sessions":true`
+	checkBoardClaim := func(id, jobID string, position int) postgresHTTPWorkerClaim {
+		t.Helper()
+		response := claimBoard(id, pi)
+		var claim postgresHTTPWorkerClaim
+		if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &claim) != nil || claim.Job.ID != jobID || claim.Job.ThreadID != board.Thread.ID || claim.Job.ThreadPosition != position {
+			t.Fatalf("Pi claim: %d %s, want Job %s at position %d", response.Code, response.Body.String(), jobID, position)
+		}
+		return claim
+	}
+	first := checkBoardClaim("pi-first", board.Job.ID, 1)
+	if retry := checkBoardClaim("pi-first", board.Job.ID, 1); retry != first {
+		t.Fatal("Pi claim retry changed the attempt")
+	}
+	if retry := claimBoard("pi-first", `,"thread_sessions":false`); retry.Code != http.StatusConflict {
+		t.Fatalf("claim capability change: %d %s", retry.Code, retry.Body.String())
+	}
+	if next := claimBoard("pi-next", pi); next.Code != http.StatusNoContent {
+		t.Fatalf("claim before predecessor finished: %d %s", next.Code, next.Body.String())
+	}
+	if response := finishPostgresHTTPWorkerJob(t, handler, first); response.Code != http.StatusOK {
+		t.Fatalf("board finish: %d %s", response.Code, response.Body.String())
+	}
+	checkBoardClaim("pi-next", followUp.ID, 2)
+
 }
 
 type postgresHTTPWorkerClaim struct {
 	Job struct {
-		ID string `json:"id"`
+		ID             string `json:"id"`
+		ThreadID       string `json:"thread_id"`
+		ThreadPosition int    `json:"thread_position"`
 	} `json:"job"`
 	Attempt struct {
 		Generation int64  `json:"generation"`

@@ -447,10 +447,10 @@ func (s *PostgresStore) admitAsContext(parent context.Context, key, principalID 
 func (s *PostgresStore) claimNext(attemptAware bool) (AttemptClaim, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return s.claimNextContext(ctx, attemptAware, "", "", "", nil)
+	return s.claimNextContext(ctx, attemptAware, "", "", "", nil, false)
 }
 
-func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool, workerID, bootID, claimID string, repositories []string) (AttemptClaim, error) {
+func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool, workerID, bootID, claimID string, repositories []string, threadSessions bool) (AttemptClaim, error) {
 	if ctx == nil {
 		return AttemptClaim{}, ErrInvalidInput
 	}
@@ -467,7 +467,11 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool,
 		}
 		repositories = append([]string(nil), repositories...)
 		sort.Strings(repositories)
-		repositoryCapabilityHash = fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(repositories, "\x00"))))
+		capabilities := strings.Join(repositories, "\x00")
+		if threadSessions {
+			capabilities = "\x00thread_sessions\x00" + capabilities
+		}
+		repositoryCapabilityHash = fmt.Sprintf("%x", sha256.Sum256([]byte(capabilities)))
 	}
 	var token string
 	var err error
@@ -506,10 +510,16 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool,
 			if scanErr != nil {
 				return AttemptClaim{}, postgresClaimContextError(ctx, "read retried PostgreSQL remote claim")
 			}
+			claim := AttemptClaim{Job: snap, Attempt: AttemptHandle{JobID: existingJob, Generation: existingGeneration, OwnerToken: existingToken, WorkerID: workerID, BootID: bootID}}
+			if threadSessions {
+				if err := loadClaimThread(ctx, tx, &claim); err != nil {
+					return AttemptClaim{}, err
+				}
+			}
 			if err = tx.Commit(); err != nil {
 				return AttemptClaim{}, postgresClaimContextError(ctx, "commit PostgreSQL remote claim retry")
 			}
-			return AttemptClaim{Job: snap, Attempt: AttemptHandle{JobID: existingJob, Generation: existingGeneration, OwnerToken: existingToken, WorkerID: workerID, BootID: bootID}}, nil
+			return claim, nil
 		}
 		if !errors.Is(lookupErr, sql.ErrNoRows) {
 			return AttemptClaim{}, postgresClaimContextError(ctx, "read PostgreSQL remote claim")
@@ -546,9 +556,23 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool,
 	}
 	var id string
 	if claimID == "" {
-		err = tx.QueryRowContext(ctx, `SELECT id FROM factory_jobs WHERE status='queued' ORDER BY queue_sequence LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&id)
+		err = tx.QueryRowContext(ctx, `SELECT j.id FROM factory_jobs j WHERE j.status='queued'
+			AND NOT EXISTS (SELECT 1 FROM factory_thread_jobs m JOIN factory_threads t ON t.id=m.thread_id WHERE m.job_id=j.id AND t.thread_sessions)
+			ORDER BY j.queue_sequence LIMIT 1 FOR UPDATE OF j SKIP LOCKED`).Scan(&id)
 	} else {
-		err = tx.QueryRowContext(ctx, `SELECT id FROM factory_jobs WHERE status='queued' AND request_json::jsonb->>'repository'=ANY($1::text[]) ORDER BY queue_sequence LIMIT 1 FOR UPDATE SKIP LOCKED`, postgresTextArray(repositories)).Scan(&id)
+		// Check Thread order under the capacity lock, including predecessors this worker cannot claim.
+		err = tx.QueryRowContext(ctx, `SELECT j.id FROM factory_jobs j
+			LEFT JOIN factory_thread_jobs m ON m.job_id=j.id
+			LEFT JOIN factory_threads t ON t.id=m.thread_id
+			WHERE j.status='queued' AND j.request_json::jsonb->>'repository'=ANY($1::text[])
+			AND (t.id IS NULL OR t.thread_sessions=$2)
+			AND NOT EXISTS (
+				SELECT 1 FROM factory_thread_jobs member
+				JOIN factory_thread_jobs earlier ON earlier.thread_id=member.thread_id AND earlier.position<member.position
+				JOIN factory_jobs predecessor ON predecessor.id=earlier.job_id
+				WHERE member.job_id=j.id AND predecessor.status IN ('queued','running')
+			)
+			ORDER BY j.queue_sequence LIMIT 1 FOR UPDATE OF j SKIP LOCKED`, postgresTextArray(repositories), threadSessions).Scan(&id)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return AttemptClaim{}, ErrNoQueuedJobs
@@ -592,17 +616,30 @@ func (s *PostgresStore) claimNextContext(ctx context.Context, attemptAware bool,
 	if err != nil {
 		return AttemptClaim{}, postgresClaimContextError(ctx, "read claimed PostgreSQL job")
 	}
+	claim := AttemptClaim{Job: snap}
+	if threadSessions {
+		if err := loadClaimThread(ctx, tx, &claim); err != nil {
+			return AttemptClaim{}, err
+		}
+	}
 	if err = ctx.Err(); err != nil {
 		return AttemptClaim{}, err
 	}
 	if err = tx.Commit(); err != nil {
 		return AttemptClaim{}, postgresClaimContextError(ctx, "commit PostgreSQL job claim")
 	}
-	claim := AttemptClaim{Job: snap}
 	if attemptAware {
 		claim.Attempt = AttemptHandle{JobID: id, Generation: generation, OwnerToken: token, WorkerID: workerID, BootID: bootID}
 	}
 	return claim, nil
+}
+
+func loadClaimThread(ctx context.Context, tx *sql.Tx, claim *AttemptClaim) error {
+	err := tx.QueryRowContext(ctx, `SELECT thread_id,position FROM factory_thread_jobs WHERE job_id=$1`, claim.Job.ID).Scan(&claim.ThreadID, &claim.ThreadPosition)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return postgresClaimContextError(ctx, "read PostgreSQL remote claim Thread membership")
+	}
+	return nil
 }
 
 func postgresTextArray(values []string) string {
@@ -641,17 +678,17 @@ func (s *PostgresStore) ClaimNextAttemptForWorker(workerID, bootID string) (Atte
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return s.claimNextContext(ctx, true, workerID, bootID, "", nil)
+	return s.claimNextContext(ctx, true, workerID, bootID, "", nil, false)
 }
 
 // ClaimRemoteAttempt returns the same attempt when claimID is retried while its
 // exact lease is still active. A completed or expired claim is stale, never a
 // new claim. Claim IDs are globally unique across workers and boots.
-func (s *PostgresStore) ClaimRemoteAttempt(ctx context.Context, claimID, workerID, bootID string, repositories []string) (AttemptClaim, error) {
+func (s *PostgresStore) ClaimRemoteAttempt(ctx context.Context, claimID, workerID, bootID string, repositories []string, threadSessions bool) (AttemptClaim, error) {
 	if ctx == nil || !validPostgresOwnerID(claimID) || !validPostgresOwnerID(workerID) || !validPostgresOwnerID(bootID) {
 		return AttemptClaim{}, ErrInvalidInput
 	}
-	return s.claimNextContext(ctx, true, workerID, bootID, claimID, repositories)
+	return s.claimNextContext(ctx, true, workerID, bootID, claimID, repositories, threadSessions)
 }
 func (s *PostgresStore) WaitClaim(ctx context.Context) (Snapshot, error) {
 	c, e := s.waitClaim(ctx, false)
@@ -670,7 +707,7 @@ func (s *PostgresStore) waitClaim(ctx context.Context, attempt bool) (AttemptCla
 		if err := ctx.Err(); err != nil {
 			return AttemptClaim{}, err
 		}
-		c, err := s.claimNextContext(ctx, attempt, "", "", "", nil)
+		c, err := s.claimNextContext(ctx, attempt, "", "", "", nil, false)
 		if err == nil {
 			return c, nil
 		}
@@ -1394,6 +1431,9 @@ func (s *PostgresStore) FinishRemoteAttempt(a AttemptHandle, status Status, evid
 	threadID, wasDone, err := postgresThreadDoneTransition(ctx, tx, a.JobID)
 	if err != nil {
 		return err
+	}
+	if evidence.Reply != "" && (threadID == "" || status != StatusSucceeded) {
+		return ErrInvalidInput
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO factory_rest_remote_results(job_id,generation,worker_id,boot_id,owner_token,status,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7)`, a.JobID, a.Generation, a.WorkerID, a.BootID, a.OwnerToken, status, string(encoded)); err != nil {
 		return errors.New("record PostgreSQL remote result")

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/leehosanganson/factory/internal/harness/pi"
 	restjobs "github.com/leehosanganson/factory/internal/jobs"
 	restserver "github.com/leehosanganson/factory/internal/server"
 	restworker "github.com/leehosanganson/factory/internal/worker"
@@ -34,17 +36,20 @@ const remoteWorkerHTTPTimeout = 15 * time.Second
 const remoteWorkerResponseLimit = 512 << 10
 
 type remoteWorkerClient struct {
-	baseURL      string
-	workerID     string
-	bootID       string
-	repositories []string
-	secret       string
-	client       *http.Client
+	baseURL        string
+	workerID       string
+	bootID         string
+	repositories   []string
+	threadSessions bool
+	secret         string
+	client         *http.Client
 }
 
 type remoteWorkerJob struct {
-	ID      string `json:"id"`
-	Request struct {
+	ThreadID       string `json:"thread_id,omitempty"`
+	ThreadPosition int    `json:"thread_position,omitempty"`
+	ID             string `json:"id"`
+	Request        struct {
 		Repository      string `json:"repository"`
 		Task            string `json:"task"`
 		Issue           *int   `json:"issue,omitempty"`
@@ -76,8 +81,10 @@ type remoteWorkerAttemptRequest struct {
 	BootID     string `json:"boot_id"`
 }
 type remoteWorkerEvidence struct {
-	Checks      []restjobs.VerificationCheck `json:"checks"`
-	Limitations []string                     `json:"limitations"`
+	Reply          string                       `json:"reply,omitempty"`
+	ReplyTruncated bool                         `json:"reply_truncated,omitempty"`
+	Checks         []restjobs.VerificationCheck `json:"checks"`
+	Limitations    []string                     `json:"limitations"`
 }
 type remoteWorkerFinish struct {
 	remoteWorkerAttemptRequest
@@ -115,7 +122,9 @@ func newRemoteWorkerClient(config restserver.RemoteWorkerConfig, secret []byte) 
 		return nil, errors.New("remote Worker Controller URL is invalid")
 	}
 	allowed := make(map[string]struct{})
+	var threadSessions bool
 	for _, profile := range config.HarnessProfiles {
+		threadSessions = threadSessions || profile.Adapter == "pi"
 		for _, alias := range profile.Repositories {
 			allowed[alias] = struct{}{}
 		}
@@ -125,7 +134,7 @@ func newRemoteWorkerClient(config restserver.RemoteWorkerConfig, secret []byte) 
 		repositories = append(repositories, alias)
 	}
 	sort.Strings(repositories)
-	return &remoteWorkerClient{baseURL: strings.TrimRight(parsed.String(), "/"), workerID: config.WorkerID, repositories: repositories, secret: string(secret), client: &http.Client{Timeout: remoteWorkerHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return &remoteWorkerClient{baseURL: strings.TrimRight(parsed.String(), "/"), workerID: config.WorkerID, repositories: repositories, threadSessions: threadSessions, secret: string(secret), client: &http.Client{Timeout: remoteWorkerHTTPTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 func (c *remoteWorkerClient) do(ctx context.Context, method, path string, body any, response any) (int, error) {
@@ -191,11 +200,12 @@ func (c *remoteWorkerClient) do(ctx context.Context, method, path string, body a
 func (c *remoteWorkerClient) claim(ctx context.Context, id string) (*remoteWorkerClaim, error) {
 	var claim remoteWorkerClaim
 	status, err := c.do(ctx, http.MethodPost, "/v1/worker/claims", struct {
-		ClaimID      string   `json:"claim_id"`
-		WorkerID     string   `json:"worker_id"`
-		BootID       string   `json:"boot_id"`
-		Repositories []string `json:"repositories"`
-	}{id, c.workerID, c.bootID, c.repositories}, &claim)
+		ClaimID        string   `json:"claim_id"`
+		WorkerID       string   `json:"worker_id"`
+		BootID         string   `json:"boot_id"`
+		Repositories   []string `json:"repositories"`
+		ThreadSessions bool     `json:"thread_sessions,omitempty"`
+	}{id, c.workerID, c.bootID, c.repositories, c.threadSessions}, &claim)
 	if err != nil {
 		return nil, err
 	}
@@ -307,13 +317,25 @@ func SelectRemoteHarness(config restserver.RemoteWorkerConfig, jobID, repository
 }
 
 // RunRemoteWorker executes Controller-assigned jobs without local persistence.
-// Transport failures stop new admission and leave uncertain claims inspectable.
+// Each slot resolves its claim and finish retries before claiming more work.
 func RunRemoteWorker(ctx context.Context, config restserver.RemoteWorkerConfig) error {
 	if ctx == nil {
 		return errors.New("remote Worker context must not be nil")
 	}
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("invalid remote Worker config: %w", err)
+	}
+	for _, profile := range config.HarnessProfiles {
+		if profile.Adapter == "pi" {
+			if _, err := exec.LookPath(profile.Executable); err != nil {
+				return errors.New("configured Pi executable is unavailable")
+			}
+			lock, err := lockPiWorker()
+			if err != nil {
+				return err
+			}
+			defer lock.Close()
+		}
 	}
 	secret, err := restserver.LoadRemoteWorkerSecret(config.SharedSecretFile)
 	if err != nil {
@@ -338,13 +360,36 @@ func runRemoteWorkerLoop(ctx context.Context, config restserver.RemoteWorkerConf
 		return err
 	}
 	client.bootID = bootID
-	for ctx.Err() == nil {
+	if config.MaxConcurrentJobs <= 1 {
+		return runRemoteWorkerSlot(ctx, ctx, config, client)
+	}
+
+	claimsCtx, stop := context.WithCancelCause(ctx)
+	defer stop(nil)
+	var slots sync.WaitGroup
+	for range config.MaxConcurrentJobs {
+		slots.Go(func() {
+			if err := runRemoteWorkerSlot(ctx, claimsCtx, config, client); err != nil {
+				stop(err)
+			}
+		})
+	}
+	slots.Wait()
+	if ctx.Err() != nil {
+		return nil
+	}
+	return context.Cause(claimsCtx)
+}
+
+func runRemoteWorkerSlot(ctx, claimsCtx context.Context, config restserver.RemoteWorkerConfig, client *remoteWorkerClient) error {
+	for claimsCtx.Err() == nil {
 		claimID, err := newRemoteClaimID(rand.Reader)
 		if err != nil {
 			return err
 		}
 		var claim *remoteWorkerClaim
-		for ctx.Err() == nil {
+		for claimsCtx.Err() == nil {
+			// Let a sent claim resolve: the Controller may already have assigned a job.
 			requestCtx, cancel := context.WithTimeout(ctx, remoteWorkerHTTPTimeout)
 			claim, err = client.claim(requestCtx, claimID)
 			cancel()
@@ -355,7 +400,7 @@ func runRemoteWorkerLoop(ctx context.Context, config restserver.RemoteWorkerConf
 			if !errors.As(err, &retryable) {
 				return err
 			}
-			if !waitRemoteWorkerRetry(ctx) {
+			if !waitRemoteWorkerRetry(claimsCtx) {
 				return nil
 			}
 		}
@@ -363,7 +408,7 @@ func runRemoteWorkerLoop(ctx context.Context, config restserver.RemoteWorkerConf
 			return nil
 		}
 		if claim == nil {
-			if !waitRemoteWorkerPoll(ctx) {
+			if !waitRemoteWorkerPoll(claimsCtx) {
 				return nil
 			}
 			continue
@@ -419,7 +464,8 @@ func cloneRemoteEvidence(value restjobs.VerificationEvidence) restjobs.Verificat
 	copy(checks, value.Checks)
 	limitations := make([]string, len(value.Limitations))
 	copy(limitations, value.Limitations)
-	return restjobs.VerificationEvidence{Checks: checks, Limitations: limitations}
+	value.Checks, value.Limitations = checks, limitations
+	return value
 }
 
 func newRemoteClaimID(reader io.Reader) (string, error) {
@@ -511,6 +557,9 @@ func runRemoteWorkerAttempt(parent context.Context, config restserver.RemoteWork
 	if err != nil {
 		return finishRemoteWorkerFailure(parent, cancel, heartbeatDone, config, client, claim)
 	}
+	if profile.Adapter == "pi" {
+		return runRemoteHarnessAttempt(parent, jobCtx, cancel, heartbeatDone, config, client, claim, pi.Runner{Executable: profile.Executable}, root, resultsBase)
+	}
 	workspace, err := restworkspace.New(restworkspace.Config{RepositoryRoot: root, ResultsRoot: filepath.Join(resultsBase, aliasDirectory(claim.Job.Request.Repository), "results")})
 	if err != nil {
 		return finishRemoteWorkerFailure(parent, cancel, heartbeatDone, config, client, claim)
@@ -546,6 +595,13 @@ func runRemoteWorkerAttempt(parent context.Context, config restserver.RemoteWork
 	if result.Err == nil && executor.Complete(jobCtx, job, attemptHandle, result) != nil {
 		result.Err = errors.New("remote Worker completion failed")
 	}
+	evidenceMu.Lock()
+	observed := cloneRemoteEvidence(evidence)
+	evidenceMu.Unlock()
+	return finishRemoteExecution(parent, cancel, heartbeatDone, config, client, claim, observed, result.Err)
+}
+
+func finishRemoteExecution(parent context.Context, cancel context.CancelFunc, heartbeatDone <-chan remoteHeartbeatResult, config restserver.RemoteWorkerConfig, client *remoteWorkerClient, claim remoteWorkerClaim, evidence restjobs.VerificationEvidence, executionErr error) error {
 	cancel()
 	heartbeatResult := <-heartbeatDone
 	if parent.Err() != nil {
@@ -555,17 +611,16 @@ func runRemoteWorkerAttempt(parent context.Context, config restserver.RemoteWork
 		return errors.New("remote Worker heartbeat failed; assigned job remains inspectable")
 	}
 	status := restjobs.StatusSucceeded
-	if result.Err != nil {
+	if executionErr != nil {
 		status = restjobs.StatusFailed
 	}
-	if heartbeatResult.cancellationRequested && errors.Is(result.Err, context.Canceled) {
+	if heartbeatResult.cancellationRequested && errors.Is(executionErr, context.Canceled) {
 		status = restjobs.StatusCanceled
 	}
 	if heartbeatResult.cancellationRequested && status != restjobs.StatusCanceled {
 		return errors.New("remote Worker execution did not confirm cooperative cancellation; assigned job remains inspectable")
 	}
-	evidenceMu.Lock()
-	if evidence.Checks == nil {
+	if len(evidence.Limitations) == 0 {
 		evidence = restjobs.VerificationEvidence{Checks: make([]restjobs.VerificationCheck, len(config.VerificationChecks)), Limitations: []string{restjobs.LimitationAgentNotVerdict}}
 		if len(evidence.Checks) == 0 {
 			evidence.Limitations = append(evidence.Limitations, restjobs.LimitationNoChecksConfigured)
@@ -586,9 +641,10 @@ func runRemoteWorkerAttempt(parent context.Context, config restserver.RemoteWork
 			}
 		}
 	}
-	evidence = cloneRemoteEvidence(evidence)
-	evidenceMu.Unlock()
-	outcome := remoteWorkerFinish{remoteWorkerAttemptRequest: remoteWorkerAttemptRequest{claim.Attempt.Generation, claim.Attempt.OwnerToken, claim.Attempt.WorkerID, claim.Attempt.BootID}, Status: status, Evidence: remoteWorkerEvidence{Checks: evidence.Checks, Limitations: evidence.Limitations}}
+	if status != restjobs.StatusSucceeded {
+		evidence.Reply, evidence.ReplyTruncated = "", false
+	}
+	outcome := remoteWorkerFinish{remoteWorkerAttemptRequest: remoteWorkerAttemptRequest{claim.Attempt.Generation, claim.Attempt.OwnerToken, claim.Attempt.WorkerID, claim.Attempt.BootID}, Status: status, Evidence: remoteWorkerEvidence{Checks: evidence.Checks, Limitations: evidence.Limitations, Reply: evidence.Reply, ReplyTruncated: evidence.ReplyTruncated}}
 	if err := retryRemoteFinishAfterStop(parent, client, claim.Attempt, outcome, true); err != nil && parent.Err() == nil {
 		return err
 	}

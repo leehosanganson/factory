@@ -201,7 +201,8 @@ func dashboardSubmitterRoute(path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/v1/threads/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/v1/threads/"), "/")
-		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet ||
+			len(parts) == 2 && parts[0] != "" && parts[1] == "jobs" && method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/v1/jobs/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/v1/jobs/"), "/")
@@ -894,7 +895,18 @@ func (h *Handler) createThread(w http.ResponseWriter, r *http.Request, caller re
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 		return
 	}
-	snapshot, replayed, err := threadStore.AdmitThreadAs(keyValues[0], caller.ID, request)
+	admit := threadStore.AdmitThreadAs
+	if h.config.RemoteWorkerAPI != nil && isDashboardSubmitter(r) {
+		sessionStore, ok := threadStore.(interface {
+			AdmitSessionThreadAs(string, string, restjobs.Request) (restjobs.ThreadSnapshot, bool, error)
+		})
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, "thread_unavailable", "Thread operations are unavailable.")
+			return
+		}
+		admit = sessionStore.AdmitSessionThreadAs
+	}
+	snapshot, replayed, err := admit(keyValues[0], caller.ID, request)
 	if err != nil {
 		h.writeManagerError(w, err)
 		return
