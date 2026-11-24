@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -277,6 +278,168 @@ func TestSQLiteScheduleDispatchLimitProcessesDifferentDueSchedulesOnce(t *testin
 	page, err := store.ListJobs(context.Background(), 0, 0, 10)
 	if err != nil || len(page.Jobs) != 3 {
 		t.Fatalf("jobs=(%d,%v), want three distinct schedule Jobs", len(page.Jobs), err)
+	}
+}
+
+func TestSQLiteScheduleDispatchSkipsMissedOccurrencesWithoutBacklogReplay(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "schedule-missed-occurrences.db"), Config{QueueCapacity: 4, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	schedule, _, err := store.CreateSchedule("alice", "missed-occurrences", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: "scheduled task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2024, 1, 2, 3, 4, 0, 0, time.UTC)
+	dispatchNow := first.Add(5*time.Minute + 30*time.Second)
+	if _, err := store.db.Exec(`UPDATE factory_schedules SET next_occurrence_at=? WHERE id=?`, first.Format(time.RFC3339Nano), schedule.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.DispatchScheduleOccurrences(context.Background(), dispatchNow, 1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.GetSchedule(schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNext := first.Add(6 * time.Minute)
+	if !got.NextOccurrence().Equal(wantNext) {
+		t.Errorf("next occurrence=%s, want %s", got.NextOccurrence(), wantNext)
+	}
+	if skipped := got.SkippedOccurrences(); skipped == nil || skipped.Revision != schedule.Revision || skipped.Count != 5 || !skipped.FirstAt.Equal(first) || !skipped.LastAt.Equal(first.Add(4*time.Minute)) {
+		t.Errorf("skipped occurrences=%+v, want revision %d, count 5, range [%s, %s]", skipped, schedule.Revision, first, first.Add(4*time.Minute))
+	}
+
+	page, err := store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRun := first.Add(5 * time.Minute)
+	if len(page.Runs) != 1 || !page.Runs[0].OccurrenceAt.Equal(wantRun) {
+		t.Fatalf("schedule runs=%+v, want one run for %s", page.Runs, wantRun)
+	}
+
+	// A repeat dispatch at the same time must not replay the skipped backlog or
+	// create another run for the occurrence that was already admitted.
+	if err := store.DispatchScheduleOccurrences(context.Background(), dispatchNow, 1); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.GetSchedule(schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.NextOccurrence().Equal(wantNext) {
+		t.Errorf("next occurrence after repeat dispatch=%s, want %s", got.NextOccurrence(), wantNext)
+	}
+	if skipped := got.SkippedOccurrences(); skipped == nil || skipped.Revision != schedule.Revision || skipped.Count != 5 || !skipped.FirstAt.Equal(first) || !skipped.LastAt.Equal(first.Add(4*time.Minute)) {
+		t.Errorf("skipped occurrences after repeat dispatch=%+v, want unchanged exact range and count", skipped)
+	}
+	page, err = store.ListScheduleRuns(schedule.ID, "alice", false, 0, 10)
+	if err != nil || len(page.Runs) != 1 || !page.Runs[0].OccurrenceAt.Equal(wantRun) {
+		t.Fatalf("schedule runs after repeat dispatch=%+v err=%v, want only occurrence %s", page.Runs, err, wantRun)
+	}
+}
+
+func TestSQLiteScheduleDispatchRollsBackAndRetriesFailedAdmission(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "schedule-dispatch-rollback.db"), Config{QueueCapacity: 2, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	const task = "scheduled rollback retry task"
+	schedule, _, err := store.CreateSchedule("alice", "rollback-retry", ScheduleInput{Cron: "* * * * *", Repository: "widget", Task: task})
+	if err != nil {
+		t.Fatal(err)
+	}
+	occurrence := schedule.NextOccurrence()
+	if occurrence.IsZero() {
+		t.Fatal("created schedule has no next occurrence")
+	}
+
+	if _, err := store.db.Exec(`CREATE TRIGGER test_schedule_dispatch_rollback_retry
+		BEFORE INSERT ON factory_jobs
+		WHEN NEW.request_json LIKE '%scheduled rollback retry task%'
+		BEGIN SELECT RAISE(ABORT, 'injected schedule dispatch failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), occurrence, 1); err == nil || !strings.Contains(err.Error(), "persist SQLite scheduled Job") {
+		t.Fatalf("dispatch error=%v, want scheduled Job persistence failure", err)
+	}
+
+	assertRowCount := func(table, where string, args ...any) int {
+		t.Helper()
+		var count int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM `+table+` `+where, args...).Scan(&count); err != nil {
+			t.Fatalf("count rows in %s: %v", table, err)
+		}
+		return count
+	}
+	if got := assertRowCount("factory_jobs", ""); got != 0 {
+		t.Fatalf("jobs after failed dispatch=%d, want none", got)
+	}
+	key := scheduleOccurrenceKey(schedule.ID, schedule.Revision, occurrence)
+	if got := assertRowCount("factory_job_idempotency", ""); got != 0 {
+		t.Fatalf("idempotency rows after failed dispatch=%d, want none", got)
+	}
+	if got := assertRowCount("factory_schedule_runs", "WHERE schedule_id=?", schedule.ID); got != 0 {
+		t.Fatalf("schedule run rows after failed dispatch=%d, want none", got)
+	}
+	unchanged, err := store.GetSchedule(schedule.ID)
+	if err != nil || !unchanged.NextOccurrence().Equal(occurrence) || unchanged.PendingOccurrence() != nil {
+		t.Fatalf("schedule after failed dispatch=(%+v,%v), want unchanged occurrence %s and no pending occurrence", unchanged, err, occurrence)
+	}
+
+	if _, err := store.db.Exec(`DROP TRIGGER test_schedule_dispatch_rollback_retry`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DispatchScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatalf("retry dispatch: %v", err)
+	}
+
+	if got := assertRowCount("factory_jobs", ""); got != 1 {
+		t.Fatalf("jobs after retry=%d, want exactly one", got)
+	}
+	if got := assertRowCount("factory_job_idempotency", ""); got != 1 {
+		t.Fatalf("idempotency rows after retry=%d, want exactly one", got)
+	}
+	if got := assertRowCount("factory_schedule_runs", "WHERE schedule_id=?", schedule.ID); got != 1 {
+		t.Fatalf("schedule run rows after retry=%d, want exactly one", got)
+	}
+	page, err := store.ListScheduleRuns(schedule.ID, schedule.Owner, false, 0, 10)
+	if err != nil || len(page.Runs) != 1 || !page.Runs[0].OccurrenceAt.Equal(occurrence) {
+		t.Fatalf("schedule runs after retry=(%+v,%v), want one run for %s", page.Runs, err, occurrence)
+	}
+	job, err := store.Get(page.Runs[0].JobID)
+	if err != nil || job.Status != StatusQueued || job.Request.Task != task || job.Request.Repository != schedule.Repository || job.Submitter != schedule.Owner {
+		t.Fatalf("scheduled job after retry=(%+v,%v), want one complete queued Job from the schedule", job, err)
+	}
+	if got := assertRowCount("factory_job_events", "WHERE job_id=?", job.ID); got != 1 {
+		t.Fatalf("scheduled Job events=%d, want its initial queued event", got)
+	}
+	var idempotencyJobID string
+	if err := store.db.QueryRow(`SELECT job_id FROM factory_job_idempotency WHERE principal_id=? AND key=?`, schedule.Owner, key).Scan(&idempotencyJobID); err != nil || idempotencyJobID != job.ID {
+		t.Fatalf("idempotency Job ID=(%q,%v), want scheduled Job %s", idempotencyJobID, err, job.ID)
+	}
+	updated, err := store.GetSchedule(schedule.ID)
+	if err != nil || !updated.NextOccurrence().After(occurrence) || updated.PendingOccurrence() != nil {
+		t.Fatalf("schedule after retry=(%+v,%v), want advanced next occurrence and no pending occurrence", updated, err)
+	}
+
+	if err := store.DispatchScheduleOccurrences(context.Background(), occurrence, 1); err != nil {
+		t.Fatalf("repeat dispatch: %v", err)
+	}
+	if got := assertRowCount("factory_jobs", ""); got != 1 {
+		t.Fatalf("jobs after repeat dispatch=%d, want no duplicate", got)
+	}
+	if got := assertRowCount("factory_job_idempotency", ""); got != 1 {
+		t.Fatalf("idempotency rows after repeat dispatch=%d, want no duplicate", got)
+	}
+	if got := assertRowCount("factory_schedule_runs", "WHERE schedule_id=?", schedule.ID); got != 1 {
+		t.Fatalf("schedule run rows after repeat dispatch=%d, want no duplicate", got)
 	}
 }
 

@@ -472,6 +472,52 @@ func TestSQLiteWorkerSessionCapabilityAuditFailuresRollBackIssuanceAndRotation(t
 	}
 }
 
+func TestSQLiteWorkerCapabilityRetirementAuditFailureRollsBackAndRetries(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "session-retirement-audit-failure.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	const principal = "worker-failed-retirement"
+	session, _, err := store.RegisterWorkerSession(ctx, principal, "boot-retirement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`CREATE TRIGGER reject_retirement_audit BEFORE INSERT ON factory_worker_session_audit WHEN NEW.event='retired' BEGIN SELECT RAISE(ABORT,'injected audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RetireWorkerCapability(ctx, principal, session.Capability); err == nil {
+		t.Fatal("capability retirement succeeded despite injected audit-write failure")
+	}
+
+	var status string
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&status); err != nil || status != "active" {
+		t.Fatalf("failed retirement status=%q err=%v, want active", status, err)
+	}
+	if got, err := store.AuthenticateWorkerCapability(ctx, principal, session.Capability); err != nil || got.ID != session.ID {
+		t.Fatalf("failed retirement did not preserve the same authenticating session: session=%+v err=%v", got, err)
+	}
+	var retiredAudits int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM factory_worker_session_audit WHERE session_id=? AND event='retired'`, session.ID).Scan(&retiredAudits); err != nil || retiredAudits != 0 {
+		t.Fatalf("failed retirement left %d retired audit rows (query error %v), want none", retiredAudits, err)
+	}
+	if _, err := store.db.Exec(`DROP TRIGGER reject_retirement_audit`); err != nil {
+		t.Fatal(err)
+	}
+
+	retired, err := store.RetireWorkerCapability(ctx, principal, session.Capability)
+	if err != nil || retired.ID != session.ID || retired.Status != "retired" {
+		t.Fatalf("retry with same capability=(%+v,%v), want retired session %s", retired, err, session.ID)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT status FROM factory_worker_sessions WHERE id=?`, session.ID).Scan(&status); err != nil || status != "retired" {
+		t.Fatalf("retried retirement status=%q err=%v, want retired", status, err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM factory_worker_session_audit WHERE session_id=? AND event='retired'`, session.ID).Scan(&retiredAudits); err != nil || retiredAudits != 1 {
+		t.Fatalf("successful retirement audit rows=%d err=%v, want exactly one", retiredAudits, err)
+	}
+}
+
 func TestSQLiteWorkerSessionsAreAtomicIdempotentRetirableAndAudited(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "sessions.db")
 	store, err := OpenSQLiteStore(path, testConfig())

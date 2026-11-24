@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -448,6 +449,81 @@ func TestSQLiteSafeProgressAndWorkerIdentityPersistWithoutEventMessages(t *testi
 	}
 }
 
+func TestSQLiteStaleAttemptIdentityAndProgressDoNotMutateSnapshot(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "stale-attempt.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	job, _, err := store.Admit("stale-attempt", Request{Repository: "widget", Task: "fence stale writes"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := store.ClaimNextAttempt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim.Attempt.WorkerID, claim.Attempt.BootID = "worker-current", "boot-current"
+	if err := store.SetAttemptIdentity(claim.Attempt); err != nil {
+		t.Fatal(err)
+	}
+	baselineProgress := ProgressSummary{Stage: "review", State: "started"}
+	if err := store.RecordProgressForAttempt(claim.Attempt, baselineProgress); err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline.Worker == nil || baseline.Worker.WorkerID != claim.Attempt.WorkerID || baseline.Worker.BootID != claim.Attempt.BootID || baseline.Progress == nil || *baseline.Progress != baselineProgress {
+		t.Fatalf("baseline snapshot did not retain valid attempt metadata: %+v", baseline)
+	}
+
+	staleToken := strings.Repeat("0", len(claim.Attempt.OwnerToken))
+	if staleToken == claim.Attempt.OwnerToken {
+		staleToken = strings.Repeat("1", len(claim.Attempt.OwnerToken))
+	}
+	staleAttempts := []AttemptHandle{
+		{
+			JobID: claim.Attempt.JobID, Generation: claim.Attempt.Generation + 1,
+			OwnerToken: claim.Attempt.OwnerToken, WorkerID: "worker-stale-generation", BootID: "boot-stale-generation",
+		},
+		{
+			JobID: claim.Attempt.JobID, Generation: claim.Attempt.Generation,
+			OwnerToken: staleToken, WorkerID: "worker-stale-token", BootID: "boot-stale-token",
+		},
+	}
+	for index, stale := range staleAttempts {
+		if stale.WorkerID == baseline.Worker.WorkerID || stale.BootID == baseline.Worker.BootID {
+			t.Fatalf("stale attempt %d does not carry distinct worker metadata: %+v", index, stale)
+		}
+		if index > 0 && (stale.WorkerID == staleAttempts[index-1].WorkerID || stale.BootID == staleAttempts[index-1].BootID) {
+			t.Fatalf("stale attempt metadata is not distinct: %+v and %+v", staleAttempts[index-1], stale)
+		}
+		if err := store.SetAttemptIdentity(stale); !errors.Is(err, ErrStaleAttempt) {
+			t.Errorf("SetAttemptIdentity(stale attempt %d) = %v, want ErrStaleAttempt", index, err)
+		}
+		after, err := store.Get(job.ID)
+		if err != nil || !reflect.DeepEqual(after, baseline) {
+			t.Fatalf("stale identity attempt %d changed snapshot: before=%+v after=%+v err=%v", index, baseline, after, err)
+		}
+
+		progress := ProgressSummary{Stage: "document", State: "completed"}
+		if index > 0 {
+			progress = ProgressSummary{Stage: "implement", State: "failed"}
+		}
+		if err := store.RecordProgressForAttempt(stale, progress); !errors.Is(err, ErrStaleAttempt) {
+			t.Errorf("RecordProgressForAttempt(stale attempt %d) = %v, want ErrStaleAttempt", index, err)
+		}
+		after, err = store.Get(job.ID)
+		if err != nil || !reflect.DeepEqual(after, baseline) {
+			t.Fatalf("stale progress attempt %d changed snapshot: before=%+v after=%+v err=%v", index, baseline, after, err)
+		}
+	}
+}
+
 func TestSQLiteCancellationRequestInterruptedByRestartIsNotAcceptedAsLive(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "jobs.db")
 	store, err := OpenSQLiteStore(path, testConfig())
@@ -792,6 +868,75 @@ func TestSQLiteStorePersistsJobHistoryAndIdempotencyAcrossRestart(t *testing.T) 
 	}
 	if _, _, err := reopened.Admit("restart-key", Request{Repository: "widget", Task: "different"}); !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("changed-payload replay error = %v, want conflict", err)
+	}
+}
+
+func TestSQLiteWaitClaimAttemptWakesAfterAdmissionWithPersistedOwnership(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "wait-claim-attempt.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	type waitResult struct {
+		claim AttemptClaim
+		err   error
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan waitResult, 1)
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		close(started)
+		claim, err := store.WaitClaimAttempt(ctx)
+		result <- waitResult{claim: claim, err: err}
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("WaitClaimAttempt goroutine did not stop")
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("WaitClaimAttempt goroutine did not start")
+	}
+	queued, _, err := store.Admit("wait-claim-attempt", Request{Repository: "widget", Task: "claim after admission"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued.Status != StatusQueued {
+		t.Fatalf("admitted job status = %q, want queued", queued.Status)
+	}
+
+	var got waitResult
+	select {
+	case got = <-result:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitClaimAttempt did not return after admission")
+	}
+	if got.err != nil {
+		t.Fatalf("WaitClaimAttempt() error = %v", got.err)
+	}
+	if got.claim.Job.ID != queued.ID || got.claim.Job.Status != StatusRunning {
+		t.Fatalf("WaitClaimAttempt() job = (%q, %q), want admitted job %q running", got.claim.Job.ID, got.claim.Job.Status, queued.ID)
+	}
+
+	var ownerJobID, ownerToken string
+	var generation int64
+	if err := store.db.QueryRow(`SELECT job_id,owner_token,generation FROM factory_worker_ownership WHERE job_id=?`, queued.ID).Scan(&ownerJobID, &ownerToken, &generation); err != nil {
+		t.Fatal(err)
+	}
+	attempt := got.claim.Attempt
+	if attempt.JobID != ownerJobID || attempt.Generation != generation || attempt.OwnerToken != ownerToken {
+		t.Fatalf("returned attempt identity=(%q,%d,%q), ownership row=(%q,%d,%q)", attempt.JobID, attempt.Generation, attempt.OwnerToken, ownerJobID, generation, ownerToken)
 	}
 }
 

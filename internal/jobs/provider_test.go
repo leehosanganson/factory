@@ -3,8 +3,202 @@ package restjobs
 import (
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
+
+func TestSQLiteReconcileProviderOutcomeAlwaysFailsClosed(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "provider-reconcile.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	job, _, err := store.Admit("provider-reconcile", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeHistory, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	outcome := ProviderOutcome{
+		Provider: "github", Repository: "acme/widget", Number: 42,
+		URL: "https://github.com/acme/widget/pull/42", Branch: "factory/job/" + job.ID,
+		Commit: "abc1234", State: "open",
+	}
+	if err := store.ReconcileProviderOutcome(job.ID, outcome); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("ReconcileProviderOutcome() error = %v, want ErrInvalidTransition", err)
+	}
+
+	after, err := store.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Errorf("snapshot changed after rejected reconciliation:\nbefore: %+v\nafter:  %+v", before, after)
+	}
+	if after.Provider != nil {
+		t.Errorf("provider outcome was recorded after rejected reconciliation: %+v", after.Provider)
+	}
+	afterHistory, err := store.History(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(afterHistory, beforeHistory) {
+		t.Errorf("history changed after rejected reconciliation:\nbefore: %+v\nafter:  %+v", beforeHistory, afterHistory)
+	}
+	for _, event := range afterHistory.Events {
+		if event.Type == "provider_reconciled" || event.Type == "provider_observed" {
+			t.Errorf("rejected reconciliation added provider event: %+v", event)
+		}
+	}
+
+	t.Run("failed job with uncertain provider attempt", func(t *testing.T) {
+		failedStore, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "provider-reconcile-failed.db"), testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer failedStore.CloseStore()
+
+		failedJob, _, err := failedStore.Admit("provider-reconcile-failed", Request{Repository: "widget", Task: "task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		claim, err := failedStore.ClaimNextAttempt()
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempt := ProviderAttempt{
+			Generation: claim.Attempt.Generation, Provider: "github", Repository: "acme/widget",
+			Branch: "factory/job/" + failedJob.ID, Commit: "abc1234",
+		}
+		if err := failedStore.RecordProviderAttemptForAttempt(claim.Attempt, attempt); err != nil {
+			t.Fatal(err)
+		}
+		if err := failedStore.MarkProviderAttemptUncertainForAttempt(claim.Attempt); err != nil {
+			t.Fatal(err)
+		}
+		if err := failedStore.FinishAttempt(claim.Attempt, StatusFailed); err != nil {
+			t.Fatal(err)
+		}
+		attempt.Uncertain = true
+
+		failedBefore, err := failedStore.Get(failedJob.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failedBefore.Status != StatusFailed {
+			t.Fatalf("job status = %q, want failed", failedBefore.Status)
+		}
+		historyBefore, err := failedStore.History(failedJob.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attemptBefore, err := failedStore.ProviderAttempt(failedJob.ID)
+		if err != nil || attemptBefore != attempt {
+			t.Fatalf("persisted uncertain attempt = (%+v, %v), want %+v", attemptBefore, err, attempt)
+		}
+		if _, err := failedStore.ProviderObservation(failedJob.ID); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("preexisting provider observation error = %v, want ErrInvalidTransition", err)
+		}
+
+		matchingOutcome := ProviderOutcome{
+			Provider: attempt.Provider, Repository: attempt.Repository, Number: 42,
+			URL: "https://github.com/acme/widget/pull/42", Branch: attempt.Branch,
+			Commit: attempt.Commit, State: "open",
+		}
+		if err := failedStore.ReconcileProviderOutcome(failedJob.ID, matchingOutcome); !errors.Is(err, ErrInvalidTransition) {
+			t.Fatalf("ReconcileProviderOutcome() error = %v, want ErrInvalidTransition", err)
+		}
+
+		failedAfter, err := failedStore.Get(failedJob.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(failedAfter, failedBefore) {
+			t.Errorf("snapshot changed after rejected reconciliation:\nbefore: %+v\nafter:  %+v", failedBefore, failedAfter)
+		}
+		historyAfter, err := failedStore.History(failedJob.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(historyAfter, historyBefore) {
+			t.Errorf("history changed after rejected reconciliation:\nbefore: %+v\nafter:  %+v", historyBefore, historyAfter)
+		}
+		attemptAfter, err := failedStore.ProviderAttempt(failedJob.ID)
+		if err != nil || attemptAfter != attemptBefore {
+			t.Errorf("provider attempt changed after rejected reconciliation: before=(%+v,nil), after=(%+v,%v)", attemptBefore, attemptAfter, err)
+		}
+		if _, err := failedStore.ProviderObservation(failedJob.ID); !errors.Is(err, ErrInvalidTransition) {
+			t.Errorf("provider observation appeared after rejected reconciliation: error = %v, want ErrInvalidTransition", err)
+		}
+	})
+}
+
+func TestSQLiteProviderEvidenceReadsDistinguishMissingJobs(t *testing.T) {
+	store, err := OpenSQLiteStore(filepath.Join(privateSQLiteDir(t), "provider-reads.db"), testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+
+	job, _, err := store.Admit("provider-read-errors", Request{Repository: "widget", Task: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reads := []struct {
+		name          string
+		read          func(string) error
+		missingErr    error
+		noEvidenceErr error
+	}{
+		{
+			name: "provider attempt",
+			read: func(id string) error {
+				_, err := store.ProviderAttempt(id)
+				return err
+			},
+			missingErr:    ErrNotFound,
+			noEvidenceErr: ErrInvalidTransition,
+		},
+		{
+			name: "provider observation",
+			read: func(id string) error {
+				_, err := store.ProviderObservation(id)
+				return err
+			},
+			missingErr:    ErrNotFound,
+			noEvidenceErr: ErrInvalidTransition,
+		},
+		{
+			name: "provider recovery",
+			read: func(id string) error {
+				_, err := store.ReadProviderRecovery(id)
+				return err
+			},
+			missingErr:    ErrNotFound,
+			noEvidenceErr: ErrProviderRecoveryUnavailable,
+		},
+	}
+
+	for _, read := range reads {
+		t.Run(read.name, func(t *testing.T) {
+			if err := read.read("missing-job-id"); !errors.Is(err, read.missingErr) {
+				t.Errorf("read missing job error = %v, want %v", err, read.missingErr)
+			}
+			if err := read.read(job.ID); !errors.Is(err, read.noEvidenceErr) {
+				t.Errorf("read admitted job without provider evidence error = %v, want %v", err, read.noEvidenceErr)
+			}
+		})
+	}
+}
 
 func TestLocalManagerRecordsProviderOutcomeBeforeTerminalSuccess(t *testing.T) {
 	store, err := NewManager(testConfig())

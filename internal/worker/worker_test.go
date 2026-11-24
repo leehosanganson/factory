@@ -659,6 +659,68 @@ func TestRequestCancelBeforeProviderDispatchRemainsCanceled(t *testing.T) {
 	}
 }
 
+func TestRequestCancelCancelsQueuedJobWhileAnotherJobRuns(t *testing.T) {
+	manager := newTestManager(t, 2, 1)
+	first := admit(t, manager, "first")
+	second := admit(t, manager, "second")
+	started := make(chan string, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var callsMu sync.Mutex
+	var calls []string
+	coordinator, err := New(manager, executorFunc(func(_ context.Context, job restjobs.Snapshot) error {
+		callsMu.Lock()
+		calls = append(calls, job.ID)
+		callsMu.Unlock()
+		started <- job.ID
+		<-release
+		return nil
+	}), CoordinatorConfig{Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(release) })
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := coordinator.Shutdown(ctx); err != nil {
+			t.Errorf("cleanup Shutdown() error = %v", err)
+		}
+	})
+
+	select {
+	case id := <-started:
+		if id != first.ID {
+			t.Fatalf("first executed job = %q, want %q", id, first.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first job did not start")
+	}
+
+	requested, err := coordinator.RequestCancel(second.ID)
+	if err != nil || requested.Status != restjobs.StatusCanceled {
+		t.Fatalf("RequestCancel(queued) = (%+v, %v), want canceled job", requested, err)
+	}
+	canceled, err := manager.Get(second.ID)
+	if err != nil || canceled.Status != restjobs.StatusCanceled {
+		t.Fatalf("Get(queued) = (%+v, %v), want canceled job", canceled, err)
+	}
+
+	releaseOnce.Do(func() { close(release) })
+	waitForStatus(t, manager, first.ID, restjobs.StatusSucceeded)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := coordinator.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	callsMu.Lock()
+	defer callsMu.Unlock()
+	if fmt.Sprint(calls) != fmt.Sprint([]string{first.ID}) {
+		t.Fatalf("executed jobs = %v, want only %q", calls, first.ID)
+	}
+}
+
 func TestRequestCancelCancelsOnlySelectedRunningExecutor(t *testing.T) {
 	manager := newTestManager(t, 2, 2)
 	first := admit(t, manager, "first")
