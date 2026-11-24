@@ -29,7 +29,7 @@ A local process, agent, Nix shell, or container is not a security sandbox. Keep 
 
 ## When to use Factory
 
-For substantive engineering work in this repository—features, behavioral fixes, multi-file changes, or work requiring requirements, implementation, review, and documentation—use `factory implement <description>`. Add `--gate` when explicit approval between stages is wanted and an interactive terminal is available.
+Implement changes directly by default. Use `factory implement <description>` only when requested. Use `--gate` only if the user requests interactive CLI stage approvals and has an interactive terminal.
 
 Do not start an implementation workflow for questions, research, review-only requests, or small isolated edits. Do not use `factory monitor` as a general implementation workflow; it is for bounded routine maintenance on an existing open PR. Use `factory tidy` only for a repository-wide review/fix/document/verify pass. Before launching a workflow, determine whether this task is already running inside Factory; continue there rather than recursively starting another worker.
 
