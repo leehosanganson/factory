@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium, expect } from '@playwright/test';
@@ -8,9 +9,36 @@ const [inputDir] = process.argv.slice(2);
 const project = process.env.COMPOSE_PROJECT_NAME ?? '';
 assert.match(project, /^factory-task-board-[a-f0-9]{16}$/, 'Run via scripts/test-task-board-compose.sh');
 const timeout = 25_000;
+const alphaTask = 'start alpha: replace the seeded README.md line with alpha-workspace; change no other files';
+
+function rawCompose(...args) {
+  return execFileSync('docker', ['compose', '-p', project, ...args], { encoding: 'utf8', timeout: 120_000 });
+}
 
 function compose(...args) {
-  return execFileSync('docker', ['compose', '-p', project, ...args], { encoding: 'utf8', timeout: 120_000 }).trim();
+  return rawCompose(...args).trim();
+}
+
+function verifyTrackedEdit(threadId) {
+  assert.match(threadId, /^[0-9a-f-]+$/);
+  const alias = createHash('sha256').update('local').digest('hex');
+  const worktree = `/var/lib/factory/state/factory/rest-server/${alias}/threads/${threadId}/worktree`;
+  const git = (dir, ...args) => rawCompose('exec', '-T', 'remote-worker', 'git', '-C', dir, ...args);
+  const seed = git('/var/lib/factory/checkouts/local', 'rev-parse', 'HEAD');
+  assert.equal(git(worktree, 'rev-parse', 'HEAD'), seed, 'Alpha must still be based on the seeded commit');
+  const diff = git(worktree, 'diff', '--no-ext-diff', '--no-textconv', '--no-color', 'HEAD');
+  assert.equal(diff.replace(/^index [0-9a-f]+\.\.[0-9a-f]+ 100644\n/m, ''), [
+    'diff --git a/README.md b/README.md',
+    '--- a/README.md',
+    '+++ b/README.md',
+    '@@ -1 +1 @@',
+    '-Disposable local Compose worker checkout.',
+    '+alpha-workspace',
+    '',
+  ].join('\n'), 'Alpha must retain exactly the intended README diff after restart');
+  assert.equal(git(worktree, 'status', '--porcelain=v1', '--untracked-files=all', '--ignored'),
+    ' M README.md\n', 'Alpha must have no other file changes');
+  console.log('Compose browser smoke: exact tracked README edit retained after down/up.');
 }
 
 function boardURL() {
@@ -32,7 +60,7 @@ try {
     const heading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
     const previous = await heading.count() ? await heading.textContent() : '';
     await page.getByLabel('Repository alias', { exact: true }).fill('local');
-    await page.getByLabel('Task', { exact: true }).fill(`start ${name}`);
+    await page.getByLabel('Task', { exact: true }).fill(name === 'alpha' ? alphaTask : `start ${name}`);
     await page.getByRole('button', { name: 'Create Thread with Job' }).click();
     await expect(heading).toBeVisible();
     await expect(heading).not.toHaveText(previous);
@@ -98,6 +126,8 @@ try {
     assert.ok(!continuation.includes(other) && !continuation.includes('private diagnostic'));
     assert.deepEqual((await jobIds(page).allTextContents()).slice(0, -1), jobs);
   }
+
+  verifyTrackedEdit(alpha);
 
   const operator = await login(url, 'operator-token');
   await expect(operator.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
