@@ -53,6 +53,8 @@ try {
 
   let url = boardURL();
   let page = await login(url, 'owner-token');
+  const liveOperator = await login(url, 'operator-token');
+  await expect(liveOperator.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
   const alpha = await start(page, 'alpha');
   await expect(statuses(page)).toHaveText(['running'], { timeout });
   // Queue Alpha's second job before Beta, so Beta must pass the blocked job to reach the gate.
@@ -61,12 +63,23 @@ try {
   const beta = await start(page, 'beta');
   assert.notEqual(alpha, beta);
   await expect(statuses(page)).toHaveText(['running'], { timeout });
+  const betaJobID = (await jobIds(page).textContent()).replace(/^Job /, '');
   await expect.poll(() => compose('exec', '-T', 'pi-provider', 'sh', '-c',
     'for name in alpha beta; do if [ -f "/tmp/$name-ready" ]; then echo "$name"; fi; done'
   ), { message: 'Both Pi fixtures must reach the gate before either can finish', timeout }).toBe('alpha\nbeta');
   await select(page, alpha);
   await expect(statuses(page)).toHaveText(['running', 'queued']);
+
+  const recentJobs = liveOperator.getByRole('region', { name: 'Recent jobs', exact: true });
+  await recentJobs.getByRole('link', { name: betaJobID, exact: true }).click({ timeout });
+  const jobDetail = liveOperator.getByRole('region', { name: `Job ${betaJobID}`, exact: true });
+  const jobStatus = jobDetail.locator('.detail-grid > div')
+    .filter({ has: liveOperator.getByText('Status', { exact: true }) })
+    .locator('.detail-value');
+  await expect(jobStatus.filter({ hasText: /^running$/ })).toBeVisible({ timeout });
   compose('exec', '-T', 'pi-provider', 'touch', '/tmp/release');
+  await expect(jobStatus.filter({ hasText: /^succeeded$/ })).toBeVisible({ timeout });
+  await liveOperator.context().close();
 
   const threads = [
     { id: alpha, name: 'alpha', other: 'beta', history: ['started alpha; remember alpha-session', 'checked alpha-workspace / alpha-session'] },
@@ -106,7 +119,7 @@ try {
   const { jobs } = await details.json();
   assert.equal(jobs.length, 3);
   assert.ok(jobs.every((job) => !('reply' in job) && !('verification' in job)));
-  console.log('Compose browser smoke: overlapping Threads, ordered Alpha jobs, retained history and isolated follow-ups after down/up, bounded replies, and operator redaction.');
+  console.log('Compose browser smoke: overlapping Threads, ordered Alpha jobs, live operator job status, retained history and isolated follow-ups after down/up, bounded replies, and operator redaction.');
 } finally {
   await browser.close();
 }
