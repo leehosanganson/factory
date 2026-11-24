@@ -4,6 +4,8 @@ cd "$(dirname "$0")/.."
 project_suffix=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
 scratch=$(mktemp -d)
 export COMPOSE_PROJECT_NAME="factory-task-board-$project_suffix"
+export FACTORY_TASK_BOARD_API_IMAGE="factory-web:$COMPOSE_PROJECT_NAME"
+export FACTORY_TASK_BOARD_PI_IMAGE="factory-pi-worker:$COMPOSE_PROJECT_NAME"
 export COMPOSE_FILE=docker-compose.yml:scripts/fixtures/task-board-pi.compose.yml
 export COMPOSE_DISABLE_ENV_FILE=1
 export COMPOSE_PROFILES=
@@ -12,6 +14,7 @@ export FACTORY_COMPOSE_PI_DIR="$scratch/pi"
 export FACTORY_COMPOSE_HARNESS_DIR="$PWD/scripts/fixtures"
 cleanup() {
   docker compose down --volumes >/dev/null 2>&1 || true
+  docker image rm --no-prune "$FACTORY_TASK_BOARD_API_IMAGE" "$FACTORY_TASK_BOARD_PI_IMAGE" >/dev/null 2>&1 || true
   rm -rf -- "$scratch"
 }
 trap cleanup EXIT

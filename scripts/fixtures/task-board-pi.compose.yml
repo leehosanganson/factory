@@ -1,5 +1,9 @@
 services:
+  remote-worker-init:
+    image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/test-task-board-compose.sh}
+
   remote-worker:
+    image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/test-task-board-compose.sh}
     networks: !override [pi-fixture]
     depends_on:
       pi-provider:
@@ -11,10 +15,11 @@ services:
       - ./scripts/fixtures/task-board-pi-models.json:/var/lib/factory/state/models.json:ro
 
   api:
+    image: ${FACTORY_TASK_BOARD_API_IMAGE:?Run scripts/test-task-board-compose.sh}
     networks: [default, pi-fixture]
 
   pi-provider:
-    image: factory-pi-worker:local
+    image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/test-task-board-compose.sh}
     entrypoint: [node, /fixture/task-board-provider.mjs]
     volumes:
       - ./scripts/fixtures/task-board-provider.mjs:/fixture/task-board-provider.mjs:ro
