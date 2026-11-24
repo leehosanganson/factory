@@ -20,13 +20,14 @@ import (
 	restserver "github.com/leehosanganson/factory/internal/server"
 )
 
-func TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce(t *testing.T) {
+func newPostgresRemoteWorkerHTTPFixture(t *testing.T) (*restjobs.PostgresStore, *Handler) {
+	t.Helper()
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {
 		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
 			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
 		}
-		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL HTTP Worker Thread notification integration test")
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL HTTP Worker integration tests")
 	}
 
 	admin, err := openAPIPostgresDB(dsn)
@@ -80,6 +81,12 @@ func TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	return store, handler
+}
+
+func TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce(t *testing.T) {
+	store, handler := newPostgresRemoteWorkerHTTPFixture(t)
 
 	thread, _, err := store.AdmitThreadAs("remote-http-thread-notification", "alice", restjobs.Request{Repository: "widget", Task: "private first task"})
 	if err != nil {
@@ -185,6 +192,85 @@ func TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce(t *tes
 	}
 	checkBoardClaim("pi-next", followUp.ID, 2)
 
+}
+
+func TestPostgresRemoteWorkerHTTPClaimCancelOrdering(t *testing.T) {
+	for _, claimFirst := range []bool{false, true} {
+		name := "cancel-before-claim"
+		if claimFirst {
+			name = "claim-before-cancel"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, handler := newPostgresRemoteWorkerHTTPFixture(t)
+			created := principalRequest(handler, http.MethodPost, "/v1/jobs", `{"repository":"widget","task":"claim and cancel"}`, namedPrincipalToken("alice"))
+			var admission struct{ Job restjobs.Snapshot }
+			if created.Code != http.StatusAccepted || json.Unmarshal(created.Body.Bytes(), &admission) != nil || admission.Job.ID == "" || admission.Job.Status != restjobs.StatusQueued {
+				t.Fatalf("admit Job: %d %s, want queued Job", created.Code, created.Body.String())
+			}
+			jobPath := "/v1/jobs/" + admission.Job.ID
+			assertJob := func(operation string, response *httptest.ResponseRecorder, code int, status restjobs.Status, pending bool) restjobs.Snapshot {
+				t.Helper()
+				var job restjobs.Snapshot
+				if response.Code != code || json.Unmarshal(response.Body.Bytes(), &job) != nil || job.ID != admission.Job.ID || job.Status != status || job.CancellationRequested != pending {
+					t.Fatalf("%s: %d %s, want %d with Job %s %s (cancellation requested: %t)", operation, response.Code, response.Body.String(), code, admission.Job.ID, status, pending)
+				}
+				return job
+			}
+			cancel := func() *httptest.ResponseRecorder {
+				return principalRequest(handler, http.MethodPost, jobPath+"/cancel", "", namedPrincipalToken("admin"))
+			}
+			readJob := func() *httptest.ResponseRecorder {
+				return principalRequest(handler, http.MethodGet, jobPath, "", namedPrincipalToken("alice"))
+			}
+			assertNoAssignment := func(claimID string) {
+				t.Helper()
+				body := fmt.Sprintf(`{"claim_id":%q,"worker_id":"other-worker","boot_id":"other-boot","repositories":["widget"]}`, claimID)
+				response := remoteRequest(handler, "/v1/worker/claims", body, remoteTestSecret)
+				if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+					t.Fatalf("claim %s: %d %s, want 204 with no assignment", claimID, response.Code, response.Body.String())
+				}
+			}
+
+			// Each handler call completes before the next starts; this does not exercise lock contention.
+			if !claimFirst {
+				assertJob("cancel queued Job", cancel(), http.StatusOK, restjobs.StatusCanceled, false)
+				assertNoAssignment("after-queued-cancel")
+				job := assertJob("read canceled Job", readJob(), http.StatusOK, restjobs.StatusCanceled, false)
+				if job.Worker != nil {
+					t.Fatalf("Job canceled before claim has Worker %+v, want no Worker", job.Worker)
+				}
+				return
+			}
+
+			claim := claimPostgresHTTPWorkerJob(t, handler, "before-cancel")
+			if claim.Job.ID != admission.Job.ID {
+				t.Fatalf("claim returned Job %s, want %s", claim.Job.ID, admission.Job.ID)
+			}
+			assertJob("cancel claimed Job", cancel(), http.StatusAccepted, restjobs.StatusRunning, true)
+			// The fixture allows two concurrent Jobs, so an otherwise empty queue has a spare slot.
+			assertNoAssignment("while-cancellation-pending")
+			job := assertJob("read Job with pending cancellation", readJob(), http.StatusOK, restjobs.StatusRunning, true)
+			if job.Worker == nil || job.Worker.WorkerID != claim.Attempt.WorkerID || job.Worker.BootID != claim.Attempt.BootID {
+				t.Fatalf("pending cancellation changed Worker: %+v, want %s/%s", job.Worker, claim.Attempt.WorkerID, claim.Attempt.BootID)
+			}
+
+			attemptPath := "/v1/worker/attempts/" + claim.Job.ID
+			attempt := fmt.Sprintf(`"generation":%d,"owner_token":%q,"worker_id":%q,"boot_id":%q`,
+				claim.Attempt.Generation, claim.Attempt.OwnerToken, claim.Attempt.WorkerID, claim.Attempt.BootID)
+			heartbeat := remoteRequest(handler, attemptPath+"/heartbeat", "{"+attempt+"}", remoteTestSecret)
+			var reply remoteHeartbeatResponse
+			if heartbeat.Code != http.StatusOK || json.Unmarshal(heartbeat.Body.Bytes(), &reply) != nil || !reply.CancellationRequested {
+				t.Fatalf("heartbeat: %d %s, want worker cancellation signal", heartbeat.Code, heartbeat.Body.String())
+			}
+			finish := remoteRequest(handler, attemptPath+"/finish",
+				fmt.Sprintf(`{%s,"status":"canceled","evidence":{"checks":[],"limitations":[%q]}}`, attempt, restjobs.LimitationAgentNotVerdict), remoteTestSecret)
+			if finish.Code != http.StatusOK {
+				t.Fatalf("finish canceled Job: %d %s", finish.Code, finish.Body.String())
+			}
+			assertNoAssignment("after-worker-finish")
+			assertJob("read Job after worker finish", readJob(), http.StatusOK, restjobs.StatusCanceled, false)
+		})
+	}
 }
 
 type postgresHTTPWorkerClaim struct {
