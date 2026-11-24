@@ -11,7 +11,48 @@ python3 scripts/compose-local.py
 mkdir -m 700 .local/factory-compose/pi
 ```
 
-Put a dedicated Pi `auth.json` and `settings.json` in that directory. Set `defaultProvider` and `defaultModel` in `settings.json`, and add `models.json` only if needed for your provider. Use credentials that work without an interactive login, with only the access this Worker needs. Do not copy your whole Pi home or reuse a directory with sessions, extensions, or unrelated credentials. The mount must be readable and writable by container UID/GID `65532:65532` (Pi locks its auth file and may refresh it). Keep the directory private (`0700`) and its files private (`0600`). Set permissions or ownership with your local administration tools before startup. You can point Compose at a different private directory with `FACTORY_COMPOSE_PI_DIR`.
+Put a dedicated Pi `auth.json` and `settings.json` in that directory. Set `defaultProvider` and `defaultModel` in `settings.json`, and add `models.json` only if needed for your provider. Use credentials that work without an interactive login, with only the access this Worker needs. Do not copy your whole Pi home or reuse a directory with sessions, extensions, or unrelated credentials. Create the files with `umask 077` and keep them at mode `0600`. You can point Compose at a different private directory with `FACTORY_COMPOSE_PI_DIR`; use the same value for the preflight and startup.
+
+The Worker runs as container UID/GID `65532:65532`. On Linux, a `0700` directory owned by your host user can block the Worker even if Compose reports that the stack is ready. Pi needs to write to the directory and to `auth.json`, which it may refresh. On a rootful Linux Docker host without user namespace remapping, transfer ownership of only the dedicated directory and files after creating them:
+
+```sh
+pi_dir=${FACTORY_COMPOSE_PI_DIR:-./.local/factory-compose/pi}
+sudo chmod 0700 -- "$pi_dir"
+sudo chmod 0600 -- "$pi_dir/auth.json" "$pi_dir/settings.json"
+if sudo test -f "$pi_dir/models.json"; then
+  sudo chmod 0600 -- "$pi_dir/models.json"
+  sudo chown 65532:65532 -- "$pi_dir/models.json"
+fi
+sudo chown 65532:65532 -- "$pi_dir/auth.json" "$pi_dir/settings.json" "$pi_dir"
+```
+
+For rootless Docker, user namespace remapping, or Docker Desktop, host ownership may map differently. Set access for the mapped Worker identity and use the preflight below. Do not make the files group- or world-accessible or run the Worker as root to make the check pass.
+
+From the repository root, build the Worker image and run the preflight before starting the stack:
+
+```sh
+docker compose build remote-worker
+docker compose run --rm --no-deps -T --entrypoint /bin/sh remote-worker -eu -c '
+  fail() { printf "Pi config preflight: %s\n" "$1" >&2; exit 1; }
+  cd "$PI_CODING_AGENT_DIR" 2>/dev/null || fail "Worker cannot enter the Pi directory"
+  [ -r . ] && [ -w . ] && [ "$(stat -c %a .)" = 700 ] ||
+    fail "Worker needs a readable, writable Pi directory with mode 0700"
+
+  private_file() {
+    [ ! -L "$1" ] && [ -f "$1" ] && [ -r "$1" ] && [ "$(stat -c %a "$1")" = 600 ] ||
+      fail "$1 must be a readable regular file (not a symlink) with mode 0600"
+  }
+  private_file auth.json
+  [ -w auth.json ] || fail "Worker cannot write auth.json"
+  private_file settings.json
+  if [ -e models.json ] || [ -L models.json ]; then
+    private_file models.json
+  fi
+  printf "%s\n" "Pi config preflight passed"
+'
+```
+
+The one-off container uses the same user and Pi mount as the Worker. It does not start dependencies, open or print file contents, run Pi, or contact a model provider. If it fails, fix the mount path, ownership, or modes and rerun it. A pass checks filesystem access only; it does not validate the JSON, model settings, or credentials.
 
 ```sh
 docker compose up -d
@@ -36,6 +77,8 @@ The generator creates private inputs under `.local/factory-compose/` and refuses
 For a Controller-only setup, explicitly select `docker compose up -d --wait api` and leave the Worker stopped. The legacy direct-PostgreSQL `worker` profile is not part of the task board; it requires a separately configured Worker Controller connection and harness. See [REST Worker processes](rest-worker.md) for its configuration.
 
 ## Verify without provider credentials
+
+The browser smoke test also requires Node.js 24.x and npm 11.x on the host (see [`frontend/package.json`](../../frontend/package.json)). These host tools are for the smoke test, not for running the Compose stack.
 
 ```sh
 npm ci --prefix frontend
