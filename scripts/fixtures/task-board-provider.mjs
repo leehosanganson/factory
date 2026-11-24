@@ -28,22 +28,26 @@ function content(message) {
   return (message?.content ?? []).map((block) => block.text ?? '').join('');
 }
 
+const alphaTask = 'start alpha: replace the seeded README.md line with alpha-workspace; change no other files';
+
 async function complete({ model, messages, stream: streaming }) {
   assert.equal(model, 'deterministic');
   assert.equal(streaming, true);
   const tasks = messages.filter(({ role }) => role === 'user').map(content);
   const task = tasks.at(-1);
   const last = messages.at(-1);
-  const name = /^start (alpha|beta)$/.exec(tasks[0])?.[1];
-  assert.ok(name, 'missing original Thread prompt');
+  const startTask = tasks[0];
+  assert.ok(startTask === alphaTask || startTask === 'start beta', 'missing original Thread prompt');
+  const alpha = startTask === alphaTask;
+  const name = alpha ? 'alpha' : 'beta';
   const workspace = `${name}-workspace`;
   const session = `${name}-session`;
-  const path = 'workspace-note';
+  const path = alpha ? 'README.md' : 'workspace-note';
 
-  if (task === `start ${name}`) {
+  if (task === startTask) {
     assert.equal(tasks.length, 1);
     if (last.role === 'tool') {
-      assert.match(content(last), /Successfully wrote/);
+      assert.match(content(last), alpha ? /Successfully replaced 1 block\(s\) in README\.md/ : /Successfully wrote/);
       return { content: `started ${name}; remember ${session}` };
     }
     assert.equal(last.role, 'user');
@@ -53,11 +57,14 @@ async function complete({ model, messages, stream: streaming }) {
       assert.ok(Date.now() < deadline, `timed out waiting to release ${name}`);
       await delay(100);
     }
+    if (alpha) {
+      return toolCall('edit', { path, edits: [{ oldText: 'Disposable local Compose worker checkout.', newText: workspace }] });
+    }
     return toolCall('write', { path, content: workspace });
   }
 
-  assert.deepEqual(tasks, name === 'beta' ? ['start beta', 'recall both'] :
-    task === 'check first' ? ['start alpha', 'check first'] : ['start alpha', 'check first', 'recall both']);
+  assert.deepEqual(tasks, !alpha ? [startTask, 'recall both'] :
+    task === 'check first' ? [startTask, 'check first'] : [startTask, 'check first', 'recall both']);
   const initialReply = messages.find((msg) => msg.role === 'assistant' && content(msg).startsWith('started '));
   assert.equal(content(initialReply), `started ${name}; remember ${session}`);
   if (last.role === 'user') return toolCall('read', { path });

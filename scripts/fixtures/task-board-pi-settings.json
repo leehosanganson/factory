@@ -3,6 +3,7 @@
   "defaultModel": "deterministic",
   "defaultTools": [
     "read",
-    "write"
+    "write",
+    "edit"
   ]
 }
