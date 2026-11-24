@@ -116,8 +116,8 @@ func TestSubmitterProxyAllowsOnlyUserWorkAndChecksCSRFAndOrigin(t *testing.T) {
 			t.Errorf("GET %s status=%d body=%s want %d", tc.path, response.Code, response.Body.String(), tc.status)
 		}
 	}
-	create := func(origin, csrf string) *httptest.ResponseRecorder {
-		request := httptest.NewRequest(http.MethodPost, "/ui/api/v1/threads", strings.NewReader(`{"repository":"widget","task":"browser task"}`))
+	post := func(path, origin, csrf string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"repository":"widget","task":"browser task"}`))
 		request.Host = "factory.example"
 		request.Header.Set("Origin", origin)
 		request.Header.Set("X-CSRF-Token", csrf)
@@ -128,14 +128,27 @@ func TestSubmitterProxyAllowsOnlyUserWorkAndChecksCSRFAndOrigin(t *testing.T) {
 		handler.ServeHTTP(response, request)
 		return response
 	}
-	if response := create("https://factory.example", ""); response.Code != http.StatusForbidden {
+	const threads = "/ui/api/v1/threads"
+	if response := post(threads, "https://factory.example", ""); response.Code != http.StatusForbidden {
 		t.Errorf("missing CSRF status=%d", response.Code)
 	}
-	if response := create("https://evil.example", sessionData.CSRF); response.Code != http.StatusForbidden {
+	if response := post(threads, "https://evil.example", sessionData.CSRF); response.Code != http.StatusForbidden {
 		t.Errorf("wrong Origin status=%d", response.Code)
 	}
-	if response := create("https://factory.example", sessionData.CSRF); response.Code != http.StatusAccepted {
+	response := post(threads, "https://factory.example", sessionData.CSRF)
+	if response.Code != http.StatusAccepted {
 		t.Fatalf("submitter create status=%d body=%s", response.Code, response.Body.String())
+	}
+	var created struct{ Thread struct{ ID string } }
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil || created.Thread.ID == "" {
+		t.Fatalf("decode Thread: %v", err)
+	}
+	path := threads + "/" + created.Thread.ID + "/jobs"
+	if response := post(path, "https://factory.example", ""); response.Code != http.StatusForbidden {
+		t.Errorf("append without CSRF status=%d", response.Code)
+	}
+	if response := post(path, "https://factory.example", sessionData.CSRF); response.Code != http.StatusAccepted || strings.Contains(response.Body.String(), "browser task") {
+		t.Fatalf("submitter append status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

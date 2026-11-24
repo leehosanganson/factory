@@ -1011,7 +1011,7 @@ func TestDashboardSubmitterBridgeRequiresSubmitterAndUsesOwnerSafeRoutes(t *test
 			t.Errorf("submitter bridge accepted operator/path %s status=%d", tc.path, blocked.Code)
 		}
 	}
-	for _, tc := range []struct{ path, method string }{{"/v1/jobs", http.MethodGet}, {"/v1/jobs", http.MethodPost}, {"/v1/jobs/job/history", http.MethodGet}, {"/v1/threads/id/jobs", http.MethodPost}, {"/v1/threads/id/complete", http.MethodPost}} {
+	for _, tc := range []struct{ path, method string }{{"/v1/jobs", http.MethodGet}, {"/v1/jobs", http.MethodPost}, {"/v1/jobs/job/history", http.MethodGet}, {"/v1/threads/id/complete", http.MethodPost}} {
 		blocked := httptest.NewRecorder()
 		handler.ServeAsDashboardSubmitter(blocked, httptest.NewRequest(tc.method, tc.path, nil), restserver.Principal{ID: "alice", Role: "submitter"})
 		if blocked.Code != http.StatusNotFound {

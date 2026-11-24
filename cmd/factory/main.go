@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -285,6 +286,12 @@ func validateImageRoleArgs(role string, args []string) error {
 			return errors.New("controller image requires config /etc/factory/server.json")
 		}
 		return nil
+	}
+	if role == "remote-worker" {
+		if len(args) == 1 && args[0] == "version" || slices.Equal(args, []string{"worker", "remote", "--config", "/etc/factory/remote-worker.json"}) {
+			return nil
+		}
+		return errors.New("remote worker image only supports the configured HTTP Worker")
 	}
 	if role == "worker" {
 		if len(args) == 1 && args[0] == "version" {

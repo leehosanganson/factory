@@ -1,0 +1,8 @@
+{
+  "defaultProvider": "task-board-fixture",
+  "defaultModel": "deterministic",
+  "defaultTools": [
+    "read",
+    "write"
+  ]
+}

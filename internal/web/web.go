@@ -291,7 +291,8 @@ func submitterProxyAllowed(path, method string) bool {
 	}
 	if strings.HasPrefix(path, "/ui/api/v1/threads/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/threads/"), "/")
-		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet
+		return len(parts) == 1 && parts[0] != "" && method == http.MethodGet ||
+			len(parts) == 2 && parts[0] != "" && parts[1] == "jobs" && method == http.MethodPost
 	}
 	if strings.HasPrefix(path, "/ui/api/v1/jobs/") {
 		parts := strings.Split(strings.TrimPrefix(path, "/ui/api/v1/jobs/"), "/")

@@ -20,6 +20,9 @@ import (
 
 const maxRemoteWorkerRequestBytes = 512 << 10
 
+// JSON can use six bytes per reply byte, plus the attempt and evidence metadata.
+const maxRemoteFinishRequestBytes = 6*restjobs.MaxTaskReplyBytes + (4 << 10)
+
 var remoteWorkerIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 var remoteRepositoryAliasPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
 
@@ -27,16 +30,17 @@ const maxRemoteWorkerRepositories = 16
 
 // RemoteWorkerStore is the PostgreSQL-backed protocol surface required by these routes.
 type RemoteWorkerStore interface {
-	ClaimRemoteAttempt(context.Context, string, string, string, []string) (restjobs.AttemptClaim, error)
+	ClaimRemoteAttempt(context.Context, string, string, string, []string, bool) (restjobs.AttemptClaim, error)
 	HeartbeatRemoteAttempt(restjobs.AttemptHandle) (bool, error)
 	FinishRemoteAttempt(restjobs.AttemptHandle, restjobs.Status, restjobs.VerificationEvidence) error
 }
 
 type remoteClaimRequest struct {
-	ClaimID      string   `json:"claim_id"`
-	WorkerID     string   `json:"worker_id"`
-	BootID       string   `json:"boot_id"`
-	Repositories []string `json:"repositories"`
+	ClaimID        string   `json:"claim_id"`
+	WorkerID       string   `json:"worker_id"`
+	BootID         string   `json:"boot_id"`
+	Repositories   []string `json:"repositories"`
+	ThreadSessions bool     `json:"thread_sessions"`
 }
 
 type remoteAttemptRequest struct {
@@ -52,8 +56,10 @@ type remoteClaimResponse struct {
 }
 
 type remoteJobDTO struct {
-	ID      string           `json:"id"`
-	Request remoteRequestDTO `json:"request"`
+	ThreadID       string           `json:"thread_id,omitempty"`
+	ThreadPosition int              `json:"thread_position,omitempty"`
+	ID             string           `json:"id"`
+	Request        remoteRequestDTO `json:"request"`
 }
 
 type remoteRequestDTO struct {
@@ -91,8 +97,10 @@ type remoteFinishRequest struct {
 }
 
 type remoteEvidenceDTO struct {
-	Checks      []remoteVerificationCheckDTO `json:"checks"`
-	Limitations []string                     `json:"limitations"`
+	Reply          string                       `json:"reply,omitempty"`
+	ReplyTruncated bool                         `json:"reply_truncated,omitempty"`
+	Checks         []remoteVerificationCheckDTO `json:"checks"`
+	Limitations    []string                     `json:"limitations"`
 }
 
 type remoteVerificationCheckDTO struct {
@@ -170,11 +178,7 @@ func authenticateRemoteWorker(r *http.Request, secret []byte, authenticate func(
 	return subtle.ConstantTimeCompare(provided[:], configured[:]) == 1
 }
 
-func (h *Handler) decodeRemoteWorkerJSON(w http.ResponseWriter, r *http.Request, destination any) bool {
-	limit := maxRemoteWorkerRequestBytes
-	if h.config.MaxRequestBodyBytes < limit {
-		limit = h.config.MaxRequestBodyBytes
-	}
+func decodeRemoteWorkerJSON(w http.ResponseWriter, r *http.Request, destination any, limit int) bool {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, int64(limit)))
 	if err != nil {
 		var maxErr *http.MaxBytesError
@@ -205,7 +209,7 @@ func (h *Handler) decodeRemoteWorkerJSON(w http.ResponseWriter, r *http.Request,
 
 func (h *Handler) remoteClaim(w http.ResponseWriter, r *http.Request, store RemoteWorkerStore) {
 	var request remoteClaimRequest
-	if !h.decodeRemoteWorkerJSON(w, r, &request) {
+	if !decodeRemoteWorkerJSON(w, r, &request, min(h.config.MaxRequestBodyBytes, maxRemoteWorkerRequestBytes)) {
 		return
 	}
 	if !remoteWorkerIDPattern.MatchString(request.ClaimID) || !remoteWorkerIDPattern.MatchString(request.WorkerID) || !remoteWorkerIDPattern.MatchString(request.BootID) || !validRemoteWorkerRepositories(request.Repositories) {
@@ -219,7 +223,7 @@ func (h *Handler) remoteClaim(w http.ResponseWriter, r *http.Request, store Remo
 		}
 	}
 	sort.Strings(request.Repositories)
-	claim, err := store.ClaimRemoteAttempt(r.Context(), request.ClaimID, request.WorkerID, request.BootID, request.Repositories)
+	claim, err := store.ClaimRemoteAttempt(r.Context(), request.ClaimID, request.WorkerID, request.BootID, request.Repositories, request.ThreadSessions)
 	if err != nil {
 		writeRemoteWorkerStoreError(w, err)
 		return
@@ -236,8 +240,12 @@ func (h *Handler) remoteClaim(w http.ResponseWriter, r *http.Request, store Remo
 	if provenance := claim.Job.Request.IssueProvenance; provenance != nil {
 		jobRequest.IssueProvenance = &remoteIssueProvenanceDTO{Tracker: provenance.Tracker, SourceRepository: provenance.SourceRepository, IssueNumber: provenance.IssueNumber, Version: provenance.Version, URL: provenance.URL, Title: provenance.Title}
 	}
+	job := remoteJobDTO{ID: claim.Job.ID, Request: jobRequest}
+	if request.ThreadSessions {
+		job.ThreadID, job.ThreadPosition = claim.ThreadID, claim.ThreadPosition
+	}
 	writeJSON(w, http.StatusOK, remoteClaimResponse{
-		Job:     remoteJobDTO{ID: claim.Job.ID, Request: jobRequest},
+		Job:     job,
 		Attempt: remoteAttemptDTO{JobID: claim.Attempt.JobID, Generation: claim.Attempt.Generation, OwnerToken: claim.Attempt.OwnerToken, WorkerID: claim.Attempt.WorkerID, BootID: claim.Attempt.BootID},
 	})
 }
@@ -261,7 +269,7 @@ func validRemoteWorkerRepositories(repositories []string) bool {
 
 func (h *Handler) remoteHeartbeat(w http.ResponseWriter, r *http.Request, store RemoteWorkerStore, jobID string) {
 	var request remoteAttemptRequest
-	if !h.decodeRemoteWorkerJSON(w, r, &request) {
+	if !decodeRemoteWorkerJSON(w, r, &request, min(h.config.MaxRequestBodyBytes, maxRemoteWorkerRequestBytes)) {
 		return
 	}
 	attempt, ok := remoteAttemptHandle(jobID, request)
@@ -279,7 +287,7 @@ func (h *Handler) remoteHeartbeat(w http.ResponseWriter, r *http.Request, store 
 
 func (h *Handler) remoteFinish(w http.ResponseWriter, r *http.Request, store RemoteWorkerStore, jobID string) {
 	var request remoteFinishRequest
-	if !h.decodeRemoteWorkerJSON(w, r, &request) {
+	if !decodeRemoteWorkerJSON(w, r, &request, maxRemoteFinishRequestBytes) {
 		return
 	}
 	attempt, ok := remoteAttemptHandle(jobID, request.remoteAttemptRequest)
@@ -291,11 +299,11 @@ func (h *Handler) remoteFinish(w http.ResponseWriter, r *http.Request, store Rem
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 		return
 	}
-	evidence := restjobs.VerificationEvidence{Limitations: request.Evidence.Limitations, Checks: make([]restjobs.VerificationCheck, len(request.Evidence.Checks))}
+	evidence := restjobs.VerificationEvidence{Reply: request.Evidence.Reply, ReplyTruncated: request.Evidence.ReplyTruncated, Limitations: request.Evidence.Limitations, Checks: make([]restjobs.VerificationCheck, len(request.Evidence.Checks))}
 	for index, check := range request.Evidence.Checks {
 		evidence.Checks[index] = restjobs.VerificationCheck{Name: check.Name, Outcome: check.Outcome}
 	}
-	if !validRemoteEvidence(evidence) {
+	if !validRemoteEvidence(evidence) || evidence.Reply != "" && request.Status != restjobs.StatusSucceeded {
 		writeError(w, http.StatusBadRequest, "invalid_request", "Request is invalid.")
 		return
 	}
@@ -318,7 +326,7 @@ var remoteJobIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{
 var remoteWorkerTokenPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func validRemoteEvidence(evidence restjobs.VerificationEvidence) bool {
-	if evidence.Checks == nil || evidence.Limitations == nil || len(evidence.Checks) > 16 || len(evidence.Limitations) > 4 {
+	if !restjobs.ValidTaskReply(evidence.Reply, evidence.ReplyTruncated) || evidence.Checks == nil || evidence.Limitations == nil || len(evidence.Checks) > 16 || len(evidence.Limitations) > 4 {
 		return false
 	}
 	for index, check := range evidence.Checks {

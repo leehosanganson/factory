@@ -59,8 +59,8 @@ func TestRemoteWorkerClientAuthDTOAndIdempotentRetry(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
-		if _, exists := payload["harness"]; exists {
-			t.Error("Controller request selected a harness")
+		if len(payload) != 4 || payload["worker_id"] != "worker-a" || payload["boot_id"] != "boot-a" {
+			t.Errorf("non-Pi claim did not retain its original envelope: %#v", payload)
 		}
 		if repositories, ok := payload["repositories"].([]any); !ok || !reflect.DeepEqual(repositories, []any{"widget"}) {
 			t.Errorf("claim repository capabilities=%#v, want only configured alias widget", payload["repositories"])

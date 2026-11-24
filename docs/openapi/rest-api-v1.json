@@ -1098,7 +1098,9 @@
         "type": "object", "additionalProperties": false, "required": [ "id", "request" ],
         "properties": {
           "id": { "type": "string", "format": "uuid" },
-          "request": { "$ref": "#/components/schemas/RemoteWorkerJobRequest" }
+          "request": { "$ref": "#/components/schemas/RemoteWorkerJobRequest" },
+          "thread_id": { "type": "string", "format": "uuid", "description": "Present for Thread members." },
+          "thread_position": { "type": "integer", "minimum": 1, "description": "One-based position within the Thread." }
         }
       },
       "RemoteWorkerJobRequest": {
@@ -1148,6 +1150,8 @@
       "RemoteWorkerEvidence": {
         "type": "object", "additionalProperties": false, "required": [ "checks", "limitations" ],
         "properties": {
+          "reply": { "type": "string", "maxLength": 8192, "x-maxBytes": 8192, "description": "Private harness reply for a successful Thread Job. Not included in public Job snapshots." },
+          "reply_truncated": { "type": "boolean" },
           "checks": { "type": "array", "maxItems": 16, "items": { "$ref": "#/components/schemas/RemoteWorkerVerificationCheck" } },
           "limitations": { "type": "array", "maxItems": 4, "items": { "type": "string", "maxLength": 128, "enum": [ "No operator-configured verification checks were run.", "Agent-reported completion is not an independent correctness verdict." ] } }
         }

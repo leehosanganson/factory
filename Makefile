@@ -1,4 +1,4 @@
-.PHONY: build frontend-build frontend-check test-dashboard-e2e container-build test test-coverage test-compose-local fmt vet test-postgres-up test-postgres test-postgres-down clean help
+.PHONY: build frontend-build frontend-check test-dashboard-e2e container-build test test-coverage test-compose-local test-task-board-compose fmt vet test-postgres-up test-postgres test-postgres-down clean help
 
 build:
 	mkdir -p bin
@@ -42,6 +42,11 @@ test-coverage:
 test-compose-local:
 	./scripts/test-compose-local.sh
 
+test-task-board-compose:
+	npm ci --prefix frontend
+	@if [ -z "$$PLAYWRIGHT_CHROMIUM_EXECUTABLE" ]; then npm exec --prefix frontend -- playwright install $(PLAYWRIGHT_INSTALL_FLAGS) chromium; fi
+	./scripts/test-task-board-compose.sh
+
 fmt:
 	gofmt -w $$(find . -name '*.go' -type f)
 
@@ -55,7 +60,7 @@ test-postgres: test-postgres-up
 	@port="$$(docker compose -f docker-compose.postgres-test.yml port postgres-test 5432 | awk -F: '{print $$NF}')"; \
 	  test -n "$$port" || { echo 'could not resolve published PostgreSQL test port' >&2; exit 1; }; \
 	  FACTORY_TEST_POSTGRES_URL="postgres://factory:factory@127.0.0.1:$$port/factory_test?sslmode=disable" FACTORY_REQUIRE_POSTGRES_TEST=1 \
-	  go test ./internal/api ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce|TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerCapabilityAuthenticationUsesDatabaseClock|TestPostgresWorkerSessionHeartbeatIsDurableAndFenced|TestPostgresWorkerSessionListingUsesNewestFirstBoundedKeyset|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestPostgresIntakeOwnerRegistrationAndTransferFencesAdapters|TestRunConfiguredPostgresStoreIntegration|TestRunConfiguredPostgresGitHubWebhookOwnerGenerationIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically|TestPostgresWorkerMappingReconciliationAndAuditFailureAtomicity|TestPostgresWorkerMappingLookupUsesCurrentCommittedRegistry|TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers|TestPostgresScheduleRegistryFullRetainsPendingOccurrence|TestPostgresScheduleAllowsOverlappingQueuedOccurrences|TestPostgresScheduleRunsAssociateOnlyRetainedAdmittedJobs|TestPostgresScheduleRunMappingRecordsRevisionAndOccurrence|TestPostgresScheduleStorePersistsAndEnforcesRevision|TestPostgresScheduleAuditMigrationLeavesLegacyHistoryEmpty|TestPostgresScheduleOccurrenceAdmissionIsAtomicAcrossIndependentStores|TestPostgresScheduleDispatchRetryAfterLostCommitResponseDoesNotDuplicate|TestPostgresScheduleMutationAndDispatchSerializeWithCurrentRevision|TestPostgresThreadAdmissionAndDispatchShareCapacityGate|TestPostgresRemoteClaimBindsWorkerIdentityAtomically|TestPostgresRemoteClaimFiltersRepositoryCapabilities|TestPostgresRemoteAttemptFinishingFinalThreadJobNotifiesOwnerOnce|TestPostgresRemoteAttemptProtocol)$$' -count=1 -v
+	  go test ./internal/api ./internal/jobs ./internal/server/runtime ./internal/issue/poller -run '^(TestPostgresRemoteWorkerHTTPFinishingFinalThreadJobNotifiesOwnerOnce|TestPostgresOwnershipIntegration|TestPostgresStoreIntegration|TestPostgresWorkerIdentityAndSafeProgressIntegration|TestPostgresThreadNotificationAtomicTransitionAndConcurrentStores|TestPostgresWorkerSessionIntegration|TestPostgresWorkerCapabilityAuthenticationUsesDatabaseClock|TestPostgresWorkerSessionHeartbeatIsDurableAndFenced|TestPostgresWorkerSessionListingUsesNewestFirstBoundedKeyset|TestPostgresWorkerSessionAndWebhookMigrationsUpgradeFromV10|TestPostgresGitHubWebhookAdmissionIsAtomicAndDeliveryIdempotent|TestPostgresIntakeOwnerRegistrationAndTransferFencesAdapters|TestRunConfiguredPostgresStoreIntegration|TestRunConfiguredPostgresGitHubWebhookOwnerGenerationIntegration|TestPostgresControlPlaneAndSeparateWorkerProcess|TestIssuePollerPostgresGuardAndAdmissionIntegration|TestPostgresProvenanceConflictQuarantinesAndAdvancesScan|TestPostgresIssueAdmissionCreatesOneThreadAtomically|TestPostgresWorkerMappingReconciliationAndAuditFailureAtomicity|TestPostgresWorkerMappingLookupUsesCurrentCommittedRegistry|TestPostgresWorkerMappingAuthenticationIsLiveAcrossHandlers|TestPostgresScheduleRegistryFullRetainsPendingOccurrence|TestPostgresScheduleAllowsOverlappingQueuedOccurrences|TestPostgresScheduleRunsAssociateOnlyRetainedAdmittedJobs|TestPostgresScheduleRunMappingRecordsRevisionAndOccurrence|TestPostgresScheduleStorePersistsAndEnforcesRevision|TestPostgresScheduleAuditMigrationLeavesLegacyHistoryEmpty|TestPostgresScheduleOccurrenceAdmissionIsAtomicAcrossIndependentStores|TestPostgresScheduleDispatchRetryAfterLostCommitResponseDoesNotDuplicate|TestPostgresScheduleMutationAndDispatchSerializeWithCurrentRevision|TestPostgresThreadAdmissionAndDispatchShareCapacityGate|TestPostgresRemoteClaimBindsWorkerIdentityAtomically|TestPostgresRemoteClaimFiltersRepositoryCapabilities|TestPostgresRemoteClaimsRespectThreadOrder|TestPostgresRemoteAttemptFinishingFinalThreadJobNotifiesOwnerOnce|TestPostgresRemoteAttemptProtocol)$$' -count=1 -v
 
 test-postgres-down:
 	docker compose -f docker-compose.postgres-test.yml down --volumes
@@ -72,6 +77,7 @@ help:
 		container-build 'Build the REST controller and worker images' \
 		test 'Run all Go tests' \
 		test-compose-local 'Build and smoke test the local Compose API control plane' \
+		test-task-board-compose 'Run the task-board browser smoke with Pi in Compose' \
 		fmt 'Format Go source files' \
 		vet 'Run go vet' \
 		test-postgres-up 'Start the disposable PostgreSQL 18 test service' \

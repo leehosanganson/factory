@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -28,7 +29,7 @@ func TestPostgresRemoteClaimBindsWorkerIdentityAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close()
+	t.Cleanup(func() { _ = admin.Close() })
 	db := scopedPostgresDB(t, admin, dsn)
 	// Use the default store constructor, which has no configured worker identity;
 	// the remote claim identity must still be returned on the attempt handle.
@@ -71,7 +72,7 @@ func TestPostgresRemoteClaimFiltersRepositoryCapabilities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer admin.Close()
+	t.Cleanup(func() { _ = admin.Close() })
 	db := scopedPostgresDB(t, admin, dsn)
 	store, err := NewPostgresStore(db, testConfig())
 	if err != nil {
@@ -87,7 +88,7 @@ func TestPostgresRemoteClaimFiltersRepositoryCapabilities(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	claim, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"widget", "other"})
+	claim, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"widget", "other"}, false)
 	if err != nil || claim.Job.ID != compatible.ID {
 		t.Fatalf("claim with other-only capability=(%+v,%v), want matching job %s", claim, err, compatible.ID)
 	}
@@ -95,10 +96,10 @@ func TestPostgresRemoteClaimFiltersRepositoryCapabilities(t *testing.T) {
 	if err != nil || stillQueued.Status != StatusQueued {
 		t.Fatalf("incompatible job=(%+v,%v), want queued", stillQueued, err)
 	}
-	if _, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"other", "third", "widget"}); !errors.Is(err, ErrRemoteClaimConflict) {
+	if _, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"other", "third", "widget"}, false); !errors.Is(err, ErrRemoteClaimConflict) {
 		t.Fatalf("claim retry with changed capability set=%v, want conflict", err)
 	}
-	retry, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"other", "widget"})
+	retry, err := store.ClaimRemoteAttempt(ctx, "claim-capability", "worker-capability", "boot-capability", []string{"other", "widget"}, false)
 	if err != nil || retry.Job.ID != compatible.ID || retry.Attempt != claim.Attempt {
 		t.Fatalf("same-capability claim retry=(%+v,%v), want original claim", retry, err)
 	}
@@ -128,7 +129,7 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	claim, err := store.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+	claim, err := store.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}, false)
 	if err != nil {
 		t.Fatalf("initial remote claim: %v", err)
 	}
@@ -143,7 +144,7 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restarted.CloseStore()
-	retried, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+	retried, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}, false)
 	if err != nil || retried.Attempt != claim.Attempt || retried.Job.ID != claim.Job.ID {
 		t.Fatalf("retry after restart=(%+v,%v), want original claim", retried, err)
 	}
@@ -153,11 +154,11 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 	}
 	concurrent := make(chan claimResult, 2)
 	go func() {
-		result, err := store.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+		result, err := store.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}, false)
 		concurrent <- claimResult{claim: result, err: err}
 	}()
 	go func() {
-		result, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"})
+		result, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}, false)
 		concurrent <- claimResult{claim: result, err: err}
 	}()
 	for range 2 {
@@ -166,10 +167,10 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 			t.Fatalf("concurrent claim retry=(%+v,%v), want same original attempt", result.claim, result.err)
 		}
 	}
-	if _, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "other-worker", "boot-remote", []string{"widget"}); !errors.Is(err, ErrRemoteClaimConflict) {
+	if _, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "other-worker", "boot-remote", []string{"widget"}, false); !errors.Is(err, ErrRemoteClaimConflict) {
 		t.Fatalf("claim ID reused by another worker = %v, want conflict", err)
 	}
-	if _, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"different"}); !errors.Is(err, ErrRemoteClaimConflict) {
+	if _, err := restarted.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"different"}, false); !errors.Is(err, ErrRemoteClaimConflict) {
 		t.Fatalf("claim retry with changed repository capabilities = %v, want conflict", err)
 	}
 	publicJSON, err := json.Marshal(retried.Job)
@@ -228,7 +229,7 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 	if err := resultStore.FinishRemoteAttempt(wrongIdentity, StatusCanceled, evidence); !errors.Is(err, ErrStaleAttempt) {
 		t.Fatalf("mismatched boot result = %v, want ErrStaleAttempt", err)
 	}
-	if _, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}); !errors.Is(err, ErrStaleAttempt) {
+	if _, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-1", "worker-remote", "boot-remote", []string{"widget"}, false); !errors.Is(err, ErrStaleAttempt) {
 		t.Fatalf("terminal claim retry = %v, want ErrStaleAttempt", err)
 	}
 	finished, err := resultStore.Get(job.ID)
@@ -242,7 +243,7 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	exactClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-concurrent-exact", "worker-remote", "boot-remote", []string{"widget"})
+	exactClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-concurrent-exact", "worker-remote", "boot-remote", []string{"widget"}, false)
 	if err != nil || exactClaim.Job.ID != exactJob.ID {
 		t.Fatalf("concurrent exact claim=(%+v,%v), want exact Job", exactClaim, err)
 	}
@@ -271,7 +272,7 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uncanceledClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-cancel-without-request", "worker-remote", "boot-remote", []string{"widget"})
+	uncanceledClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-cancel-without-request", "worker-remote", "boot-remote", []string{"widget"}, false)
 	if err != nil || uncanceledClaim.Job.ID != uncanceledJob.ID {
 		t.Fatalf("claim without cancellation=(%+v,%v), want expected job", uncanceledClaim, err)
 	}
@@ -285,7 +286,7 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conflictClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-concurrent-conflict", "worker-remote", "boot-remote", []string{"widget"})
+	conflictClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-concurrent-conflict", "worker-remote", "boot-remote", []string{"widget"}, false)
 	if err != nil || conflictClaim.Job.ID != conflictJob.ID {
 		t.Fatalf("concurrent conflicting claim=(%+v,%v), want conflict Job", conflictClaim, err)
 	}
@@ -328,14 +329,14 @@ func TestPostgresRemoteAttemptProtocol(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expiredClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-expired", "worker-remote", "boot-remote", []string{"widget"})
+	expiredClaim, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-expired", "worker-remote", "boot-remote", []string{"widget"}, false)
 	if err != nil || expiredClaim.Job.ID != expiredJob.ID {
 		t.Fatalf("second remote claim=(%+v,%v), want second Job", expiredClaim, err)
 	}
 	if _, err := db.Exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1`, expiredJob.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-expired", "worker-remote", "boot-remote", []string{"widget"}); !errors.Is(err, ErrStaleAttempt) {
+	if _, err := resultStore.ClaimRemoteAttempt(ctx, "claim-remote-expired", "worker-remote", "boot-remote", []string{"widget"}, false); !errors.Is(err, ErrStaleAttempt) {
 		t.Fatalf("expired claim retry=%v, want stale without a new attempt", err)
 	}
 	if err := resultStore.FinishRemoteAttempt(expiredClaim.Attempt, StatusFailed, VerificationEvidence{}); !errors.Is(err, ErrStaleAttempt) {
@@ -1658,6 +1659,91 @@ func TestPostgresThreadAdmissionAndDispatchShareCapacityGate(t *testing.T) {
 	}
 }
 
+func TestPostgresRemoteClaimsRespectThreadOrder(t *testing.T) {
+	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
+	if dsn == "" {
+		if os.Getenv("FACTORY_REQUIRE_POSTGRES_TEST") == "1" {
+			t.Fatal("FACTORY_REQUIRE_POSTGRES_TEST=1 but FACTORY_TEST_POSTGRES_URL is unset")
+		}
+		t.Skip("set FACTORY_TEST_POSTGRES_URL to run PostgreSQL Thread claim coverage")
+	}
+	admin, err := sqlOpenPGX(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = admin.Close() })
+	db := scopedPostgresDB(t, admin, dsn)
+	config := testConfig()
+	config.MaxConcurrentJobs = 3
+	first, err := NewPostgresStore(db, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = first.CloseStore() })
+	second, err := NewPostgresStore(postgresDBForSchema(t, dsn, currentTestSchema(t, db)), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = second.CloseStore() })
+
+	thread, _, err := first.AdmitSessionThreadAs("thread-one", "alice", Request{Repository: "widget", Task: "first Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, followUp, _, err := first.AdmitThreadJobAs(thread.Thread.ID, "thread-one-follow-up", "alice", Request{Repository: "other", Task: "follow-up Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated, _, err := first.AdmitSessionThreadAs("thread-two", "alice", Request{Repository: "widget", Task: "unrelated Job"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// The earlier queued Job blocks even when the worker cannot claim its repository.
+	if claim, err := second.ClaimRemoteAttempt(ctx, "follow-up", "worker-other", "boot", []string{"other"}, true); !errors.Is(err, ErrNoQueuedJobs) {
+		t.Fatalf("claim with queued predecessor: got Job %q, err=%v; want ErrNoQueuedJobs", claim.Job.ID, err)
+	}
+
+	type result struct {
+		claim AttemptClaim
+		err   error
+	}
+	start := make(chan struct{})
+	results := make(chan result, 2)
+	for i, store := range []*PostgresStore{first, second} {
+		go func() {
+			<-start
+			claim, err := store.ClaimRemoteAttempt(ctx, fmt.Sprintf("claim-%d", i), fmt.Sprintf("worker-%d", i), "boot", []string{"widget", "other"}, true)
+			results <- result{claim, err}
+		}()
+	}
+	close(start)
+	claims := make(map[string]AttemptClaim)
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("concurrent claim: %v", result.err)
+		}
+		claims[result.claim.Job.ID] = result.claim
+	}
+	initialID, unrelatedID := thread.Jobs[0].ID, unrelated.Jobs[0].ID
+	if claims[initialID].Job.ID != initialID || claims[unrelatedID].Job.ID != unrelatedID {
+		t.Fatalf("concurrent claims: got %+v; want Jobs %s and %s", claims, initialID, unrelatedID)
+	}
+	// A third worker slot is still available, so capacity cannot explain the rejection.
+	if claim, err := second.ClaimRemoteAttempt(ctx, "follow-up", "worker-other", "boot", []string{"other"}, true); !errors.Is(err, ErrNoQueuedJobs) {
+		t.Fatalf("claim with running predecessor: got Job %q, err=%v; want ErrNoQueuedJobs", claim.Job.ID, err)
+	}
+	if err := first.FinishRemoteAttempt(claims[initialID].Attempt, StatusSucceeded, VerificationEvidence{}); err != nil {
+		t.Fatalf("finish predecessor: %v", err)
+	}
+	if claim, err := second.ClaimRemoteAttempt(ctx, "follow-up", "worker-other", "boot", []string{"other"}, true); err != nil || claim.Job.ID != followUp.ID {
+		t.Fatalf("claim after predecessor finished: got Job %q, err=%v; want %s", claim.Job.ID, err, followUp.ID)
+	}
+}
+
 func TestPostgresRemoteAttemptFinishingFinalThreadJobNotifiesOwnerOnce(t *testing.T) {
 	dsn := os.Getenv("FACTORY_TEST_POSTGRES_URL")
 	if dsn == "" {
@@ -1687,13 +1773,9 @@ func TestPostgresRemoteAttemptFinishingFinalThreadJobNotifiesOwnerOnce(t *testin
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	firstClaim, err := store.ClaimRemoteAttempt(ctx, "remote-thread-notification-first", "worker", "boot", []string{"widget"})
+	firstClaim, err := store.ClaimRemoteAttempt(ctx, "remote-thread-notification-first", "worker", "boot", []string{"widget"}, false)
 	if err != nil || firstClaim.Job.ID != created.Jobs[0].ID {
 		t.Fatalf("first remote claim=(%+v,%v), want first Thread Job", firstClaim, err)
-	}
-	finalClaim, err := store.ClaimRemoteAttempt(ctx, "remote-thread-notification-final", "worker", "boot", []string{"widget"})
-	if err != nil || finalClaim.Job.ID != finalJob.ID {
-		t.Fatalf("final remote claim=(%+v,%v), want final Thread Job", finalClaim, err)
 	}
 	evidence := VerificationEvidence{Limitations: []string{LimitationAgentNotVerdict}}
 	if err := store.FinishRemoteAttempt(firstClaim.Attempt, StatusSucceeded, evidence); err != nil {
@@ -1707,6 +1789,10 @@ func TestPostgresRemoteAttemptFinishingFinalThreadJobNotifiesOwnerOnce(t *testin
 		t.Fatalf("owner inbox before final Job=(%+v,%v), want empty", page, err)
 	}
 
+	finalClaim, err := store.ClaimRemoteAttempt(ctx, "remote-thread-notification-final", "worker", "boot", []string{"widget"}, false)
+	if err != nil || finalClaim.Job.ID != finalJob.ID {
+		t.Fatalf("final remote claim=(%+v,%v), want final Thread Job", finalClaim, err)
+	}
 	if err := store.FinishRemoteAttempt(finalClaim.Attempt, StatusSucceeded, evidence); err != nil {
 		t.Fatalf("finish final remote attempt: %v", err)
 	}

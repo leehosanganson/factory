@@ -1,0 +1,16 @@
+{
+	admin off
+	skip_install_trust
+	auto_https disable_redirects
+}
+
+https://localhost {
+	tls internal
+	@board path / /ui /ui/*
+	handle @board {
+		reverse_proxy api:8080
+	}
+	handle {
+		respond 404
+	}
+}

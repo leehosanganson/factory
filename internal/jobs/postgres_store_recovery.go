@@ -49,6 +49,15 @@ func (s *PostgresStore) recoveryNeededWithQuery(ctx context.Context, queryer pos
 // AdmitThreadAs atomically persists a Thread and its initial queued Job. Thread
 // idempotency keys use a separate principal-scoped namespace from job keys.
 func (s *PostgresStore) AdmitThreadAs(idempotencyKey, principalID string, request Request) (ThreadSnapshot, bool, error) {
+	return s.admitThreadAs(idempotencyKey, principalID, request, false)
+}
+
+// AdmitSessionThreadAs limits all Jobs in the Thread to session-capable Workers.
+func (s *PostgresStore) AdmitSessionThreadAs(idempotencyKey, principalID string, request Request) (ThreadSnapshot, bool, error) {
+	return s.admitThreadAs(idempotencyKey, principalID, request, true)
+}
+
+func (s *PostgresStore) admitThreadAs(idempotencyKey, principalID string, request Request, threadSessions bool) (ThreadSnapshot, bool, error) {
 	s.admitMu.Lock()
 	defer s.admitMu.Unlock()
 	key, normalized, err := normalizeAdmission(idempotencyKey, request, s.config.MaxTaskBytes)
@@ -80,13 +89,14 @@ func (s *PostgresStore) AdmitThreadAs(idempotencyKey, principalID string, reques
 		return ThreadSnapshot{}, false, errors.New("lock PostgreSQL admission")
 	}
 	var threadID, raw string
-	err = tx.QueryRowContext(ctx, `SELECT thread_id,request_json FROM factory_thread_idempotency WHERE principal_id=$1 AND key=$2`, principalID, key).Scan(&threadID, &raw)
+	var existingThreadSessions bool
+	err = tx.QueryRowContext(ctx, `SELECT i.thread_id,i.request_json,t.thread_sessions FROM factory_thread_idempotency i JOIN factory_threads t ON t.id=i.thread_id WHERE i.principal_id=$1 AND i.key=$2`, principalID, key).Scan(&threadID, &raw, &existingThreadSessions)
 	if err == nil {
 		var existing Request
 		if json.Unmarshal([]byte(raw), &existing) != nil {
 			return ThreadSnapshot{}, false, errors.New("PostgreSQL Thread record is invalid")
 		}
-		if !sameRequest(existing, normalized) {
+		if !sameRequest(existing, normalized) || existingThreadSessions != threadSessions {
 			return ThreadSnapshot{}, false, ErrIdempotencyConflict
 		}
 		snapshot, err := s.threadSnapshotTx(ctx, tx, threadID, "")
@@ -132,7 +142,7 @@ func (s *PostgresStore) AdmitThreadAs(idempotencyKey, principalID string, reques
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_jobs(id,request_json,status,created_at,updated_at,queue_sequence,submitter) VALUES($1,$2,'queued',clock_timestamp(),clock_timestamp(),$3,$4)`, jobID, string(requestJSON), sequence, principalID); err != nil {
 		return ThreadSnapshot{}, false, errors.New("persist PostgreSQL Thread job")
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_threads(id,submitter,created_at,initial_job_id) VALUES($1,$2,clock_timestamp(),$3)`, threadID, principalID, jobID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_threads(id,submitter,created_at,initial_job_id,thread_sessions) VALUES($1,$2,clock_timestamp(),$3,$4)`, threadID, principalID, jobID, threadSessions); err != nil {
 		return ThreadSnapshot{}, false, errors.New("persist PostgreSQL Thread")
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO factory_thread_jobs(thread_id,job_id,position) VALUES($1,$2,1)`, threadID, jobID); err != nil {
