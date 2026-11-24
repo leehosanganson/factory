@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import type { Runtime } from './runtime.js';
 
+const sourceEditTask = 'Change RELEASE_LABEL in release.py from draft to ready.';
+
 async function runtime(): Promise<Runtime> {
   const runtimeFile = test.info().config.metadata.dashboardRuntimeFile;
   if (typeof runtimeFile !== 'string') throw new Error('Playwright runtime fixture path is missing');
@@ -89,7 +91,7 @@ test('operator can inspect worker session summaries through the read-only dashbo
   expect(requests.every((request) => request.method === 'GET')).toBe(true);
 });
 
-test('enabled submitter follows a Thread outcome and inbox after reload without operator controls', async ({ page }) => {
+test('Thread owner sees a verified source edit and inbox notice after reload without operator controls', async ({ page }) => {
   const fixture = await runtime();
   await page.goto(fixture.url);
   await page.getByLabel('Access token').fill(fixture.submitterToken);
@@ -103,9 +105,8 @@ test('enabled submitter follows a Thread outcome and inbox after reload without 
     await expect(page.getByRole('heading', { name: forbidden, exact: true })).toHaveCount(0);
   }
 
-  const task = 'Create dashboard-e2e-result.txt so Factory can verify this Thread.';
-  await page.getByLabel('Repository alias').fill('fixture');
-  await page.getByLabel('Task').fill(task);
+  await page.getByLabel('Repository alias', { exact: true }).fill('fixture');
+  await page.getByLabel('Task', { exact: true }).fill(sourceEditTask);
   await page.getByRole('button', { name: 'Create Thread with Job' }).click();
   const threadHeading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
   await expect(threadHeading).toBeVisible();
@@ -114,15 +115,17 @@ test('enabled submitter follows a Thread outcome and inbox after reload without 
   const job = page.locator('.thread-job').first();
   await expect(job.locator('.status')).toHaveText('succeeded', { timeout: 30_000 });
   await expect(job.getByRole('heading', { name: 'Safe outcome' })).toBeVisible();
-  await expect(job).toContainText('check-01: passed');
+  const passedCheck = job.locator('.safe-outcome').getByText('check-01: passed', { exact: true });
+  await expect(passedCheck).toBeVisible();
   await expect(page.locator('.notification-list').getByRole('button', { name: `Thread ${threadID}` })).toBeVisible({ timeout: 10_000 });
-  await expect(page.getByText(task)).toHaveCount(0);
+  await expect(page.getByText(sourceEditTask)).toHaveCount(0);
 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Threads', exact: true })).toBeVisible();
   await page.locator('.thread-list').getByRole('button', { name: threadID! }).click();
   await expect(page.getByRole('heading', { name: `Thread ${threadID}` })).toBeVisible();
-  await expect(page.locator('.thread-job').first().locator('.status')).toHaveText('succeeded');
+  await expect(job.locator('.status')).toHaveText('succeeded');
+  await expect(passedCheck).toBeVisible();
   await expect(page.locator('.notification-list').getByRole('button', { name: `Thread ${threadID}` })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Schedules' })).toHaveCount(0);
 });
@@ -151,7 +154,7 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   expect(session?.value).not.toBe(fixture.token);
 
   await page.getByLabel('Repository alias').first().fill('fixture');
-  await page.getByLabel('Task').first().fill('Write the fixture result file.');
+  await page.getByLabel('Task').first().fill(sourceEditTask);
   await page.getByRole('button', { name: 'Queue job' }).click();
   await expect(page.locator('.notice')).toContainText(' admitted.');
   const admissionNotice = (await page.locator('.notice').textContent()) || '';
@@ -164,20 +167,19 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   await expect(page.getByText('succeeded', { exact: true }).last()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('Pull request')).toHaveCount(0);
 
-  const threadTask = 'Create a browser-visible Thread for follow-up.';
   await page.getByLabel('Repository alias').nth(1).fill('fixture');
-  await page.getByLabel('Task').nth(1).fill(threadTask);
+  await page.getByLabel('Task').nth(1).fill(sourceEditTask);
   await page.getByRole('button', { name: 'Create Thread' }).click();
   const threadHeading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
   await expect(threadHeading).toBeVisible({ timeout: 10_000 });
   const threadID = (await threadHeading.textContent())?.replace('Thread ', '').trim();
   expect(threadID).toBeTruthy();
-  await expect(page.getByText(threadTask)).toHaveCount(0);
+  await expect(page.getByText(sourceEditTask)).toHaveCount(0);
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
   await page.getByRole('button', { name: threadID! }).click();
   await expect(page.getByRole('heading', { name: `Thread ${threadID}` })).toBeVisible();
-  await expect(page.getByText(threadTask)).toHaveCount(0);
+  await expect(page.getByText(sourceEditTask)).toHaveCount(0);
 
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByRole('heading', { name: 'Sign in' })).toBeVisible();

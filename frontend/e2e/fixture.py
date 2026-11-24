@@ -147,11 +147,19 @@ def main() -> int:
         subprocess.run(["git", "-C", str(repository), "config", "user.name", "Dashboard E2E"], check=True)
         subprocess.run(["git", "-C", str(repository), "config", "user.email", "dashboard-e2e@example.invalid"], check=True)
         (repository / "README.md").write_text("Disposable dashboard E2E repository.\n")
-        subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
+        (repository / "release.py").write_text('RELEASE_LABEL = "draft"\n')
+        subprocess.run(["git", "-C", str(repository), "add", "README.md", "release.py"], check=True)
         subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "Initialize fixture repository"], check=True)
         harness = root / "harness.sh"
-        harness.write_text("#!/bin/sh\nprintf 'dashboard e2e completed\\n' > dashboard-e2e-result.txt\n")
+        harness.write_text(
+            "#!/bin/sh\n"
+            'if [ "$2" = "Change RELEASE_LABEL in release.py from draft to ready." ] && [ -f release.py ]; then\n'
+            '    printf \'RELEASE_LABEL = "ready"\\n\' > release.py\n'
+            "fi\n"
+        )
         harness.chmod(0o700)
+        expected_source = root / "expected-release.py"
+        expected_source.write_text('RELEASE_LABEL = "ready"\n')
         server_port = free_port(args.port)
         config = {
             "mode": "local_process",
@@ -163,7 +171,7 @@ def main() -> int:
                 {"id": "e2e-operator", "role": "operator", "token_file": str(verifier), "enabled": True},
                 {"id": "e2e-submitter", "role": "submitter", "token_file": str(verifier), "enabled": True},
             ],
-            "verification_checks": [["test", "-f", "dashboard-e2e-result.txt"]],
+            "verification_checks": [["cmp", "-s", "release.py", str(expected_source)]],
             "web_ui": {"enabled": True, "operator_id": "e2e-operator"},
             "persistence": {"backend": "sqlite", "path": str(root / "schedules.db")},
             "workers_enabled": True,
