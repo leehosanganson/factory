@@ -1,6 +1,8 @@
 services:
   remote-worker-init:
     image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/test-task-board-compose.sh}
+    build: !reset null
+    pull_policy: never
 
   remote-worker:
     image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/test-task-board-compose.sh}
@@ -20,6 +22,7 @@ services:
 
   pi-provider:
     image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/test-task-board-compose.sh}
+    pull_policy: never
     entrypoint: [node, /fixture/task-board-provider.mjs]
     volumes:
       - ./scripts/fixtures/task-board-provider.mjs:/fixture/task-board-provider.mjs:ro
