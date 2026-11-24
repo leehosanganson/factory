@@ -53,6 +53,8 @@ try {
 
   let url = boardURL();
   let page = await login(url, 'owner-token');
+  const liveOperator = await login(url, 'operator-token');
+  await expect(liveOperator.getByRole('heading', { name: 'Jobs', exact: true })).toBeVisible();
   const alpha = await start(page, 'alpha');
   await expect(statuses(page)).toHaveText(['running'], { timeout });
   // Queue Alpha's second job before Beta, so Beta must pass the blocked job to reach the gate.
@@ -68,7 +70,6 @@ try {
   await select(page, alpha);
   await expect(statuses(page)).toHaveText(['running', 'queued']);
 
-  const liveOperator = await login(url, 'operator-token');
   const recentJobs = liveOperator.getByRole('region', { name: 'Recent jobs', exact: true });
   await recentJobs.getByRole('link', { name: betaJobID, exact: true }).click({ timeout });
   const jobDetail = liveOperator.getByRole('region', { name: `Job ${betaJobID}`, exact: true });
