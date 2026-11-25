@@ -151,10 +151,11 @@ def main() -> int:
         (repository / "release.py").write_text('RELEASE_LABEL = "draft"\n')
         subprocess.run(["git", "-C", str(repository), "add", "README.md", "release.py"], check=True)
         subprocess.run(["git", "-C", str(repository), "commit", "-q", "-m", "Initialize fixture repository"], check=True)
+        source_edit_task = "Change RELEASE_LABEL in release.py from draft to ready."
         harness = root / "harness.sh"
         harness.write_text(
             "#!/bin/sh\n"
-            'if [ "$2" = "Change RELEASE_LABEL in release.py from draft to ready." ] && [ -f release.py ]; then\n'
+            f'if [ "$2" = "{source_edit_task}" ] && [ -f release.py ]; then\n'
             '    printf \'RELEASE_LABEL = "ready"\\n\' > release.py\n'
             "fi\n"
         )
@@ -230,6 +231,15 @@ def main() -> int:
                 raise RuntimeError("Factory test server did not become ready")
 
             with sqlite3.connect(root / "schedules.db") as database:
+                # A pending occurrence lets the real dispatcher admit a Job without waiting for a cron boundary.
+                occurrence = "2025-01-01T00:00:00Z"
+                database.execute(
+                    "INSERT INTO factory_schedules "
+                    "(id,owner,cron,repository,task,status,revision,created_at,updated_at,next_occurrence_at,pending_occurrence_at) "
+                    "VALUES (?,?,?,?,?,'active',1,?,?,?,?)",
+                    ("fixture-schedule-run", "e2e-operator", "0 0 1 1 *", "fixture", source_edit_task,
+                     "2024-12-31T00:00:00Z", "2024-12-31T00:00:00Z", occurrence, occurrence),
+                )
                 database.execute("DROP INDEX IF EXISTS factory_worker_sessions_one_active_principal")
                 database.execute("DROP INDEX IF EXISTS factory_worker_sessions_principal_boot")
                 sessions = [("session-latest", "worker-zeta", "hidden-boot-id", "active", "2025-01-03T00:00:00Z", None, None)]
