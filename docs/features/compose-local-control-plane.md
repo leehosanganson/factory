@@ -91,6 +91,19 @@ The generator creates private inputs under `.local/factory-compose/` and refuses
 
 For a Controller-only setup, explicitly select `docker compose up -d --wait api` and leave the Worker stopped. The legacy direct-PostgreSQL `worker` profile is not part of the task board; it requires a separately configured Worker Controller connection and harness. See [REST Worker processes](rest-worker.md) for its configuration.
 
+## Run a disposable mock demo
+
+From the repository root, run one of these commands in a terminal:
+
+```sh
+./scripts/demo-task-board-compose.sh                           # normal sign-in (default)
+FACTORY_DEMO_AUTO_LOGIN=1 ./scripts/demo-task-board-compose.sh  # demo submitter auto-login
+```
+
+Open `https://localhost:19443/ui`. Only this demo uses the fixed host port `127.0.0.1:19443`; it must be free. Caddy uses a local certificate as in the normal setup. With auto-login off, use the submitter token from the private file whose path the launcher prints. With it on, the demo exchanges that fresh token server-side for a normal submitter session. The browser does not receive the token. Signing out clears the session; reloading the board can sign you back in while auto-login is enabled.
+
+Use this demo only on a trusted local machine. Browser request checks do not authenticate local processes. Do not proxy, tunnel, or expose the demo to other users. The launcher always uses a deterministic mock model, a disposable checkout, and fresh local credentials; it has no real-provider mode. Press Enter or Ctrl-C in the launcher terminal to remove the project, its volumes, and its scratch files. Relaunch without the variable (or with `FACTORY_DEMO_AUTO_LOGIN=0`) to turn auto-login off.
+
 ## Verify without provider credentials
 
 The browser smoke test also requires Node.js 24.x and npm 11.x on the host (see [`frontend/package.json`](../../frontend/package.json)). These host tools are for the smoke test, not for running the Compose stack.

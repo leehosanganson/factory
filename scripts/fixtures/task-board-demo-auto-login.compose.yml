@@ -1,0 +1,27 @@
+services:
+  task-board:
+    depends_on:
+      demo-session:
+        condition: service_healthy
+    volumes:
+      - ./scripts/fixtures/task-board-demo.Caddyfile:/etc/caddy/Caddyfile:ro
+      - demo-session:/run/demo-session:ro
+
+  demo-session:
+    image: ${FACTORY_TASK_BOARD_PI_IMAGE:?Run scripts/demo-task-board-compose.sh}
+    pull_policy: never
+    user: "0:0"
+    entrypoint: [node, /fixture/task-board-demo-session.mjs]
+    read_only: true
+    volumes:
+      - ./scripts/fixtures/task-board-demo-session.mjs:/fixture/task-board-demo-session.mjs:ro
+      - ${FACTORY_COMPOSE_CONFIG_DIR:?Run scripts/demo-task-board-compose.sh}/owner-token:/run/demo-owner-token:ro
+      - demo-session:/run/demo-session
+    healthcheck:
+      test: [CMD, node, -e, "const s = require('node:net').connect('/run/demo-session/session.sock'); s.on('connect', () => s.end()); s.on('error', () => process.exit(1));"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  demo-session:
