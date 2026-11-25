@@ -325,6 +325,125 @@ func TestDashboardScheduleProjectionOmitsTaskAndBoundsRuns(t *testing.T) {
 	}
 }
 
+func TestScheduleRunsExcludePendingAndSkippedOccurrencesAtCapacity(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := restjobs.OpenSQLiteStore(filepath.Join(dir, "schedule-capacity.db"), restjobs.Config{
+		QueueCapacity: 1, MaxConcurrentJobs: 1, MaxRecords: 8, MaxEventsPerJob: 8, MaxTaskBytes: 128,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	handler := newPrincipalTestHandler(t, store, restserver.PrincipalConfig{ID: "admin", Role: "operator", Enabled: true})
+	requestJSON := func(method, path, body string, status int, dst any) {
+		t.Helper()
+		response := principalRequest(handler, method, path, body, namedPrincipalToken("admin"))
+		if response.Code != status {
+			t.Fatalf("%s %s status=%d, want %d; body=%s", method, path, response.Code, status, response.Body.String())
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), dst); err != nil {
+			t.Fatalf("decode %s %s: %v; body=%s", method, path, err, response.Body.String())
+		}
+	}
+
+	var created struct {
+		Schedule restjobs.Schedule `json:"schedule"`
+	}
+	requestJSON(http.MethodPost, "/v1/schedules", `{"cron":"* * * * *","repository":"widget","task":"scheduled task"}`, http.StatusCreated, &created)
+	schedule, err := store.GetSchedule(created.Schedule.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1/schedules/" + schedule.ID
+	dispatch := func(at time.Time) {
+		t.Helper()
+		if err := store.DispatchDueScheduleOccurrences(t.Context(), at, 1); err != nil {
+			t.Fatalf("dispatch at %s: %v", at, err)
+		}
+	}
+	first := schedule.NextOccurrence()
+	dispatch(first)
+
+	var filler struct {
+		Job restjobs.Snapshot `json:"job"`
+	}
+	// With no workers, the first run and this Job fill both admission slots.
+	requestJSON(http.MethodPost, "/v1/jobs", `{"repository":"widget","task":"fill remaining slot"}`, http.StatusAccepted, &filler)
+	pending := first.Add(time.Minute)
+	lastSkipped := pending.Add(2 * time.Minute)
+	dispatch(pending)
+	dispatch(lastSkipped)
+
+	assertScheduleState := func(wantPending *time.Time) {
+		t.Helper()
+		var state struct {
+			Pending *time.Time                           `json:"pending_occurrence_at"`
+			Skipped *restjobs.SkippedScheduleOccurrences `json:"skipped_occurrences"`
+		}
+		requestJSON(http.MethodGet, path, "", http.StatusOK, &state)
+		if got := state.Pending; (wantPending == nil && got != nil) || (wantPending != nil && (got == nil || !got.Equal(*wantPending))) {
+			t.Fatalf("pending occurrence=%v, want %v", got, wantPending)
+		}
+		skipped := state.Skipped
+		if skipped == nil || skipped.Revision != schedule.Revision || skipped.Count != 2 || !skipped.FirstAt.Equal(pending.Add(time.Minute)) || !skipped.LastAt.Equal(lastSkipped) {
+			t.Fatalf("skipped summary=%+v, want two occurrences from %s through %s at revision %d", skipped, pending.Add(time.Minute), lastSkipped, schedule.Revision)
+		}
+	}
+	type runItem struct {
+		OccurrenceAt time.Time       `json:"occurrence_at"`
+		JobID        string          `json:"job_id"`
+		Status       restjobs.Status `json:"status"`
+		JobURL       string          `json:"job_url"`
+	}
+	readRuns := func(wantOccurrences ...time.Time) []runItem {
+		t.Helper()
+		var page struct {
+			Runs    []runItem `json:"runs"`
+			HasMore bool      `json:"has_more"`
+		}
+		requestJSON(http.MethodGet, path+"/runs", "", http.StatusOK, &page)
+		if len(page.Runs) != len(wantOccurrences) || page.HasMore {
+			t.Fatalf("runs=%+v has_more=%t, want exactly %v", page.Runs, page.HasMore, wantOccurrences)
+		}
+		for i, run := range page.Runs {
+			if !run.OccurrenceAt.Equal(wantOccurrences[i]) || run.JobID == "" || run.Status != restjobs.StatusQueued || run.JobURL != "/v1/jobs/"+run.JobID {
+				t.Fatalf("run=%+v, want queued Job link for occurrence %s", run, wantOccurrences[i])
+			}
+		}
+		return page.Runs
+	}
+
+	assertScheduleState(&pending)
+	original := readRuns(first)[0]
+
+	var canceled restjobs.Snapshot
+	requestJSON(http.MethodPost, "/v1/jobs/"+filler.Job.ID+"/cancel", "", http.StatusOK, &canceled)
+	if canceled.ID != filler.Job.ID || canceled.Status != restjobs.StatusCanceled {
+		t.Fatalf("cancel response=%+v, want filler Job %s canceled", canceled, filler.Job.ID)
+	}
+	dispatch(lastSkipped)
+	assertScheduleState(nil)
+	runs := readRuns(pending, first)
+	if runs[1].JobID != original.JobID || runs[0].JobID == original.JobID {
+		t.Fatalf("runs after capacity frees=%+v, want a new Job and original Job %s", runs, original.JobID)
+	}
+	for _, run := range runs {
+		var job restjobs.Snapshot
+		requestJSON(http.MethodGet, run.JobURL, "", http.StatusOK, &job)
+		if job.ID != run.JobID || job.Status != run.Status || job.Submitter != "admin" || job.Request.Repository != "widget" || job.Request.Task != "scheduled task" {
+			t.Fatalf("run %+v links to unexpected Job %+v", run, job)
+		}
+	}
+	var threads restjobs.ThreadPage
+	requestJSON(http.MethodGet, "/v1/threads", "", http.StatusOK, &threads)
+	if len(threads.Threads) != 0 {
+		t.Fatalf("scheduled Jobs created Threads: %+v", threads.Threads)
+	}
+}
+
 func TestScheduleRunsExposeRetainedJobsWithOwnerFilteringAndPagination(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
