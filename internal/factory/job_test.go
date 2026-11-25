@@ -738,14 +738,15 @@ func TestDuplicateJobWorkerCannotRerunOrReplaceWorkerIdentity(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", filepath.Dir(configDir))
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- RunJobWorker("single-run", store.Root()) }()
+	var worker WorkerRecord
 	waitFor(t, 3*time.Second, func() bool {
-		job, err := store.GetJob("single-run")
-		return err == nil && job.Status == "running"
+		record, err := store.ReadWorker("single-run")
+		if err != nil {
+			return false
+		}
+		worker = record
+		return true
 	})
-	worker, err := store.ReadWorker("single-run")
-	if err != nil {
-		t.Fatal(err)
-	}
 	duplicateDone := make(chan error, 1)
 	go func() { duplicateDone <- RunJobWorker("single-run", store.Root()) }()
 	select {
