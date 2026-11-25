@@ -108,7 +108,8 @@ test('Thread owner sees a verified source edit and inbox notice after reload wit
 
   await page.getByLabel('Repository alias', { exact: true }).fill('fixture');
   await page.getByLabel('Task', { exact: true }).fill(sourceEditTask);
-  await page.getByRole('button', { name: 'Create Thread with Job' }).click();
+  await page.getByRole('button', { name: 'Add draft' }).click();
+  await page.getByRole('button', { name: 'Queue', exact: true }).click();
   const threadHeading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
   await expect(threadHeading).toBeVisible();
   const threadID = (await threadHeading.textContent())?.replace('Thread ', '').trim();
@@ -123,7 +124,7 @@ test('Thread owner sees a verified source edit and inbox notice after reload wit
 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Threads', exact: true })).toBeVisible();
-  await page.locator('.thread-list').getByRole('button', { name: threadID! }).click();
+  await page.getByRole('region', { name: 'Your Threads' }).getByRole('button', { name: threadID!, exact: true }).click();
   await expect(page.getByRole('heading', { name: `Thread ${threadID}` })).toBeVisible();
   await expect(job.locator('.status')).toHaveText('succeeded');
   await expect(passedCheck).toBeVisible();
@@ -143,11 +144,18 @@ for (const role of ['submitter', 'operator'] as const) {
     const threads = page.getByRole('region', { name: role === 'submitter' ? 'Your Threads' : 'Threads', exact: true });
     await threads.getByLabel('Repository alias').fill('fixture');
     await threads.getByLabel('Task', { exact: true }).fill('Create a Thread to reopen on mobile.');
-    await threads.getByRole('button', { name: /Create Thread/ }).click();
+    const create = threads.getByRole('button', { name: role === 'submitter' ? 'Add draft' : 'Create Thread', exact: true });
+    await create.click();
+    if (role === 'submitter') await threads.getByRole('button', { name: 'Queue', exact: true }).click();
     const heading = threads.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
     await expect(heading).toBeVisible();
     const threadName = (await heading.innerText()).trim();
     const threadID = threadName.slice('Thread '.length);
+    if (role === 'operator') {
+      // Unrelated list updates above Threads can change the page height during this assertion.
+      await page.route('**/ui/api/v1/jobs?limit=100', (route) => route.fulfill({ json: { jobs: [] } }));
+      await page.route('**/ui/api/v1/schedules', (route) => route.fulfill({ json: { schedules: [] } }));
+    }
     await page.reload();
 
     const select = threads.getByRole('button', { name: threadID, exact: true });
@@ -162,7 +170,6 @@ for (const role of ['submitter', 'operator'] as const) {
       if (test.info().errors.length) return;
     }
 
-    const create = threads.getByRole('button', { name: /Create Thread/ });
     await create.evaluate((button) => {
       button.scrollIntoView({ block: 'end' });
       button.focus({ preventScroll: true });
