@@ -57,6 +57,62 @@ test('operator can manage schedules without exposing definitions in summaries', 
   expect(requests.filter((request) => ['PATCH', 'DELETE'].includes(request.method)).map((request) => request.ifMatch)).toEqual(['"1"', '"2"', '"3"', '"4"']);
 });
 
+test('operator sees the recovery count and can refresh it without inferring Worker health', async ({ page }) => {
+  const fixture = await runtime();
+  await page.goto(fixture.url);
+  await page.getByLabel('Access token').fill(fixture.token);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+
+  const panel = page.getByRole('region', { name: 'Jobs needing recovery' });
+  const count = panel.getByRole('status');
+  await expect(count).toHaveText('0');
+  await expect(panel.getByText('This count does not show whether a Worker has stopped.')).toBeVisible();
+
+  const operationsURL = '**/ui/api/v1/operations';
+  const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+  await page.route(operationsURL, async (route) => {
+    expect(route.request().method()).toBe('GET');
+    await route.fulfill({ json: { recovery_needed: 3, running: 9 } });
+  }, { times: 1 });
+  await refresh.click();
+  await expect(count).toHaveText('3');
+
+  await page.route(operationsURL, (route) => route.fulfill({ status: 503, json: { error: { message: 'private diagnostic' } } }), { times: 1 });
+  await refresh.click();
+  await expect(count).toHaveText('Unavailable');
+  await expect(panel).not.toContainText('private diagnostic');
+
+  await refresh.click();
+  await expect(count).toHaveText('0');
+  await page.route(operationsURL, (route) => route.fulfill({ json: { running: 9 } }), { times: 1 });
+  await refresh.click();
+  await expect(count).toHaveText('Unavailable');
+});
+
+test('signing out cancels a pending recovery count before entering the submitter workbench', async ({ page }) => {
+  const fixture = await runtime();
+  let capture!: (route: Route) => void;
+  const pending = new Promise<Route>((resolve) => { capture = resolve; });
+  await page.route('**/ui/api/v1/operations', (route) => capture(route), { times: 1 });
+  await page.goto(fixture.url);
+  await page.getByLabel('Access token').fill(fixture.token);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+
+  const route = await pending;
+  const panel = page.getByRole('region', { name: 'Jobs needing recovery' });
+  await expect(panel.getByRole('status')).toHaveText('Loading…');
+  const canceled = page.waitForEvent('requestfailed', (request) => request === route.request());
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await canceled;
+  await expect(panel).toHaveCount(0);
+
+  await page.getByLabel('Access token').fill(fixture.submitterToken);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible();
+  await route.fulfill({ json: { recovery_needed: 42 } });
+  await expect(panel).toHaveCount(0);
+});
+
 test('operator can inspect worker session summaries through the read-only dashboard', async ({ page }) => {
   const fixture = await runtime();
   const requests: { method: string; url: string }[] = [];
@@ -102,13 +158,14 @@ test('Thread owner sees a verified source edit and inbox notice after reload wit
   const submitterCookie = (await page.context().cookies(new URL(fixture.url).origin)).find((cookie) => cookie.name === 'factory_operator_session');
   expect(submitterCookie?.httpOnly).toBe(true);
   expect(submitterCookie?.secure).toBe(true);
-  for (const forbidden of ['Schedules', 'Worker sessions', 'Recent jobs', 'Admit a job']) {
+  for (const forbidden of ['Schedules', 'Worker sessions', 'Jobs needing recovery', 'Recent jobs', 'Admit a job']) {
     await expect(page.getByRole('heading', { name: forbidden, exact: true })).toHaveCount(0);
   }
 
   await page.getByLabel('Repository alias', { exact: true }).fill('fixture');
   await page.getByLabel('Task', { exact: true }).fill(sourceEditTask);
-  await page.getByRole('button', { name: 'Create Thread with Job' }).click();
+  await page.getByRole('button', { name: 'Add draft' }).click();
+  await page.getByRole('button', { name: 'Queue', exact: true }).click();
   const threadHeading = page.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
   await expect(threadHeading).toBeVisible();
   const threadID = (await threadHeading.textContent())?.replace('Thread ', '').trim();
@@ -123,7 +180,7 @@ test('Thread owner sees a verified source edit and inbox notice after reload wit
 
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Threads', exact: true })).toBeVisible();
-  await page.locator('.thread-list').getByRole('button', { name: threadID! }).click();
+  await page.getByRole('region', { name: 'Your Threads' }).getByRole('button', { name: threadID!, exact: true }).click();
   await expect(page.getByRole('heading', { name: `Thread ${threadID}` })).toBeVisible();
   await expect(job.locator('.status')).toHaveText('succeeded');
   await expect(passedCheck).toBeVisible();
@@ -143,11 +200,18 @@ for (const role of ['submitter', 'operator'] as const) {
     const threads = page.getByRole('region', { name: role === 'submitter' ? 'Your Threads' : 'Threads', exact: true });
     await threads.getByLabel('Repository alias').fill('fixture');
     await threads.getByLabel('Task', { exact: true }).fill('Create a Thread to reopen on mobile.');
-    await threads.getByRole('button', { name: /Create Thread/ }).click();
+    const create = threads.getByRole('button', { name: role === 'submitter' ? 'Add draft' : 'Create Thread', exact: true });
+    await create.click();
+    if (role === 'submitter') await threads.getByRole('button', { name: 'Queue', exact: true }).click();
     const heading = threads.getByRole('heading', { name: /^Thread [0-9a-f-]+$/ });
     await expect(heading).toBeVisible();
     const threadName = (await heading.innerText()).trim();
     const threadID = threadName.slice('Thread '.length);
+    if (role === 'operator') {
+      // Unrelated list updates above Threads can change the page height during this assertion.
+      await page.route('**/ui/api/v1/jobs?limit=100', (route) => route.fulfill({ json: { jobs: [] } }));
+      await page.route('**/ui/api/v1/schedules', (route) => route.fulfill({ json: { schedules: [] } }));
+    }
     await page.reload();
 
     const select = threads.getByRole('button', { name: threadID, exact: true });
@@ -162,7 +226,6 @@ for (const role of ['submitter', 'operator'] as const) {
       if (test.info().errors.length) return;
     }
 
-    const create = threads.getByRole('button', { name: /Create Thread/ });
     await create.evaluate((button) => {
       button.scrollIntoView({ block: 'end' });
       button.focus({ preventScroll: true });

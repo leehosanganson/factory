@@ -180,6 +180,10 @@ func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) proxy(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/ui/api/v1/operations" && (r.URL.RawQuery != "" || r.URL.ForceQuery) {
+		http.NotFound(w, r)
+		return
+	}
 	query, queryErr := url.ParseQuery(r.URL.RawQuery)
 	queryAllowed := r.URL.RawQuery == "" || dashboardProxyQueryAllowed(r.URL.Path, r.Method)
 	if r.URL.Path == "/ui/api/v1/threads" && r.URL.RawQuery != "" {
@@ -250,7 +254,7 @@ func dashboardProxyAllowed(path, method string) bool {
 	if path == "/ui/api/v1/jobs" {
 		return method == http.MethodGet || method == http.MethodPost
 	}
-	if path == "/ui/api/v1/worker-sessions" {
+	if path == "/ui/api/v1/worker-sessions" || path == "/ui/api/v1/operations" {
 		return method == http.MethodGet
 	}
 	if strings.HasPrefix(path, "/ui/api/v1/jobs/") {
