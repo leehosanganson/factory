@@ -8,6 +8,25 @@ import (
 	"time"
 )
 
+// ReadRecoveryNeeded observes committed Job and lease state without using or
+// updating the legacy recovery cache. Lease expiry is not process-stop evidence.
+func (s *PostgresStore) ReadRecoveryNeeded(ctx context.Context, id string) (Status, bool, error) {
+	if err := s.checkOpen(); err != nil {
+		return "", false, err
+	}
+	var status Status
+	var needed bool
+	err := s.db.QueryRowContext(ctx, `SELECT j.status, j.status='running' AND (o.job_id IS NULL OR o.lease_until<=clock_timestamp())
+		FROM factory_jobs j LEFT JOIN factory_rest_worker_ownership o ON o.job_id=j.id WHERE j.id=$1`, id).Scan(&status, &needed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, ErrNotFound
+	}
+	if err != nil {
+		return "", false, errors.New("read PostgreSQL job recovery state")
+	}
+	return status, needed, nil
+}
+
 // RecoveryNeeded reports whether this store instance opened with an interrupted
 // running job (or subsequently resolved it). A live, unexpired worker lease is
 // not classified as interrupted.

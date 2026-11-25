@@ -307,6 +307,20 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   await expect(page.getByRole('heading', { name: `Job ${jobID}` })).toBeVisible();
   await expect(page.getByText('succeeded', { exact: true }).last()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('Pull request')).toHaveCount(0);
+  const detail = page.getByRole('region', { name: `Job ${jobID}` });
+  await expect(detail.getByText('Not needed', { exact: true })).toBeVisible();
+  const jobURL = `**/ui/api/v1/jobs/${jobID}`;
+  for (const [state, label] of [['needs_operator', 'Needs operator attention'], ['unavailable', 'Unavailable']]) {
+    await page.route(jobURL, async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), status: 'running', recovery_state: state } });
+    });
+    await jobLink.click();
+    await expect(detail.getByText(label, { exact: true })).toBeVisible();
+    await expect(detail.getByText('running', { exact: true })).toBeVisible();
+    if (state === 'needs_operator') await expect(detail.getByText(/does not prove the process stopped/)).toBeVisible();
+    await page.unroute(jobURL);
+  }
 
   await page.getByLabel('Repository alias').nth(1).fill('fixture');
   await page.getByLabel('Task').nth(1).fill(sourceEditTask);

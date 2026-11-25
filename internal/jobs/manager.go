@@ -433,6 +433,13 @@ type RecoveryClassifier interface {
 	RecoveryNeeded(id string) bool
 }
 
+// RecoveryReader classifies a retained Job without changing recovery state.
+// It returns the status used for the classification so callers can detect a
+// transition since an earlier read. A read failure is not a negative result.
+type RecoveryReader interface {
+	ReadRecoveryNeeded(ctx context.Context, id string) (status Status, needed bool, err error)
+}
+
 // InterruptedDisposition is the bounded non-success outcome an operator may
 // record for SQLite work found running at startup, only when no provider side
 // effect was recorded.
@@ -908,6 +915,20 @@ func (m *LocalManager) ownsAttemptLocked(attempt AttemptHandle) (*job, error) {
 		return nil, ErrStaleAttempt
 	}
 	return entry, nil
+}
+
+func (m *LocalManager) ReadRecoveryNeeded(ctx context.Context, id string) (status Status, needed bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	// The volatile store cannot retain interrupted Jobs across a restart.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry := m.jobs[id]
+	if entry == nil {
+		return "", false, ErrNotFound
+	}
+	return entry.snapshot.Status, false, nil
 }
 
 // Get returns a defensive copy of a retained job snapshot.
