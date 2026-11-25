@@ -1,0 +1,28 @@
+{
+	admin off
+	skip_install_trust
+	auto_https disable_redirects
+}
+
+https://localhost {
+	tls internal
+	@session {
+		expression {http.request.uri} == '/ui/session'
+		method GET
+	}
+	handle @session {
+		reverse_proxy unix//run/demo-session/session.sock {
+			@declined status 204
+			handle_response @declined {
+				reverse_proxy api:8080
+			}
+		}
+	}
+	@board path / /ui /ui/*
+	handle @board {
+		reverse_proxy api:8080
+	}
+	handle {
+		respond 404
+	}
+}

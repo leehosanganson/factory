@@ -1,0 +1,19 @@
+services:
+  task-board:
+    ports: !override ["127.0.0.1:19443:443"]
+    networks:
+      demo-ingress:
+        gw_priority: 1
+      default: {}
+
+  api:
+    ports: !reset []
+
+  pi-provider:
+    environment:
+      FACTORY_TASK_BOARD_DEMO: "1"
+
+networks:
+  default:
+    internal: true
+  demo-ingress: {}

@@ -30,9 +30,7 @@ function content(message) {
 
 const alphaTask = 'start alpha: replace the seeded README.md line with alpha-workspace; change no other files';
 
-async function complete({ model, messages, stream: streaming }) {
-  assert.equal(model, 'deterministic');
-  assert.equal(streaming, true);
+async function complete({ messages }) {
   const tasks = messages.filter(({ role }) => role === 'user').map(content);
   const task = tasks.at(-1);
   const last = messages.at(-1);
@@ -87,7 +85,12 @@ createServer(async (request, response) => {
     assert.equal(request.headers.authorization, 'Bearer task-board-fixture-only');
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
-    const result = await complete(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+    const input = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    assert.equal(input.model, 'deterministic');
+    assert.equal(input.stream, true);
+    const result = process.env.FACTORY_TASK_BOARD_DEMO === '1'
+      ? { content: 'Mock model completed this turn. No external model was called and no files were changed.' }
+      : await complete(input);
     stream(response, result);
   } catch (error) {
     console.error(error);
