@@ -61,13 +61,14 @@ try {
     const previous = await heading.count() ? await heading.textContent() : '';
     await page.getByLabel('Repository alias', { exact: true }).fill('local');
     await page.getByLabel('Task', { exact: true }).fill(name === 'alpha' ? alphaTask : `start ${name}`);
-    await page.getByRole('button', { name: 'Create Thread with Job' }).click();
+    await page.getByRole('button', { name: 'Add draft' }).click();
+    await page.getByRole('button', { name: 'Queue', exact: true }).click();
     await expect(heading).toBeVisible();
     await expect(heading).not.toHaveText(previous);
     return (await heading.textContent()).replace('Thread ', '');
   }
   async function select(page, id) {
-    await page.locator('.thread-list').getByRole('button', { name: id, exact: true }).click();
+    await page.getByRole('region', { name: 'Your Threads' }).getByRole('button', { name: id, exact: true }).click();
     await expect(page.getByRole('heading', { name: `Thread ${id}`, exact: true })).toBeVisible();
   }
   async function followUp(page, task) {
