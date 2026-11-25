@@ -9,6 +9,7 @@ const [inputDir] = process.argv.slice(2);
 const project = process.env.COMPOSE_PROJECT_NAME ?? '';
 assert.match(project, /^factory-task-board-[a-f0-9]{16}$/, 'Run via scripts/test-task-board-compose.sh');
 const timeout = 25_000;
+const scheduleTask = 'complete the scheduled smoke task without changing files';
 const alphaTask = 'start alpha: replace the seeded README.md line with alpha-workspace; change no other files';
 
 function rawCompose(...args) {
@@ -151,6 +152,43 @@ try {
   assert.equal(jobs.length, 3);
   assert.ok(jobs.every((job) => !('reply' in job) && !('verification' in job)));
   console.log('Compose browser smoke: overlapping Threads, ordered Alpha jobs, live operator job status, retained history and isolated follow-ups after down/up, bounded replies, and operator redaction.');
+
+  const schedules = operator.getByRole('region', { name: 'Schedules', exact: true });
+  await schedules.getByLabel('Cron (UTC)').fill('* * * * *');
+  await schedules.getByLabel('Repository alias').fill('local');
+  await schedules.getByLabel('Task', { exact: true }).fill(scheduleTask);
+  const [creation] = await Promise.all([
+    operator.waitForResponse((response) => response.request().method() === 'POST'
+      && response.url() === new URL('/ui/api/v1/schedules', url).href, { timeout }),
+    schedules.getByRole('button', { name: 'Create schedule' }).click({ timeout }),
+  ]);
+  assert.equal(creation.status(), 201);
+  const { schedule } = await creation.json();
+  // Use the Controller's creation time, not the browser host clock, to identify the first firing.
+  const minute = 60_000;
+  const occurrence = new Date(Math.floor(Date.parse(schedule.created_at) / minute) * minute + minute).toISOString();
+  const card = schedules.getByRole('article').filter({
+    has: operator.getByRole('heading', { name: schedule.id, exact: true }),
+  });
+  const run = card.getByRole('listitem').filter({ hasText: occurrence });
+  const runLink = run.getByRole('link', { name: /^Job [0-9a-f-]+$/ });
+  await expect(runLink).toBeVisible({ timeout: minute + timeout });
+  const scheduledJobID = (await runLink.textContent({ timeout })).replace(/^Job /, '');
+  const runStatus = run.locator('.status');
+  await expect(runStatus).toHaveText(/^(succeeded|failed|canceled)$/, { timeout });
+  assert.equal(await runStatus.textContent({ timeout }), 'succeeded', `Scheduled Job ${scheduledJobID} outcome`);
+  await runLink.click({ timeout });
+  const scheduledJob = operator.getByRole('region', { name: `Job ${scheduledJobID}`, exact: true });
+  await expect(scheduledJob.getByText('succeeded', { exact: true })).toBeVisible();
+  await expect(scheduledJob.getByText('compose-remote-worker', { exact: true })).toBeVisible();
+  await expect(scheduledJob.getByText('Agent-reported completion is not an independent correctness verdict.', { exact: true })).toBeVisible();
+
+  // The Job panel does not expose Thread membership; check the authoritative join table.
+  assert.match(scheduledJobID, /^[0-9a-f-]+$/);
+  assert.equal(compose('exec', '-T', 'postgres', 'psql', '-XAt', '-v', 'ON_ERROR_STOP=1', '-U', 'factory', '-d', 'factory', '-c',
+    `SELECT count(*) FROM factory_thread_jobs WHERE job_id = '${scheduledJobID}'`), '0',
+    `Scheduled Job ${scheduledJobID} must not belong to any Thread`);
+  console.log(`Compose browser smoke: schedule ${schedule.id} fired at ${occurrence}; opened Job ${scheduledJobID}, succeeded on compose-remote-worker, 0 Thread memberships.`);
 } finally {
   await browser.close();
 }
