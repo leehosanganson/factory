@@ -166,6 +166,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ServeAsDashboardOperator serves the allowlisted embedded dashboard routes.
 func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/operations" && (r.URL.RawQuery != "" || r.URL.ForceQuery) {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
 	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || isThreadsPath(r.URL.Path) && r.URL.RawQuery != "" && r.URL.Path != "/v1/threads" || !dashboardRoute(r.URL.Path, r.Method) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
@@ -219,7 +223,7 @@ func isDashboardOperator(r *http.Request) bool {
 }
 
 func dashboardRoute(path, method string) bool {
-	if path == "/v1/worker-sessions" {
+	if path == "/v1/worker-sessions" || path == "/v1/operations" {
 		return method == http.MethodGet
 	}
 	if path == "/v1/schedules" {
