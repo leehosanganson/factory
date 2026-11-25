@@ -102,6 +102,7 @@ func TestSubmitterProxyAllowsOnlyUserWorkAndChecksCSRFAndOrigin(t *testing.T) {
 	}{
 		{"/ui/api/v1/schedules", http.StatusNotFound},
 		{"/ui/api/v1/worker-sessions", http.StatusNotFound},
+		{"/ui/api/v1/operations", http.StatusNotFound},
 		{"/ui/api/v1/jobs/job-id/history", http.StatusNotFound},
 		{"/ui/api/v1/threads", http.StatusOK},
 		{"/ui/api/v1/threads?cursor=older", http.StatusNotFound},
@@ -568,7 +569,15 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 		method string
 		path   string
 		want   int
-	}{{http.MethodGet, "/ui/api/v1/worker-sessions", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/worker-sessions", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?before_id=partial", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&before_id=id", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&before_created_at=2026-01-01T00%3A00%3A00Z", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&limit=1", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodDelete, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50", http.StatusOK}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?limit=50", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads?cursor=secret", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
+	}{
+		{http.MethodGet, "/ui/api/v1/operations", http.StatusOK},
+		{http.MethodHead, "/ui/api/v1/operations", http.StatusNotFound},
+		{http.MethodPost, "/ui/api/v1/operations", http.StatusNotFound},
+		{http.MethodGet, "/ui/api/v1/operations?limit=1", http.StatusNotFound},
+		{http.MethodGet, "/ui/api/v1/operations?", http.StatusNotFound},
+		{http.MethodGet, "/ui/api/v1/%6fperations", http.StatusNotFound},
+		{http.MethodGet, "/ui/api/v1/operations/extra", http.StatusNotFound},
+		{http.MethodGet, "/ui/api/v1/worker-sessions", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/worker-sessions", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?before_id=partial", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&before_id=id", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&before_created_at=2026-01-01T00%3A00%3A00Z", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/worker-sessions?limit=1&limit=1", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/runs?limit=5", http.StatusServiceUnavailable}, {http.MethodPost, "/ui/api/v1/schedules", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodPatch, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodDelete, "/ui/api/v1/schedules/example", http.StatusServiceUnavailable}, {http.MethodGet, "/ui/api/v1/schedules/example/history", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50", http.StatusOK}, {http.MethodGet, "/ui/api/v1/threads/id/jobs", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id/complete", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads/id/extra", http.StatusNotFound}, {http.MethodPost, "/ui/api/v1/threads?limit=50", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads/id/complete?key=x", http.StatusBadRequest}, {http.MethodPost, "/ui/api/v1/threads?foo=bar", http.StatusBadRequest}, {http.MethodGet, "/ui/api/v1/threads?cursor=secret", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads?limit=50&include=private", http.StatusNotFound}, {http.MethodGet, "/ui/api/v1/threads/id?foo=bar", http.StatusNotFound}} {
 		proxyRequest := httptest.NewRequest(tc.method, tc.path, nil)
 		proxyRequest.Host = "factory.example"
 		proxyRequest.Header.Set("Origin", "https://factory.example")
@@ -578,6 +587,9 @@ func TestOperatorSessionUsesHttpOnlyCookieAndCSRFProtectedProxy(t *testing.T) {
 		handler.ServeHTTP(proxyResponse, proxyRequest)
 		if proxyResponse.Code != tc.want {
 			t.Errorf("proxy %s %s status=%d body=%s; want %d", tc.method, tc.path, proxyResponse.Code, proxyResponse.Body.String(), tc.want)
+		}
+		if strings.HasPrefix(tc.path, "/ui/api/v1/operations?") && proxyResponse.Body.String() != "404 page not found\n" {
+			t.Errorf("proxy %s should be rejected before reaching the API bridge, body=%q", tc.path, proxyResponse.Body.String())
 		}
 	}
 }

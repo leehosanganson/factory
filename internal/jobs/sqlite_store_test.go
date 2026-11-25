@@ -940,6 +940,47 @@ func TestSQLiteWaitClaimAttemptWakesAfterAdmissionWithPersistedOwnership(t *test
 	}
 }
 
+func TestSQLiteReadRecoveryNeeded(t *testing.T) {
+	path := filepath.Join(privateSQLiteDir(t), "recovery.db")
+	store, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.CloseStore()
+	job, _, err := store.Admit("recovery-visibility", Request{Repository: "widget", Task: "test recovery"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	check := func(store *SQLiteStore, label string, wantStatus Status, want bool) {
+		t.Helper()
+		if status, got, err := store.ReadRecoveryNeeded(ctx, job.ID); err != nil || status != wantStatus || got != want {
+			t.Fatalf("%s: recovery=(%s, %t, %v), want (%s, %t, nil)", label, status, got, err, wantStatus, want)
+		}
+	}
+	check(store, "queued", StatusQueued, false)
+	if _, err := store.ClaimNextAttempt(); err != nil {
+		t.Fatal(err)
+	}
+	check(store, "live running", StatusRunning, false)
+	if err := store.CloseStore(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenSQLiteStore(path, testConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.CloseStore()
+	check(reopened, "running at startup", StatusRunning, true)
+	if err := reopened.ResolveInterrupted(job.ID, InterruptedDispositionFailed); err != nil {
+		t.Fatal(err)
+	}
+	check(reopened, "terminal", StatusFailed, false)
+	if _, _, err := reopened.ReadRecoveryNeeded(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing Job: %v, want not found", err)
+	}
+}
+
 func TestSQLiteRestartPreservesOwnershipButFencesInterruptedWorker(t *testing.T) {
 	path := filepath.Join(privateSQLiteDir(t), "ownership.db")
 	store, err := OpenSQLiteStore(path, testConfig())

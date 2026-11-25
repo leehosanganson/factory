@@ -166,6 +166,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ServeAsDashboardOperator serves the allowlisted embedded dashboard routes.
 func (h *Handler) ServeAsDashboardOperator(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/operations" && (r.URL.RawQuery != "" || r.URL.ForceQuery) {
+		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
+		return
+	}
 	if h.config.DashboardOperatorID == "" || r.URL.EscapedPath() != r.URL.Path || isThreadsPath(r.URL.Path) && r.URL.RawQuery != "" && r.URL.Path != "/v1/threads" || !dashboardRoute(r.URL.Path, r.Method) {
 		writeError(w, http.StatusNotFound, "not_found", "Resource not found.")
 		return
@@ -219,7 +223,7 @@ func isDashboardOperator(r *http.Request) bool {
 }
 
 func dashboardRoute(path, method string) bool {
-	if path == "/v1/worker-sessions" {
+	if path == "/v1/worker-sessions" || path == "/v1/operations" {
 		return method == http.MethodGet
 	}
 	if path == "/v1/schedules" {
@@ -422,7 +426,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 			if caller.Role == "submitter" {
 				h.getJobForPrincipal(w, r, parts[0], caller.ID)
 			} else {
-				h.getJob(w, parts[0])
+				h.getJob(w, r, parts[0])
 			}
 			return
 		}
@@ -1318,7 +1322,7 @@ func (h *Handler) getHistoryForPrincipal(w http.ResponseWriter, id, principalID 
 	h.getHistory(w, id)
 }
 
-func (h *Handler) getJob(w http.ResponseWriter, id string) {
+func (h *Handler) getJob(w http.ResponseWriter, r *http.Request, id string) {
 	snapshot, err := h.manager.Get(id)
 	if err != nil {
 		h.writeManagerError(w, err)
@@ -1331,6 +1335,10 @@ func (h *Handler) getJob(w http.ResponseWriter, id string) {
 		if snapshot.Progress == nil {
 			snapshot.Progress = history.Progress
 		}
+	}
+	if isDashboardOperator(r) {
+		h.writeDashboardJob(w, r.Context(), snapshot)
+		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
 }

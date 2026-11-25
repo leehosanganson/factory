@@ -1253,6 +1253,22 @@ func (s *SQLiteStore) MarkProviderAttemptUncertain(id string) error {
 	return tx.Commit()
 }
 
+func (s *SQLiteStore) ReadRecoveryNeeded(ctx context.Context, id string) (Status, bool, error) {
+	if err := s.checkOpen(); err != nil {
+		return "", false, err
+	}
+	// A startup marker can only be removed after a terminal state commits.
+	// Read it first so a concurrent resolution cannot hide it for a running row.
+	interrupted := s.RecoveryNeeded(id)
+	var status Status
+	if err := s.db.QueryRowContext(ctx, `SELECT status FROM factory_jobs WHERE id=?`, id).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return "", false, ErrNotFound
+	} else if err != nil {
+		return "", false, errors.New("read SQLite job recovery state")
+	}
+	return status, status == StatusRunning && interrupted, nil
+}
+
 func (s *SQLiteStore) RecoveryNeeded(id string) bool {
 	s.recoveryMu.RLock()
 	defer s.recoveryMu.RUnlock()

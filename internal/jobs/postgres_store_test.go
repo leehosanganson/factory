@@ -417,6 +417,62 @@ func TestPostgresStoreIntegration(t *testing.T) {
 		t.Fatalf("PostgreSQL server_version_num=%d, integration coverage requires PostgreSQL 18", version)
 	}
 
+	t.Run("read-only per-Job recovery", func(t *testing.T) {
+		db := scopedPostgresDB(t, admin, dsn)
+		store, err := NewPostgresStore(db, testConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.CloseStore() })
+		ctx := context.Background()
+		job, _, err := store.Admit("recovery-visibility", Request{Repository: "widget", Task: "test recovery"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		check := func(label string, wantStatus Status, want bool) {
+			t.Helper()
+			if status, got, err := store.ReadRecoveryNeeded(ctx, job.ID); err != nil || status != wantStatus || got != want {
+				t.Fatalf("%s: recovery=(%s, %t, %v), want (%s, %t, nil)", label, status, got, err, wantStatus, want)
+			}
+		}
+		exec := func(query string) {
+			t.Helper()
+			if _, err := db.Exec(query, job.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		check("queued", StatusQueued, false)
+		if _, err := store.ClaimNextAttempt(); err != nil {
+			t.Fatal(err)
+		}
+		check("live lease", StatusRunning, false)
+		exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()-interval '1 second' WHERE job_id=$1`)
+		check("expired lease", StatusRunning, true)
+		if summary, err := store.OperationalSummary(ctx); err != nil || summary.RecoveryNeeded != 0 || summary.Running != 1 {
+			t.Fatalf("inspection changed cached count or running status: %+v, %v", summary, err)
+		}
+		if !store.RecoveryNeeded(job.ID) {
+			t.Fatal("legacy classifier did not record interrupted Job")
+		}
+		check("expired lease with cached marker", StatusRunning, true)
+		canceled, cancel := context.WithCancel(ctx)
+		cancel()
+		if _, _, err := store.ReadRecoveryNeeded(canceled, job.ID); err == nil {
+			t.Fatal("failed query returned a cached classification")
+		}
+		exec(`UPDATE factory_rest_worker_ownership SET lease_until=clock_timestamp()+interval '1 minute' WHERE job_id=$1`)
+		check("live lease with cached marker", StatusRunning, false)
+		exec(`DELETE FROM factory_rest_worker_ownership WHERE job_id=$1`)
+		check("missing lease", StatusRunning, true)
+		if err := store.ResolveInterrupted(job.ID, InterruptedDispositionFailed); err != nil {
+			t.Fatal(err)
+		}
+		check("terminal", StatusFailed, false)
+		if _, _, err := store.ReadRecoveryNeeded(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("missing Job: %v, want not found", err)
+		}
+	})
+
 	t.Run("Thread persistence, ownership, and recovery projection", func(t *testing.T) {
 		db1 := scopedPostgresDB(t, admin, dsn)
 		schema := currentTestSchema(t, db1)
