@@ -37,6 +37,7 @@ The binary is written to `./bin/factory`. See [Contributing](CONTRIBUTING.md).
 
 - [Factory Worker MVP](docs/roadmap/factory-unit-mvp.md) — target product, architecture, and scope.
 - [Local Compose setup](docs/features/compose-local-control-plane.md) — current development topology and smoke test.
+- [Operator dashboard](docs/features/rest-web-ui.md) — browser Job inspection and read-only recovery visibility.
 - [REST server operations](docs/features/rest-server-operations.md) — current API, persistence, and recovery behavior.
 - [Implemented features](docs/features/README.md) — index of current CLI and service capabilities.
 - [Roadmap](docs/roadmap/roadmap.md) — short index separating current behavior from target direction.

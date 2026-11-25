@@ -7,7 +7,7 @@ import type { Thread, ThreadRequest } from './thread-board';
 import './style.css';
 
 type Session = { authenticated: boolean; csrf?: string; role?: 'operator' | 'submitter' };
-type Job = { reply?: string; reply_truncated?: boolean; id: string; status: string; created_at: string; updated_at: string; submitted_by?: string; worker?: { worker_id: string; boot_id: string }; progress?: { stage: string; state: string }; provider?: { repository: string; number: number; url?: string }; verification?: { checks?: { name: string; outcome: string }[]; limitations?: string[] } };
+type Job = { recovery_state?: 'needs_operator' | 'not_needed' | 'unavailable'; reply?: string; reply_truncated?: boolean; id: string; status: string; created_at: string; updated_at: string; submitted_by?: string; worker?: { worker_id: string; boot_id: string }; progress?: { stage: string; state: string }; provider?: { repository: string; number: number; url?: string }; verification?: { checks?: { name: string; outcome: string }[]; limitations?: string[] } };
 type History = { events?: { at: string; type: string; stage?: string; state?: string }[] };
 type Schedule = { id: string; status: string; cron: string; revision: number; pending_occurrence_at?: string; skipped_occurrences?: { count: number; first_at: string; last_at: string } };
 type ScheduleDefinition = { id: string; status: string; cron: string; repository: string; task: string };
@@ -72,6 +72,7 @@ function App() {
   const [notice, setNotice] = useState('');
   const [jobs, setJobs] = useState<Job[]>([]);
   const [loading, setLoading] = useState('');
+  const [recoveryRefresh, setRecoveryRefresh] = useState(0);
   const [admissionPending, setAdmissionPending] = useState(false);
   const selectionGeneration = useRef(0);
   const activeSelection = useRef('');
@@ -453,18 +454,45 @@ function App() {
   </main></div>;
 
   return <><header className="topbar"><a className="brand" href="/ui">Factory <span>Control Plane</span></a><button className="quiet" type="button" onClick={() => void logout()}>Sign out</button></header><main>
-    <div className="welcome"><div><p className="eyebrow">LOCAL JOB SERVICE</p><h1>Jobs</h1><p className="muted">Admit work, monitor safe lifecycle progress, and inspect outcomes.</p></div><button className="secondary" type="button" onClick={() => { void refreshJobs(); void refreshSchedules(); void refreshThreads(); if (thread) void inspectThread(thread.id); }}>Refresh</button></div>
+    <div className="welcome"><div><p className="eyebrow">LOCAL JOB SERVICE</p><h1>Jobs</h1><p className="muted">Admit work, monitor safe lifecycle progress, and inspect outcomes.</p></div><button className="secondary" type="button" onClick={() => { void refreshJobs(); void refreshSchedules(); void refreshThreads(); setRecoveryRefresh((current) => current + 1); if (thread) void inspectThread(thread.id); }}>Refresh</button></div>
     <div className="notice" role="status" aria-live="polite">{notice}</div>
     <div className="layout"><section className="panel admission" aria-labelledby="admit-title"><h2 id="admit-title">Admit a job</h2><form onSubmit={admit}><label htmlFor="repository">Repository alias</label><input id="repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="task">Task</label><textarea id="task" name="task" rows={6} maxLength={262144} required/><button type="submit" disabled={admissionPending}>{admissionPending ? 'Queueing…' : 'Queue job'}</button></form></section>
     <section className="panel jobs-panel" aria-labelledby="jobs-title"><div className="section-heading"><h2 id="jobs-title">Recent jobs</h2><span className="muted" role="status">{loading}</span></div><div className="job-list" aria-live="polite">{jobs.length ? jobs.map((job) => <article className="job-row" key={job.id}><a className="job-link" href={`#job-${encodeURIComponent(job.id)}`} onClick={(e) => { e.preventDefault(); void inspect(job.id); }}>{job.id}</a><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">{date(job.created_at)} · Updated {date(job.updated_at)}</span></article>) : <p className="empty">No jobs yet. Submit a task to create the first job.</p>}</div></section></div>
     <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Threads</h2><span className="muted" role="status">{threadLoading}</span></div><p className="muted">Browse recent Threads and select one to reopen its safe job summary.</p><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => selectThread(item.id)}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)} · Updated {date(item.updated_at)}{item.completed_at ? ` · Completed ${date(item.completed_at)}` : ''}</span></article>) : <p className="empty">No retained Threads yet.</p>}</div>{threadPagination.page.has_more && <button className="secondary" type="button" onClick={() => void refreshThreads('older')}>Load older Threads</button>}<h3>Start a Thread</h3><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread</button></form>
       <div className="thread-result" aria-live="polite">{thread && <><h3 ref={threadHeading} tabIndex={-1}>Thread {thread.id}</h3><span className={`status ${thread.status}`}>{thread.status}</span>{thread.completed_at && <p className="job-meta">Completed {date(thread.completed_at)}</p>}{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span></article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Append Job</button></form><button className="danger" type="button" disabled={threadPending} onClick={() => void completeThread()}>Complete Thread</button></section>}</section>
+    <RecoveryCount refresh={recoveryRefresh} />
     <WorkerSessions csrf={session.csrf || ''} />
     <section className="panel schedules-panel" aria-labelledby="schedules-title"><div className="section-heading"><h2 id="schedules-title">Schedules</h2><span className="muted" role="status">{scheduleLoading}</span></div><p className="muted">Schedule tasks run on their cron times. Cron uses UTC and supports one-minute minimum recurrence.</p><form className="schedule-form" onSubmit={createSchedule}><label htmlFor="schedule-cron">Cron (UTC)</label><input id="schedule-cron" name="cron" maxLength={128} required autoComplete="off" placeholder="0 9 * * 1-5"/><span className="muted">Five fields; UTC; one-minute minimum recurrence.</span><label htmlFor="schedule-repository">Repository alias</label><input id="schedule-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="schedule-task">Task</label><textarea id="schedule-task" name="task" rows={4} maxLength={262144} required/><button id="schedule-submit" type="submit" disabled={schedulePending}>Create schedule</button></form>
       <div className="schedule-list" aria-live="polite">{schedules.length ? schedules.map((schedule) => <ScheduleCard key={schedule.id} schedule={schedule} revision={scheduleRevision} csrf={session.csrf || ''} onInspect={(id) => void inspect(id)} onRefresh={refreshSchedules} onError={setNotice}/> ) : <p className="empty">No schedules are configured.</p>}</div></section>
     {detail && <JobDetail key={detail.job.id} job={detail.job} history={detail.history} csrf={session.csrf || ''} onRefresh={() => { void refreshJobs(); }} onError={setNotice} />}
   </main></>;
+}
+
+function RecoveryCount({ refresh }: { refresh: number }) {
+  const [count, setCount] = useState<number | 'loading' | 'unavailable'>('loading');
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setCount('loading');
+    async function load() {
+      try {
+        const summary = await api<{ recovery_needed?: unknown } | null>('/v1/operations', { signal: controller.signal });
+        if (controller.signal.aborted) return;
+        const value = summary?.recovery_needed;
+        setCount(typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 'unavailable');
+      } catch {
+        if (!controller.signal.aborted) setCount('unavailable');
+      }
+    }
+    void load();
+    return () => controller.abort();
+  }, [refresh]);
+
+  return <section className="panel" aria-labelledby="recovery-count-title">
+    <div className="section-heading"><h2 id="recovery-count-title">Jobs needing recovery</h2><span role="status">{count === 'loading' ? 'Loading…' : count === 'unavailable' ? 'Unavailable' : count}</span></div>
+    <p className="muted">This count does not show whether a Worker has stopped.</p>
+  </section>;
 }
 
 function WorkerSessions({ csrf }: { csrf: string }) {
@@ -570,6 +598,7 @@ function JobDetail({ job, history, csrf, onRefresh, onError }: { job: Job; histo
   const mounted = useRef(true);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   const field = (label: string, value?: string) => <div key={label}><span className="detail-label">{label}</span><span className="detail-value">{value || 'Not available'}</span></div>;
+  const recoveryLabel = job.recovery_state === 'needs_operator' ? 'Needs operator attention' : job.recovery_state === 'not_needed' ? 'Not needed' : 'Unavailable';
   async function cancel() {
     setBusy(true);
     try {
@@ -581,7 +610,7 @@ function JobDetail({ job, history, csrf, onRefresh, onError }: { job: Job; histo
       if (mounted.current) setBusy(false);
     }
   }
-  return <section id="detail" className="panel detail" aria-labelledby="detail-title" aria-live="polite"><p className="eyebrow">JOB INSPECTION</p><h2 id="detail-title">Job {job.id}</h2><div className="detail-grid">{field('Status', job.status)}{field('Submitted by', job.submitted_by)}{field('Created', date(job.created_at))}{field('Updated', date(job.updated_at))}{job.worker && field('Worker', job.worker.worker_id)}{job.worker && field('Worker boot', job.worker.boot_id)}{job.progress && field('Stage', `${job.progress.stage} · ${job.progress.state}`)}{job.provider && field('Pull request', `${job.provider.repository}#${job.provider.number}`)}</div>{job.status === 'running' && job.progress && <><p>Current stage: {job.progress.stage} — {job.progress.state}</p><div className="progress-track"><span/></div></>}{job.verification && <><h3>Verification</h3>{(job.verification.checks || []).map((check) => <p key={check.name}>{check.name}: {check.outcome}</p>)}{(job.verification.limitations || []).map((limitation) => <p className="muted" key={limitation}>{limitation}</p>)}</>}{job.provider?.url && <a href={job.provider.url} target="_blank" rel="noopener noreferrer">Open pull request</a>}<h3>Lifecycle</h3>{history.events?.length ? <ol className="event-list">{history.events.map((event, index) => <li key={`${event.at}-${index}`}>{date(event.at)} · {event.type}{event.stage ? ` · ${event.stage} ${event.state || ''}` : ''}</li>)}</ol> : <p className="muted">No retained lifecycle events.</p>}{!['succeeded', 'failed', 'canceled'].includes(job.status) && <div className="actions">{['queued', 'running'].includes(job.status) && <button className="danger" type="button" disabled={busy} onClick={() => void cancel()}>Request cancellation</button>}</div>}</section>;
+  return <section id="detail" className="panel detail" aria-labelledby="detail-title" aria-live="polite"><p className="eyebrow">JOB INSPECTION</p><h2 id="detail-title">Job {job.id}</h2><div className="detail-grid">{field('Status', job.status)}{field('Recovery', recoveryLabel)}{field('Submitted by', job.submitted_by)}{field('Created', date(job.created_at))}{field('Updated', date(job.updated_at))}{job.worker && field('Worker', job.worker.worker_id)}{job.worker && field('Worker boot', job.worker.boot_id)}{job.progress && field('Stage', `${job.progress.stage} · ${job.progress.state}`)}{job.provider && field('Pull request', `${job.provider.repository}#${job.provider.number}`)}</div>{job.recovery_state === 'needs_operator' && <p className="muted">Investigate this job before taking action. This signal does not prove the process stopped or that retrying is safe.</p>}{job.status === 'running' && job.progress && <><p>Current stage: {job.progress.stage} — {job.progress.state}</p><div className="progress-track"><span/></div></>}{job.verification && <><h3>Verification</h3>{(job.verification.checks || []).map((check) => <p key={check.name}>{check.name}: {check.outcome}</p>)}{(job.verification.limitations || []).map((limitation) => <p className="muted" key={limitation}>{limitation}</p>)}</>}{job.provider?.url && <a href={job.provider.url} target="_blank" rel="noopener noreferrer">Open pull request</a>}<h3>Lifecycle</h3>{history.events?.length ? <ol className="event-list">{history.events.map((event, index) => <li key={`${event.at}-${index}`}>{date(event.at)} · {event.type}{event.stage ? ` · ${event.stage} ${event.state || ''}` : ''}</li>)}</ol> : <p className="muted">No retained lifecycle events.</p>}{!['succeeded', 'failed', 'canceled'].includes(job.status) && <div className="actions">{['queued', 'running'].includes(job.status) && <button className="danger" type="button" disabled={busy} onClick={() => void cancel()}>Request cancellation</button>}</div>}</section>;
 }
 
 createRoot(document.getElementById('root')!).render(<StrictMode><App/></StrictMode>);

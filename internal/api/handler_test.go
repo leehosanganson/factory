@@ -1034,6 +1034,39 @@ func TestDashboardSubmitterBridgeRequiresSubmitterAndUsesOwnerSafeRoutes(t *test
 	}
 }
 
+func TestDashboardOperationsBridge(t *testing.T) {
+	manager := newTestManager(t, managerConfig(4, 100, 8))
+	handler := newTestHandler(t, manager, func() bool { return true })
+	for _, tc := range []struct {
+		operatorID, method, path string
+		want                     int
+	}{
+		{"", http.MethodGet, "/v1/operations", http.StatusNotFound},
+		{"admin", http.MethodGet, "/v1/operations", http.StatusOK},
+		{"admin", http.MethodPost, "/v1/operations", http.StatusNotFound},
+		{"admin", http.MethodHead, "/v1/operations", http.StatusNotFound},
+		{"admin", http.MethodGet, "/v1/operations/", http.StatusNotFound},
+		{"admin", http.MethodGet, "/v1/%6fperations", http.StatusNotFound},
+		{"admin", http.MethodGet, "/v1/operations?limit=1", http.StatusNotFound},
+		{"admin", http.MethodGet, "/v1/operations?", http.StatusNotFound},
+	} {
+		handler.config.DashboardOperatorID = tc.operatorID
+		response := httptest.NewRecorder()
+		handler.ServeAsDashboardOperator(response, httptest.NewRequest(tc.method, tc.path, nil))
+		if response.Code != tc.want {
+			t.Errorf("operator %q %s %s status=%d body=%s; want %d", tc.operatorID, tc.method, tc.path, response.Code, response.Body.String(), tc.want)
+		}
+		if tc.want == http.StatusOK {
+			var summary struct {
+				RecoveryNeeded *int `json:"recovery_needed"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &summary); err != nil || summary.RecoveryNeeded == nil || *summary.RecoveryNeeded != 0 {
+				t.Errorf("expected explicit zero recovery count, body=%s err=%v", response.Body.String(), err)
+			}
+		}
+	}
+}
+
 func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T) {
 	manager := newTestManager(t, managerConfig(4, 100, 8))
 	handler := newTestHandler(t, manager, func() bool { return true })
@@ -1048,7 +1081,7 @@ func TestDashboardPrincipalIsBoundToConfiguredOperatorAndSafeRoutes(t *testing.T
 		t.Fatalf("trusted principal admission status=%d body=%s", response.Code, response.Body.String())
 	}
 
-	for _, path := range []string{"/v1/operations", "/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
+	for _, path := range []string{"/v1/jobs/one/reconcile", "/v1/jobs/one/events/extra", "/v1/schedules/one/history", "/v1/schedules/one/runs/extra", "/v1/threads/one/jobs", "/v1/threads/one/complete"} {
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		response := httptest.NewRecorder()
 		handler.ServeAsDashboardOperator(response, request)

@@ -57,6 +57,62 @@ test('operator can manage schedules without exposing definitions in summaries', 
   expect(requests.filter((request) => ['PATCH', 'DELETE'].includes(request.method)).map((request) => request.ifMatch)).toEqual(['"1"', '"2"', '"3"', '"4"']);
 });
 
+test('operator sees the recovery count and can refresh it without inferring Worker health', async ({ page }) => {
+  const fixture = await runtime();
+  await page.goto(fixture.url);
+  await page.getByLabel('Access token').fill(fixture.token);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+
+  const panel = page.getByRole('region', { name: 'Jobs needing recovery' });
+  const count = panel.getByRole('status');
+  await expect(count).toHaveText('0');
+  await expect(panel.getByText('This count does not show whether a Worker has stopped.')).toBeVisible();
+
+  const operationsURL = '**/ui/api/v1/operations';
+  const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+  await page.route(operationsURL, async (route) => {
+    expect(route.request().method()).toBe('GET');
+    await route.fulfill({ json: { recovery_needed: 3, running: 9 } });
+  }, { times: 1 });
+  await refresh.click();
+  await expect(count).toHaveText('3');
+
+  await page.route(operationsURL, (route) => route.fulfill({ status: 503, json: { error: { message: 'private diagnostic' } } }), { times: 1 });
+  await refresh.click();
+  await expect(count).toHaveText('Unavailable');
+  await expect(panel).not.toContainText('private diagnostic');
+
+  await refresh.click();
+  await expect(count).toHaveText('0');
+  await page.route(operationsURL, (route) => route.fulfill({ json: { running: 9 } }), { times: 1 });
+  await refresh.click();
+  await expect(count).toHaveText('Unavailable');
+});
+
+test('signing out cancels a pending recovery count before entering the submitter workbench', async ({ page }) => {
+  const fixture = await runtime();
+  let capture!: (route: Route) => void;
+  const pending = new Promise<Route>((resolve) => { capture = resolve; });
+  await page.route('**/ui/api/v1/operations', (route) => capture(route), { times: 1 });
+  await page.goto(fixture.url);
+  await page.getByLabel('Access token').fill(fixture.token);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+
+  const route = await pending;
+  const panel = page.getByRole('region', { name: 'Jobs needing recovery' });
+  await expect(panel.getByRole('status')).toHaveText('Loading…');
+  const canceled = page.waitForEvent('requestfailed', (request) => request === route.request());
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await canceled;
+  await expect(panel).toHaveCount(0);
+
+  await page.getByLabel('Access token').fill(fixture.submitterToken);
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('heading', { name: 'Inbox' })).toBeVisible();
+  await route.fulfill({ json: { recovery_needed: 42 } });
+  await expect(panel).toHaveCount(0);
+});
+
 test('operator can inspect worker session summaries through the read-only dashboard', async ({ page }) => {
   const fixture = await runtime();
   const requests: { method: string; url: string }[] = [];
@@ -102,7 +158,7 @@ test('Thread owner sees a verified source edit and inbox notice after reload wit
   const submitterCookie = (await page.context().cookies(new URL(fixture.url).origin)).find((cookie) => cookie.name === 'factory_operator_session');
   expect(submitterCookie?.httpOnly).toBe(true);
   expect(submitterCookie?.secure).toBe(true);
-  for (const forbidden of ['Schedules', 'Worker sessions', 'Recent jobs', 'Admit a job']) {
+  for (const forbidden of ['Schedules', 'Worker sessions', 'Jobs needing recovery', 'Recent jobs', 'Admit a job']) {
     await expect(page.getByRole('heading', { name: forbidden, exact: true })).toHaveCount(0);
   }
 
@@ -314,6 +370,20 @@ test('operator can sign in, admit and inspect a job, and sign out', async ({ pag
   await expect(page.getByRole('heading', { name: `Job ${jobID}` })).toBeVisible();
   await expect(page.getByText('succeeded', { exact: true }).last()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('Pull request')).toHaveCount(0);
+  const detail = page.getByRole('region', { name: `Job ${jobID}` });
+  await expect(detail.getByText('Not needed', { exact: true })).toBeVisible();
+  const jobURL = `**/ui/api/v1/jobs/${jobID}`;
+  for (const [state, label] of [['needs_operator', 'Needs operator attention'], ['unavailable', 'Unavailable']]) {
+    await page.route(jobURL, async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), status: 'running', recovery_state: state } });
+    });
+    await jobLink.click();
+    await expect(detail.getByText(label, { exact: true })).toBeVisible();
+    await expect(detail.getByText('running', { exact: true })).toBeVisible();
+    if (state === 'needs_operator') await expect(detail.getByText(/does not prove the process stopped/)).toBeVisible();
+    await page.unroute(jobURL);
+  }
 
   await page.getByLabel('Repository alias').nth(1).fill('fixture');
   await page.getByLabel('Task').nth(1).fill(sourceEditTask);
