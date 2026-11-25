@@ -8,7 +8,7 @@ Browser → Controller ↔ PostgreSQL
                   Workers → configured harness
 ```
 
-The [local Compose task board](docs/features/compose-local-control-plane.md) runs one Pi Worker and an HTTPS browser UI. See that guide for Pi credentials and setup. GitHub is not required. The [Factory Worker MVP](docs/roadmap/factory-unit-mvp.md) describes the broader product direction.
+The [local Compose task board](docs/features/compose-local-control-plane.md) runs one Pi Worker and an HTTPS browser UI. The [submitter ticket board](docs/features/rest-web-ui.md#submitter-ticket-board) keeps drafts in the current tab until you queue them as Threads. See the Compose guide for Pi credentials and setup. GitHub is not required. The [Factory Worker MVP](docs/roadmap/factory-unit-mvp.md) describes the broader product direction.
 
 ## Run Factory's local CLI
 
