@@ -13,6 +13,8 @@ The browser supports two separate views. The operator dashboard remains focused 
 
 The operator dashboard shows the `recovery_needed` count from the existing [aggregate operations endpoint](rest-server-operations.md#aggregate-operational-status). The count loads on sign-in and updates when the operator selects **Refresh**. A reported zero is distinct from **Unavailable**. The count does not show whether a Worker has stopped and does not trigger any recovery action.
 
+The operator Job inspection shows **Recovery** separately from lifecycle status. **Needs operator attention** means SQLite found the job running at startup, or PostgreSQL shows a running job with no current lease or an expired lease (checked against the database clock). **Not needed** means this check did not flag the job; memory storage has no durable startup state. **Unavailable** means the check could not establish a result or observed a different job status than the detail read. This read does not prove that a process stopped, settle provider effects, or make a retry safe. It does not take any recovery action or change the job. The field is only in the dashboard operator Job detail response, not in the submitter or bearer-token REST responses.
+
 In either browser view, selecting a Thread moves keyboard focus to its detail heading and scrolls it into view. Background refreshes update the details without moving focus or scrolling.
 
 ## Broader target user workbench (partially implemented)

@@ -426,7 +426,7 @@ func (h *Handler) serveHTTP(w http.ResponseWriter, r *http.Request, authenticate
 			if caller.Role == "submitter" {
 				h.getJobForPrincipal(w, r, parts[0], caller.ID)
 			} else {
-				h.getJob(w, parts[0])
+				h.getJob(w, r, parts[0])
 			}
 			return
 		}
@@ -1322,7 +1322,7 @@ func (h *Handler) getHistoryForPrincipal(w http.ResponseWriter, id, principalID 
 	h.getHistory(w, id)
 }
 
-func (h *Handler) getJob(w http.ResponseWriter, id string) {
+func (h *Handler) getJob(w http.ResponseWriter, r *http.Request, id string) {
 	snapshot, err := h.manager.Get(id)
 	if err != nil {
 		h.writeManagerError(w, err)
@@ -1335,6 +1335,10 @@ func (h *Handler) getJob(w http.ResponseWriter, id string) {
 		if snapshot.Progress == nil {
 			snapshot.Progress = history.Progress
 		}
+	}
+	if isDashboardOperator(r) {
+		h.writeDashboardJob(w, r.Context(), snapshot)
+		return
 	}
 	writeJSON(w, http.StatusOK, snapshot)
 }
