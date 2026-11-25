@@ -46,6 +46,10 @@
 .workbench .secondary:hover { background: #e8d6ba; }
 .owner-board { padding: clamp(12px, 2vw, 24px); }
 .owner-board .section-heading { flex-wrap: wrap; }
+.thread-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+.thread-pagination:has(button), .thread-pagination:has([role="status"]:not(:empty)) { margin-top: 14px; }
+.thread-pagination button[aria-disabled="true"] { opacity: .65; cursor: default; }
+.thread-pagination [role="status"] { font-size: .875rem; }
 .owner-board .thread-result:empty { display: none; }
 .owner-board .thread-result h2, .workbench .notice { overflow-wrap: anywhere; }
 .ticket-board {
