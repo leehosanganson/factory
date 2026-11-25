@@ -202,8 +202,16 @@ func TestLatestActivityTruncationPreservesUTF8(t *testing.T) {
 	if !utf8.ValidString(activity) {
 		t.Fatalf("latest activity is invalid UTF-8 after truncation: %q", activity)
 	}
-	if !strings.HasSuffix(activity, "… ("+time.Now().Local().Format("15:04:05")+")") {
-		t.Fatalf("truncated latest activity lost its marker or timestamp: %q", activity)
+	events, err := store.SessionEvents("utf8-activity", "workflow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d session events, want 1", len(events))
+	}
+	wantSuffix := "… (" + events[0].At.Local().Format("15:04:05") + ")"
+	if !strings.HasSuffix(activity, wantSuffix) {
+		t.Fatalf("truncated latest activity = %q, want suffix %q", activity, wantSuffix)
 	}
 }
 
