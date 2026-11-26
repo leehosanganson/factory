@@ -22,6 +22,195 @@ async function addDraft(page: Page, task: string) {
 
 const lane = (page: Page, name: string) => page.getByRole('region', { name, exact: true });
 
+const firstPage = '**/ui/api/v1/threads?limit=50';
+const olderPage = '**/ui/api/v1/threads?limit=50&cursor=*';
+
+test('owned pagination opens real older Threads, retains them on polling, and resets on Refresh', async ({ page }) => {
+  const { url, submitterToken } = await fixture();
+  await page.clock.install();
+  await page.goto(url);
+  await signIn(page, submitterToken);
+  const board = lane(page, 'Your Threads');
+  const load = board.getByRole('button', { name: 'Load older Threads', exact: true });
+  const oldest = board.getByRole('button', { name: 'retained-thread-1', exact: true });
+  const checkPrivacy = async () => {
+    for (const id of ['retained-thread-2', 'retained-thread-54']) {
+      await expect(board.getByRole('button', { name: id, exact: true })).toHaveCount(0);
+    }
+    await expect(board.getByText('Private fixture task')).toHaveCount(0);
+  };
+  await expect(load).toBeEnabled();
+  await expect(board.locator('[data-thread-id]')).toHaveCount(50);
+  await expect(oldest).toHaveCount(0);
+  await checkPrivacy();
+  const continuation = page.waitForResponse(olderPage);
+  await load.press('Enter');
+  expect((await continuation).ok()).toBe(true);
+  await expect(oldest).toBeVisible();
+  await expect(load).toBeFocused();
+  await expect(load).toBeDisabled();
+  await expect(board.getByRole('status')).toHaveText(/No older Threads in this history view/);
+  await checkPrivacy();
+  const poll = page.waitForResponse(firstPage);
+  await page.clock.runFor(5000);
+  await poll;
+  await oldest.press('Enter');
+  await expect(board.getByRole('heading', { name: 'Thread retained-thread-1' })).toBeFocused();
+  await expect(board.getByText('Job retained-job-1')).toBeVisible();
+  await expect(board.getByText('Thread status: done')).toBeVisible();
+  await checkPrivacy();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(oldest).toHaveCount(0);
+  await expect(load).toBeEnabled();
+});
+
+test('owned pagination keeps loaded cards on cursor rejection and resumes after Refresh', async ({ page }) => {
+  const { url, submitterToken } = await fixture();
+  const now = new Date().toISOString();
+  const thread = (id: string) => ({ id, status: 'done', created_at: now, updated_at: now });
+  await page.route(firstPage, (route) => route.fulfill({ json: {
+    threads: [thread('newest')], has_more: true, next_cursor: 'first',
+  } }));
+  await page.route('**/ui/api/v1/threads?limit=50&cursor=first', (route) => route.fulfill({ json: {
+    threads: [thread('older')], has_more: true, next_cursor: 'no-such-cursor',
+  } }));
+  await page.goto(url);
+  await signIn(page, submitterToken);
+  const board = lane(page, 'Your Threads');
+  const load = board.getByRole('button', { name: 'Load older Threads', exact: true });
+  await load.click();
+  await expect(board.getByRole('button', { name: 'older', exact: true })).toBeVisible();
+  await load.press('Enter');
+  await expect(board.getByRole('status')).toHaveText(/expired.*Refresh/);
+  await expect(board.getByRole('button', { name: 'older', exact: true })).toBeVisible();
+  await expect(load).toBeFocused();
+  await expect(load).toBeDisabled();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(load).toBeEnabled();
+  await expect(board.getByRole('button', { name: 'older', exact: true })).toHaveCount(0);
+});
+
+for (const pollFails of [false, true]) {
+  test(`keyboard selection opens and focuses Thread detail while the background poll ${pollFails ? 'fails' : 'is stalled'}`, async ({ page }) => {
+    const { url, submitterToken } = await fixture();
+    const now = new Date().toISOString();
+    const id = 'keyboard-thread';
+    const thread = { id, status: 'done', created_at: now, updated_at: now };
+    const detailURL = `**/ui/api/v1/threads/${id}`;
+    await page.route(firstPage, (route) => route.fulfill({ json: { threads: [thread] } }));
+    await page.clock.install();
+    await page.goto(url);
+    await signIn(page, submitterToken);
+    const ticket = lane(page, 'Your Threads').getByRole('button', { name: id, exact: true });
+    let releaseSelection!: () => void;
+    let releasePoll!: () => void;
+    const selectionHeld = new Promise<void>((resolve) => { releaseSelection = resolve; });
+    const pollHeld = new Promise<void>((resolve) => { releasePoll = resolve; });
+    const failure = 'Background detail temporarily unavailable';
+    await page.route(detailURL, async (route) => {
+      if (!pollFails) await pollHeld;
+      await route.fulfill({ status: 503, json: { message: failure } });
+    });
+    await page.route(detailURL, async (route) => {
+      await selectionHeld;
+      await route.fulfill({ json: { thread } });
+    }, { times: 1 });
+    try {
+      const selection = page.waitForRequest(detailURL);
+      await ticket.press('Enter');
+      await selection;
+      const poll = page.waitForRequest(detailURL);
+      const failed = pollFails ? page.waitForResponse((response) => response.url().endsWith(`/threads/${id}`) && response.status() === 503) : null;
+      await page.clock.runFor(5000);
+      await poll;
+      await failed;
+      releaseSelection();
+      await expect(page.getByRole('heading', { name: `Thread ${id}` })).toBeFocused();
+      await expect(page.getByText(failure)).toHaveCount(0);
+    } finally {
+      releaseSelection();
+      releasePoll();
+    }
+  });
+}
+
+for (const stalled of ['quiet refresh', 'Load older Threads']) {
+  test(`quiet refresh recovers after a stalled ${stalled}`, async ({ page }) => {
+    const { url, submitterToken } = await fixture();
+    const now = new Date().toISOString();
+    const thread = (id: string) => ({ id, status: 'done', created_at: now, updated_at: now });
+    await page.route(firstPage, (route) => route.fulfill({ json: {
+      threads: [thread('before-stall')], has_more: true, next_cursor: 'first',
+    } }));
+    await page.clock.install();
+    await page.goto(url);
+    await signIn(page, submitterToken);
+    const board = lane(page, 'Your Threads');
+    const load = board.getByRole('button', { name: 'Load older Threads', exact: true });
+    await expect(load).toBeEnabled();
+    await page.route(firstPage, (route) => route.fulfill({ json: {
+      threads: [thread('after-recovery')], has_more: true, next_cursor: 'first',
+    } }));
+    const quiet = stalled === 'quiet refresh';
+    const stalledURL = quiet ? firstPage : olderPage;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    await page.route(stalledURL, async (route) => {
+      await held;
+      await route.fulfill({ json: { threads: [thread('stale-result')] } });
+    }, { times: 1 });
+    try {
+      const request = page.waitForRequest(stalledURL);
+      if (quiet) await page.clock.runFor(5000);
+      else await load.press('Enter');
+      const stalledRequest = await request;
+      const aborted = page.waitForEvent('requestfailed', { predicate: (failed) => failed === stalledRequest, timeout: 2500 });
+      await page.clock.runFor(20_000);
+      await Promise.all([
+        expect(board.getByRole('button', { name: 'after-recovery' })).toBeVisible({ timeout: 2000 }),
+        aborted,
+      ]);
+      release();
+      await expect(board.getByRole('button', { name: 'stale-result' })).toHaveCount(0);
+      await expect(load).toBeEnabled();
+    } finally { release(); }
+  });
+}
+
+test('a delayed Thread detail cannot undo a newer recorded status', async ({ page }) => {
+  const { url, submitterToken } = await fixture();
+  const now = new Date().toISOString();
+  const id = 'changing-thread';
+  const thread = { id, status: 'done', created_at: now, updated_at: now };
+  await page.route(firstPage, (route) => route.fulfill({ json: { threads: [thread] } }));
+  await page.clock.install();
+  await page.goto(url);
+  await signIn(page, submitterToken);
+  const ticket = lane(page, 'Your Threads').getByRole('button', { name: id, exact: true });
+  await expect(ticket).toBeVisible();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const detailURL = `**/ui/api/v1/threads/${id}`;
+  await page.route(detailURL, (route) => route.fulfill({ json: { thread: { ...thread, status: 'in_progress' } } }));
+  await page.route(detailURL, async (route) => {
+    await held;
+    await route.fulfill({ json: { thread } });
+  }, { times: 1 });
+  try {
+    const request = page.waitForRequest(detailURL);
+    await ticket.click();
+    await request;
+    await page.clock.runFor(5000);
+    await expect(page.getByText('Thread status: in_progress')).toBeVisible();
+    const stale = page.waitForResponse(detailURL);
+    release();
+    await stale;
+    await expect(page.getByText('Thread status: done')).not.toBeVisible({ timeout: 1000 });
+    await expect(page.getByText('Thread status: in_progress')).toBeVisible();
+    await expect(lane(page, 'Work').getByRole('button', { name: id, exact: true })).toBeVisible();
+  } finally { release(); }
+});
+
 test('drafts admit only from the Work drop zone or Queue, and retry a lost response without duplicate admission', async ({ page, context }) => {
   const { url, submitterToken } = await fixture();
   const writes: { path: string; key: string; body: unknown }[] = [];

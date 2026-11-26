@@ -44,7 +44,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             or self.command == "GET" and path == "/ui/api/v1/worker-sessions" and parsed.query in ("limit=50", "limit=50&before_created_at=2025-01-02T23%3A11%3A00Z&before_id=session-48")
             or self.command == "POST" and path == "/ui/api/v1/threads" and not parsed.query
             or self.command == "POST" and re.fullmatch(r"/ui/api/v1/threads/[A-Za-z0-9_-]+/complete", path) and not parsed.query
-            or self.command == "GET" and path == "/ui/api/v1/threads" and parsed.query == "limit=50"
+            or self.command == "GET" and path == "/ui/api/v1/threads" and re.fullmatch(r"limit=50&cursor=[A-Za-z0-9_-]+", parsed.query)
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/threads/[A-Za-z0-9_-]+", path) and not parsed.query
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/jobs/[A-Za-z0-9_-]+/(history|events)", path) and not parsed.query
             or self.command == "GET" and re.fullmatch(r"/ui/api/v1/jobs/[A-Za-z0-9_-]+", path) and not parsed.query
@@ -178,7 +178,7 @@ def main() -> int:
             "web_ui": {"enabled": True, "operator_id": "e2e-operator"},
             "persistence": {"backend": "sqlite", "path": str(root / "schedules.db")},
             "workers_enabled": True,
-            "limits": {"workers": 1, "queue_capacity": 4, "max_records": 20},
+            "limits": {"workers": 1, "queue_capacity": 4, "max_records": 128},
         }
         config_path = root / "server.json"
         config_path.write_text(json.dumps(config))
@@ -232,6 +232,16 @@ def main() -> int:
                 raise RuntimeError("Factory test server did not become ready")
 
             with sqlite3.connect(root / "schedules.db") as database:
+                at = "2025-01-01T00:00:00Z"
+                for sequence in range(1, 55):
+                    owner = "e2e-operator" if sequence in (2, 54) else "e2e-submitter"
+                    thread_id, job_id = f"retained-thread-{sequence}", f"retained-job-{sequence}"
+                    database.execute(
+                        "INSERT INTO factory_jobs (id,request_json,status,created_at,updated_at,queue_sequence,submitter) VALUES (?,?,'succeeded',?,?,?,?)",
+                        (job_id, '{"repository":"fixture","task":"Private fixture task"}', at, at, sequence, owner),
+                    )
+                    database.execute("INSERT INTO factory_threads (id,submitter,created_at,initial_job_id) VALUES (?,?,?,?)", (thread_id, owner, at, job_id))
+                    database.execute("INSERT INTO factory_thread_jobs (thread_id,job_id,position,created_at) VALUES (?,?,1,?)", (thread_id, job_id, at))
                 # A pending occurrence lets the real dispatcher admit a Job without waiting for a cron boundary.
                 occurrence = "2025-01-01T00:00:00Z"
                 database.execute(
