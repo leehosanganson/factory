@@ -105,7 +105,10 @@ func TestSubmitterProxyAllowsOnlyUserWorkAndChecksCSRFAndOrigin(t *testing.T) {
 		{"/ui/api/v1/operations", http.StatusNotFound},
 		{"/ui/api/v1/jobs/job-id/history", http.StatusNotFound},
 		{"/ui/api/v1/threads", http.StatusOK},
-		{"/ui/api/v1/threads?cursor=older", http.StatusNotFound},
+		{"/ui/api/v1/threads?limit=50&cursor=unknown", http.StatusBadRequest},
+		{"/ui/api/v1/threads?cursor=", http.StatusNotFound},
+		{"/ui/api/v1/threads?cursor=one&cursor=two", http.StatusNotFound},
+		{"/ui/api/v1/threads?before_sequence=2&snapshot_sequence=2", http.StatusNotFound},
 		{"/ui/api/v1/threads?limit=50", http.StatusOK},
 		{"/ui/api/v1/notifications", http.StatusOK},
 	} {
