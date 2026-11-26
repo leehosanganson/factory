@@ -238,7 +238,7 @@ for (const role of ['submitter', 'operator'] as const) {
       body.thread.status = 'need_attention';
       await route.fulfill({ response, json: body });
     }, { times: 1 });
-    await expect(threads.getByText(/^(Thread status: )?need_attention$/)).toBeVisible({ timeout: 10_000 });
+    await expect(threads.locator('.thread-result').getByText(role === 'submitter' ? 'Thread status: need_attention' : 'need_attention', { exact: true })).toBeVisible({ timeout: 10_000 });
     await expect(create).toBeFocused();
     expect(await page.evaluate(() => window.scrollY)).toBe(scrollY);
   });

@@ -347,7 +347,7 @@ func dashboardThreadListQueryAllowed(query map[string][]string) bool {
 
 func submitterThreadListQueryAllowed(query map[string][]string) bool {
 	for key, values := range query {
-		if key != "limit" || len(values) != 1 || values[0] == "" {
+		if (key != "limit" && key != "cursor") || len(values) != 1 || values[0] == "" {
 			return false
 		}
 	}
