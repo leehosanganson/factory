@@ -34,6 +34,11 @@ async function complete({ messages }) {
   const tasks = messages.filter(({ role }) => role === 'user').map(content);
   const task = tasks.at(-1);
   const last = messages.at(-1);
+  if (task === 'complete the scheduled smoke task without changing files') {
+    assert.equal(tasks.length, 1);
+    assert.equal(last.role, 'user');
+    return { content: 'Scheduled smoke task completed.' };
+  }
   const startTask = tasks[0];
   assert.ok(startTask === alphaTask || startTask === 'start beta', 'missing original Thread prompt');
   const alpha = startTask === alphaTask;

@@ -11,7 +11,11 @@ type Job = { recovery_state?: 'needs_operator' | 'not_needed' | 'unavailable'; r
 type History = { events?: { at: string; type: string; stage?: string; state?: string }[] };
 type Schedule = { id: string; status: string; cron: string; revision: number; pending_occurrence_at?: string; skipped_occurrences?: { count: number; first_at: string; last_at: string } };
 type ScheduleDefinition = { id: string; status: string; cron: string; repository: string; task: string };
-type ThreadPage = { threads?: Thread[]; has_more?: boolean; next_sequence?: number; snapshot_sequence?: number };
+type ThreadPage = { threads?: Thread[]; has_more?: boolean; next_cursor?: string; next_sequence?: number; snapshot_sequence?: number };
+type ThreadPagination = { page: Omit<ThreadPage, 'threads'>; extended?: boolean; expired?: boolean };
+type ThreadRead = { thread: Thread; order: number };
+type ThreadReadMode = 'reset' | 'older' | 'quiet';
+const threadListTimeoutMs = 10_000;
 type Notification = { id: number; thread_id: string; status: string; created_at: string };
 type WorkerSession = { id: string; principal_id: string; status: string; created_at: string; retired_at: string | null; heartbeat_at: string | null };
 type WorkerSessionPage = { sessions?: WorkerSession[]; has_more?: boolean; next_created_at?: string; next_id?: string };
@@ -38,6 +42,27 @@ const api = async <T,>(path: string, options: RequestInit = {}, csrf = '', onRes
 const idempotency = () => crypto.randomUUID();
 const date = (value: string) => new Date(value).toLocaleString();
 
+function newestThreadRead(previous: ThreadRead | undefined, incoming: ThreadRead) {
+  if (!previous) return incoming;
+  if (Boolean(incoming.thread.completed_at) !== Boolean(previous.thread.completed_at)) {
+    return incoming.thread.completed_at ? incoming : previous;
+  }
+  const a = incoming.thread.updated_at;
+  const b = previous.thread.updated_at;
+  // Date.parse drops the sub-millisecond part of the server's timestamps.
+  const fraction = (timestamp: string) => (timestamp.match(/\.(\d+)/)?.[1] ?? '').padEnd(9, '0');
+  const comparison = Date.parse(a) - Date.parse(b) || fraction(a).localeCompare(fraction(b)) || incoming.order - previous.order;
+  return comparison >= 0 ? incoming : previous;
+}
+
+function mergeThreadReads(previous: ThreadRead[], incoming: ThreadRead[], mode: ThreadReadMode) {
+  const seen = new Map(previous.map((row) => [row.thread.id, row]));
+  const page = new Map(incoming.map((row) => [row.thread.id, newestThreadRead(seen.get(row.thread.id), row)]));
+  if (mode === 'older') return [...new Map([...seen, ...page]).values()];
+  if (mode === 'reset') return [...page.values()];
+  return [...page.values(), ...previous.filter((row) => !page.has(row.thread.id))];
+}
+
 function App() {
   const [session, setSession] = useState<Session>({ authenticated: false });
   const [token, setToken] = useState('');
@@ -56,10 +81,16 @@ function App() {
   const [scheduleLoading, setScheduleLoading] = useState('');
   const [scheduleRevision, setScheduleRevision] = useState(0);
   const [thread, setThread] = useState<Thread | null>(null);
-  const [threads, setThreads] = useState<Thread[]>([]);
-  const [threadPage, setThreadPage] = useState<ThreadPage>({});
-  const threadPageRef = useRef<ThreadPage>({});
+  const [threadReads, setThreadReads] = useState<ThreadRead[]>([]);
+  const threads = threadReads.map((row) => row.thread);
+  const [threadPagination, setThreadPagination] = useState<ThreadPagination>({ page: {} });
+  const threadPaginationRef = useRef(threadPagination);
+  const threadListRead = useRef<{ mode: ThreadReadMode; controller: AbortController } | null>(null);
+  const threadReadOrder = useRef(0);
+  const threadDetailForeground = useRef(0);
+  const threadDetailApplied = useRef(0);
   const [threadLoading, setThreadLoading] = useState('');
+  const [threadPageError, setThreadPageError] = useState('');
   const [threadJobs, setThreadJobs] = useState<Job[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [threadPending, setThreadPending] = useState(false);
@@ -81,7 +112,6 @@ function App() {
   const scheduleGeneration = useRef(0);
   const jobRefreshGeneration = useRef(0);
   const scheduleRefreshGeneration = useRef(0);
-  const threadRefreshGeneration = useRef(0);
 
   const refreshJobs = useCallback(async () => {
     const generation = ++jobRefreshGeneration.current;
@@ -100,21 +130,65 @@ function App() {
     } catch (error) { if (generation === jobRefreshGeneration.current && mounted.current) { setLoading(''); setNotice((error as Error).message); } }
   }, [session.csrf]);
 
-  const refreshThreads = useCallback(async (older = false, quiet = false) => {
-    const generation = ++threadRefreshGeneration.current;
-    const current = () => generation === threadRefreshGeneration.current;
-    if (!quiet) setThreadLoading(older ? 'Loading older Threads…' : 'Refreshing…');
+  const refreshThreads = useCallback(async (mode: ThreadReadMode = 'reset') => {
+    const owner = session.role === 'submitter';
+    const pagination = threadPaginationRef.current;
+    const older = mode === 'older';
+    const quiet = mode === 'quiet';
+    const previous = threadListRead.current;
+    if (!mounted.current || (previous && mode !== 'reset' && !(older && previous.mode === 'quiet'))) return;
+    const query = new URLSearchParams({ limit: '50' });
+    if (older) {
+      if (!pagination.page.has_more || pagination.expired) return;
+      if (owner) {
+        if (!pagination.page.next_cursor) return;
+        query.set('cursor', pagination.page.next_cursor);
+      } else {
+        query.set('before_sequence', String(pagination.page.next_sequence));
+        query.set('snapshot_sequence', String(pagination.page.snapshot_sequence));
+      }
+    }
+    const controller = new AbortController();
+    const read = { mode, controller };
+    threadListRead.current = read;
+    previous?.controller.abort();
+    const timeout = window.setTimeout(() => controller.abort(), threadListTimeoutMs);
+    const order = ++threadReadOrder.current;
+    const current = () => threadListRead.current === read && mounted.current;
+    if (!quiet) {
+      setThreadLoading(older ? 'Loading older Threads…' : 'Refreshing…');
+      setThreadPageError('');
+    }
+    function updatePagination(next: ThreadPagination) {
+      threadPaginationRef.current = next;
+      setThreadPagination(next);
+    }
     try {
-      const currentPage = threadPageRef.current;
-      const query = older && currentPage.has_more ? `?limit=50&before_sequence=${currentPage.next_sequence}&snapshot_sequence=${currentPage.snapshot_sequence}` : '?limit=50';
-      const page = await api<ThreadPage>(`/v1/threads${query}`, {}, session.csrf);
-      if (!current() || !mounted.current) return;
-      setThreads((rows) => older ? rows.concat(page.threads || []) : page.threads || []);
-      threadPageRef.current = page;
-      setThreadPage(page);
-      setThreadLoading('');
-    } catch (error) { if (current() && mounted.current) { setThreadLoading(''); setNotice((error as Error).message); } }
-  }, [session.csrf]);
+      const { threads: summaries, ...page } = await api<ThreadPage>(`/v1/threads?${query}`, { signal: controller.signal }, session.csrf);
+      controller.signal.throwIfAborted();
+      if (!current()) return;
+      // Keep the continuation tied to the original snapshot once history is open.
+      const keepHistory = quiet && (pagination.extended || pagination.expired);
+      const incoming = (summaries ?? []).map((thread) => ({ thread, order }));
+      setThreadReads((rows) => mergeThreadReads(rows, incoming, keepHistory ? 'quiet' : older ? 'older' : 'reset'));
+      if (!keepHistory) updatePagination({ page, extended: older });
+    } catch (error) {
+      if (!current() || quiet) return;
+      if (!controller.signal.aborted && owner && older && (error as ApiError).code === 'invalid_request') {
+        updatePagination({ ...pagination, expired: true });
+      } else {
+        const message = controller.signal.aborted ? 'Loading Threads timed out. Try again.' : (error as Error).message;
+        if (owner) setThreadPageError(message);
+        else setNotice(message);
+      }
+    } finally {
+      window.clearTimeout(timeout);
+      if (current()) {
+        threadListRead.current = null;
+        if (!quiet) setThreadLoading('');
+      }
+    }
+  }, [session.csrf, session.role]);
 
   const refreshSchedules = useCallback(async (): Promise<Schedule[]> => {
     const generation = ++scheduleRefreshGeneration.current;
@@ -181,13 +255,16 @@ function App() {
     const timer = window.setInterval(async () => {
       if (session.role === 'submitter') {
         if (!await checkSubmitterSession()) return;
-        void refreshThreads(false, true);
+        void refreshThreads('quiet');
       } else if (session.role === 'operator') { void refreshJobs(); void refreshSchedules(); }
       void refreshInbox();
-      if (activeThreadID.current) void inspectThread(activeThreadID.current);
+      if (activeThreadID.current) void inspectThread(activeThreadID.current, undefined, true);
     }, 5000);
     return () => {
       active = false;
+      const read = threadListRead.current;
+      threadListRead.current = null;
+      read?.controller.abort();
       window.removeEventListener('focus', checkOnFocus);
       window.clearInterval(timer);
     };
@@ -213,10 +290,13 @@ function App() {
   }
   async function logout() {
     mounted.current = false;
+    const read = threadListRead.current;
+    threadListRead.current = null;
+    read?.controller.abort();
     try { await fetch('/ui/logout', { method: 'POST', credentials: 'same-origin', headers: { 'X-CSRF-Token': session.csrf || '' }, cache: 'no-store' }); }
     finally {
-      stream.current?.close(); stream.current = null; activeSelection.current = ''; selectionGeneration.current++; activeThreadID.current = ''; threadMutationGeneration.current++; threadCreationGeneration.current++; loginGeneration.current++; jobRefreshGeneration.current++; scheduleRefreshGeneration.current++; threadRefreshGeneration.current++; scheduleGeneration.current++;
-      setThreadPending(false); setSession({ authenticated: false }); setDetail(null); setNotifications([]); setThread(null); setThreads([]); threadPageRef.current = {}; setThreadPage({}); setThreadJobs([]); setSchedules([]); setNotice('');
+      stream.current?.close(); stream.current = null; activeSelection.current = ''; selectionGeneration.current++; activeThreadID.current = ''; threadMutationGeneration.current++; threadCreationGeneration.current++; loginGeneration.current++; jobRefreshGeneration.current++; scheduleRefreshGeneration.current++; scheduleGeneration.current++;
+      setThreadPending(false); setSession({ authenticated: false }); setDetail(null); setNotifications([]); setThread(null); setThreadReads([]); threadPaginationRef.current = { page: {} }; setThreadPagination(threadPaginationRef.current); setThreadLoading(''); setThreadPageError(''); setThreadJobs([]); setSchedules([]); setNotice('');
       threadSelection.current = null;
       threadAttempt.current = null; appendAttempt.current = null; scheduleAttempt.current = null; scheduleKey.current = ''; admissionAttempt.current = null; setAdmissionPending(false);
     }
@@ -252,21 +332,31 @@ function App() {
     if (!mounted.current || loginGeneration.current !== generation) return;
     setNotice(`Thread ${result.thread.id} created with Job ${result.job.id}.`);
     selectThread(result.thread.id);
-    void refreshThreads(false, true);
+    void refreshThreads('quiet');
   }
-  async function inspectThread(id: string, selection?: { id: string }) {
+  async function inspectThread(id: string, selection?: { id: string }, quiet = false) {
     const generation = threadMutationGeneration.current;
-    const current = () => generation === threadMutationGeneration.current && activeThreadID.current === id && mounted.current;
+    const order = ++threadReadOrder.current;
+    if (!quiet) threadDetailForeground.current = order;
+    // A poll only supersedes a pending selection once it supplies usable detail.
+    const current = () => generation === threadMutationGeneration.current && activeThreadID.current === id && mounted.current
+      && order >= threadDetailForeground.current && order >= threadDetailApplied.current;
     try {
       const result = await api<{ thread: Thread; jobs?: Job[] }>(`/v1/threads/${encodeURIComponent(id)}`, {}, session.csrf);
       if (!current()) return;
       if (result.thread.id !== id) throw new Error('Thread detail did not match the requested Thread.');
+      threadDetailApplied.current = order;
       setThread(result.thread);
       setThreadJobs(result.jobs || []);
+      if (session.role === 'submitter') {
+        const incoming = { thread: result.thread, order };
+        setThreadReads((rows) => rows.map((row) => row.thread.id === id ? newestThreadRead(row, incoming) : row));
+      }
       const pending = threadSelection.current;
       if (pending?.id === id) setThreadFocus(pending);
     } catch (error) {
-      if (mounted.current && selection && threadSelection.current === selection) threadSelection.current = null;
+      if (quiet) return;
+      if (mounted.current && selection && threadSelection.current === selection && (current() || session.role === 'operator')) threadSelection.current = null;
       if (current()) setNotice((error as Error).message);
     }
   }
@@ -303,7 +393,7 @@ function App() {
         formElement.reset();
         setNotice(result.replayed ? `Job ${result.job.id} was already appended to Thread ${id}.` : `Job ${result.job.id} appended to Thread ${id}.`);
         await inspectThread(id);
-        if (session.role === 'submitter') void refreshThreads(false, true);
+        if (session.role === 'submitter') void refreshThreads('quiet');
       }
     } catch (error) {
       if (activeThreadID.current === id && mounted.current) {
@@ -345,8 +435,17 @@ function App() {
     <div className="welcome"><div><p className="eyebrow">YOUR WORK</p><h1>Threads</h1><p className="muted">Draft a ticket, queue work, and inspect recorded outcomes.</p></div><button className="secondary" type="button" onClick={() => { void refreshThreads(); if (thread) void inspectThread(thread.id); }}>Refresh</button></div>
     <div className="notice" role="status" aria-live="polite">{notice}</div>
     <section className="panel threads-panel owner-board" aria-labelledby="threads-title">
-      <div className="section-heading"><h2 id="threads-title">Your Threads</h2><span className="muted" role="status">{threadLoading}</span></div>
+      <div className="section-heading"><h2 id="threads-title">Your Threads</h2></div>
       <ThreadBoard key={session.csrf} threads={threads} onSelect={selectThread} onQueue={queueDraft}/>
+      <div className="thread-pagination">
+        {(threadPagination.page.next_cursor || threadPagination.extended) && <button className="secondary" type="button"
+          aria-disabled={Boolean(threadLoading || threadPagination.expired || !threadPagination.page.next_cursor)}
+          onClick={() => { if (!threadLoading) void refreshThreads('older'); }}>Load older Threads</button>}
+        <span role="status" className="muted">{threadLoading || threadPageError || (threadPagination.expired
+          ? 'This page link expired. Select Refresh to restart from the newest Threads.'
+          : threadPagination.extended && !threadPagination.page.has_more ? `No older Threads in this history view. ${threads.length} loaded.`
+          : threadPagination.extended ? `${threads.length} Threads loaded.` : '')}</span>
+      </div>
       <div className="thread-result" aria-live="polite">{thread && <><h2 ref={threadHeading} tabIndex={-1}>Thread {thread.id}</h2><p className="status">Thread status: {thread.status}</p>{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span>{job.reply && <div className="safe-outcome"><h3>Reply</h3><p className="task-reply">{job.reply}</p>{job.reply_truncated && <p className="muted">Reply truncated.</p>}</div>}{job.verification && <div className="safe-outcome"><h3>Safe outcome</h3><p>Factory recorded the Job as {job.status}.</p>{job.verification.checks?.map((check) => <p key={check.name}>{check.name}: {check.outcome}</p>)}{job.verification.limitations?.map((limitation) => <p className="muted" key={limitation}>{limitation}</p>)}</div>}</article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form key={thread.id} className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Follow-up repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Send follow-up</button></form></section>}
 
@@ -359,7 +458,7 @@ function App() {
     <div className="notice" role="status" aria-live="polite">{notice}</div>
     <div className="layout"><section className="panel admission" aria-labelledby="admit-title"><h2 id="admit-title">Admit a job</h2><form onSubmit={admit}><label htmlFor="repository">Repository alias</label><input id="repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="task">Task</label><textarea id="task" name="task" rows={6} maxLength={262144} required/><button type="submit" disabled={admissionPending}>{admissionPending ? 'Queueing…' : 'Queue job'}</button></form></section>
     <section className="panel jobs-panel" aria-labelledby="jobs-title"><div className="section-heading"><h2 id="jobs-title">Recent jobs</h2><span className="muted" role="status">{loading}</span></div><div className="job-list" aria-live="polite">{jobs.length ? jobs.map((job) => <article className="job-row" key={job.id}><a className="job-link" href={`#job-${encodeURIComponent(job.id)}`} onClick={(e) => { e.preventDefault(); void inspect(job.id); }}>{job.id}</a><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">{date(job.created_at)} · Updated {date(job.updated_at)}</span></article>) : <p className="empty">No jobs yet. Submit a task to create the first job.</p>}</div></section></div>
-    <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Threads</h2><span className="muted" role="status">{threadLoading}</span></div><p className="muted">Browse recent Threads and select one to reopen its safe job summary.</p><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => selectThread(item.id)}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)} · Updated {date(item.updated_at)}{item.completed_at ? ` · Completed ${date(item.completed_at)}` : ''}</span></article>) : <p className="empty">No retained Threads yet.</p>}</div>{threadPage.has_more && <button className="secondary" type="button" onClick={() => void refreshThreads(true)}>Load older Threads</button>}<h3>Start a Thread</h3><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread</button></form>
+    <section className="panel threads-panel" aria-labelledby="threads-title"><div className="section-heading"><h2 id="threads-title">Threads</h2><span className="muted" role="status">{threadLoading}</span></div><p className="muted">Browse recent Threads and select one to reopen its safe job summary.</p><div className="thread-list" aria-live="polite">{threads.length ? threads.map((item) => <article className="thread-row" key={item.id}><button className="thread-select" type="button" onClick={() => selectThread(item.id)}>{item.id}</button><span className={`status ${item.status}`}>{item.status}</span><span className="job-meta">{date(item.created_at)} · Updated {date(item.updated_at)}{item.completed_at ? ` · Completed ${date(item.completed_at)}` : ''}</span></article>) : <p className="empty">No retained Threads yet.</p>}</div>{threadPagination.page.has_more && <button className="secondary" type="button" onClick={() => void refreshThreads('older')}>Load older Threads</button>}<h3>Start a Thread</h3><form className="thread-form" onSubmit={createThread}><label htmlFor="thread-repository">Repository alias</label><input id="thread-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-task">Task</label><textarea id="thread-task" name="task" rows={4} maxLength={262144} required/><button type="submit">Create Thread</button></form>
       <div className="thread-result" aria-live="polite">{thread && <><h3 ref={threadHeading} tabIndex={-1}>Thread {thread.id}</h3><span className={`status ${thread.status}`}>{thread.status}</span>{thread.completed_at && <p className="job-meta">Completed {date(thread.completed_at)}</p>}{threadJobs.map((job) => <article className="thread-job" key={job.id}><strong>Job {job.id}</strong><span className={`status ${job.status}`}>{job.status}</span><span className="job-meta">Created {date(job.created_at)} · Updated {date(job.updated_at)}</span></article>)}</>}</div>
       {thread && !thread.completed_at && <section className="thread-controls" aria-label="Current Thread actions"><h3>Continue this Thread</h3><form className="thread-form" onSubmit={appendThread}><label htmlFor="thread-append-repository">Repository alias</label><input id="thread-append-repository" name="repository" maxLength={64} required autoComplete="off"/><label htmlFor="thread-append-task">Follow-up task</label><textarea id="thread-append-task" name="task" rows={3} maxLength={262144} required/><button type="submit" disabled={threadPending}>Append Job</button></form><button className="danger" type="button" disabled={threadPending} onClick={() => void completeThread()}>Complete Thread</button></section>}</section>
     <RecoveryCount refresh={recoveryRefresh} />
