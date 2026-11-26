@@ -48,15 +48,13 @@ The MVP does not require an issue poller or issue webhook. Existing issue intake
 
 ## Current implementation is different
 
-Factory already ships a REST job service, persistent schedules, direct-request Threads and owner notifications, a focused browser dashboard, and separate PostgreSQL worker processes. These provide useful foundations but are not this target architecture:
+Factory already ships a REST job service, persistent schedules, direct-request Threads and owner notifications, a focused browser dashboard, and two separate Worker modes. The shipped HTTP Worker implements part of the target architecture; the legacy mode remains available:
 
-- The current separate `factory worker` connects directly to PostgreSQL and claims Jobs and writes lifecycle state through the shared Store. It does not receive assignments or report results through a Controller worker-job API.
-- The current Controller session listener handles Worker registration and advisory heartbeat only. It does not carry Job claims, assignments, or results. See [REST worker process](../features/rest-worker.md) for shipped behavior and the [worker identity and credential contract](worker-identity-credential-contract.md) for the current session boundary and deferred protocol design.
-- Current Docker Compose defaults to a Controller and PostgreSQL with **no Worker service**, so admitted Jobs remain queued unless the optional worker profile is started. See [local Compose API control plane](../features/compose-local-control-plane.md).
+- The default [local Compose task board](../features/compose-local-control-plane.md) starts the Controller, PostgreSQL, one Pi Worker (`remote-worker`), and a loopback-only HTTPS task board. The optional `worker` profile is for the legacy direct-PostgreSQL Worker, not the default Pi Worker.
+- The standalone `factory worker remote` polls the PostgreSQL-backed Controller's shared-secret HTTP Worker API for Job assignments (`/v1/worker/claims`) and sends attempt heartbeats and terminal results (`/v1/worker/attempts/{id}/heartbeat` and `/v1/worker/attempts/{id}/finish`). It does not connect directly to PostgreSQL. See [REST worker processes](../features/rest-worker.md).
+- The legacy `factory worker` claims Jobs and writes lifecycle state directly through the shared PostgreSQL Store. Its separate mutual TLS (mTLS) Controller listener handles registration and advisory session heartbeats, not Job claims, assignments, or results. See the [worker identity and credential contract](worker-identity-credential-contract.md) for that session boundary.
 - The current embedded dashboard is operator-focused. It supports bounded Job operations, direct Thread actions, schedules, and read-only Worker-session inspection; it is not yet the required user-facing Thread request/response/outcome workbench. See [embedded REST operator dashboard](../features/rest-web-ui.md).
-- Current implementation documentation describes shipped behavior. Consult [implemented features](../features/README.md), the [REST job API and lifecycle contract](rest-api-contract.md), and [REST server operations](../features/rest-server-operations.md) for current semantics. In particular, current REST jobs with a configured provider require PR publication for success. That is not the target success rule stated above.
-
-The target Controller-to-Worker protocol replaces direct shared-PostgreSQL Worker ownership operations. Do not infer that target assignment model from the existing separate process command, session heartbeat, or Compose profile.
+- The standalone HTTP Worker does not publish pull requests. In-process server workers and legacy direct-PostgreSQL Workers require confirmed pull request publication for success when a GitHub publication provider is configured. That is not the target success rule stated above. See [implemented features](../features/README.md) and [REST server operations](../features/rest-server-operations.md) for shipped behavior, and the [REST Job and lifecycle contract](rest-api-contract.md) for target behavior.
 
 ## Safety and operational limits
 
